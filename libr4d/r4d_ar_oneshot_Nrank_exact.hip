@@ -1,5 +1,5 @@
-// r4d_ar_oneshot_Nrank_exact.hip: r4d_ar_oneshot_4rank_exact,
-// r4d_ar_oneshot_8rank_exact -- one-shot P2P push all-reduce, 4 or 8
+// r4d_ar_oneshot_Nrank_exact.hip: r4d_ar_oneshot_3rank_exact, r4d_ar_oneshot_4rank_exact,
+// r4d_ar_oneshot_8rank_exact -- one-shot P2P push all-reduce, 3, 4 or 8
 // ranks, gfx1201. WS is compile-time; the 2-rank kernel keeps its own file.
 //
 // Per-block handshake: block b waits only on the peers' block b, so push
@@ -341,6 +341,23 @@ static void ar_wide_launch(const long* peer_scratch, const long* peer_flags, lon
   else if (dtype == 2) R4D_AR_WIDE_LAUNCH(float, 4);
   else throw std::runtime_error("all_reduce: bad dtype");
 #undef R4D_AR_WIDE_LAUNCH
+}
+
+// Three ranks: the same kernel at WS=3. Nothing in the push, the handshake or the ascending-rank
+// reduce assumes a power of two -- the peer bundle is WS-1 wide and the slot/flag layout is
+// parity x source rank -- so this is an instantiation, not a variant. It exists because a 3-card
+// box is a real configuration (three R9700s) and the two-shot cannot serve it: that one shards the
+// message `world` ways and a residual width of 2560 does not divide by 3.
+void r4d_ar_oneshot_3rank_exact(long peer_scratch0, long peer_scratch1,
+                                long peer_flags0, long peer_flags1,
+                                long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+                                long inp, long out, long n_elem, long dtype, long rank,
+                                long stream, long nblocks, long nthreads, long drain, long acq,
+                                long pub) {
+  const long ps[2] = {peer_scratch0, peer_scratch1};
+  const long pf[2] = {peer_flags0, peer_flags1};
+  ar_wide_launch<3>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
+                    dtype, rank, stream, nblocks, nthreads, drain, acq, pub);
 }
 
 void r4d_ar_oneshot_4rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,

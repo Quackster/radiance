@@ -2432,6 +2432,14 @@ static const RadConstraint cArExact[] = {
     C_EQ("world_size", 2), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
     C_P2P,
 };
+static const RadConstraint cArGather3[] = {
+    C_EQ("world_size", 3), C_IN("dtype", "bf16 fp16 f16 fp32 f32"),
+    C_P2P,
+};
+static const RadConstraint cArExact3[] = {
+    C_EQ("world_size", 3), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_P2P,
+};
 static const RadConstraint cArExact4[] = {
     C_EQ("world_size", 4), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
     C_P2P,
@@ -4010,6 +4018,26 @@ static const RadKernelInfo kKernels[] = {
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_oneshot_2rank_wht6, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
+{ "ar_gather_3rank", "all_gather", "ar",
+  "all-gather, one-shot push over P2P IPC scratch, the wide family's per-block handshake",
+  "exactly 3 ranks, all peer-accessible; y is [3 * numel] with rank r's input at r * numel, or "
+  "row-interleaved [rows][3][row] when `row` is given; shares the wide family's "
+  "flag/seq/scratch set; cudagraph-safe",
+  "any payload -- the bytes are moved, never summed, so the (u32 id, f32 logit) pairs the "
+  "vocab-parallel sampler gathers survive intact",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+  ROW(cArGather3), ROW(tAr), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_gather_3rank, nullptr, nullptr, nullptr,
+  r4d_shape_all_gather },
+{ "ar_oneshot_3rank_exact", "all_reduce", "ar",
+  "all-reduce (sum), one-shot push over P2P IPC scratch, per-block handshake",
+  "exactly 3 ranks, all peer-accessible; one scratch slot per (parity, source rank); "
+  "the only wide form at three -- the two-shot shards the message `world` ways; cudagraph-safe",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+  ROW(cArExact3), ROW(tAr), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_oneshot_3rank_exact, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
 { "ar_oneshot_4rank_exact", "all_reduce", "ar",
   "all-reduce (sum), one-shot push over P2P IPC scratch, per-block handshake",
   "exactly 4 ranks, all peer-accessible; one scratch slot per (parity, source rank); in "

@@ -551,7 +551,7 @@ extern "C" int r4d_rad_ar_gather_2rank(const RadArgs* a, RadStream s) {
     return RAD_OK;
 }
 
-/* ------------------------------------------------------------------ wide (4 / 8 rank) all-gather
+/* ------------------------------------------------------------------ wide (3 / 4 / 8 rank) all-gather
  * The gather the 2-rank one cannot be at width: its handshake is one peer flag per block, so the
  * wide form takes the wide family's peer arrays and r4d_ar_handshake instead (r4d_ar_wide.h), and
  * it rides the SAME instance, scratch, flags and counters as the wide one-shots above -- a slot
@@ -620,6 +620,21 @@ static int ar_gather_wide_setup(const RadArgs* a, int ws, const ArInst** out_in,
     c->acq = cfgv.acq;
     c->pub = cfgv.pub;
     *row_out = row;
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_ar_gather_3rank(const RadArgs* a, RadStream s) {
+    const ArInst* in = nullptr;
+    ArCall c;
+    long long row = 0;
+    int rc = ar_gather_wide_setup(a, 3, &in, &c, &row);
+    if (rc != RAD_OK) return rc;
+    R4D_TRY("ar_gather_3rank",
+        r4d_ar_gather_3rank(in->peer_scratch[0], in->peer_scratch[1],
+                            in->peer_flags[0], in->peer_flags[1],
+                            in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                            c.inp, c.out, c.numel, in->dtype, in->rank, (long)row,
+                            (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub));
     return RAD_OK;
 }
 
@@ -737,7 +752,7 @@ extern "C" int r4d_rad_ar_oneshot_2rank_wht6(const RadArgs* a, RadStream s) {
     return RAD_OK;
 }
 
-/* ------------------------------------------------------------------ wide (4 / 8 rank)
+/* ------------------------------------------------------------------ wide (3 / 4 / 8 rank)
  *
  * The peer arguments are ascending global rank with the current rank removed, which is exactly
  * the order build() filled peer_scratch/peer_flags in. */
@@ -745,6 +760,22 @@ extern "C" int r4d_rad_ar_oneshot_2rank_wht6(const RadArgs* a, RadStream s) {
 /* The one-shots run in place: the thread that stores word k of the output is the one that read
  * word k of the input, for its push and again as its own term of the fold, and peers read only
  * their own scratch (r4d_ar_oneshot_Nrank_exact.hip). */
+extern "C" int r4d_rad_ar_oneshot_3rank_exact(const RadArgs* a, RadStream s) {
+    ArCall c;
+    int rc = ar_setup(a, &c, 0);
+    if (rc != RAD_OK) return rc;
+    if (c.in->world != 3) return RAD_E_SHAPE;
+    const ArInst* in = c.in;
+    R4D_TRY("ar_oneshot_3rank_exact",
+        r4d_ar_oneshot_3rank_exact(in->peer_scratch[0], in->peer_scratch[1],
+                                   in->peer_flags[0], in->peer_flags[1],
+                                   in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                                   c.inp, c.out, c.numel, in->dtype, in->rank,
+                                   (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
+                                   c.pub));
+    return RAD_OK;
+}
+
 extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
     ArCall c;
     int rc = ar_setup(a, &c, 0);

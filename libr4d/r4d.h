@@ -326,12 +326,29 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
 // words parity x source rank, this rank's own slot unused); flags are max_blocks*ws words indexed 
 // [block][source rank]; seq_ctrs is 2 * max_blocks words, a handshake and a slot-parity counter
 // per block of capacity (r4d_ar_seq.h).
+// Three ranks: the same kernel instantiated at WS=3 (two peers). Nothing in the wide family is
+// power-of-two; the two-shot cannot serve 3 because it shards the message `world` ways.
+void r4d_ar_oneshot_3rank_exact(long peer_scratch0, long peer_scratch1,
+                                long peer_flags0, long peer_flags1,
+                                long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+                                long inp, long out, long n_elem, long dtype, long rank,
+                                long stream, long nblocks, long nthreads, long drain, long acq,
+                                long pub);
 void r4d_ar_oneshot_4rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                 long peer_flags0, long peer_flags1, long peer_flags2,
                                 long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
                                 long inp, long out, long n_elem, long dtype, long rank,
                                 long stream, long nblocks, long nthreads, long drain, long acq,
                                 long pub);
+// ---- all-gather at width (r4d_ar_gather_Nrank.hip) ------------------------------------------
+// The 2-rank gather's placement on the wide family's transport: `out` is world * n_elem elements,
+// rank r's slice at r * n_elem, or row-interleaved [rows][world][row] when row_elems > 0. Shares
+// the wide all-reduce's instance (scratch, [block][source] flags, seq counters).
+void r4d_ar_gather_3rank(long peer_scratch0, long peer_scratch1, long peer_flags0,
+                         long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
+                         long slot_stride16, long inp, long out, long n_elem, long dtype,
+                         long rank, long row_elems, long stream, long nblocks, long nthreads,
+                         long drain, long acq, long pub);
 void r4d_ar_oneshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                 long peer_scratch3, long peer_scratch4, long peer_scratch5,
                                 long peer_scratch6, long peer_flags0, long peer_flags1,

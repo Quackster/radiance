@@ -1,4 +1,4 @@
-// r4d_ar_gather_Nrank.hip: r4d_ar_gather_4rank, r4d_ar_gather_8rank -- one-shot P2P all-GATHER,
+// r4d_ar_gather_Nrank.hip: r4d_ar_gather_3rank, r4d_ar_gather_4rank, r4d_ar_gather_8rank -- one-shot P2P all-GATHER,
 // 4 or 8 ranks, gfx1201. WS is compile-time; the 2-rank gather keeps its own file, exactly as the
 // one-shot all-reduce's does.
 //
@@ -34,6 +34,12 @@
 // "C" here, at arm's length from the definitions below, so those definitions get C linkage; the
 // caller is r4d_ar_entry.hip, which owns the instance and repeats the two prototypes at its call
 // site (r4d.h declares the rest of the family and is not this unit's file).
+extern "C" void r4d_ar_gather_3rank(long peer_scratch0, long peer_scratch1,
+                                    long peer_flags0, long peer_flags1,
+                                    long my_scratch, long my_flags, long seq_ctrs,
+                                    long slot_stride16, long inp, long out, long n_elem,
+                                    long dtype, long rank, long row_elems, long stream,
+                                    long nblocks, long nthreads, long drain, long acq, long pub);
 extern "C" void r4d_ar_gather_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                     long peer_flags0, long peer_flags1, long peer_flags2,
                                     long my_scratch, long my_flags, long seq_ctrs,
@@ -213,6 +219,19 @@ static void ar_gather_wide_launch(const long* peer_scratch, const long* peer_fla
       (const int4*)inp, peers, (const int4*)my_scratch, (int4*)out, (unsigned int*)my_flags,
       (unsigned int*)seq_ctrs, n16, (int)slot_stride16, (int)rank, row16, (int)drain, (int)acq,
       (int)pub);
+}
+
+/* Three ranks: the same launch with two peers. The vocab-parallel sampler's gather at a world of
+ * three (Qwen3.8-Flash-Next padded to 36 heads / 3 KV heads, docs/TP3.md) resolves here. */
+void r4d_ar_gather_3rank(long peer_scratch0, long peer_scratch1,
+                         long peer_flags0, long peer_flags1, long my_scratch,
+                         long my_flags, long seq_ctrs, long slot_stride16, long inp, long out,
+                         long n_elem, long dtype, long rank, long row_elems, long stream,
+                         long nblocks, long nthreads, long drain, long acq, long pub) {
+  const long ps[2] = {peer_scratch0, peer_scratch1};
+  const long pf[2] = {peer_flags0, peer_flags1};
+  ar_gather_wide_launch<3>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
+                           dtype, rank, row_elems, stream, nblocks, nthreads, drain, acq, pub);
 }
 
 void r4d_ar_gather_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,

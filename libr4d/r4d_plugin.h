@@ -173,6 +173,8 @@ int  r4d_rad_ar_gather_2rank       (const RadArgs*, RadStream);
 int  r4d_rad_ar_gather_4rank       (const RadArgs*, RadStream);
 int  r4d_rad_ar_gather_8rank       (const RadArgs*, RadStream);
 int  r4d_rad_ar_oneshot_2rank_wht6 (const RadArgs*, RadStream);
+int  r4d_rad_ar_oneshot_3rank_exact(const RadArgs*, RadStream);
+int  r4d_rad_ar_gather_3rank       (const RadArgs*, RadStream);
 int  r4d_rad_ar_oneshot_4rank_exact(const RadArgs*, RadStream);
 int  r4d_rad_ar_oneshot_8rank_exact(const RadArgs*, RadStream);
 int  r4d_rad_ar_twoshot_4rank_exact(const RadArgs*, RadStream);

@@ -8820,14 +8820,17 @@ struct ArThread {
     /* The all-gather row width in ELEMENTS. 0 is the plain concatenation; anything else asks for
      * the row-interleaved placement the vocab-parallel sampler needs. */
     int64_t row_elems = 0;
+    /* Ranks in the collective. 2 is the pair; 3 exercises the wide family at the one width that
+     * is not a power of two. */
+    int world = 2;
 };
 
 static void ar_worker(ArThread* t) {
     if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
     std::vector<RadParam> ps = {
-        PI("world_size", 2), PI("numel", t->numel), PS("dtype", "fp32"), PI("exact", 1),
+        PI("world_size", t->world), PI("numel", t->numel), PS("dtype", "fp32"), PI("exact", 1),
     };
-    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, 2, &t->inst);
+    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, t->world, &t->inst);
     if (t->rc_init != RAD_OK) return;
 
     void* in = nullptr;
@@ -8845,7 +8848,7 @@ static void ar_worker(ArThread* t) {
     a.p = ps.data(); a.n_p = (int)ps.size();
     a.instance = t->inst;
     a.rank = t->rank;
-    a.world_size = 2;
+    a.world_size = t->world;
     t->rc_launch = t->row->launch(&a, nullptr);
     st_stream_sync(nullptr);
 
@@ -8905,6 +8908,7 @@ struct ArSweep {
     void* inst = nullptr;
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     int64_t bad = 0;
+    int world = 2;
 };
 
 static void ar_sweep_worker(ArSweep* t) {
@@ -8912,10 +8916,12 @@ static void ar_sweep_worker(ArSweep* t) {
     int64_t most = 0;
     for (int64_t n : kArSweepNumel) most = n > most ? n : most;
     std::vector<RadParam> ps = {
-        PI("world_size", 2), PI("numel", most), PS("dtype", "fp32"), PI("exact", 1),
+        PI("world_size", t->world), PI("numel", most), PS("dtype", "fp32"), PI("exact", 1),
     };
-    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, 2, &t->inst);
+    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, t->world, &t->inst);
     if (t->rc_init != RAD_OK) return;
+    /* Rank r contributes (r + 1) * (j + 1), so launch j sums to (1 + 2 + .. + world) * (j + 1). */
+    const float tri = (float)(t->world * (t->world + 1) / 2);
 
     void* in[kArSweepN] = {};
     void* out[kArSweepN] = {};
@@ -8939,14 +8945,14 @@ static void ar_sweep_worker(ArSweep* t) {
         a.p = ps.data(); a.n_p = (int)ps.size();
         a.instance = t->inst;
         a.rank = t->rank;
-        a.world_size = 2;
+        a.world_size = t->world;
         t->rc_launch = t->row->launch(&a, nullptr);
     }
     st_stream_sync(nullptr);
     for (int j = 0; j < kArSweepN; ++j) {
         std::vector<float> h((size_t)kArSweepNumel[j]);
         st_memcpy(h.data(), out[j], h.size() * 4, hipMemcpyDeviceToHost);
-        for (float v : h) if (v != (float)(3 * (j + 1))) ++t->bad;
+        for (float v : h) if (v != tri * (float)(j + 1)) ++t->bad;
         st_free(in[j]);
         st_free(out[j]);
     }
@@ -8984,16 +8990,16 @@ static void ar_two_rank_sweep(const Plugin& pl, const std::vector<int>& devs) {
 static void gather_worker(ArThread* t) {
     if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
     std::vector<RadParam> ps = {
-        PI("world_size", 2), PI("numel", t->numel), PS("dtype", "f32"),
+        PI("world_size", t->world), PI("numel", t->numel), PS("dtype", "f32"),
     };
     if (t->row_elems > 0) ps.push_back(PI("row", t->row_elems));
-    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, 2, &t->inst);
+    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, t->world, &t->inst);
     if (t->rc_init != RAD_OK) return;
 
     void* in = nullptr;
     void* out = nullptr;
     if (hipMalloc(&in, (size_t)t->numel * 4) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; return; }
-    if (hipMalloc(&out, (size_t)t->numel * 8) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; return; }
+    if (hipMalloc(&out, (size_t)t->numel * 4 * t->world) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; return; }
 
     std::vector<uint32_t> h((size_t)t->numel);
     for (int64_t i = 0; i < t->numel; i += 2) {
@@ -9002,20 +9008,20 @@ static void gather_worker(ArThread* t) {
         std::memcpy(&h[(size_t)i + 1], &v, 4);
     }
     st_memcpy(in, h.data(), h.size() * 4, hipMemcpyHostToDevice);
-    st_memset(out, 0xAB, (size_t)t->numel * 8);   /* so an untouched half is visibly untouched */
+    st_memset(out, 0xAB, (size_t)t->numel * 4 * t->world);   /* so an untouched slice is visibly untouched */
 
-    RadTensor ts[2] = { T(in, RAD_F32, { t->numel }), T(out, RAD_F32, { t->numel * 2 }) };
+    RadTensor ts[2] = { T(in, RAD_F32, { t->numel }), T(out, RAD_F32, { t->numel * t->world }) };
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
     a.t = ts; a.n_t = 2;
     a.p = ps.data(); a.n_p = (int)ps.size();
     a.instance = t->inst;
     a.rank = t->rank;
-    a.world_size = 2;
+    a.world_size = t->world;
     t->rc_launch = t->row->launch(&a, nullptr);
     st_stream_sync(nullptr);
 
-    t->out.assign((size_t)t->numel * 2, 0.0f);
+    t->out.assign((size_t)t->numel * t->world, 0.0f);
     st_memcpy(t->out.data(), out, t->out.size() * 4, hipMemcpyDeviceToHost);
     st_free(in);
     st_free(out);
@@ -9103,6 +9109,151 @@ static void gather_two_rank(const Plugin& pl, const std::vector<int>& devs) {
 
     if (row->fini) { row->fini(c.inst); row->fini(d.inst); }
     ok("2-rank all-gather fini ran", true);
+}
+
+/* ------------------------------------------------------------------ the three-rank wide family */
+/* THE ONE WIDTH THAT IS NOT A POWER OF TWO. The wide kernels are templated on the world size and
+ * shipped at 4 and 8; three cards instantiate the same template at 3, and these are the checks that
+ * the instantiation, the dispatch rows and the entry points agree: a rendezvous of three, a sum of
+ * 1 + 2 + 3 on every rank bit for bit, the slot parity surviving a block-count sweep, and the
+ * gather placing three slices in both of its layouts. Skipped, not failed, on fewer cards. */
+static void ar_three_rank(const Plugin& pl, const std::vector<int>& devs) {
+    const RadKernelInfo* row = find(pl, "ar_oneshot_3rank_exact");
+    if (!row) { ok("ar_oneshot_3rank_exact", false, "row absent"); return; }
+    if (devs.size() < 3) { skip("ar_oneshot_3rank_exact (3 ranks)", "fewer than three gfx1201 cards"); return; }
+    const int64_t numel = 8192;
+    ArThread a{ row, 0, devs[0], numel }, b{ row, 1, devs[1], numel }, c{ row, 2, devs[2], numel };
+    a.world = b.world = c.world = 3;
+    std::thread ta(ar_worker, &a), tb(ar_worker, &b), tc(ar_worker, &c);
+    ta.join();
+    tb.join();
+    tc.join();
+    ok("3-rank all-reduce init (peer rendezvous)",
+       a.rc_init == RAD_OK && b.rc_init == RAD_OK && c.rc_init == RAD_OK,
+       "rc " + std::to_string(a.rc_init) + "/" + std::to_string(b.rc_init) + "/" +
+           std::to_string(c.rc_init));
+    if (a.rc_init != RAD_OK || b.rc_init != RAD_OK || c.rc_init != RAD_OK) return;
+    ok("3-rank all-reduce launch",
+       a.rc_launch == RAD_OK && b.rc_launch == RAD_OK && c.rc_launch == RAD_OK,
+       "rc " + std::to_string(a.rc_launch) + "/" + std::to_string(b.rc_launch) + "/" +
+           std::to_string(c.rc_launch));
+    int64_t bad = 0;
+    for (int64_t i = 0; i < numel; ++i) {
+        if (a.out[(size_t)i] != 6.0f) ++bad;
+        if (b.out[(size_t)i] != 6.0f) ++bad;
+        if (c.out[(size_t)i] != 6.0f) ++bad;
+    }
+    ok("3-rank all-reduce sums 1 + 2 + 3 == 6 on every rank, bit for bit", bad == 0,
+       std::to_string(bad) + " elements wrong");
+    if (row->fini) { row->fini(a.inst); row->fini(b.inst); row->fini(c.inst); }
+    ok("3-rank all-reduce fini ran", true);
+
+    /* Block counts that change launch to launch on one instance: the wide family takes its slot
+     * parity from the shared counters exactly as the pair does, and this is the check that it
+     * does so at a width whose flag array is [block][3]. */
+    ArSweep x{ row, 0, devs[0] }, y{ row, 1, devs[1] }, z{ row, 2, devs[2] };
+    x.world = y.world = z.world = 3;
+    std::thread tx(ar_sweep_worker, &x), ty(ar_sweep_worker, &y), tz(ar_sweep_worker, &z);
+    tx.join();
+    ty.join();
+    tz.join();
+    const bool up = x.rc_init == RAD_OK && y.rc_init == RAD_OK && z.rc_init == RAD_OK &&
+                    x.rc_launch == RAD_OK && y.rc_launch == RAD_OK && z.rc_launch == RAD_OK;
+    ok("3-rank all-reduce, eight launches at changing block counts on one instance",
+       up && x.bad == 0 && y.bad == 0 && z.bad == 0,
+       up ? std::to_string(x.bad + y.bad + z.bad) + " elements wrong"
+          : "rc " + std::to_string(x.rc_init) + "/" + std::to_string(y.rc_init) + "/" +
+                std::to_string(z.rc_init) + " init, " + std::to_string(x.rc_launch) + "/" +
+                std::to_string(y.rc_launch) + "/" + std::to_string(z.rc_launch) + " launch");
+    if (row->fini) {
+        if (x.inst) row->fini(x.inst);
+        if (y.inst) row->fini(y.inst);
+        if (z.inst) row->fini(z.inst);
+    }
+}
+
+static void gather_three_rank(const Plugin& pl, const std::vector<int>& devs) {
+    const RadKernelInfo* row = find(pl, "ar_gather_3rank");
+    if (!row) { ok("ar_gather_3rank", false, "row absent"); return; }
+    if (devs.size() < 3) { skip("ar_gather_3rank (3 ranks)", "fewer than three gfx1201 cards"); return; }
+    const int64_t numel = 8192;   /* the sampler's own message at 4 rows and 1024 candidates */
+    const int W = 3;
+    /* What each rank sent, rebuilt here rather than read back off the device (gather_two_rank). */
+    auto sent = [](int rank, int64_t i) -> uint32_t {
+        if ((i & 1) == 0) return (uint32_t)(rank * 124160 + (int)i + 1);
+        uint32_t u; const float v = (float)(rank + 1) * 0.5f + (float)(i - 1);
+        std::memcpy(&u, &v, 4);
+        return u;
+    };
+    {
+        ArThread a{ row, 0, devs[0], numel }, b{ row, 1, devs[1], numel }, c{ row, 2, devs[2], numel };
+        a.world = b.world = c.world = W;
+        std::thread ta(gather_worker, &a), tb(gather_worker, &b), tc(gather_worker, &c);
+        ta.join();
+        tb.join();
+        tc.join();
+        ok("3-rank all-gather init (peer rendezvous)",
+           a.rc_init == RAD_OK && b.rc_init == RAD_OK && c.rc_init == RAD_OK,
+           "rc " + std::to_string(a.rc_init) + "/" + std::to_string(b.rc_init) + "/" +
+               std::to_string(c.rc_init));
+        if (a.rc_init != RAD_OK || b.rc_init != RAD_OK || c.rc_init != RAD_OK) return;
+        ok("3-rank all-gather launch",
+           a.rc_launch == RAD_OK && b.rc_launch == RAD_OK && c.rc_launch == RAD_OK,
+           "rc " + std::to_string(a.rc_launch) + "/" + std::to_string(b.rc_launch) + "/" +
+               std::to_string(c.rc_launch));
+        int64_t bad = 0, bad_id = 0;
+        for (const ArThread* t : { &a, &b, &c }) {
+            for (int r = 0; r < W; ++r) {
+                for (int64_t i = 0; i < numel; ++i) {
+                    uint32_t got;
+                    std::memcpy(&got, &t->out[(size_t)(r * numel + i)], 4);
+                    if (got == sent(r, i)) continue;
+                    ++bad;
+                    if ((i & 1) == 0) ++bad_id;
+                }
+            }
+        }
+        ok("3-rank all-gather places every rank's bytes on every rank, bit for bit", bad == 0,
+           std::to_string(bad) + " words wrong, " + std::to_string(bad_id) + " of them token ids");
+        if (row->fini) { row->fini(a.inst); row->fini(b.inst); row->fini(c.inst); }
+    }
+
+    /* The row-interleaved placement the sampler asks for: [rows][3][row]. */
+    const int64_t rowe = 2048;                     /* 4 rows of 1024 (id, logit) pairs */
+    ArThread c{ row, 0, devs[0], numel }, d{ row, 1, devs[1], numel }, e{ row, 2, devs[2], numel };
+    c.world = d.world = e.world = W;
+    c.row_elems = d.row_elems = e.row_elems = rowe;
+    std::thread tc(gather_worker, &c), td(gather_worker, &d), te(gather_worker, &e);
+    tc.join();
+    td.join();
+    te.join();
+    if (c.rc_init != RAD_OK || d.rc_init != RAD_OK || e.rc_init != RAD_OK ||
+        c.rc_launch != RAD_OK || d.rc_launch != RAD_OK || e.rc_launch != RAD_OK) {
+        ok("3-rank all-gather, row-interleaved", false,
+           "rc " + std::to_string(c.rc_init) + "/" + std::to_string(d.rc_init) + "/" +
+               std::to_string(e.rc_init) + " init, " + std::to_string(c.rc_launch) + "/" +
+               std::to_string(d.rc_launch) + "/" + std::to_string(e.rc_launch) + " launch");
+        return;
+    }
+    const int64_t nrows = numel / rowe;
+    int64_t bad = 0, bad_id = 0;
+    for (const ArThread* t : { &c, &d, &e }) {
+        for (int64_t m = 0; m < nrows; ++m) {
+            for (int r = 0; r < W; ++r) {
+                for (int64_t j = 0; j < rowe; ++j) {
+                    uint32_t got;
+                    std::memcpy(&got, &t->out[(size_t)(m * W * rowe + r * rowe + j)], 4);
+                    if (got == sent(r, m * rowe + j)) continue;
+                    ++bad;
+                    if ((j & 1) == 0) ++bad_id;
+                }
+            }
+        }
+    }
+    ok("3-rank all-gather interleaves by row, so one row carries all three ranks", bad == 0,
+       std::to_string(bad) + " words wrong, " + std::to_string(bad_id) + " of them token ids");
+    if (row->fini) { row->fini(c.inst); row->fini(d.inst); row->fini(e.inst); }
+    ok("3-rank all-gather fini ran", true);
 }
 
 /* ------------------------------------------------------------------ the device sweep */
@@ -10296,6 +10447,17 @@ static void device_phase(const Plugin& pl) {
     if (sel("ar_gather_2rank")) {
         if (!g_case) std::printf("\ncross-rank\n");
         gather_two_rank(pl, devs);
+    }
+    /* The wide family at three. Its own rows, so the sweep names them (a row the sweep never
+     * mentions is reported as a coverage hole) and so `--case ar_oneshot_3rank_exact` reproduces
+     * one of them alone. */
+    if (sel("ar_oneshot_3rank_exact")) {
+        if (!g_case) std::printf("\ncross-rank, three\n");
+        ar_three_rank(pl, devs);
+    }
+    if (sel("ar_gather_3rank")) {
+        if (!g_case) std::printf("\ncross-rank, three\n");
+        gather_three_rank(pl, devs);
     }
     /* The 4- and 8-rank rows cannot be exercised on a two-card box. Reported as skipped rather
      * than quietly passing: a row that has never been launched is not a row that works. */
