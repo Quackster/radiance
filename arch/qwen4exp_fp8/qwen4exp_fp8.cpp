@@ -515,7 +515,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * is two row ranges and a column range of the container, which the file tier cannot read
          * as one run, and nothing about bf16 needs the parity split's balance -- a bf16 model is
          * served to calibrate and to compare, not for its decode rate. */
-        if (g.world > 2 || (g.world > 1 && (mc.calib || mc.expert_bf16))) {
+        if (g.world > 1 && (mc.calib || mc.expert_bf16)) {
             int s;
             int64_t per = 0;
             if ((s = divide_or_fail(mc.n_expert_all, g.world, "expert_count", &per)) < 0) return s;
@@ -549,11 +549,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             const int64_t nb = g.n_ff_all / RAD_FP8_BLOCK;
             if (nb % g.world == 0) {
                 mc.n_ff_exp = g.n_ff_all / g.world;
-            } else if (g.world == 2) {
-                const int64_t base = nb / 2, extra = nb % 2;
+            } else if (g.world <= nb) {
+                /* The uneven split is TWO SLICES, not two RANKS: each parity's blocks are cut
+                 * contiguously across the ranks and the rank taking the odd block alternates with
+                 * the parity, so every rank's slices are whole blocks and every block of every
+                 * expert has exactly one owner. At two ranks this is the split the tree has always
+                 * made, byte for byte; at four it gives widths of ceil(nb/W) and floor(nb/W).
+                 * A rank must come away with at least one block of each parity -- an empty slice
+                 * is a rank that computes nothing and still joins the all-reduce -- which needs
+                 * the ranks to fit inside the two parities' blocks together. */
+                const int64_t base = nb / g.world, extra = nb % g.world;
                 for (int q = 0; q < 2; ++q) {
                     /* This rank's place in expert parity q's split: first for its own parity. */
-                    const int64_t p = (g.rank - q + 2) % 2;
+                    const int64_t p = (g.rank - q + g.world) % g.world;
                     const int64_t b0 = p * base + std::min<int64_t>(p, extra);
                     const int64_t b1 = b0 + base + (p < extra ? 1 : 0);
                     mc.ff_lo[q] = b0 * RAD_FP8_BLOCK;
@@ -562,9 +570,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 mc.n_ff_exp = std::max(mc.ff_hi[0] - mc.ff_lo[0], mc.ff_hi[1] - mc.ff_lo[1]);
                 rad_note(b, "routed experts: rank %d computes columns [%lld, %lld) of each even "
                             "expert and [%lld, %lld) of each odd one, of %lld. The width is %lld "
-                            "blocks of %d, which two ranks split unevenly, so the rank taking the "
+                            "blocks of %d, which %lld ranks split unevenly, so the rank taking the "
                             "extra block alternates with the expert's parity; the block's "
                             "all-reduce sums the partials.",
+                         g.rank, (long long)mc.ff_lo[0], (long long)mc.ff_hi[0],
+                         (long long)mc.ff_lo[1], (long long)mc.ff_hi[1], (long long)g.n_ff_all,
+                         (long long)nb, RAD_FP8_BLOCK, (long long)g.world);
+            } else {
+                fprintf(stderr, "radiance: qwen4exp: an expert is %lld blocks of %d, which %d ranks "
+                                "cannot each take a whole block of in both parities. Lower the rank "
+                                "count, or serve whole experts (a bf16 container or a calibration "
+                                "run does).\n",
+                        (long long)nb, RAD_FP8_BLOCK, g.world);
+                return RAD_E_INVAL;
+            }
+        }
                          g.rank, (long long)mc.ff_lo[0], (long long)mc.ff_hi[0],
                          (long long)mc.ff_lo[1], (long long)mc.ff_hi[1], (long long)g.n_ff_all,
                          (long long)nb, RAD_FP8_BLOCK);

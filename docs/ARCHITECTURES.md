@@ -295,16 +295,21 @@ its slice of every routed expert, and the block's existing end-of-block all-redu
 partials. No all-to-all, no extra collective. The shared expert's 640 columns split the same way,
 three blocks on rank 0 and two on rank 1.
 
-**Five blocks is why that split stops at two ranks.** 5 is odd, so no world above 2 cuts it into
-equal whole blocks — at tp4 an even share is 160 columns, 1.25 blocks. Above two ranks the routed
-experts split by expert instead: each rank owns 128 whole experts of the 512, reads them through the
-same `n_ff_exp` 640, the router stays replicated so every rank agrees on the routing, and the same
-end-of-block all-reduce sums the partials. A slot whose expert is not local is dropped by
-`moe_scatter`, which is how the split is expressed; the parity tables stay two-rank. The shared
-expert's 640 columns take the uneven-block branch as they always did: five blocks over four ranks
-is rank 0 `[0, 256)` and ranks 1, 2 and 3 one block each. The known cost is expert-selection imbalance — a token's top-10 lands
-locally 2.5 times out of 10 — and removing it is exactly what the parity split buys at two ranks.
-A whole-block width split is the follow-up.
+**Five blocks do not divide evenly, and an even share is not required.** 5 is odd, so at tp4 an
+even share is 160 columns, 1.25 blocks — but the split is TWO SLICES per expert, not one slice a
+rank: each parity's blocks are cut contiguously across the ranks and the rank taking the odd block
+alternates with the parity, so every rank's share is whole blocks, every block of every expert has
+exactly one owner, and each rank still computes a slice of every routed expert — the balance the
+parity tables buy at two ranks survives at any world. At four ranks and five blocks an even-parity
+expert is `[0, 2)` blocks on rank 0, `[2, 3)` on rank 1, `[3, 4)` on rank 2, `[4, 5)` on rank 3,
+and each rank's place on the odd parity shifts by one — rank 1 takes the fat block there instead of
+rank 0 — so no rank takes the extra block of both parities. A world
+above the block count is refused at declare, by name: a rank with an empty slice computes nothing
+and still joins the all-reduce. The shared expert's 640 columns split as evenly as whole blocks
+allow: five blocks over four ranks is rank 0 `[0, 256)` and one block each on ranks 1, 2 and 3.
+Expert parallelism — whole experts a rank — is what this replaced, and why it stays replaced: the
+recipe protects its bf16 experts in pairs precisely so each rank's quantised count stays even, and
+sharding experts by rank breaks that parity property the weight tables rest on.
 
 **Attention splits by KV head, and replicates once the ranks outrun the heads.** There are 2 KV
 heads of 256 rows, so each rank declares `n_head_kv 1` and reads one head's row-span of `k_proj` and
