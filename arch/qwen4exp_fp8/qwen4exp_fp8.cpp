@@ -585,17 +585,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 return RAD_E_INVAL;
             }
         }
-                         g.rank, (long long)mc.ff_lo[0], (long long)mc.ff_hi[0],
-                         (long long)mc.ff_lo[1], (long long)mc.ff_hi[1], (long long)g.n_ff_all,
-                         (long long)nb, RAD_FP8_BLOCK);
-            } else {
-                fprintf(stderr, "radiance: qwen4exp: an expert is %lld blocks of %d, which %d ranks "
-                                "cannot split into two slices; the uneven split alternates by "
-                                "parity and so serves two ranks.\n",
-                        (long long)nb, RAD_FP8_BLOCK, g.world);
-                return RAD_E_INVAL;
-            }
-        }
     }
 
 

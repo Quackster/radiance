@@ -1845,9 +1845,13 @@ TEST(a_sizing_declare_leaves_the_step_state_alone_and_shrinks_only_rows) {
  *     [256,512). That is a span, not a shard index, and it is the only place in the engine where a
  *     rank names the container rows it wants -- so it is asserted here as a pair of agreeing spans
  *     whose union is the whole projection.
- *   - the experts go WHOLE, rank r owning [r*128, (r+1)*128) of 512, with the router REPLICATED at
- *     the model's full 512 logits. A rank that disagreed with the router about the expert count
- *     would route to a different model.
+ *   - an expert of this model is 640 columns = five 128-column scale blocks, which four ranks
+ *     cannot cut evenly, so the split is UNEVEN BY PARITY and it is the width that divides, not the
+ *     expert set: every rank routes every one of the 512 experts and computes [lo, hi) of each, the
+ *     rank taking the odd block alternating with the expert's parity. Sharding the experts instead
+ *     was tried and is wrong here -- protection is per-rank, so a rank can end up owning one plain
+ *     bf16 expert, leaving an odd count of quantised ones, and the grouped GEMM takes its experts as
+ *     two EQUAL tables by parity. The recipe protects experts in pairs for exactly that reason.
  *   - the FUSED all-reduces are world-2 kernels (`ar_wire_is_exact` and `ar_fused_ok` both return
  *     false off two, and `HyperConn` declares `ar_hc_write` only at world 2), so at four the chain
  *     is unfused: a standalone `all_reduce` where the collective happens. The contrast with world 2
@@ -1858,7 +1862,7 @@ TEST(a_sizing_declare_leaves_the_step_state_alone_and_shrinks_only_rows) {
  * 256, num_experts 512), so the fixture and the assertions cannot drift apart. Where a number is
  * really the PRODUCTION container's -- the unsharded k_proj entry's 512 rows -- the relation is
  * asserted instead of the literal. */
-TEST(flashnext_tp4_replicates_kv_heads_and_owns_whole_experts) {
+TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
     RadModelMeta meta = qwen4exp_meta();
     const int      world    = 4;
     const int64_t  n_head   = meta.n_head;        /* 24 query heads */
@@ -1919,45 +1923,65 @@ TEST(flashnext_tp4_replicates_kv_heads_and_owns_whole_experts) {
             CHECK_EQ(w->span_lo, (int64_t)(r / (world / n_head_kv)) * head_dim);
             CHECK_EQ(w->span_hi, w->span_lo + head_dim);
         }
-        /* (3) THE EXPERTS THIS RANK OWNS, whole, and a router that still names every one. */
+        /* (3) EVERY RANK ROUTES EVERY EXPERT, and computes a SLICE of each one. The router is
+         * replicated and so is the expert SET -- n_expert stays the model's 512 with base 0 --
+         * because what the ranks divide is each expert's WIDTH, in whole 128-column scale blocks,
+         * one block class per parity. A rank that disagreed with the router about the expert count
+         * would route to a different model. */
         const RecOp* sc = find_op(b[r], "moe_scatter");
         REQUIRE(sc != nullptr);
-        CHECK_EQ(pint(sc, "n_expert"), ne_all / world);
-        CHECK_EQ(pint(sc, "expert_base"), (int64_t)r * (ne_all / world));
+        CHECK_EQ(pint(sc, "n_expert"), ne_all);
+        CHECK_EQ(pint(sc, "expert_base"), (int64_t)0);
         const RecOp* tk = find_op(b[r], "router_topk");
         REQUIRE(tk != nullptr);
         CHECK_EQ(pint(tk, "n_expert"), ne_all);         /* replicated: one routing per token */
         if (const RecOp* ts = find_op(b[r], "router_topk_scatter")) {
             CHECK_EQ(pint(ts, "n_expert"), ne_all);
-            CHECK_EQ(pint(ts, "n_local"), ne_all / world);
-            CHECK_EQ(pint(ts, "expert_base"), (int64_t)r * (ne_all / world));
+            CHECK_EQ(pint(ts, "expert_base"), (int64_t)0);
         }
-        /* The experts declared by name are the ones in that range -- the weight manifest is the
-         * rank's ownership, and the numbering is the CHECKPOINT's (rad_block_moe_fp8.h's
-         * `expert_base + e`), so a slip here routes the wrong tensor. */
-        const std::string pre = "blk.0.ffn_gate_up_exps.";
-        int64_t lo = -1, hi = -1;
+        /* THE WIDTH EACH RANK TAKES OF EACH PARITY, as a span on every expert's down projection --
+         * the fixture protects no expert, so an expert's class is its own parity. These six numbers
+         * per rank are the whole TP4 MoE contract: five blocks of 128, four ranks, and the rank
+         * taking the odd block alternating with the parity. They are LITERAL here on purpose --
+         * recomputing them from the plugin's formula would only prove the test agrees with the
+         * code, not that either agrees with the model. */
+        const int64_t blk = 128;                    /* RAD_FP8_BLOCK, the scale block's width */
+        const int64_t nblk = meta.n_ff / blk;        /* five, at the fixture's 640 */
+        const int64_t cls_lo[4][2] = { { 0, 512 }, { 256, 0 }, { 384, 256 }, { 512, 384 } };
+        const int64_t cls_hi[4][2] = { { 256, 640 }, { 384, 256 }, { 512, 384 }, { 640, 512 } };
+        REQUIRE_EQ(nblk, (int64_t)5);
+        int spanned[2] = { 0, 0 };
         for (const RecWeight& w : b[r].weights) {
-            if (w.name.rfind(pre, 0) != 0 || w.name.size() < pre.size() + 8) continue;
+            if (w.name.rfind("blk.0.ffn_down_exps.", 0) != 0) continue;
             if (w.name.compare(w.name.size() - 7, 7, ".weight") != 0) continue;
-            const int64_t ge = atoll(w.name.c_str() + pre.size());
-            if (lo < 0) { lo = ge; hi = ge; }
-            if (ge < lo) lo = ge;
-            if (ge > hi) hi = ge;
+            const int q = atoi(w.name.c_str() + 20) % 2;      /* the expert's parity */
+            CHECK(w.span_set);
+            CHECK_EQ(w.span_lo, cls_lo[r][q]);
+            CHECK_EQ(w.span_hi, cls_hi[r][q]);
+            ++spanned[q];
         }
-        REQUIRE(lo >= 0);
-        CHECK_EQ(lo, (int64_t)r * (ne_all / world));
-        CHECK_EQ(hi, (int64_t)r * (ne_all / world) + ne_all / world - 1);
-        /* And NO expert weight carries a span: whole experts and a slice of every one are
-         * exclusive (rad_block_moe_fp8.h refuses "whole experts OR a slice of every one"), which in
-         * the declaration means the parity tables ff_lo/ff_hi stay 0 and `span()` is never called.
-         * The shared arm is the one exception and it is sliced by columns, not by parity -- asserted
-         * by its own span below. */
-        int expert_spanned = 0;
-        for (const RecWeight& w : b[r].weights)
-            if (w.name.find("ffn_gate_up_exps.") != std::string::npos && w.span_set)
-                ++expert_spanned;
-        CHECK_EQ(expert_spanned, 0);
+        CHECK_EQ(spanned[0], ne_all / 2);                /* every expert of each class is declared */
+        CHECK_EQ(spanned[1], ne_all / 2);
+        /* AND THE FOUR RANKS' SLICES OF ONE PARITY TILE ITS WIDTH EXACTLY: no block unserved (a
+         * rank silently dropping a fifth of every expert's output), none claimed twice (the
+         * all-reduce then sums that block twice and the number is wrong by its own size). Read off
+         * the declared spans, not off the formula that produced them. */
+        for (int q = 0; q < 2; ++q) {
+            int64_t covered = 0;
+            for (int r2 = 0; r2 < world; ++r2)
+                for (int64_t i = 0; i < nblk; ++i) {
+                    const int64_t lo = cls_lo[r2][q], hi = cls_hi[r2][q];
+                    if (lo <= i * blk && i * blk < hi) ++covered;
+                }
+            CHECK_EQ(covered, nblk);   /* per parity, exactly once each */
+        }
+        /* The gate/up GEMM's two classes follow the same split, doubled because the operand stacks
+         * gate and up, and the op's buffers take the WIDER class. */
+        const RecOp* gu = find_op(b[r], "moe_gemm_q");
+        REQUIRE(gu != nullptr);
+        CHECK_EQ(pint(gu, "N"), 2 * (cls_hi[r][0] - cls_lo[r][0]));
+        CHECK_EQ(pint(gu, "N_odd"), 2 * (cls_hi[r][1] - cls_lo[r][1]));
+        CHECK_EQ(pint(gu, "n_expert"), ne_all);
 
         /* (4) THE UNFUSED CHAIN: a standalone collective per reduction, and none of the three
          * fused world-2 forms. */
