@@ -318,7 +318,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.nm = Names(ctx->scope ? ctx->scope : "");
     Names& nm = m.nm;
 
-    RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
+    /* arch_splits_ff: the routed experts' width (640 = five fp8 blocks) is split by the plugin
+     * below, by whole blocks and parity, at any world up to the block count -- three ranks included,
+     * which 640 does not divide. geom_from must not refuse what the plugin then answers. */
+    RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16, /*arch_splits_ff=*/true));
     Geom& g = m.g;
 
     /* Qwen4-Exp's norms are all `x_hat * (1 + w)` -- `Qwen3NextRMSNorm.forward` is

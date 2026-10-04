@@ -717,8 +717,13 @@ inline long long meta_int2(const RadModelMeta* m, const char* gguf_key, const ch
     return v == sentinel ? dflt : v;
 }
 
+/* `arch_splits_ff`: the plugin divides the feed-forward width across the ranks ITSELF (qwen4exp:
+ * the routed experts' width is cut by whole fp8 blocks, by parity, at any world up to the block
+ * count). With it set, a width the world does not divide is left whole in g.n_ff and the plugin
+ * takes its slice from there; without it the refusal stands, because for every other plugin g.n_ff
+ * IS the per-rank width. A width that does divide is unaffected either way. */
 inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
-                     const char* dtype, uint32_t act_dtype) {
+                     const char* dtype, uint32_t act_dtype, bool arch_splits_ff = false) {
     if (!m || !c) return RAD_E_INVAL;
     if (c->is_draft) {
         /* A drafter declared into this plugin would need a second set of per-rank handles and a
@@ -814,7 +819,11 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     } else {
         g.kv_off = 0;   /* a split rank reads the rows the plain row-shard already gives it */
     }
-    if ((s = divide_or_fail(g.n_ff_all,      g.world, "n_ff",      &g.n_ff))      < 0) return s;
+    if (arch_splits_ff && g.world > 1 && g.n_ff_all % g.world != 0) {
+        g.n_ff = g.n_ff_all;   /* the plugin slices it (see the parameter's comment) */
+    } else if ((s = divide_or_fail(g.n_ff_all, g.world, "n_ff", &g.n_ff)) < 0) {
+        return s;
+    }
     /* THE VOCABULARY IS SPLIT. r4d_sample_topk_f32 takes a vocabulary offset and packs its
      * candidates as (u32 GLOBAL id, f32 logit) pairs, and the all-gather places every rank's
      * pairs for one sampled position side by side, which is the layout sample_merge_topk reads.
