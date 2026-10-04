@@ -2077,6 +2077,65 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
         c3.max_tok = 2048; c3.max_seqs = 8; c3.max_spec = 3; c3.max_ctx = 200000;
         CHECK(qwen4exp_fp8::declare(&b3, &meta, &c3) != RAD_OK);
     }
+
+    /* ---- THE PLAIN bf16 EXPERTS AT FOUR RANKS.
+     *
+     * They are declared beside the quantised ones by a SECOND grouped GEMM, over their own slice of
+     * the same width, and that slice has its own rule: whole 64-wide output tiles, one range a rank,
+     * uniform across the protected experts of a layer (their GEMM takes ONE table, so every entry
+     * must have one geometry -- unlike the quantised experts, they do not alternate by parity).
+     * The width was read off this rank's parity slices, which at two ranks is the model's width and
+     * at four is not, so the rank took a number that was not its expert's width, and the check on
+     * it refused the model on the ranks where that number was wrong -- two of four, which then
+     * never arrived at the all-reduce's rendezvous and took the whole launch down with it.
+     *
+     * Ten tiles over four ranks is 3, 3, 2, 2: an UNEVEN share, still whole tiles, every tile owned
+     * once. Ranks 0 and 1 compute 192 columns of every protected expert, ranks 2 and 3 compute 128.
+     * Two protected experts so the even-count rule the parity tables need holds, as the production
+     * recipe's pairs make it hold. */
+    {
+        const RadEncoding w4p = [] { RadEncoding e = rad_enc_affine(RAD_I4, RAD_BF16, 1, 128);
+                                     rad_enc_copy_str(e.transform, "fwht128"); return e; }();
+        const RadEncoding plain = rad_enc_plain(RAD_BF16);
+        /* [lo, hi) of the plain expert's columns, per rank -- literal, for the reason given above. */
+        const int64_t p_lo[4] = { 0, 192, 384, 512 };
+        const int64_t p_hi[4] = { 192, 384, 512, 640 };
+        for (int r = 0; r < world; ++r) {
+            RadBuilder bp;
+            bp.encs = { { "blk.1.ffn_gate_up_exps.3.weight", plain },
+                        { "blk.1.ffn_down_exps.3.weight", plain },
+                        { "blk.1.ffn_gate_up_exps.10.weight", plain },
+                        { "blk.1.ffn_down_exps.10.weight", plain },
+                        { "ffn_gate_up_exps", w4p }, { "ffn_down_exps", w4p } };
+            RadBuildCtx cp = build_ctx(r, world);
+            cp.max_tok = 2048; cp.max_seqs = 8; cp.max_spec = 3; cp.max_ctx = 200000;
+            REQUIRE_EQ(qwen4exp_fp8::declare(&bp, &meta, &cp), RAD_OK);
+            const int64_t wp = p_hi[r] - p_lo[r];
+            int seen = 0;
+            for (const RecWeight& w : bp.weights) {
+                if (w.name.rfind("blk.1.ffn_gate_up_exps.", 0) != 0 &&
+                    w.name.rfind("blk.1.ffn_down_exps.", 0) != 0) continue;
+                if (w.d.dtype != RAD_BF16) continue;      /* only the plain ones are in scope */
+                if (w.name.compare(w.name.size() - 7, 7, ".weight") != 0) continue;
+                CHECK(w.span_set);
+                CHECK_EQ(w.span_lo, p_lo[r]);
+                CHECK_EQ(w.span_hi, p_hi[r]);
+                ++seen;
+            }
+            /* Both projections of both protected experts. */
+            CHECK_EQ(seen, 4);
+            /* The gate/up GEMM is as wide as this rank's share, doubled for the stacked pair, and
+             * the down GEMM's K is that share: the partial this rank contributes. */
+            int gu_ok = 0, dn_ok = 0;
+            for (const RecOp& o : bp.ops) {
+                if (o.op != "moe_gemm") continue;
+                if (pint(&o, "N") == 2 * wp && pint(&o, "n_expert") == 2) ++gu_ok;
+                if (pint(&o, "K") == wp && pint(&o, "n_expert") == 2) ++dn_ok;
+            }
+            CHECK_EQ(gu_ok, 1);
+            CHECK_EQ(dn_ok, 1);
+        }
+    }
 }
 
 /* ==================================================================== media */

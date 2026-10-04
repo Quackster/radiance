@@ -1057,19 +1057,43 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         const int64_t np = (int64_t)prot.size();
         int64_t wp = c.n_ff_exp;
         int     psh_row = RAD_SHARD_NONE, psh_col = RAD_SHARD_NONE, pparts = 0;
+        /* This rank's tile range within one plain expert, in the model's numbering; `phi` 0 is the
+         * even split, which needs no span because the loader divides the entry itself. */
+        int64_t plo = 0, phi = 0;
         if (split) {
-            /* `n_ff_exp` is this rank's wider slice here; the expert's whole width is where the
-             * parity slices end. */
-            const int64_t full = c.ff_hi[0] > c.ff_hi[1] ? c.ff_hi[0] : c.ff_hi[1];
-            if (full % g.world || (full / g.world) % 64) {
+            /* THE EXPERT'S WHOLE WIDTH, not this rank's slice of it: `n_ff_all` is the model's, and
+             * where the parity tables end says the same thing at two ranks and nothing else at
+             * more -- reading it off `ff_hi` gave a per-rank answer, which happened to be right
+             * only when there were two of them. A plain expert has no scale blocks to land on, so
+             * the unit here is the GEMM's 64-wide output tile. */
+            const int64_t full = g.n_ff_all > 0 ? g.n_ff_all
+                                                : (c.ff_hi[0] > c.ff_hi[1] ? c.ff_hi[0]
+                                                                          : c.ff_hi[1]);
+            /* ONE SLICE A RANK, and it does not have to be the same size on every rank: an uneven
+             * share of the 64-wide tiles is still whole tiles, and an uneven share is the only
+             * kind available when the width does not divide -- this family's 640 columns are ten
+             * tiles, which four ranks take as 3, 3, 2, 2. Every tile has exactly one owner, each
+             * rank writes its own columns of gate/up and reads its own of down, and the block's
+             * all-reduce sums the partials exactly as it does for the quantised experts and for
+             * the shared arm. The even case keeps the old declaration verbatim -- no span at all --
+             * so a rank count that divides stays byte-identical to the tree this fork started on. */
+            psh_row = RAD_SHARD_ROW;
+            psh_col = RAD_SHARD_COL;
+            pparts  = 2;
+            if (full % g.world == 0 && (full / g.world) % 64 == 0) {
+                wp = full / g.world;
+            } else if (full % 64 || full / 64 < g.world) {
                 fprintf(stderr, "radiance: layer %d's plain experts are %lld wide, which %d ranks "
                                 "cannot share in 64-wide tiles\n", l, (long long)full, g.world);
                 return RAD_E_INVAL;
+            } else {
+                const int64_t nt = full / 64, base = nt / g.world, extra = nt % g.world;
+                const int64_t t0 = (int64_t)g.rank * base + std::min<int64_t>(g.rank, extra);
+                const int64_t t1 = t0 + base + ((int64_t)g.rank < extra ? 1 : 0);
+                plo = t0 * 64;
+                phi = t1 * 64;
+                wp  = phi - plo;
             }
-            wp = full / g.world;
-            psh_row = RAD_SHARD_ROW;
-            psh_col = RAD_SHARD_COL;
-            pparts = 2;
         }
         w_pgu.assign((size_t)np, 0);
         w_pdn.assign((size_t)np, 0);
@@ -1080,6 +1104,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                         RAD_BF16, {2 * wp, g.n_embd}, RAD_ACCESS_PER_TOKEN,
                                         psh_row, grp_layer(l), 0, parts, pparts);
             if (!w_pgu[(size_t)j]) return RAD_E_INVAL;
+            if (phi > 0) RAD_ARCH_TRY(rad_weight_shard_span(b, w_pgu[(size_t)j], plo, phi));
         }
         for (int64_t j = 0; j < np; ++j) {
             w_pdn[(size_t)j] = decl_w(b, nm.f("blk.%d.ffn_down_exps.%lld.weight", l,
@@ -1087,6 +1112,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                       RAD_BF16, {g.n_embd, wp}, RAD_ACCESS_PER_TOKEN, psh_col,
                                       grp_layer(l));
             if (!w_pdn[(size_t)j]) return RAD_E_INVAL;
+            if (phi > 0) RAD_ARCH_TRY(rad_weight_shard_span(b, w_pdn[(size_t)j], plo, phi));
         }
         /* The gate_up output and the gate's, a sorted row each and in bf16: the rows of the
          * regular experts are never written and never read. */
