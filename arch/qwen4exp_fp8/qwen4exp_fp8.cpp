@@ -914,6 +914,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          weight_codes_dtype(b, nm.f("output.weight"), RAD_BF16),
                          {g.n_vocab, g.n_embd}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
     if (!m.w_tok || !m.w_lm_head) return RAD_E_INVAL;
+    /* THE RANK'S ROWS, STATED: a vocabulary that does not divide by the world (248320 at three
+     * ranks) is split by rad_arch.h's rule -- ceil to a 128-row block, last rank short -- and that
+     * is a span, not the even share the core would otherwise cut. Harmless where it does divide
+     * (the span IS the even share). */
+    if (g.world > 1) {
+        RAD_ARCH_TRY(rad_weight_shard_span(b, m.w_tok,     g.vocab_off, g.vocab_off + g.n_vocab));
+        RAD_ARCH_TRY(rad_weight_shard_span(b, m.w_lm_head, g.vocab_off, g.vocab_off + g.n_vocab));
+    }
 
     m.op_embed = rw(b, RAD_OP(b, "embed_lookup",
                        RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n_embd", g.n_embd),

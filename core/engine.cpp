@@ -122,13 +122,18 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
     sc.n_vocab_local = logits_width > 0 ? logits_width : meta_.n_vocab;
     /* THIS RANK'S FIRST VOCABULARY ROW, and it is the one thing the declared width cannot say:
      * a width tells you how many rows a rank owns, not which. The rule is arch/common/rad_arch.h's
-     * shard_begin -- ceil(total/world) per rank with the last one short -- and it is restated here
+     * shard_begin -- ceil(total/world) per rank, rounded up to a 128-row block, the last one short -- and it is restated here
      * rather than carried through the ABI, so the restatement is CHECKED against what the plugin
      * actually declared. A plugin that shards some other way gets a named refusal at startup
      * instead of a sampler that names rank 0's tokens with rank 1's ids. */
     sc.vocab_off = 0;
     if (sc.n_vocab_local < sc.n_vocab) {
-        const int64_t per = (sc.n_vocab + cfg_.tp - 1) / cfg_.tp;
+        /* rad_arch.h vocab_per_rank, restated: the even share when the world divides the vocabulary;
+         * otherwise ceil(n / tp) rounded up to a whole 128-row block so a block-scaled head can be
+         * cut there. */
+        const int64_t ceil_per = (sc.n_vocab + cfg_.tp - 1) / cfg_.tp;
+        const int64_t per = (sc.n_vocab % cfg_.tp == 0) ? sc.n_vocab / cfg_.tp
+                                                        : (ceil_per + 127) / 128 * 128;
         sc.vocab_off = per * rank;
         const int64_t want = std::min<int64_t>(per, sc.n_vocab - sc.vocab_off);
         if (sc.vocab_off >= sc.n_vocab || want != sc.n_vocab_local) {

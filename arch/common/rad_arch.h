@@ -675,14 +675,30 @@ inline int divide_or_fail(int64_t v, int world, const char* what, int64_t* out) 
  * absurd. So the last rank holds fewer rows. The sampler merges candidate sets rather than
  * gathering full logits (spec §9, §13), so a ragged shard costs it nothing; a padded one would
  * cost a fake token id that has to be masked everywhere forever. */
-inline int64_t shard_extent(int64_t total, int world, int rank) {
+/* THE VOCABULARY SPLIT: ceil(total / world) rows a rank, ROUNDED UP TO A WHOLE 128-ROW BLOCK, the
+ * last rank short. The block is RAD_FP8_BLOCK: a block-scaled fp8 lm_head is stored in 128x128
+ * tiles and a row span that cuts a tile is refused (rad_weight_shard_span), so the cut has to land
+ * on one. At two ranks on 248320 or 151936 the rounding changes nothing -- both halves are block
+ * multiples -- and a vocabulary the world divides is never rounded; at three it is what makes the
+ * head shardable at all (248320 / 3 = 82773.3; the ranks take 82816, 82816, 82688). core/engine.cpp
+ * RESTATES this rule and checks it against the width the plugin declared; the two must move together. */
+inline int64_t vocab_per_rank(int64_t total, int world) {
+    /* A vocabulary the world divides keeps the even share, whatever the world: every container
+     * served today splits that way (248320 at 2 and 4, 151936 at 2 -- the last halves mid-block and
+     * is served with an untiled head). Only a vocabulary the world does NOT divide takes the
+     * block-aligned ceil, which is what makes a tiled head shardable at all. */
+    if (total % world == 0) return total / world;
     const int64_t per = (total + world - 1) / world;
+    return (per + 127) / 128 * 128;
+}
+inline int64_t shard_extent(int64_t total, int world, int rank) {
+    const int64_t per = vocab_per_rank(total, world);
     const int64_t beg = per * rank;
     const int64_t end = beg + per < total ? beg + per : total;
     return end > beg ? end - beg : 0;
 }
 inline int64_t shard_begin(int64_t total, int world, int rank) {
-    const int64_t per = (total + world - 1) / world;
+    const int64_t per = vocab_per_rank(total, world);
     const int64_t beg = per * rank;
     return beg < total ? beg : total;
 }
