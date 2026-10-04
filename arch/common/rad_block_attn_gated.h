@@ -103,6 +103,21 @@ inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
         return RAD_E_INVAL;
     }
 
+    /* KV-HEAD REPLICATION IS NOT PLUMBLED HERE. `geom_from` answers a world size above the KV head
+     * count by giving every rank ONE kv head and a `kv_off` row span into a projection that stays
+     * `n_head_kv_all * head_dim` rows in the container -- and this block declares its k and v with
+     * the plain even row-shard, which at four ranks would hand a rank half of one KV head. The
+     * shapes would declare, the numbers would be wrong, and the text would be fluent. Refuse by
+     * name instead: rad_block_attn_gated_fp8.h is the block that passes the span, and a bf16 model
+     * that needs TP4 plumbs it the same way. */
+    if (g.world > g.n_head_kv_all) {
+        fprintf(stderr, "radiance: %s declares no KV row span and cannot serve world_size = %d "
+                        "with n_head_kv = %lld; the KV-head replication in geom_from needs the "
+                        "span passed to its k/v weights.\n", __func__, g.world,
+                (long long)g.n_head_kv_all);
+        return RAD_E_UNSUPPORTED;
+    }
+
     /* ---- weights. Shapes are [out, in]: gemm_nt is A[M,K] times B transposed [N,K], the layout
      * every transformer weight already has, so nothing is transposed at load.
      *

@@ -286,14 +286,52 @@ block), the router, `shared_expert_gate` and `embed_tokens` stay bf16.
 ten protected experts left bf16, int8 block linears and lm_head, E4M3 mixing and MTP fc matrices,
 and the n-gram table at one fixed E4M3 scale.
 
-**Tensor parallel splits every expert's width, unevenly.** `moe_intermediate_size` is 640 = 5 x 128,
-so an even share at tp2 is 320, which is not a whole number of 128-column blocks — and the fp8
-scale block, the four-bit scale group and the rotation all sit on them. So each rank takes three
-blocks of the experts of one parity and two of the other's (`moe_gemm_q`'s two tables in
+**Tensor parallel at two ranks splits every expert's width, unevenly.** `moe_intermediate_size` is
+640 = 5 x 128, so an even share at tp2 is 320, which is not a whole number of 128-column blocks —
+and the fp8 scale block, the four-bit scale group and the rotation all sit on them. So each rank
+takes three blocks of the experts of one parity and two of the other's (`moe_gemm_q`'s two tables in
 `docs/OPS.md`), the router stays replicated so both ranks agree on the routing, each rank computes
 its slice of every routed expert, and the block's existing end-of-block all-reduce sums the
 partials. No all-to-all, no extra collective. The shared expert's 640 columns split the same way,
 three blocks on rank 0 and two on rank 1.
+
+**Five blocks is why that split stops at two ranks.** 5 is odd, so no world above 2 cuts it into
+equal whole blocks — at tp4 an even share is 160 columns, 1.25 blocks. Above two ranks the routed
+experts split by expert instead: each rank owns 128 whole experts of the 512, reads them through the
+same `n_ff_exp` 640, the router stays replicated so every rank agrees on the routing, and the same
+end-of-block all-reduce sums the partials. A slot whose expert is not local is dropped by
+`moe_scatter`, which is how the split is expressed; the parity tables stay two-rank. The shared
+expert's 640 columns take the uneven-block branch as they always did: five blocks over four ranks
+is rank 0 `[0, 256)` and ranks 1, 2 and 3 one block each. The known cost is expert-selection imbalance — a token's top-10 lands
+locally 2.5 times out of 10 — and removing it is exactly what the parity split buys at two ranks.
+A whole-block width split is the follow-up.
+
+**Attention splits by KV head, and replicates once the ranks outrun the heads.** There are 2 KV
+heads of 256 rows, so each rank declares `n_head_kv 1` and reads one head's row-span of `k_proj` and
+`v_proj`. At tp2 that is the ordinary row shard. At tp4 the heads cannot divide four ways, so they
+are replicated in rank pairs: ranks {0,1} carry KV head 0, ranks {2,3} carry KV head 1, and both
+ranks of a pair hold byte-identical KV weights — more read traffic, no extra VRAM. `n_head` is 12 a
+rank at tp2 and 6 at tp4, so gqa is 12 at tp2 and 6 at tp4 and the attention kernel is a different
+instantiation (`attn_{prefill,decode}_h256_gqa6_bs4`, the QSA page of 4) than the gqa12 pair tp2
+resolves to, not the same kernel over fewer heads. Any world size above the KV head count must be a
+multiple of it: 4 is a multiple of 2, 3 and 5 are not, and those widths are refused at declare
+time.
+
+**The fused all-reduce forms are two-rank.** At four ranks nothing fuses: the hyper-connection pair
+runs the standalone sequence — `all_reduce` (libr4d's 4-rank oneshot/twoshot), then
+`hc_write_bf16`, then `moe_gather` — 2 to 3 extra launches per pair against the two-rank fused
+form, and the fused attention ops have no bs4/gqa6 instantiation either. The unfused sequence is
+declared beside the probe, so nothing is unresolved at boot. The per-step cost against tp2 on the
+same cards is unmeasured.
+
+**One collective does generalise, because it has to.** The lm_head is vocab-sharded, so the sampler
+gathers the ranks' candidate sets rather than their logits (`core/sample/sampler.cpp`) and an
+`all_gather` is on every step's sample path at any world size above one. libr4d shipped a two-rank
+form only — one peer flag, a `1 - rank` peer index, a destination stride of `2 * row16` — so the
+N-rank gather is a new kernel, not a fallback: at four ranks nothing but the reference
+implementation resolves and the engine refuses to serve rather than run a naive gather. It is the
+same one-shot push as the N-rank all-reduce with the reduction removed, and it moves the
+(u32 id, f32 logit) pairs without ever adding them.
 
 **Four-bit experts are what make it fit.** 512 experts of 640 over 48 layers is 112.8 GiB of expert
 weight at E4M3 and twice that at bf16. `--weights-disk-tier` serves what fits neither VRAM nor the

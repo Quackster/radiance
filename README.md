@@ -79,6 +79,7 @@ prefix-cache tiers:
 | model | flags |
 |---|---|
 | Qwen3.8-Flash-Next | `--tp 2 --tp-wire wht6 --max-num-seqs 8 --max-model-len 200000 --placement expert_tiered --host-pool-mib 12288 --gpu-headroom-mib 96 --expert-vs-cache-ratio 0.82 --kv-cache-dtype fp8 --num-speculative-tokens 3 --max-num-batched-tokens 2048` |
+| Qwen3.8-Flash-Next, four ranks | `--tp 4 --max-num-seqs 8 --max-model-len 200000 --placement expert_tiered --host-pool-mib 12288 --gpu-headroom-mib 96 --expert-vs-cache-ratio 0.82 --kv-cache-dtype fp8 --num-speculative-tokens 3 --max-num-batched-tokens 2048` |
 | Qwen3.8-27B FP8, Qwen3.6-35B-A3B | `--tp 2 --max-num-seqs 32 --max-model-len 200000 --kv-cache-dtype fp8` |
 | Qwen3.8-27B bf16 | `--tp 2 --max-num-seqs 8 --max-model-len 200000 --kv-cache-dtype fp8` |
 | MiniCPM5-2B FP8 and bf16 | `--tp 2 --max-num-seqs 32 --max-model-len 131072 --kv-cache-dtype fp8 --gpu-headroom-mib 160 --max-num-batched-tokens 512` |
@@ -89,6 +90,14 @@ sequence holds its own recurrent state and 32 of them leave the attention cache 
 200K-token request: Flash-Next at ratio 0.82 (`--max-num-seqs 32 --expert-vs-cache-ratio 0.78`
 keeps the 200K request and costs single-stream decode about 15%) and the 27B in bf16. See
 [`docs/GUIDE.md`](docs/GUIDE.md) §4.4.
+
+`--tp 4` runs the unfused all-reduce chain, so it is slower per step than `--tp 2` on the same
+cards (unmeasured) — it is a capacity configuration, not a speed one, and it takes no `--tp-wire`:
+`wht6` is a two-rank wire and four ranks run the exact one. The tiering flags above are the tp2
+recipe carried over, and at four ranks a rank owns a quarter of the experts WHOLE instead of half
+the width of every one, so the resident expert bytes per rank are smaller and the elastic window
+is a different shape: read the boot log's `elastic` line and re-derive `--expert-vs-cache-ratio`
+and `--host-pool-mib` before trusting them.
 
 Add `--api-key KEY` to require `Authorization: Bearer KEY`. Add `--debug-graph` to print every op
 and the kernel it resolved to, then exit without serving. Then:

@@ -180,6 +180,22 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
     const int64_t kv_dim = g.kv_dim();
     const int64_t qg_dim = 2 * q_dim;
 
+    /* THE KV ROW SPAN, AND IT ONLY EXISTS ABOVE THE KV HEAD COUNT.
+     * A world size larger than `n_head_kv_all` cannot divide the KV heads, so rad_arch.h's
+     * `geom_from` replicates them in PAIRS: two ranks serve the same head, `g.n_head_kv` is 1 on
+     * each, and the checkpoint entry they both read is still `n_head_kv_all * head_dim` rows -- 512
+     * for 2 KV heads at head_dim 256. This rank wants ONE head's row-span of that entry, which the
+     * even shard would cut up instead (at 4 ranks it would hand rank 2 rows [256, 384), half of one
+     * head), so the span `[g.kv_off, g.kv_off + kv_dim)` is declared in the CONTAINER's unsharded
+     * units -- [0, 256) on ranks 0 and 1, [256, 512) on ranks 2 and 3 -- and the scale plane takes
+     * the same span in 128-blocks. `kv_off` is a multiple of head_dim, so it is whole blocks and
+     * never cuts one, and share.cpp's `shard_hi <= cpart` holds with cpart = 512 / 1 part.
+     * AT WORLD <= n_head_kv_all the ordinary even shard already selects exactly these rows, so the
+     * span stays 0/0 and the default path runs as before -- TP2 declares identically. */
+    const bool    kv_spanned = g.world > g.n_head_kv_all;
+    const int64_t kv_span_lo = kv_spanned ? g.kv_off : 0;
+    const int64_t kv_span_hi = kv_spanned ? g.kv_off + kv_dim : 0;
+
     if (n_rot <= 0 || n_rot > g.head_dim || (n_rot & 1)) {
         fprintf(stderr, "radiance: rotary_dim %lld is not an even width inside head_dim %lld\n",
                 (long long)n_rot, (long long)g.head_dim);
@@ -221,9 +237,11 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
     RAD_ARCH_TRY(qg.declare(b, nm, g, nm.f("blk.%d.attn_qg", l), qg_dim, g.n_embd,
                             RAD_SHARD_ROW, grp_layer(l), { src.qg }, w.h, w.qg));
     RAD_ARCH_TRY(kp.declare(b, nm, g, nm.f("blk.%d.attn_k", l), kv_dim, g.n_embd,
-                            RAD_SHARD_ROW, grp_layer(l), { src.k }, w.h, w.k));
+                            RAD_SHARD_ROW, grp_layer(l), { src.k }, w.h, w.k,
+                            0, {}, kv_span_lo, kv_span_hi));
     RAD_ARCH_TRY(vp.declare(b, nm, g, nm.f("blk.%d.attn_v", l), kv_dim, g.n_embd,
-                            RAD_SHARD_ROW, grp_layer(l), { src.v }, w.h, w.v));
+                            RAD_SHARD_ROW, grp_layer(l), { src.v }, w.h, w.v,
+                            0, {}, kv_span_lo, kv_span_hi));
 
     /* THE FUSED PROLOGUE, AND IT IS A PROBE: the four ops below are declared either way and are
      * what runs when nothing serves this one. rad_block_attn_gated.h does not make the probe,

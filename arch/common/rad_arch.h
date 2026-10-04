@@ -570,6 +570,12 @@ struct Geom {
     int64_t n_head_kv  = 0;    /* per rank */
     int64_t n_head_all = 0;
     int64_t n_head_kv_all = 0;
+    /* THIS RANK'S FIRST KV ROW inside the checkpoint's UNSHARDED k/v projection rows, used only
+     * when the KV heads are replicated over ranks instead of split (world > n_head_kv_all, see
+     * geom_from). It is in container rows, the same unit a LinearFP8 span takes, so a block that
+     * declares a row-sharded k/v passes it straight through as `span_lo`. Zero on every split
+     * deployment, which is what keeps TP2 reading the projection exactly as it always did. */
+    int64_t kv_off   = 0;
     int64_t n_ff       = 0;    /* per rank */
     int64_t n_ff_all   = 0;
     int64_t max_tok    = 0;
@@ -760,10 +766,38 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
 
     int s;
     if ((s = divide_or_fail(g.n_head_all,    g.world, "n_head",    &g.n_head))    < 0) return s;
-    /* A world size larger than n_head_kv would need the KV heads replicated across ranks rather
-     * than split, which is a different attention declaration and not a rounding decision. Refuse
-     * it here rather than have the block quietly produce a zero-width KV projection. */
-    if ((s = divide_or_fail(g.n_head_kv_all, g.world, "n_head_kv", &g.n_head_kv)) < 0) return s;
+    /* THE KV HEADS ARE REPLICATED WHEN THERE ARE NOT ENOUGH TO SPLIT. There is one row-span per KV
+     * head and no way to hand four ranks half a head, so `divide_or_fail` on n_head_kv is the
+     * wrong verb once world exceeds the head count -- the question is not rounding, it is whether
+     * the declaration is allowed to say one KV head per rank. It is, when world is a multiple of
+     * the KV head count: query heads 0-11 belong to KV head 0 and 12-23 to KV head 1, so ranks
+     * {0,1} need only KV head 0 and ranks {2,3} only KV head 1. Each rank then declares
+     * n_head_kv 1 and reads its own head's row-span of k/v, which `kv_off` locates; the attention
+     * declaration comes out at gqa 6 over a page of 4 instead of gqa 12 over a page of 2, and
+     * kv_dim(), gqa() and every block that reads them need no new branch because from here down a
+     * replicated rank and a split rank look the same.
+     *
+     * THE COST IS HONEST AND IT IS MEMORY, NOT MATH: the replicating ranks hold BYTE-IDENTICAL KV
+     * weights, a replicated read that costs no extra VRAM per rank versus the TP2 split it
+     * replaces (Flash-Next: 2 KV heads x 5120 x 256 rows read twice instead of once). What it buys
+     * is that world 4 is declarable at all.
+     *
+     * When world <= n_head_kv_all the split below is untouched: TP2 stays byte-identical, the
+     * geometry paro is served on cannot regress. */
+    if (g.world > g.n_head_kv_all) {
+        if (g.world % g.n_head_kv_all != 0) {
+            fprintf(stderr, "radiance: world_size = %d cannot replicate n_head_kv = %lld; "
+                            "replication needs world to be a multiple of the KV head count\n",
+                    g.world, (long long)g.n_head_kv_all);
+            return RAD_E_INVAL;
+        }
+        g.n_head_kv = 1;   /* world / n_head_kv_all ranks share each KV head */
+        g.kv_off    = (g.rank / (g.world / g.n_head_kv_all)) * g.head_dim;
+    } else if ((s = divide_or_fail(g.n_head_kv_all, g.world, "n_head_kv", &g.n_head_kv)) < 0) {
+        return s;
+    } else {
+        g.kv_off = 0;   /* a split rank reads the rows the plain row-shard already gives it */
+    }
     if ((s = divide_or_fail(g.n_ff_all,      g.world, "n_ff",      &g.n_ff))      < 0) return s;
     /* THE VOCABULARY IS SPLIT. r4d_sample_topk_f32 takes a vocabulary offset and packs its
      * candidates as (u32 GLOBAL id, f32 logit) pairs, and the all-gather places every rank's

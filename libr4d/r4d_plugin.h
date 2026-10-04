@@ -119,6 +119,18 @@ int     r4d_rad_attn_decode_gq_h256_gqa12_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_gq_h256_gqa12_bf16_describe(const RadArgs*, RadStream, RadLaunchDesc*,
                                                         int, int*);
 int64_t r4d_rad_attn_decode_h256_gqa12_scratch(const RadArgs*);
+/* Six queries a KV head, head_dim 256, paged block 4 -- the same QSA layers at four ranks, where
+ * the KV head is replicated across a rank pair. Same body again; the verify width is 64/6 = 10
+ * against gqa12's 5, which is the decode rows' constraint value. */
+int     r4d_rad_attn_prefill_h256_gqa6_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_prefill_h256_gqa6_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h256_gqa6_fp8  (const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h256_gqa6_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*,
+                                                   int, int*);
+int     r4d_rad_attn_decode_h256_gqa6_bf16 (const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h256_gqa6_bf16_describe(const RadArgs*, RadStream, RadLaunchDesc*,
+                                                    int, int*);
+int64_t r4d_rad_attn_decode_h256_gqa6_scratch(const RadArgs*);
 
 /* -- gated delta net (r4d_gdn_*.hip) -- */
 int r4d_rad_gdn_chunk_scan      (const RadArgs*, RadStream);
@@ -149,6 +161,9 @@ int  r4d_rad_ar_init(const RadParam*, int, int rank, int world, void** out);
 void r4d_rad_ar_fini(void*);
 int  r4d_rad_ar_oneshot_2rank_exact(const RadArgs*, RadStream);
 int  r4d_rad_ar_gather_2rank       (const RadArgs*, RadStream);
+/* The gather at a wide group's handshake (r4d_ar_gather_Nrank.hip launches it). */
+int  r4d_rad_ar_gather_4rank       (const RadArgs*, RadStream);
+int  r4d_rad_ar_gather_8rank       (const RadArgs*, RadStream);
 int  r4d_rad_ar_oneshot_2rank_wht6 (const RadArgs*, RadStream);
 int  r4d_rad_ar_oneshot_4rank_exact(const RadArgs*, RadStream);
 int  r4d_rad_ar_oneshot_8rank_exact(const RadArgs*, RadStream);

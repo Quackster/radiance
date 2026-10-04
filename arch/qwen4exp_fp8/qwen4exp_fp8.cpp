@@ -479,26 +479,31 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         g.w_bf16 = mc.expert_bf16 != 0;
         /* ...and the connections in front of the blocks emit no codes, since nothing reads any. */
         m.hccfg.quant = g.w_bf16 ? 0 : 1;
-        /* ============================== EVERY RANK HOLDS A SLICE OF EVERY EXPERT ==============================
+        /* ================= THE RANKS EITHER SLICE EVERY EXPERT, OR OWN WHOLE ONES =================
          *
          * An expert of this model is 640 columns, five 128-column blocks -- the fp8 scale block,
          * the 4-bit plane's scale group and the rotation's width all at once -- so two ranks
-         * cannot halve one. Each rank takes three blocks of the experts of one parity and two of
-         * the other's: rank r's slice of expert e is the first three blocks when e % 2 == r and
-         * the last two otherwise (MoeFP8::Config::ff_lo says why by parity). The router stays
-         * replicated, every rank computes its slice of every routed expert, and the block's
-         * all-reduce sums the partials.
+         * cannot halve one.
          *
-         * WHY NOT EXPERT PARALLELISM, which splits the EXPERTS: rank r owns [r*E/W, (r+1)*E/W)
-         * whole. The bytes a rank reads are the same on average either way, but which rank a
-         * routed expert lands on is a coin flip, and a verify step's forty routed slots leave one
-         * rank about five experts ahead -- which the all-reduce turns into the other rank waiting,
-         * about a millisecond a step at one sequence. Split by parity the ranks differ by a fifth
-         * of an expert per unit of the even/odd difference instead.
+         * AT TWO RANKS EVERY EXPERT IS SLICED BY PARITY: each rank takes three blocks of the
+         * experts of one parity and two of the other's -- rank r's slice of expert e is the first
+         * three blocks when e % 2 == r and the last two otherwise (MoeFP8::Config::ff_lo says why
+         * by parity). The router stays replicated, every rank computes its slice of every routed
+         * expert, and the block's all-reduce sums the partials.
          *
-         * A width that divides into whole blocks at the rank count is split evenly and has one
-         * slice; five blocks at more than two ranks would need more slices than two parities, and
-         * is refused by name.
+         * ABOVE TWO RANKS THE RANKS OWN WHOLE EXPERTS: rank r owns [r*E/W, (r+1)*E/W). A width
+         * that divides into whole blocks at the rank count is still split evenly and has one
+         * slice, but five blocks cannot be cut into four even whole-block slices, and the parity
+         * trick is by construction a two-rank rule. So the block's all-reduce sums whole-expert
+         * partials instead.
+         *
+         * THE TRADE IS ROUTING BALANCE FOR A WORKING TP4. The bytes a rank reads are the same on
+         * average either way, but which rank a routed expert lands on is a coin flip, and a verify
+         * step's forty routed slots leave one rank about five experts ahead -- which the all-reduce
+         * turns into the other ranks waiting, about a millisecond a step at one sequence. Split by
+         * parity the ranks differ by a fifth of an expert per unit of the even/odd difference
+         * instead. This is correctness-first v1: the follow-up is a 4-way block split, an
+         * ff_lo[4]/ff_hi[4] generalising the parity tables, which keeps that balance at four.
          *
          * A CALIBRATION RUN SPLITS THE EXPERTS INSTEAD, whole experts per rank. The down
          * projection's Hessian is over an expert's whole K, and a rank holding a slice of each
@@ -510,16 +515,28 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * is two row ranges and a column range of the container, which the file tier cannot read
          * as one run, and nothing about bf16 needs the parity split's balance -- a bf16 model is
          * served to calibrate and to compare, not for its decode rate. */
-        if (g.world > 1 && (mc.calib || mc.expert_bf16)) {
+        if (g.world > 2 || (g.world > 1 && (mc.calib || mc.expert_bf16))) {
             int s;
             int64_t per = 0;
             if ((s = divide_or_fail(mc.n_expert_all, g.world, "expert_count", &per)) < 0) return s;
             mc.n_ff_exp    = g.n_ff_all;
             mc.n_expert    = per;
             mc.expert_base = (int64_t)g.rank * per;
+            /* WHY this run owns whole experts: whichever of the three reasons applies. The parity
+             * case says so by the block count, because that is the number that refuses the split. */
+            char why[192];
+            if (mc.calib)
+                snprintf(why, sizeof why,
+                         "calibration (each expert's Hessian is over its whole width)");
+            else if (mc.expert_bf16)
+                snprintf(why, sizeof why, "bf16 experts");
+            else
+                snprintf(why, sizeof why,
+                         "%lld blocks of %d split %d ways are not whole blocks, so the ranks own "
+                         "whole experts", (long long)(g.n_ff_all / RAD_FP8_BLOCK),
+                         RAD_FP8_BLOCK, g.world);
             rad_note(b, "%s: rank %d owns experts [%lld, %lld) of %lld whole.",
-                     mc.calib ? "calibration (each expert's Hessian is over its whole width)"
-                              : "bf16 experts", g.rank,
+                     why, g.rank,
                      (long long)mc.expert_base, (long long)(mc.expert_base + mc.n_expert),
                      (long long)mc.n_expert_all);
         } else if (g.world > 1) {

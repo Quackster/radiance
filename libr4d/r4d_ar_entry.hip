@@ -527,6 +527,112 @@ extern "C" int r4d_rad_ar_gather_2rank(const RadArgs* a, RadStream s) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ wide (4 / 8 rank) all-gather
+ * The gather the 2-rank one cannot be at width: its handshake is one peer flag per block, so the
+ * wide form takes the wide family's peer arrays and r4d_ar_handshake instead (r4d_ar_wide.h), and
+ * it rides the SAME instance, scratch, flags and counters as the wide one-shots above -- a slot
+ * holds a full message here exactly as it does there, and this message is the INPUT. The two
+ * launchers live in r4d_ar_gather_Nrank.hip, which is the only family unit whose caller is inside
+ * the plugin, so they are declared here rather than in r4d.h. */
+extern "C" void r4d_ar_gather_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                    long peer_flags0, long peer_flags1, long peer_flags2,
+                                    long my_scratch, long my_flags, long seq_ctrs,
+                                    long slot_stride16, long inp, long out, long n_elem,
+                                    long dtype, long rank, long row_elems, long stream,
+                                    long nblocks, long nthreads, long drain, long acq, long pub);
+extern "C" void r4d_ar_gather_8rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                    long peer_scratch3, long peer_scratch4, long peer_scratch5,
+                                    long peer_scratch6, long peer_flags0, long peer_flags1,
+                                    long peer_flags2, long peer_flags3, long peer_flags4,
+                                    long peer_flags5, long peer_flags6, long my_scratch,
+                                    long my_flags, long seq_ctrs, long slot_stride16, long inp,
+                                    long out, long n_elem, long dtype, long rank, long row_elems,
+                                    long stream, long nblocks, long nthreads, long drain, long acq,
+                                    long pub);
+
+/* Every check the 2-rank gather makes, and the same `row` rule: an all-gather's output is
+ * world_size times its input, so this is not ar_setup either. */
+static int ar_gather_wide_setup(const RadArgs* a, int ws, const ArInst** out_in, ArCall* c,
+                                long long* row_out) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;                  /* init did not run: a core sequencing bug */
+    if (in->world != ws) return RAD_E_SHAPE;      /* the peer bundle is compiled for this width */
+
+    const RadTensor* x = r4d_opt(a, AR_X);
+    const RadTensor* y = r4d_opt(a, AR_Y);
+    if (!x || !y) return RAD_E_INVAL;             /* the gather has no in-place form */
+    if (!r4d_contig(x) || !r4d_contig(y)) return RAD_E_STRIDE;
+    if (y->data == x->data) return RAD_E_INVAL;
+
+    const long n = (long)r4d_numel(x);
+    if (n <= 0 || n > in->max_numel) return RAD_E_SHAPE;
+    /* "y is [world_size * numel] with rank r's contribution at offset r * numel" (docs/OPS.md).
+     * A y of any other extent is a caller that means something this kernel does not do. */
+    if ((long long)r4d_numel(y) != (long long)n * in->world) return RAD_E_SHAPE;
+
+    /* The row width, if the caller asked for the row-interleaved placement. It has to divide the
+     * message and be a whole number of 16-byte words, both of which libr4d rechecks. */
+    const long long row = r4d_pgeti_or(a->p, a->n_p, "row", 0);
+    if (row < 0 || (row > 0 && (n % row || (row * in->esize) % 16))) return RAD_E_SHAPE;
+
+    /* 16-byte vector stores, and libr4d throws on a message that is not a whole number of them. */
+    if (((long long)n * in->esize) % 16) return RAD_E_ALIGN;
+    if (!r4d_aligned(x->data, 16) || !r4d_aligned(y->data, 16)) return RAD_E_ALIGN;
+
+    R4dArCfg cfgv;
+    r4d_cfg_ar(a, &cfgv);
+    const long words16 = (long)n * in->esize / 16;
+    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, in->nb_cap);
+    if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+
+    *out_in = in;
+    c->in = in;
+    c->inp = r4d_addr(x);
+    c->out = r4d_addr(y);
+    c->numel = n;
+    c->nblocks = nblocks;
+    c->nthreads = cfgv.nthreads;
+    c->drain = cfgv.drain;
+    c->acq = cfgv.acq;
+    c->pub = cfgv.pub;
+    *row_out = row;
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_ar_gather_4rank(const RadArgs* a, RadStream s) {
+    const ArInst* in = nullptr;
+    ArCall c;
+    long long row = 0;
+    int rc = ar_gather_wide_setup(a, 4, &in, &c, &row);
+    if (rc != RAD_OK) return rc;
+    R4D_TRY("ar_gather_4rank",
+        r4d_ar_gather_4rank(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                            in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                            in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                            c.inp, c.out, c.numel, in->dtype, in->rank, (long)row,
+                            (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub));
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_ar_gather_8rank(const RadArgs* a, RadStream s) {
+    const ArInst* in = nullptr;
+    ArCall c;
+    long long row = 0;
+    int rc = ar_gather_wide_setup(a, 8, &in, &c, &row);
+    if (rc != RAD_OK) return rc;
+    R4D_TRY("ar_gather_8rank",
+        r4d_ar_gather_8rank(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                            in->peer_scratch[3], in->peer_scratch[4], in->peer_scratch[5],
+                            in->peer_scratch[6],
+                            in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                            in->peer_flags[3], in->peer_flags[4], in->peer_flags[5],
+                            in->peer_flags[6],
+                            in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                            c.inp, c.out, c.numel, in->dtype, in->rank, (long)row,
+                            (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub));
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ 2-rank one-shot */
 
 extern "C" int r4d_rad_ar_oneshot_2rank_exact(const RadArgs* a, RadStream s) {

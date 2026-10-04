@@ -36,7 +36,16 @@ struct RecParam {
     std::string sval;
 };
 
-struct RecWeight { std::string name; RadWeightDecl d{}; };
+struct RecWeight {
+    std::string     name;
+    RadWeightDecl   d{};
+    /* The uneven slice this weight was handed, in the CONTAINER's unsharded units
+     * (rad_weight_shard_span). Recorded rather than dropped: "which rows of the checkpoint's k/v
+     * projection does rank 3 read" is a declare-time fact and this file is where declare is
+     * checked. A weight with no span -- every even shard -- has `span_set` false. */
+    bool            span_set = false;
+    int64_t         span_lo = 0, span_hi = 0;
+};
 struct RecBuf    { std::string name; RadBufDecl    d{}; };
 struct RecOp {
     std::string             op;
@@ -198,8 +207,15 @@ extern "C" int rad_declare_logits(RadBuilder* b, rad_buf logits) {
 /* Recorded as calls and nothing else: no test here reads a lane or a drafter declaration. */
 extern "C" int rad_buf_concurrent(RadBuilder* b, rad_buf buf) { (void)b; (void)buf; return RAD_OK; }
 extern "C" int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi) {
-    (void)b; (void)w;
-    return (lo >= 0 && hi > lo) ? RAD_OK : RAD_E_INVAL;
+    if (!b || w == 0 || w > b->weights.size()) return RAD_E_INVAL;
+    if (lo < 0 || hi <= lo) return RAD_E_INVAL;
+    /* The real Builder also checks the declared extent against hi-lo (core/build/rad_builder.cpp);
+     * the fake checks what it always did and records the answer so a test can read it back. */
+    RecWeight& rw = b->weights[w - 1];
+    rw.span_set = true;
+    rw.span_lo  = lo;
+    rw.span_hi  = hi;
+    return RAD_OK;
 }
 extern "C" int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {
     (void)b; (void)d;
@@ -1815,6 +1831,229 @@ TEST(a_sizing_declare_leaves_the_step_state_alone_and_shrinks_only_rows) {
     }
 }
 
+
+/* FOUR RANKS: THE KV HEADS REPLICATE, THE EXPERTS SPLIT WHOLE, THE FUSED COLLECTIVES STOP.
+ *
+ * This is the tensor-parallel test above's sibling for the other model in the tree, and it exists
+ * because world 4 was not declarable at all: `geom_from` refused any world larger than the KV head
+ * count, and qwen4exp's parity split of a 640-column expert "serves two ranks" by name. Both are
+ * now answered by a DIFFERENT declaration rather than a rounding rule, and the point of this test
+ * is to pin which one:
+ *
+ *   - the KV heads cannot be cut four ways, so they are REPLICATED in pairs: one KV head a rank,
+ *     ranks {0,1} reading rows [0,256) of the checkpoint's k/v projection and {2,3} reading
+ *     [256,512). That is a span, not a shard index, and it is the only place in the engine where a
+ *     rank names the container rows it wants -- so it is asserted here as a pair of agreeing spans
+ *     whose union is the whole projection.
+ *   - the experts go WHOLE, rank r owning [r*128, (r+1)*128) of 512, with the router REPLICATED at
+ *     the model's full 512 logits. A rank that disagreed with the router about the expert count
+ *     would route to a different model.
+ *   - the FUSED all-reduces are world-2 kernels (`ar_wire_is_exact` and `ar_fused_ok` both return
+ *     false off two, and `HyperConn` declares `ar_hc_write` only at world 2), so at four the chain
+ *     is unfused: a standalone `all_reduce` where the collective happens. The contrast with world 2
+ *     in the same test is the contract -- it fails loudly if a fused declare is ever gated on the
+ *     wrong condition.
+ *
+ * Every expected number is derived from the meta this file builds (n_head 24, n_head_kv 2, head_dim
+ * 256, num_experts 512), so the fixture and the assertions cannot drift apart. Where a number is
+ * really the PRODUCTION container's -- the unsharded k_proj entry's 512 rows -- the relation is
+ * asserted instead of the literal. */
+TEST(flashnext_tp4_replicates_kv_heads_and_owns_whole_experts) {
+    RadModelMeta meta = qwen4exp_meta();
+    const int      world    = 4;
+    const int64_t  n_head   = meta.n_head;        /* 24 query heads */
+    const int64_t  n_head_kv = meta.n_head_kv;    /* 2 KV heads -- fewer than the ranks */
+    const int64_t  head_dim = meta.head_dim;      /* 256 */
+    const int64_t  ne_all   = atoll(rad_meta_gets(&meta, "num_experts", "0"));
+    REQUIRE(n_head % world == 0);
+    REQUIRE_EQ(world % n_head_kv, (int64_t)0);   /* replication needs the multiple */
+    REQUIRE(ne_all % world == 0);
+
+    /* Full-attention layers of the eight-layer fixture: 3 and 7 (interval 4). */
+    const int lfull = 3;
+    const std::string kq = "blk." + std::to_string(lfull) + ".attn_k.weight";
+    const std::string kv = "blk." + std::to_string(lfull) + ".attn_v.weight";
+
+    RadBuilder b[world];
+    RadBuildCtx  c[world];
+    for (int r = 0; r < world; ++r) {
+        c[r] = build_ctx(r, world);
+        c[r].max_tok  = 2048;
+        c[r].max_seqs = 8;
+        c[r].max_spec = 3;
+        c[r].max_ctx  = 200000;
+        /* THE DISCRIMINATOR: on the unpatched tree this returns RAD_E_INVAL from geom_from's
+         * divide_or_fail(n_head_kv, 4) and nothing below it runs. */
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b[r], &meta, &c[r]), RAD_OK);
+    }
+
+    for (int r = 0; r < world; ++r) {
+        /* (1) ONE QUARTER OF THE QUERY HEADS, ONE KV HEAD, so gqa is 6 and the page is the QSA
+         * compress block of 4 (qwen4exp_fp8.cpp sets lay.attn.kv_block = 4, and the row's
+         * C_EQ("block_size", 4) has to agree with it or nothing resolves). */
+        const RecOp* at = find_op(b[r], "attn_paged");
+        REQUIRE(at != nullptr);
+        CHECK_EQ(pint(at, "n_head"), n_head / world);
+        CHECK_EQ(pint(at, "gqa"), n_head / world);   /* n_head_kv is 1, so gqa == the rank's heads */
+        CHECK_EQ(pint(at, "block_size"), 4);
+        /* The full-attention KV group holds the one head this rank serves. Group 0 is kv_attn --
+         * the first declared (qwen4exp_fp8.cpp's three groups, RAD_KV_FULL first). */
+        REQUIRE(b[r].kv_groups.size() > 0);
+        CHECK_EQ(b[r].kv_groups[0].name, std::string("kv_attn"));
+        CHECK_EQ(b[r].kv_groups[0].d.n_head_kv, 1);
+        CHECK_EQ(b[r].kv_groups[0].d.head_dim, head_dim);
+
+        /* (2) ONE KV HEAD'S ROWS, and the SPAN that locates them in the entry. shape[0] is
+         * n_head_kv * head_dim = 256 per rank; the pair of ranks reading it declares the SAME span,
+         * and the two spans together are the checkpoint's whole k_proj -- n_head_kv_all * head_dim
+         * = 512 rows, which is a CONTAINER fact this file cannot read, so it is asserted as the
+         * relation below rather than as a literal. */
+        for (const std::string& wn : {kq, kv}) {
+            const RecWeight* w = find_w(b[r], wn);
+            REQUIRE(w != nullptr);
+            CHECK_EQ(w->d.shape[0], head_dim);          /* one head */
+            CHECK_EQ(w->d.shape[1], meta.n_embd);       /* the projection's K is not sharded */
+            CHECK_EQ(w->d.shard, RAD_SHARD_ROW);
+            CHECK(w->span_set);
+            CHECK_EQ(w->span_hi - w->span_lo, w->d.shape[0]);
+            CHECK_EQ(w->span_lo, (int64_t)(r / (world / n_head_kv)) * head_dim);
+            CHECK_EQ(w->span_hi, w->span_lo + head_dim);
+        }
+        /* (3) THE EXPERTS THIS RANK OWNS, whole, and a router that still names every one. */
+        const RecOp* sc = find_op(b[r], "moe_scatter");
+        REQUIRE(sc != nullptr);
+        CHECK_EQ(pint(sc, "n_expert"), ne_all / world);
+        CHECK_EQ(pint(sc, "expert_base"), (int64_t)r * (ne_all / world));
+        const RecOp* tk = find_op(b[r], "router_topk");
+        REQUIRE(tk != nullptr);
+        CHECK_EQ(pint(tk, "n_expert"), ne_all);         /* replicated: one routing per token */
+        if (const RecOp* ts = find_op(b[r], "router_topk_scatter")) {
+            CHECK_EQ(pint(ts, "n_expert"), ne_all);
+            CHECK_EQ(pint(ts, "n_local"), ne_all / world);
+            CHECK_EQ(pint(ts, "expert_base"), (int64_t)r * (ne_all / world));
+        }
+        /* The experts declared by name are the ones in that range -- the weight manifest is the
+         * rank's ownership, and the numbering is the CHECKPOINT's (rad_block_moe_fp8.h's
+         * `expert_base + e`), so a slip here routes the wrong tensor. */
+        const std::string pre = "blk.0.ffn_gate_up_exps.";
+        int64_t lo = -1, hi = -1;
+        for (const RecWeight& w : b[r].weights) {
+            if (w.name.rfind(pre, 0) != 0 || w.name.size() < pre.size() + 8) continue;
+            if (w.name.compare(w.name.size() - 7, 7, ".weight") != 0) continue;
+            const int64_t ge = atoll(w.name.c_str() + pre.size());
+            if (lo < 0) { lo = ge; hi = ge; }
+            if (ge < lo) lo = ge;
+            if (ge > hi) hi = ge;
+        }
+        REQUIRE(lo >= 0);
+        CHECK_EQ(lo, (int64_t)r * (ne_all / world));
+        CHECK_EQ(hi, (int64_t)r * (ne_all / world) + ne_all / world - 1);
+        /* And NO expert weight carries a span: whole experts and a slice of every one are
+         * exclusive (rad_block_moe_fp8.h refuses "whole experts OR a slice of every one"), which in
+         * the declaration means the parity tables ff_lo/ff_hi stay 0 and `span()` is never called.
+         * The shared arm is the one exception and it is sliced by columns, not by parity -- asserted
+         * by its own span below. */
+        int expert_spanned = 0;
+        for (const RecWeight& w : b[r].weights)
+            if (w.name.find("ffn_gate_up_exps.") != std::string::npos && w.span_set)
+                ++expert_spanned;
+        CHECK_EQ(expert_spanned, 0);
+
+        /* (4) THE UNFUSED CHAIN: a standalone collective per reduction, and none of the three
+         * fused world-2 forms. */
+        CHECK(count_op(b[r], "all_reduce") > 0);
+        CHECK_EQ(pint(find_op(b[r], "all_reduce"), "world_size"), world);
+        CHECK_EQ(count_op(b[r], "ar_hc_write"), 0);
+        CHECK_EQ(count_op(b[r], "ar_gather_hc_write"), 0);
+        CHECK_EQ(count_op(b[r], "ar_rmsnorm_quant_fp8"), 0);
+    }
+
+    /* THE PAIRS AGREE AND THEIR UNION IS THE WHOLE PROJECTION. 2 * head_dim is the container's
+     * k_proj entry height (n_head_kv_all rows of head_dim each) -- the relation, not the literal,
+     * because the rows belong to the model file and not to this fixture. */
+    for (const std::string& wn : {kq, kv}) {
+        CHECK_EQ(find_w(b[0], wn)->span_hi, find_w(b[1], wn)->span_hi);
+        CHECK_EQ(find_w(b[2], wn)->span_lo, find_w(b[3], wn)->span_lo);
+        CHECK_EQ(find_w(b[0], wn)->span_lo, find_w(b[2], wn)->span_hi - n_head_kv * head_dim);
+        const int64_t lo = find_w(b[0], wn)->span_lo;
+        const int64_t hi = find_w(b[2], wn)->span_hi;
+        CHECK_EQ(hi - lo, n_head_kv * head_dim);
+        CHECK_EQ(hi - lo, world * find_w(b[0], wn)->d.shape[0] / (world / n_head_kv));
+    }
+
+    /* (5) THE FOUR GRAPHS ARE THE SAME GRAPH. A rank's shard differs in a parameter or a weight's
+     * span, never in which ops it declares -- a graph that varied by rank would be a plan that
+     * varied by rank. */
+    for (int r = 1; r < world; ++r) {
+        if (op_names(b[r]) != op_names(b[0])) {
+            fprintf(stderr, "    rank %d differs from rank 0 in its op list (%zu vs %zu)\n", r,
+                    b[r].ops.size(), b[0].ops.size());
+            for (size_t i = 0; i < b[0].ops.size() && i < b[r].ops.size(); ++i)
+                if (b[0].ops[i].op != b[r].ops[i].op) {
+                    fprintf(stderr, "    first at %zu: '%s' vs '%s'\n", i,
+                            b[0].ops[i].op.c_str(), b[r].ops[i].op.c_str());
+                    break;
+                }
+        }
+        CHECK_EQ(join(op_names(b[r])), join(op_names(b[0])));
+    }
+
+    /* THE SHARED ARM IS SPLIT BY WHOLE BLOCKS AND IS UNEVEN AT FOUR: 640 is five blocks of 128, so
+     * the rank taking the extra block is rank 0 -- [0,256) [256,384) [384,512) [512,640) in the
+     * model's column numbering, the same rule that gives rank 0 three of five blocks at two ranks
+     * (qwen4exp_fp8.cpp's uneven-block branch). This is the one world-4 span that is NOT a KV head. */
+    for (int r = 0; r < world; ++r) {
+        const RecWeight* sg = find_w(b[r], "blk.0.ffn_gate_up_shexp.weight");
+        REQUIRE(sg != nullptr);
+        CHECK(sg->span_set);
+        const int64_t want_lo[] = { 0,   256, 384, 512 };
+        const int64_t want_hi[] = { 256, 384, 512, 640 };
+        CHECK_EQ(sg->span_lo, want_lo[r]);
+        CHECK_EQ(sg->span_hi, want_hi[r]);
+        CHECK_EQ(sg->d.shape[0], 2 * (want_hi[r] - want_lo[r]));   /* gate's rows and up's */
+        if (r) CHECK_EQ(sg->span_lo, find_w(b[r - 1], "blk.0.ffn_gate_up_shexp.weight")->span_hi);
+    }
+
+    /* AT TWO, THE OLD DECLARATION: the KV heads split, so the even shard already selects the right
+     * rows and NO SPAN is declared at all -- TP2 is byte-identical to the tree this fork started
+     * from. The fused forms are the tell that world 2 is a different deployment and not the same
+     * one stretched: they resolve there and nowhere else. */
+    {
+        RadBuilder h[2];
+        for (int r = 0; r < 2; ++r) {
+            RadBuildCtx c2 = build_ctx(r, 2);
+            c2.max_tok  = 2048;
+            c2.max_seqs = 8;
+            c2.max_spec = 3;
+            c2.max_ctx  = 200000;
+            REQUIRE_EQ(qwen4exp_fp8::declare(&h[r], &meta, &c2), RAD_OK);
+            const RecWeight* w = find_w(h[r], kq);
+            REQUIRE(w != nullptr);
+            CHECK_EQ(w->d.shape[0], n_head_kv / 2 * head_dim);   /* one of two heads */
+            CHECK(!w->span_set);
+            CHECK_EQ(h[r].kv_groups[0].d.n_head_kv, n_head_kv / 2);
+            CHECK_EQ(pint(find_op(h[r], "attn_paged"), "gqa"), (n_head / 2) / (n_head_kv / 2));
+            CHECK_EQ(pint(find_op(h[r], "moe_scatter"), "n_expert"), ne_all);
+            CHECK_EQ(pint(find_op(h[r], "moe_scatter"), "expert_base"), 0);
+            CHECK(count_op(h[r], "ar_hc_write") > 0);
+            CHECK(count_op(h[r], "ar_gather_hc_write") > 0);
+            /* Not ar_rmsnorm_quant_fp8: qwen4exp hands every block's norm `kArNone`, because here
+             * the reduction rides in the gated residual's WRITE rather than in the norm that
+             * follows it (qwen4exp_fp8.cpp's block declares). So this one is absent at BOTH world
+             * sizes -- asserted so, rather than claimed as part of the contrast. */
+            CHECK_EQ(count_op(h[r], "ar_rmsnorm_quant_fp8"), 0);
+        }
+    }
+
+    /* A WORLD THAT CANNOT REPLICATE -- not a multiple of the KV head count -- is refused by name,
+     * not rounded into a half head. */
+    {
+        RadBuilder b3;
+        RadBuildCtx c3 = build_ctx(0, 3);
+        c3.max_tok = 2048; c3.max_seqs = 8; c3.max_spec = 3; c3.max_ctx = 200000;
+        CHECK(qwen4exp_fp8::declare(&b3, &meta, &c3) != RAD_OK);
+    }
+}
 
 /* ==================================================================== media */
 namespace {

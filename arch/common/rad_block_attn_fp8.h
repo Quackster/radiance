@@ -99,6 +99,17 @@ inline int AttnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, r
         return RAD_E_INVAL;
     }
 
+    /* NO KV-HEAD REPLICATION HERE. The fused [q|k|v] row-shards by head with the plain even shard,
+     * so above the KV head count a rank would get a slice of one KV head and declare fine while
+     * reading the wrong rows. rad_block_attn_gated.h refuses for the same reason; the block that
+     * plumbs geom_from's `kv_off` is rad_block_attn_gated_fp8.h. */
+    if (g.world > g.n_head_kv_all) {
+        fprintf(stderr, "radiance: %s declares no KV row span and cannot serve world_size = %d "
+                        "with n_head_kv = %lld.\n", __func__, g.world,
+                (long long)g.n_head_kv_all);
+        return RAD_E_UNSUPPORTED;
+    }
+
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_norm.weight", l), src.norm));
     w_norm = decl_w(b, nm.f("blk.%d.attn_norm.weight", l), RAD_F32, {g.n_embd},
                     RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));

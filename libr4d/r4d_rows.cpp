@@ -2201,6 +2201,35 @@ static const RadConstraint cAttnDecodeGqH256G12Bf16[] = {
     C_GE("causal", 0), C_LE("q_len", 5), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
     C_EQ("group", 128), C_IN("act", "sigmoid"),
 };
+/* SIX QUERIES PER KV HEAD, head_dim 256, paged block 4 (r4d_attn_paged_h256_gqa6_bs4.hip) -- the
+ * SAME QSA layers as the gqa12 leg above, at four ranks. The model has two KV heads; a world of
+ * four replicates each across a rank pair, so a rank declares 6 queries over the 1 kv head it
+ * holds and `gqa` is 6 where the TP2 leg reads 12. What the ratio changes is the two bounds, as
+ * ever: `q_len <= 10` is the same `q_len * gqa <= 64` at 6 queries a position rather than 12, so
+ * this leg's bucket boundary sits where the plain h256/gqa6 leg's does, and a draft block of six or
+ * seven positions -- which gqa12 hands to the prefill kernel -- is a decode launch here. The page
+ * stays 4 because it is the model's indexer's block size, not a consequence of the parallelism.
+ *
+ * NO `attn_paged_gate_quant` ROW AT THIS GEOMETRY. The body instantiates the `_gq` entry points at
+ * every ratio, but v1 of this port registers none of them as a row, so the sparse path's gate and
+ * quantiser resolve to the standalone pair declared beside the probe. That is the design, not an
+ * omission. */
+static const RadConstraint cAttnPrefillH256G6Bs4Fp8[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 4),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cAttnPrefillH256G6Bs4Bf16[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 4),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
+static const RadConstraint cAttnDecodeH256G6Bs4Fp8[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 4),
+    C_GE("causal", 0), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cAttnDecodeH256G6Bs4Bf16[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 4),
+    C_GE("causal", 0), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
 static const RadConstraint cAttnPrefillH128G8Fp8[] = {
     C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 8), C_EQ("block_size", 16),
     C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
@@ -2297,6 +2326,14 @@ static const RadConstraint cGdnGatedRmsNorm[] = {
  * accepts either, so a constraint that took only one would refuse the sampler by a synonym. */
 static const RadConstraint cArGather2[] = {
     C_EQ("world_size", 2), C_IN("dtype", "bf16 fp16 f16 fp32 f32"),
+};
+/* The same gather at a width whose handshake is the wide family's tree and not one peer flag. The
+ * dtype set is cArGather2's verbatim for the same reason -- the two callers' synonyms. */
+static const RadConstraint cArGather4[] = {
+    C_EQ("world_size", 4), C_IN("dtype", "bf16 fp16 f16 fp32 f32"),
+};
+static const RadConstraint cArGather8[] = {
+    C_EQ("world_size", 8), C_IN("dtype", "bf16 fp16 f16 fp32 f32"),
 };
 
 static const RadConstraint cArExact[] = {
@@ -3513,6 +3550,48 @@ static const RadKernelInfo kKernels[] = {
   r4d_shape_attn_paged_gate_quant, nullptr, r4d_fuse_attn_paged_gate_quant,
   r4d_rad_attn_decode_gq_h256_gqa12_bf16_describe },
 
+/* The TP4 leg of Flash-Next's sparse attention: the same kernels the gqa12 rows above resolve, at
+ * the ratio a four-rank world hands a rank (see cAttnPrefillH256G6Bs4Fp8). The two are not
+ * alternatives -- `gqa` is a per-rank parameter, so world 2 resolves gqa 12 and these four rows
+ * never win there, and world 4 resolves gqa 6 and the gqa12 rows never win. */
+{ "attn_prefill_h256_gqa6_bs4_fp8kv", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 256, 6 queries per kv head, paged block 4, varlen",
+  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH256G6Bs4Fp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa6_fp8, nullptr, nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_prefill_h256_gqa6_bs4_bf16kv", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 256, 6 queries per kv head, paged block 4, varlen",
+  "bf16 query, bf16 kv cache, bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH256G6Bs4Bf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa6_bf16, nullptr, nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_decode_h256_gqa6_bs4_fp8kv", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
+  "head_dim 256, 6 queries per kv head, paged block 4, q_len*gqa <= 64, no window",
+  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256G6Bs4Fp8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_gqa6_fp8, r4d_rad_attn_decode_h256_gqa6_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged, nullptr, nullptr, r4d_rad_attn_decode_h256_gqa6_fp8_describe },
+
+{ "attn_decode_h256_gqa6_bs4_bf16kv", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
+  "head_dim 256, 6 queries per kv head, paged block 4, q_len*gqa <= 64, no window",
+  "bf16 query, bf16 kv cache, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256G6Bs4Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_gqa6_bf16, r4d_rad_attn_decode_h256_gqa6_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged, nullptr, nullptr, r4d_rad_attn_decode_h256_gqa6_bf16_describe },
+
 { "attn_prefill_h128_gqa8_fp8kv", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",
   "head_dim 128, 8 queries per kv head, paged block 16, varlen",
@@ -3731,6 +3810,30 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
   ROW(cArGather2), ROW(tAr), nullptr,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_gather_2rank, nullptr, nullptr, nullptr,
+  r4d_shape_all_gather },
+
+{ "ar_gather_4rank", "all_gather", "ar",
+  "all-gather, one-shot push over P2P IPC scratch, per-block handshake",
+  "exactly 4 ranks, all peer-accessible; y is [4 * numel] with rank r's input at r * numel; one "
+  "scratch slot per (parity, source rank); shares the wide family's flag/seq/scratch set; "
+  "cudagraph-safe",
+  "any payload -- the bytes are moved, never summed, so the (u32 id, f32 logit) pairs the "
+  "vocab-parallel sampler gathers survive intact",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+  ROW(cArGather4), ROW(tAr), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_gather_4rank, nullptr, nullptr, nullptr,
+  r4d_shape_all_gather },
+
+{ "ar_gather_8rank", "all_gather", "ar",
+  "all-gather, one-shot push over P2P IPC scratch, per-block handshake",
+  "exactly 8 ranks, all peer-accessible; y is [8 * numel] with rank r's input at r * numel; one "
+  "scratch slot per (parity, source rank); shares the wide family's flag/seq/scratch set; "
+  "cudagraph-safe",
+  "any payload -- the bytes are moved, never summed, so the (u32 id, f32 logit) pairs the "
+  "vocab-parallel sampler gathers survive intact",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+  ROW(cArGather8), ROW(tAr), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_gather_8rank, nullptr, nullptr, nullptr,
   r4d_shape_all_gather },
 
 { "ar_oneshot_2rank_exact", "all_reduce", "ar",

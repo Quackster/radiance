@@ -63,6 +63,9 @@ set(R4D_UNITS
   # Twelve, head_dim 256 only: Qwen3.8-Flash-Next's QSA layers are 24 over 2. Four lines that
   # set the ratio and include the unit above, which is the parameterised body.
   "r4d_attn_paged_h256_gqa12|"
+  # Six, head_dim 256 and the same 4-token page: the same QSA layers at four ranks, where each KV
+  # head is replicated across a rank pair. Again four lines that set the ratio and include the body.
+  "r4d_attn_paged_h256_gqa6_bs4|"
   "r4d_attn_vit_h72_bf16|"
   # The vision tower's own small ops: layer norm, the learned-grid position embedding, and the
   # biased GEMM with a linear layer's activation and residual in its store.
@@ -87,6 +90,7 @@ set(R4D_UNITS
   # copy of it, which is the one thing it must not have.
   "r4d_ar_entry|"
   "r4d_ar_gather_2rank|"
+  "r4d_ar_gather_Nrank|"
   "r4d_ar_oneshot_2rank_exact|"
   "r4d_ar_oneshot_2rank_wht6|"
   "r4d_ar_oneshot_Nrank_exact|"
