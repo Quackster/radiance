@@ -131,6 +131,15 @@ int     r4d_rad_attn_decode_h256_gqa6_bf16 (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h256_gqa6_bf16_describe(const RadArgs*, RadStream, RadLaunchDesc*,
                                                     int, int*);
 int64_t r4d_rad_attn_decode_h256_gqa6_scratch(const RadArgs*);
+/* The same two merges with the output gate and the quantiser in them, at the four-rank ratio. The
+ * body instantiates these at every ratio (`R4D_ATTN_GQA` pastes them), so unlike `all_gather` this
+ * one needed a ROW and not a kernel — see attn_decode_gq_h256_gqa6_fp8kv. */
+int     r4d_rad_attn_decode_gq_h256_gqa6_fp8(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_gq_h256_gqa6_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*,
+                                                      int, int*);
+int     r4d_rad_attn_decode_gq_h256_gqa6_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_gq_h256_gqa6_bf16_describe(const RadArgs*, RadStream, RadLaunchDesc*,
+                                                       int, int*);
 
 /* -- gated delta net (r4d_gdn_*.hip) -- */
 int r4d_rad_gdn_chunk_scan      (const RadArgs*, RadStream);

@@ -2210,10 +2210,12 @@ static const RadConstraint cAttnDecodeGqH256G12Bf16[] = {
  * seven positions -- which gqa12 hands to the prefill kernel -- is a decode launch here. The page
  * stays 4 because it is the model's indexer's block size, not a consequence of the parallelism.
  *
- * NO `attn_paged_gate_quant` ROW AT THIS GEOMETRY. The body instantiates the `_gq` entry points at
- * every ratio, but v1 of this port registers none of them as a row, so the sparse path's gate and
- * quantiser resolve to the standalone pair declared beside the probe. That is the design, not an
- * omission. */
+ * THE `attn_paged_gate_quant` ROWS ARE HERE TOO (see attn_decode_gq_h256_gqa6_fp8kv). Registering
+ * them costs nothing the plain legs don't already pay -- the body instantiates the `_gq` entry
+ * points at EVERY ratio, so this leg needs a row and not a kernel -- and NOT registering them is
+ * not neutral: the block declares the fused op beside its unfused pair either way, so an
+ * unregistered geometry is a device band with nothing behind it, reported as a hole a request can
+ * fall into. The unfused pair still runs whenever the fused row does not resolve, unchanged. */
 static const RadConstraint cAttnPrefillH256G6Bs4Fp8[] = {
     C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 4),
     C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
@@ -2229,6 +2231,18 @@ static const RadConstraint cAttnDecodeH256G6Bs4Fp8[] = {
 static const RadConstraint cAttnDecodeH256G6Bs4Bf16[] = {
     C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 4),
     C_GE("causal", 0), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
+/* The gate and the quantiser as the merge's epilogue, at the four-rank ratio: the gqa12 pair's
+ * constraints with the ratio and the verify width moved together (`q_len <= 10`, not `<= 5`). */
+static const RadConstraint cAttnDecodeGqH256G6Bs4Fp8[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 4),
+    C_GE("causal", 0), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+    C_EQ("group", 128), C_IN("act", "sigmoid"),
+};
+static const RadConstraint cAttnDecodeGqH256G6Bs4Bf16[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 4),
+    C_GE("causal", 0), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+    C_EQ("group", 128), C_IN("act", "sigmoid"),
 };
 static const RadConstraint cAttnPrefillH128G8Fp8[] = {
     C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 8), C_EQ("block_size", 16),
@@ -3591,6 +3605,33 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_attn_decode_h256_gqa6_bf16, r4d_rad_attn_decode_h256_gqa6_scratch,
   nullptr, nullptr,
   r4d_shape_attn_paged, nullptr, nullptr, r4d_rad_attn_decode_h256_gqa6_bf16_describe },
+
+/* The TP4 leg's sparse decode WITH the gate and the quantiser in the merge, as the gqa12 pair
+ * above. Two launches where the unfused path is three, once a layer, at the shape TP4 serves every
+ * decode step of this model. */
+{ "attn_decode_gq_h256_gqa6_bs4_fp8kv", "attn_paged_gate_quant", "attn",
+  "paged split-KV decode attention with the output gate and the fp8 quantiser in the merge",
+  "attn_decode_h256_gqa6_bs4_fp8kv's geometry; gate_quant_fp8 over the merged (token, head) rows: "
+  "sigmoid only, group 128, the gate 16-byte aligned with a pitch of 8, the codes 8-byte aligned",
+  "bf16 query, fp8-e4m3 kv cache, bf16 gated out, E4M3 codes with an f32 scale per 128 columns",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeGqH256G6Bs4Fp8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_gq_h256_gqa6_fp8, r4d_rad_attn_decode_h256_gqa6_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged_gate_quant, nullptr, r4d_fuse_attn_paged_gate_quant,
+  r4d_rad_attn_decode_gq_h256_gqa6_fp8_describe },
+
+{ "attn_decode_gq_h256_gqa6_bs4_bf16kv", "attn_paged_gate_quant", "attn",
+  "paged split-KV decode attention with the output gate and the fp8 quantiser in the merge",
+  "attn_decode_h256_gqa6_bs4_bf16kv's geometry; gate_quant_fp8 over the merged (token, head) rows: "
+  "sigmoid only, group 128, the gate 16-byte aligned with a pitch of 8, the codes 8-byte aligned",
+  "bf16 query, bf16 kv cache, bf16 gated out, E4M3 codes with an f32 scale per 128 columns",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeGqH256G6Bs4Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_gq_h256_gqa6_bf16, r4d_rad_attn_decode_h256_gqa6_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged_gate_quant, nullptr, r4d_fuse_attn_paged_gate_quant,
+  r4d_rad_attn_decode_gq_h256_gqa6_bf16_describe },
 
 { "attn_prefill_h128_gqa8_fp8kv", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",
