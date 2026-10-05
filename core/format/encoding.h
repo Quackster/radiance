@@ -62,10 +62,11 @@ std::string enc_name(const RadEncoding& e);
  * `data[k]`, dense [rows[k], cols[k]] in its own elements -- as `n` elements of dtype `dt` at
  * `out`: the tensor a reference implementation reads where a kernel reads the stored form. One
  * plane is converted element by element (a bf16 scale plane into an f32 reference, codes as their
- * values); codes with the scalar codebook they index, each code as its table entry; the whole
- * encoding is decoded. RAD_OK, or RAD_E_SHAPE with `why` when the planes do not
- * make that tensor -- part of an encoding, which decodes to nothing on its own, or extents that
- * disagree with `n`; or the decoder's own refusal. */
+ * values); codes with the scalar codebook they index, each code as its table entry; a scale with
+ * the levels of its chain above it, each scale as their product; the whole encoding is decoded.
+ * RAD_OK, or RAD_E_SHAPE with `why` when the planes do not make that tensor -- part of an
+ * encoding, which decodes to nothing on its own, or extents that disagree with `n`; or the
+ * decoder's own refusal. */
 int enc_selection_logical(const RadEncoding& e, const int* sel, int n_sel, const int64_t* rows,
                           const int64_t* cols, const void* const* data, uint32_t dt, int64_t n,
                           void* out, std::string* why);

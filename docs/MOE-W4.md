@@ -381,7 +381,10 @@ typo'd directory is a message, not a silent quality regression.
   relayout; the same for `w4nl64a8h`, `w4nl32a8h` and `w5nl64a8h`, with a second level other than
   2^-13 refused, a 32-entry table other than `w5nl` refused, and each refusing the others'
   encodings. `r4d_selftest --case moe_gemm_w4a8` also checks `w5nl64a8h`'s arranged row bit for
-  bit against the statement in r4d_layout.cpp, and its inverse.
+  bit against the statement in r4d_layout.cpp, and its inverse. `moe_gemm_q_mod4`'s four classes
+  are held to `moe_gemm_q`'s stored bytes in every format, and for both ops what the op oracle
+  reads through the inverse -- codes as their levels, an E4M3 scale times its second level -- is
+  held to the quantiser's planes.
 - `r4d_selftest --case gram_accum` -- the accumulator against an f64 host Gram, **launched twice
   over a seeded buffer**, because a kernel that stored instead of adding would agree with any
   single-call oracle.

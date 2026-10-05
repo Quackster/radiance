@@ -172,6 +172,8 @@ const Hooks nW2        { r4d_rad_layout_w2a8, r4d_rad_relayout_w2a8, r4d_rad_unr
 const Hooks nMx        { r4d_rad_layout_mxfp4, r4d_rad_relayout_mxfp4, nullptr };
 const Hooks nMoeW4     { r4d_rad_layout_moe_w4, r4d_rad_relayout_moe_w4,
                        r4d_rad_unrelayout_moe_w4 };
+const Hooks nMoeW4Mod4 { r4d_rad_layout_moe_w4_mod4, r4d_rad_relayout_moe_w4_mod4,
+                       r4d_rad_unrelayout_moe_w4_mod4 };
 
 /* gemm_nt_q's operands and the other ops' weight slots, as the kernels number them */
 enum { B = 2, BSCALE = 3, BREF = 6, LM_W = 1, HC_DOWN = 2, HC_UP = 3, MTP_FCH = 4, MTP_FCE = 5 };
@@ -477,6 +479,143 @@ TEST(moe_codebook_experts_at_five_bits) {
     Selection s4 = select(q4, N, K, { "codes", "table" });
     CHECK_EQ(r4d_rad_layout_moe_w4(kp.data(), kp.n(), B, &q4.enc, s4.sel.data(), s4.t.data(),
                                    (int)s4.t.size(), &L), RAD_E_DTYPE);
+}
+
+namespace {
+
+/* WHAT THE OP ORACLE READS FOR A RE-LAID WEIGHT, got the way Ctx::oracle_unrelayout gets it: the
+ * stored bytes back through the kernel's own inverse into the selected planes, and those through
+ * the core's enc_selection_logical into the values a dense reference multiplies -- f32 here, held
+ * to the same values read straight off the quantiser's planes: a code as itself or as its table
+ * entry, a scale times the levels above it. A selection the core cannot read on its own is a
+ * weight the oracle has to decline, and the E4M3 scale views were one. A view stored as it is has
+ * nothing to invert and is handed over unchanged. */
+void oracle_reads(const char* label, const Hooks& nf, Opts kp, int operand, const Quantised& q,
+                  int64_t R, int64_t C, const std::vector<const char*>& roles) {
+    Selection s = select(q, R, C, roles);
+    RadLayout L{};
+    const int lrc = nf.layout(kp.data(), kp.n(), operand, &q.enc, s.sel.data(), s.t.data(),
+                              (int)s.t.size(), &L);
+    if (lrc == RAD_E_UNSUPPORTED) return;
+    REQUIRE_EQ(lrc, RAD_OK);
+    std::vector<uint8_t> laid((size_t)L.bytes);
+    REQUIRE_EQ(nf.relayout(kp.data(), kp.n(), operand, &q.enc, s.sel.data(), s.t.data(),
+                           (int)s.t.size(), laid.data(), L.bytes), RAD_OK);
+    std::vector<std::vector<uint8_t>> bufs;
+    Selection back = select(q, R, C, roles, &bufs);
+    REQUIRE_EQ(nf.unrelayout(kp.data(), kp.n(), operand, &q.enc, back.sel.data(), laid.data(),
+                             L.bytes, back.t.data(), (int)back.t.size()), RAD_OK);
+    std::vector<int64_t> rows, cols;
+    std::vector<const void*> pd;
+    for (size_t k = 0; k < back.t.size(); ++k) {
+        rows.push_back(back.t[k].shape[0]);
+        cols.push_back(back.t[k].shape[1]);
+        pd.push_back(bufs[k].data());
+    }
+    const int64_t n = rows[0] * cols[0];
+    std::vector<float> got((size_t)n);
+    std::string why;
+    const int rc = rad::enc_selection_logical(q.enc, back.sel.data(), (int)back.sel.size(),
+                                              rows.data(), cols.data(), pd.data(), RAD_F32, n,
+                                              got.data(), &why);
+    if (rc != RAD_OK)
+        std::fprintf(stderr, "    %s operand %d: %s\n", label, operand, why.c_str());
+    REQUIRE_EQ(rc, RAD_OK);
+    const RadEncPlane& p0 = q.enc.plane[s.sel[0]];
+    const uint8_t* src = q.planes[(size_t)s.sel[0]].data();
+    const int64_t rb = rad_enc_row_bytes(p0.dtype, cols[0]);
+    const float* table = nullptr;
+    float level = 1.0f;
+    for (size_t k = 1; k < roles.size(); ++k) {
+        const std::vector<uint8_t>& pk = q.planes[(size_t)s.sel[k]];
+        if (!std::strcmp(roles[k], "table")) table = (const float*)pk.data();
+        else level *= rad_load_f32(pk.data(), q.enc.plane[s.sel[k]].dtype, 0);
+    }
+    int64_t bad = 0;
+    for (int64_t i = 0; i < rows[0]; ++i)
+        for (int64_t j = 0; j < cols[0]; ++j) {
+            float v = rad_load_f32(src + i * rb, p0.dtype, j);
+            if (table) v = table[(int64_t)v];
+            if (got[(size_t)(i * cols[0] + j)] != v * level) ++bad;
+        }
+    if (bad) std::fprintf(stderr, "    %s operand %d: %lld of %lld read wrong\n", label, operand,
+                          (long long)bad, (long long)n);
+    CHECK_EQ(bad, (int64_t)0);
+}
+
+/* A four-bit expert format as the quantiser is asked for it, and its two views. */
+struct MoeFmt {
+    const char* dtype;
+    Opts quant;
+    std::vector<const char*> codes, scales;
+};
+std::vector<MoeFmt> moe_formats() {
+    auto nl = [](const char* table, long long group) {
+        Opts g;
+        g.s("table", table).i("group", group).s("scale", "fp8_e4m3").s("scale2", "f32")
+         .s("block2", "*x*").f("scale2_value", 0x1p-13).s("transform", "fwht128")
+         .s("rule", "search");
+        return g;
+    };
+    Opts i4, nla;
+    i4.s("codes", "i4").i("group", 128).s("scale", "bf16").s("transform", "fwht128");
+    nla.s("table", "w4nl").i("group", 128).s("scale", "bf16").s("transform", "fwht128")
+       .s("rule", "search");
+    return {
+        { "w4a8h", i4, { "codes" }, { "scale" } },
+        { "w4nla8h", nla, { "codes", "table" }, { "scale" } },
+        { "w4nl64a8h", nl("w4nl", 64), { "codes", "table" }, { "scale", "scale.1" } },
+        { "w4nl32a8h", nl("w4nl", 32), { "codes", "table" }, { "scale", "scale.1" } },
+        { "w5nl64a8h", nl("w5nl", 64), { "codes", "table" }, { "scale", "scale.1" } },
+    };
+}
+
+}  /* namespace */
+
+/* THE FOUR CLASSES ARE THE TWO-CLASS HOOKS ONE CLASS FURTHER ALONG. moe_gemm_q_mod4's class q is
+ * operands 2/3 at N/K for q = 0 and 2q+4/2q+5 at N_q/K_q after it, and each is stored, and read
+ * back, exactly as moe_gemm_q's hooks store an expert of that geometry -- codes and scales, in
+ * every four-bit format, at four class geometries. Then what the op oracle reads through each
+ * class's inverse, codes and E4M3 scale views alike, and through the two-class op's own. */
+TEST(moe_four_classes_store_and_read_back_as_two_classes_do) {
+    NEED_LIBQUANT();
+    const int64_t Nq[4] = { 64, 128, 64, 48 }, Kq[4] = { 256, 256, 128, 128 };
+    for (MoeFmt& f : moe_formats()) {
+        Opts kp4;
+        kp4.i("N", Nq[0]).i("K", Kq[0]).i("N_1", Nq[1]).i("K_1", Kq[1]).i("N_2", Nq[2])
+           .i("K_2", Kq[2]).i("N_3", Nq[3]).i("K_3", Kq[3]).s("dtype", f.dtype).i("group", 128);
+        for (int q = 0; q < 4; ++q) {
+            const std::vector<float> w = weight(Nq[q], Kq[q], 30 + q, 1, 128);
+            const int cop = q == 0 ? B : 2 * q + 4, sop = cop + 1;
+            Opts kp2;
+            kp2.i("N", Nq[q]).i("K", Kq[q]).s("dtype", f.dtype).i("group", 128);
+            const std::string label = std::string(f.dtype) + " class " + std::to_string(q);
+            Quantised kept;
+            const uint64_t h4 = stored(label.c_str(), nMoeW4Mod4, kp4, "rtn", f.quant,
+                                       "blk.0.ffn_down_exps.0.weight", Nq[q], Kq[q], w,
+                                       { { cop, f.codes }, { sop, f.scales } }, &kept);
+            const uint64_t h2 = stored(label.c_str(), nMoeW4, kp2, "rtn", f.quant,
+                                       "blk.0.ffn_down_exps.0.weight", Nq[q], Kq[q], w,
+                                       { { B, f.codes }, { BSCALE, f.scales } });
+            if (h4 != h2)
+                std::fprintf(stderr, "    %s: four-class hash 0x%016llx, two-class 0x%016llx\n",
+                             label.c_str(), (unsigned long long)h4, (unsigned long long)h2);
+            CHECK_EQ(h4, h2);
+            REQUIRE_EQ(kept.status, RAD_OK);
+            oracle_reads(label.c_str(), nMoeW4Mod4, kp4, cop, kept, Nq[q], Kq[q], f.codes);
+            oracle_reads(label.c_str(), nMoeW4Mod4, kp4, sop, kept, Nq[q], Kq[q], f.scales);
+            oracle_reads(label.c_str(), nMoeW4, kp2, B, kept, Nq[q], Kq[q], f.codes);
+            oracle_reads(label.c_str(), nMoeW4, kp2, BSCALE, kept, Nq[q], Kq[q], f.scales);
+            /* A class reads its own geometry and nobody else's: class 1 is 128 wide, so an
+             * expert of any other class's width is refused there. */
+            if (q != 1) {
+                Selection s = select(kept, Nq[q], Kq[q], f.codes);
+                RadLayout L{};
+                CHECK_EQ(nMoeW4Mod4.layout(kp4.data(), kp4.n(), 6, &kept.enc, s.sel.data(),
+                                           s.t.data(), (int)s.t.size(), &L), RAD_E_SHAPE);
+            }
+        }
+    }
 }
 
 TEST(moe_int4_gptq_against_a_calibration_hessian) {

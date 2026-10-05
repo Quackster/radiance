@@ -849,6 +849,65 @@ TEST(the_reference_reads_what_the_planes_decode_to) {
         CHECK_EQ(((const float*)out.data())[i], rad_load_f32(sp[0].data(), RAD_BF16, i));
 }
 
+/* A SCALE WITH THE LEVEL ABOVE IT, selected without the codes -- the scale view of a w4nl64a8h
+ * expert, an E4M3 scale a (row, 64 of K) under one f32 for the weight. The reference reads each
+ * scale times the level, in the scale plane's own extents. Part of a chain that does not start at
+ * its first level, a level finer than the scale it would multiply, and a reader wanting another
+ * count are refused rather than read as something. */
+TEST(the_reference_reads_a_scale_times_the_level_above_it) {
+    const int64_t R = 32, C = 256;
+    RadEncoding e;
+    rad_enc_clear(&e);
+    rad_enc_copy_str(e.scheme, "affine");
+    rad_enc_copy_str(e.transform, "fwht128");
+    rad_enc_add_plane(&e, "codes", RAD_U4, 1, 1);
+    rad_enc_add_plane(&e, "scale", RAD_F8E4M3, 1, 64);
+    rad_enc_add_plane(&e, "scale.1", RAD_F32, 0, 0);
+    rad_enc_add_table(&e, "table", RAD_F32, 1, 16);
+    REQUIRE(rad_enc_valid(&e));
+    auto view = [&](const RadEncoding& enc, std::vector<const char*> roles) {
+        KfOperand d;
+        d.role = RAD_OPD_WEIGHT;
+        d.has_enc = true;
+        d.enc = enc;
+        d.dtype = RAD_F32;
+        for (const char* r : roles) {
+            const int i = rad_enc_find(&enc, r);
+            int64_t pr = 0, pc = 0;
+            rad_enc_plane_dims(&enc.plane[i], R, C, &pr, &pc);
+            d.sel.push_back(i);
+            d.sel_rows.push_back(pr);
+            d.sel_cols.push_back(pc);
+        }
+        d.shape = { d.sel_rows[0], d.sel_cols[0] };
+        return d;
+    };
+    const KfOperand d = view(e, { "scale", "scale.1" });
+    REQUIRE_EQ(numel(d), R * C / 64);
+    std::vector<std::vector<uint8_t>> pl;
+    kf_draw_planes(d, 9, &pl);
+    REQUIRE_EQ(pl.size(), (size_t)2);
+    std::vector<uint8_t> out;
+    std::string why;
+    REQUIRE_EQ(kf_planes_logical(d, pl, &out, &why), RAD_OK);
+    const float level = rad_load_f32(pl[1].data(), RAD_F32, 0);
+    const float* f = (const float*)out.data();
+    for (int64_t i = 0; i < R * C / 64; ++i)
+        CHECK_EQ(f[i], rad_load_f32(pl[0].data(), RAD_F8E4M3, i) * level);
+
+    CHECK_EQ(kf_planes_logical(view(e, { "scale.1", "scale" }), pl, &out, &why), RAD_E_SHAPE);
+    KfOperand more = d;
+    more.shape = { R, C / 32 };
+    CHECK_EQ(kf_planes_logical(more, pl, &out, &why), RAD_E_SHAPE);
+    RadEncoding fine = e;
+    fine.plane[rad_enc_find(&e, "scale.1")].block[1] = 32;
+    const KfOperand df = view(fine, { "scale", "scale.1" });
+    std::vector<std::vector<uint8_t>> pf;
+    kf_draw_planes(df, 9, &pf);
+    CHECK_EQ(kf_planes_logical(df, pf, &out, &why), RAD_E_SHAPE);
+    CHECK(why.find("does not cover") != std::string::npos);
+}
+
 namespace {
 
 int lay_identity(const RadParam*, int, int, const RadEncoding*, const int*, const RadTensor*, int,

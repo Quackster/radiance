@@ -1979,6 +1979,101 @@ TEST(op_moe_gemm_q_mod4) {
     }
 }
 
+/* THE WEIGHT SCALE GRID IS THE ONE THE DTYPE NAMES, in both grouped GEMMs: the checkpoint's
+ * 128x128 tiles for block fp8, one scale a row per group of K for the four-bit experts -- a 128 at
+ * w4a8/w4a8h/w4nla8h, a 64 at w4nl64a8h/w5nl64a8h, a 32 at w4nl32a8h. The oracle inverts a re-laid
+ * weight into exactly this description (core/runtime/oracle.cpp), and the E4M3 scale views are
+ * re-laid, so tiles here leave their scales nowhere to go. Then a case built from the description
+ * itself: one expert of the last class at K = 128, whose two 64-wide halves scale by 2 and 3 under
+ * one activation scale of 0.5 over the whole 128 -- a reading at any other grid gives another
+ * number. */
+TEST(op_moe_gemm_q_scale_grid_by_dtype) {
+    struct Want { const char* dt; int64_t rows, cols; };
+    /* N 256, K 512, group 128; the last class at N 128, K 256. */
+    const Want wants[] = { { "fp8a8", 2, 4 },      { "w4a8", 256, 4 },     { "w4a8h", 256, 4 },
+                           { "w4nla8h", 256, 4 },  { "w4nl64a8h", 256, 8 }, { "w5nl64a8h", 256, 8 },
+                           { "w4nl32a8h", 256, 16 } };
+    for (const char* op : { "moe_gemm_q", "moe_gemm_q_mod4" }) {
+        const RadKernelInfo* k = kern(op);
+        REQUIRE(k != nullptr && k->opd_shape != nullptr);
+        const bool four = std::strcmp(op, "moe_gemm_q_mod4") == 0;
+        const int last = four ? 11 : 7;
+        for (const Want& w : wants) {
+            A a;
+            a.i("M", 2).i("N", 256).i("K", 512).i("n_expert", 8).i("top_k", 2).i("group", 128)
+             .s("a_order", "token").s("dtype", w.dt);
+            if (four) a.i("N_3", 128).i("K_3", 256);
+            else      a.i("N_odd", 128).i("K_odd", 256);
+            const RadArgs* r = a.get();
+            RadOpdDesc d{}, dl{};
+            REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 3, &d), RAD_OK);
+            REQUIRE_EQ(k->opd_shape(r->p, r->n_p, last, &dl), RAD_OK);
+            CHECK_EQ(d.dtype, (uint32_t)RAD_BF16);
+            CHECK_EQ(d.rank, 3u);
+            CHECK_EQ(d.shape[0], four ? 2LL : 4LL);
+            if (d.shape[1] != w.rows || d.shape[2] != w.cols)
+                std::fprintf(stderr, "    %s at %s: w_scale [%lld, %lld], want [%lld, %lld]\n", op,
+                             w.dt, (long long)d.shape[1], (long long)d.shape[2],
+                             (long long)w.rows, (long long)w.cols);
+            CHECK_EQ(d.shape[1], w.rows);
+            CHECK_EQ(d.shape[2], w.cols);
+            /* the last class at its own geometry, on the same grid */
+            CHECK_EQ(dl.shape[1], w.rows == 2 ? 1LL : 128LL);
+            CHECK_EQ(dl.shape[2], w.cols / 2);
+        }
+    }
+
+    for (const char* op : { "moe_gemm_q", "moe_gemm_q_mod4" }) {
+        const RadKernelInfo* k = kern(op);
+        REQUIRE(k != nullptr && k->opd_shape != nullptr);
+        const bool four = std::strcmp(op, "moe_gemm_q_mod4") == 0;
+        const int ncls = four ? 4 : 2, ne = ncls, n_opd = four ? 13 : 9;
+        auto params = [&](A& x) {
+            x.i("M", 1).i("N", 2).i("K", 128).i("n_expert", ne).i("top_k", 1).i("group", 128)
+             .s("a_order", "token").s("dtype", "w4nl64a8h");
+        };
+        A p;
+        params(p);
+        const RadArgs* pr = p.get();
+        std::deque<T> opd;
+        for (int i = 0; i < n_opd; ++i) {
+            RadOpdDesc d{};
+            REQUIRE_EQ(k->opd_shape(pr->p, pr->n_p, i, &d), RAD_OK);
+            opd.emplace_back(d.dtype, std::vector<int64_t>(d.shape, d.shape + d.rank));
+        }
+        /* the classes' (codes, scale) operand pairs, class 0 first */
+        std::vector<std::pair<int, int>> cls = { { 2, 3 }, { 6, 7 } };
+        if (four) cls.insert(cls.end(), { { 8, 9 }, { 10, 11 } });
+        for (int q = 0; q < ncls; ++q) {
+            T& w = opd[(size_t)cls[(size_t)q].first];
+            T& s = opd[(size_t)cls[(size_t)q].second];
+            REQUIRE_EQ(s.t.shape[1], 2LL);
+            REQUIRE_EQ(s.t.shape[2], 2LL);
+            const bool hit = q == ncls - 1;
+            std::vector<float> wv(256);
+            for (int64_t n = 0; n < 2; ++n)
+                for (int64_t kk = 0; kk < 128; ++kk)
+                    wv[(size_t)(n * 128 + kk)] = hit ? (float)(n + 1) : 7.0f;
+            w.f(wv);
+            s.f(hit ? std::vector<float>{ 2, 3, 2, 3 } : std::vector<float>{ 1, 1, 1, 1 });
+        }
+        opd[0].f(std::vector<float>(128, 1.0f));
+        opd[1].f({ 0.5f });
+        opd[4].n({ 0 });
+        /* every expert empty but the last one, which owns the one row */
+        std::vector<int64_t> off((size_t)ne + 1, 0);
+        off[(size_t)ne] = 1;
+        opd[5].n(off);
+        A a;
+        for (int i = 0; i < n_opd; ++i) a.t(opd[(size_t)i]);
+        params(a);
+        CHECK_OK(run(op, a));
+        const T& y = opd[(size_t)n_opd - 1];
+        CHECK_EQ(y.at(0), 160.0f);                   /* 0.5 * (64*1*2 + 64*1*3) */
+        CHECK_EQ(y.at(1), 320.0f);                   /* 0.5 * (64*2*2 + 64*2*3) */
+    }
+}
+
 TEST(op_moe_chain) {
     /* Two tokens, two experts, top_k 2 -- every token visits every expert, so the whole chain is
      * checkable without any routing subtlety. */

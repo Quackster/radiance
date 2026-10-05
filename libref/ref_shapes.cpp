@@ -1110,12 +1110,36 @@ int ref_moe_gemm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("moe_gemm", operand, out);
 }
 
+/* THE WEIGHT SCALE GRID IS THE ONE `dtype` NAMES, and the grouped GEMM serves more than one. The
+ * block-fp8 experts carry the checkpoint's: a scale a 128x128 tile, `group` holding the 128. The
+ * four-bit ones (docs/MOE-W4.md) carry one a ROW per group of K -- all of `group` at w4a8, w4a8h
+ * and w4nla8h, half of it at w4nl64a8h and w5nl64a8h, a quarter at w4nl32a8h. Those strings are
+ * the served formats' own names (arch/common/rad_block_moe_fp8.h, kServed), so this states a
+ * format and guesses at no kernel's stream; anything else is the block grid.
+ *
+ * It matters past the extents. A weight its kernel stores re-laid goes back through that
+ * kernel's inverse into the tensor THIS describes before the oracle hands it over
+ * (core/runtime/oracle.cpp), and the E4M3 scale views are re-laid -- their two levels are one
+ * operand -- so tiles here leave every such expert's scales with nothing to be inverted into.
+ * The arithmetic reads whichever grid it is handed (ref_gemm.h derives the group from the
+ * extents) and is unchanged. Weight rows and K elements a scale covers, or 0 when `group` is too
+ * small to divide. */
+struct MoeScaleGrid { int64_t rows, k; };
+static MoeScaleGrid moe_scale_grid(const RadParam* p, int n_p, int64_t g) {
+    const char* d = gs(p, n_p, "dtype");
+    auto is = [&](const char* s) { return d && std::strcmp(d, s) == 0; };
+    if (is("w4a8") || is("w4a8h") || is("w4nla8h")) return { 1, g };
+    if (is("w4nl64a8h") || is("w5nl64a8h")) return { 1, g / 2 };
+    if (is("w4nl32a8h")) return { 1, g / 4 };
+    return { g, g };
+}
+
 /* The quantised arm. Same planes, plus the two scale streams: the activation's is per row per
- * group of K (rblk 1) and the weight's is one [ceil(N/g), ceil(K/g)] plane per expert, which is
- * the DeepSeek block grid the checkpoint ships. `w` is described as the STACKED [ne, N, K] plane
- * even though the engine issues a pointer table against it, because a fixture has nowhere to put
- * a pointer array -- ref_gemm.h's expert_entry() reads both forms and rad-kbench therefore checks
- * the arithmetic against the same bytes the engine would. */
+ * group of K (rblk 1) and the weight's is one plane per expert on the grid above -- for block fp8
+ * [ceil(N/g), ceil(K/g)], the DeepSeek block grid the checkpoint ships. `w` is described as the
+ * STACKED [ne, N, K] plane even though the engine issues a pointer table against it, because a
+ * fixture has nowhere to put a pointer array -- ref_gemm.h's expert_entry() reads both forms and
+ * rad-kbench therefore checks the arithmetic against the same bytes the engine would. */
 int ref_moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M  = gi(p, n_p, "M", 0);
     const int64_t N0 = gi(p, n_p, "N", 0), K0 = gi(p, n_p, "K", 0);
@@ -1130,17 +1154,19 @@ int ref_moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     const int64_t N = N0 > N1 ? N0 : N1, K = K0 > K1 ? K0 : K1;
     const int64_t ne0 = (ne + 1) / 2, ne1 = ne / 2;
     if (g <= 0) g = K;
+    const MoeScaleGrid sg = moe_scale_grid(p, n_p, g);
+    if (sg.rows <= 0 || sg.k <= 0) return RAD_E_UNSUPPORTED;
     const uint32_t D = act_dt(p, n_p);
     Opd o;
     const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
     o.t((uint32_t)RAD_F8E4M3, { AR, K });             /* a -- E4M3 codes, see `a_order` */
     o.t((uint32_t)RAD_F32, { AR, (K + g - 1) / g });   /* a_scale */
     o.t((uint32_t)RAD_F8E4M3, { ne0, N0, K0 });       /* w -- the even experts */
-    o.t(D, { ne0, (N0 + g - 1) / g, (K0 + g - 1) / g });   /* w_scale */
+    o.t(D, { ne0, (N0 + sg.rows - 1) / sg.rows, (K0 + sg.k - 1) / sg.k });   /* w_scale */
     o.t_idx({ M * k }, M * k, -1, 0);                 /* sorted_tok */
     o.t_idx({ ne + 1 }, M * k + 1, -1, 0);            /* expert_offset -- see moe_gemm's note */
     o.t((uint32_t)RAD_F8E4M3, { ne1, N1, K1 });       /* w_odd -- the odd experts */
-    o.t(D, { ne1, (N1 + g - 1) / g, (K1 + g - 1) / g });   /* w_odd_scale */
+    o.t(D, { ne1, (N1 + sg.rows - 1) / sg.rows, (K1 + sg.k - 1) / sg.k });   /* w_odd_scale */
     o.t(D, { M * k, N });                             /* y -- in SORTED order */
     return o.finish("moe_gemm_q", operand, out);
 }
@@ -1163,13 +1189,15 @@ int ref_moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpdDes
         if (Kq[q] > K) K = Kq[q];
     }
     if (g <= 0) g = K;
+    const MoeScaleGrid sg = moe_scale_grid(p, n_p, g);
+    if (sg.rows <= 0 || sg.k <= 0) return RAD_E_UNSUPPORTED;
     const uint32_t D = act_dt(p, n_p);
     Opd o;
     const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
     auto cls = [&](int q) {
         const int64_t nq = (ne + 3 - q) / 4;
         o.t((uint32_t)RAD_F8E4M3, { nq, Nq[q], Kq[q] });
-        o.t(D, { nq, (Nq[q] + g - 1) / g, (Kq[q] + g - 1) / g });
+        o.t(D, { nq, (Nq[q] + sg.rows - 1) / sg.rows, (Kq[q] + sg.k - 1) / sg.k });
     };
     o.t((uint32_t)RAD_F8E4M3, { AR, K });             /* a -- E4M3 codes, see `a_order` */
     o.t((uint32_t)RAD_F32, { AR, (K + g - 1) / g });   /* a_scale */

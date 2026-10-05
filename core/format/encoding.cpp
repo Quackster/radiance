@@ -346,6 +346,56 @@ int enc_selection_logical(const RadEncoding& e, const int* sel, int n_sel, const
             }
         return RAD_OK;
     }
+    /* A SCALE AND THE LEVELS ABOVE IT, without the codes: each first-level scale times every level
+     * that covers it. It is what a kernel that takes its scales as an operand of their own reads
+     * where the encoding states them in two levels -- the scale view of a w4nl64a8h expert, an
+     * E4M3 scale a (row, 64 of K) under one fixed f32 -- and the product is the scale the
+     * reference multiplies, where the first level on its own is that scale off by the second. One
+     * element a first-level scale, in that plane's extents. A level has to cover whole
+     * first-level blocks -- the whole weight, or a block a multiple of the first's -- or a scale
+     * would straddle two of its elements and have no one product. */
+    if (n_sel >= 2 && !std::strcmp(e.plane[sel[0]].role, "scale")) {
+        bool chain = true;
+        for (int k = 0; k < n_sel && chain; ++k) {
+            const RadEncPlane& p = e.plane[sel[k]];
+            chain = p.kind == RAD_PLANE_TILED && rad_enc_role_in_chain(p.role, "scale") &&
+                    (k == 0 || std::strcmp(p.role, "scale") != 0);
+        }
+        if (chain) {
+            const RadEncPlane& p0 = e.plane[sel[0]];
+            const int64_t r = rows[0], c = cols[0];
+            if (r * c != n)
+                return refuse("its scales hold " + std::to_string(r * c) + " elements and the "
+                              "reader wants " + std::to_string(n));
+            auto covers = [](int64_t b0, int64_t b) { return b <= 0 || (b0 > 0 && b % b0 == 0); };
+            for (int k = 1; k < n_sel; ++k) {
+                const RadEncPlane& p = e.plane[sel[k]];
+                if (!covers(p0.block[0], p.block[0]) || !covers(p0.block[1], p.block[1]))
+                    return refuse(std::string("its '") + p.role + "' level does not cover whole '" +
+                                  p0.role + "' blocks");
+            }
+            const int64_t rb0 = rad_enc_row_bytes(p0.dtype, c);
+            for (int64_t i = 0; i < r; ++i)
+                for (int64_t j = 0; j < c; ++j) {
+                    float v = rad_load_f32((const uint8_t*)data[0] + i * rb0, p0.dtype, j);
+                    for (int k = 1; k < n_sel; ++k) {
+                        const RadEncPlane& p = e.plane[sel[k]];
+                        const int64_t li = p.block[0] > 0 ? i * p0.block[0] / p.block[0] : 0;
+                        const int64_t lj = p.block[1] > 0 ? j * p0.block[1] / p.block[1] : 0;
+                        if (li >= rows[k] || lj >= cols[k])
+                            return refuse(std::string("its '") + p.role + "' level is " +
+                                          std::to_string(rows[k]) + "x" +
+                                          std::to_string(cols[k]) + " and does not reach scale " +
+                                          std::to_string(i) + "," + std::to_string(j));
+                        v *= rad_load_f32((const uint8_t*)data[k] +
+                                              li * rad_enc_row_bytes(p.dtype, cols[k]),
+                                          p.dtype, lj);
+                    }
+                    rad_store_f32(out, dt, i * c + j, v);
+                }
+            return RAD_OK;
+        }
+    }
     if (n_sel != e.n_planes)
         return refuse("it takes " + std::to_string(n_sel) + " of its encoding's " +
                       std::to_string(e.n_planes) + " planes, which decode to nothing on their own");
