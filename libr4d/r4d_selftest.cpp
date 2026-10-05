@@ -6741,12 +6741,21 @@ static void moe_dec_variants(const Plugin& pl, const RadKernelInfo* row, RadArgs
  * Described first where the row can be: the map's kernel must differ from the default's exactly
  * when 16 is on, and the GEMM's exactly when 64 is or the wide tile applies, so the bytes below are
  * never one kernel against itself; and the launch must report the parts it took. `base` is the
- * form's own bytes, already held to the host decode by the form loop. */
+ * form's own bytes, already held to the host decode by the form loop.
+ *
+ * PAST 512 EXPERTS THERE IS NO ALIGNED LAUNCH: the map's builder holds kMaxExpert + 1 offsets, so
+ * the launcher hands a wider expert count the uniform grid whatever scratch it is given, and none
+ * of these parts has a launch to take. Such a shape is skipped, not failed. */
 static void moe_pf2_aligned(const Plugin& pl, const RadKernelInfo* row, RadArgs& a, void* d_y,
                             void* d_map, int64_t map_bytes, size_t elems,
-                            const std::vector<uint16_t>& base, bool dn_wide,
+                            const std::vector<uint16_t>& base, bool dn_wide, int64_t ne,
                             const std::string& what) {
     if (!pl.pin_pf2 || !pl.pf2_used || !pl.pin_moe || base.empty()) return;
+    if (ne > 512) {
+        skip((what + " aligned prefill form, R4D_MOE_PF2").c_str(),
+             "no run map past 512 experts, so no aligned launch");
+        return;
+    }
     void* const sc0 = a.scratch;
     const int64_t sb0 = a.scratch_bytes;
     struct Var { int pin; uint32_t mask; const char* name; };
@@ -7074,7 +7083,8 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     /* The aligned form under R4D_MOE_PF2: the parallel map prefix always, the 256-column down
      * tile where the sorted operand's every class is whole tiles of it. */
     const bool dn_wide = sh.sorted_a && sh.parts == 1 && sh.N0 % 256 == 0 && sh.N1 % 256 == 0;
-    moe_pf2_aligned(pl, r, a, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1], dn_wide, what);
+    moe_pf2_aligned(pl, r, a, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1], dn_wide, ne,
+                    what);
     /* The decode form's staged K both ways, where this shape can take two blocks a pass --
      * never on the sorted operand, which the rule keeps at one. */
     const bool fk2 = !sh.sorted_a && g64 && sh.K0 % 256 == 0 && sh.K1 % 256 == 0;
@@ -7142,7 +7152,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
         ok(label.c_str(), diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
                                      " elements differ from the two-class op's");
     }
-    moe_pf2_aligned(pl, r4, a4, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1], dn_wide,
+    moe_pf2_aligned(pl, r4, a4, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1], dn_wide, ne,
                     what4);
     moe_dec_variants(pl, r4, a4, d_y, (size_t)(Tr * N), fk2, what4);
 }
@@ -7369,6 +7379,7 @@ static void moe_q4_gemm(const Plugin& pl, int64_t Tr, const MoeQ4Shape& sh, cons
     }
 
     const int f_lo = pl.pin_moe ? 1 : 0, f_hi = pl.pin_moe ? 3 : 0;
+    std::vector<uint16_t> aligned;     /* the aligned form's bytes, for the R4D_MOE_PF2 pass */
     for (int form = f_lo; form <= f_hi; ++form) {
         const std::string label = what + " " + kForm[form];
         if (pl.pin_moe) pl.pin_moe(form);
@@ -7405,7 +7416,11 @@ static void moe_q4_gemm(const Plugin& pl, int64_t Tr, const MoeQ4Shape& sh, cons
             }
         ok(label.c_str(), bad == 0, std::to_string(bad) + " of " + std::to_string(Tr * N) +
                                     " elements off, worst " + std::to_string(worst) + first);
+        if (form == 1) aligned = got;
     }
+    /* The aligned form under R4D_MOE_PF2, each class at its own geometry; fp8a8 runs W4 0 here,
+     * the token operand, so no 256-column down tile. */
+    moe_pf2_aligned(pl, r, a, d_y, d_map, map_bytes, (size_t)(Tr * N), aligned, false, ne, what);
     /* The decode form's variants, each class at its own geometry; fp8a8 runs W4 0 here. */
     bool fk2 = g64;
     for (int q = 0; q < 4; ++q) fk2 = fk2 && sh.K[q] % 256 == 0;
