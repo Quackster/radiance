@@ -892,6 +892,53 @@ int Builder::weight_shard_span(rad_weight h, int64_t lo, int64_t hi) {
     return RAD_OK;
 }
 
+int Builder::weight_shard_span_parts(rad_weight h, const int64_t* lo, const int64_t* hi,
+                                     const int64_t* total, int n) {
+    if (finished_) { err(RAD_E_STATE, "weight_shard_span_parts after declare finished"); return RAD_E_STATE; }
+    if (h == 0 || h >= prog_.weights.size() || !lo || !hi || !total) return RAD_E_INVAL;
+    WeightInfo& w = prog_.weights[h];
+    const RadWeightDecl& d = w.decl;
+    if (d.shard != RAD_SHARD_ROW || d.n_row_parts < 2 || n != d.n_row_parts) {
+        err(RAD_E_INVAL, "weight '%s': per-part spans need a row-sharded weight of %d stacked "
+                         "parts, and %d span(s) were given", w.name.c_str(), d.n_row_parts, n);
+        return RAD_E_INVAL;
+    }
+    for (int g = 0; g < n; ++g) {
+        if (lo[g] < 0 || hi[g] <= lo[g] || hi[g] > total[g]) {
+            err(RAD_E_INVAL, "weight '%s': part %d span [%lld, %lld) is empty or outside its "
+                             "%lld rows", w.name.c_str(), g, (long long)lo[g], (long long)hi[g],
+                (long long)total[g]);
+            return RAD_E_INVAL;
+        }
+        if (d.row_parts[g] != hi[g] - lo[g]) {
+            err(RAD_E_SHAPE, "weight '%s': part %d span [%lld, %lld) is %lld wide and the "
+                             "declared part is %lld", w.name.c_str(), g, (long long)lo[g],
+                (long long)hi[g], (long long)(hi[g] - lo[g]), (long long)d.row_parts[g]);
+            return RAD_E_SHAPE;
+        }
+        w.part_lo[g] = lo[g];
+        w.part_hi[g] = hi[g];
+        w.part_total[g] = total[g];
+    }
+    w.n_part_spans = n;
+    w.shard_lo = 0;
+    w.shard_hi = 0;
+    return RAD_OK;
+}
+
+int Builder::weight_shard_zero(rad_weight h) {
+    if (finished_) { err(RAD_E_STATE, "weight_shard_zero after declare finished"); return RAD_E_STATE; }
+    if (h == 0 || h >= prog_.weights.size()) return RAD_E_INVAL;
+    WeightInfo& w = prog_.weights[h];
+    if (w.decl.shard != RAD_SHARD_ROW && w.decl.shard != RAD_SHARD_COL) {
+        err(RAD_E_INVAL, "weight '%s': a zero share on a weight that is not row- or "
+                         "column-sharded", w.name.c_str());
+        return RAD_E_INVAL;
+    }
+    w.shard_zero = true;
+    return RAD_OK;
+}
+
 /* ================================================================== name map */
 int Builder::decl_name_map(const RadNameMap* m) {
     if (finished_) { err(RAD_E_STATE, "decl_name_map after declare finished"); return RAD_E_STATE; }
@@ -1613,6 +1660,17 @@ int rad_buf_concurrent(RadBuilder* b, rad_buf buf) {
 int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi) {
     if (!b) return RAD_E_INVAL;
     return B(b)->weight_shard_span(w, lo, hi);
+}
+
+int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo, const int64_t* hi,
+                                const int64_t* total, int n) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->weight_shard_span_parts(w, lo, hi, total, n);
+}
+
+int rad_weight_shard_zero(RadBuilder* b, rad_weight w) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->weight_shard_zero(w);
 }
 
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m) {

@@ -1349,4 +1349,47 @@ TEST(the_gate_names_its_caller) {
     CHECK(has(msg, "the container's layout"));
 }
 
+/* A span, per-part spans and a zero share have to SURVIVE THE WEIGHT LIST GROWING: WeightInfo's
+ * copy is hand-written (the atomic), so a field the copy leaves out is reset on every weight
+ * declared before the vector's last reallocation -- which is what the loader saw on rank 0 of a
+ * three-rank Flash-Next: layer 0's [a|b] with its per-part spans gone, refused as an even share. */
+TEST(shard_spans_and_zero_survive_the_weight_list_reallocating) {
+    NEED_PLUGIN(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    /* Three weights declared first and marked, then enough declared after them to grow the
+     * list several times over. */
+    RadWeightDecl d{};
+    d.dtype = RAD_BF16; d.rank = 2; d.shape[0] = 36; d.shape[1] = 64;
+    d.access = RAD_ACCESS_PER_TOKEN; d.shard = RAD_SHARD_ROW; d.group = rad_group_layer(0);
+    d.n_row_parts = 2; d.row_parts[0] = 18; d.row_parts[1] = 18;
+    const rad_weight ab = b.decl_weight("ab", &d);
+    REQUIRE(ab != 0);
+    const int64_t lo[2] = { 0, 0 }, hi[2] = { 18, 18 }, tot[2] = { 48, 48 };
+    CHECK_EQ(b.weight_shard_span_parts(ab, lo, hi, tot, 2), RAD_OK);
+
+    const rad_weight sp = decl_w(b, "span", 18, 64);
+    CHECK_EQ(b.weight_shard_span(sp, 6, 24), RAD_OK);
+
+    const rad_weight z = decl_w(b, "zero", 18, 64);
+    CHECK_EQ(b.weight_shard_zero(z), RAD_OK);
+
+    for (int i = 0; i < 300; ++i) {
+        char n[32]; snprintf(n, sizeof n, "w%d", i);
+        REQUIRE(decl_w(b, n, 64, 64) != 0);
+    }
+
+    const WeightInfo* w = b.program().weight(ab);
+    REQUIRE(w != nullptr);
+    CHECK_EQ(w->n_part_spans, 2);
+    CHECK_EQ((long long)w->part_lo[1], 0LL);
+    CHECK_EQ((long long)w->part_hi[1], 18LL);
+    CHECK_EQ((long long)w->part_total[1], 48LL);
+    w = b.program().weight(sp);
+    CHECK_EQ((long long)w->shard_lo, 6LL);
+    CHECK_EQ((long long)w->shard_hi, 24LL);
+    w = b.program().weight(z);
+    CHECK(w->shard_zero);
+    CHECK_EQ((int)b.errors().size(), 0);
+}
+
 RAD_TEST_MAIN()

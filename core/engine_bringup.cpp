@@ -1979,11 +1979,15 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
     std::string why;
     for (size_t k = 0; k < shares.size(); ++k) {
         const PlaneShare& sh = shares[k];
+        uint8_t* at = in + offs[k];
+        if (sh.zero) {
+            std::memset(at, 0, (size_t)sh.dense_bytes());
+            continue;
+        }
         const RadEncPlane& p = cw.enc.plane[sel[k]];
         int64_t pr = 0, pc = 0;
         rad_enc_plane_dims(&p, cw.rows, cw.cols, &pr, &pc);
         const int64_t crb = rad_enc_row_bytes(p.dtype, pc);
-        uint8_t* at = in + offs[k];
         for (const PlaneShare::Rect& q : sh.rects) {
             if (q.byte0 == 0 && q.bytes == sh.row_bytes) {
                 const int64_t off = q.row0 * sh.row_bytes, n = q.rows * sh.row_bytes;
@@ -2296,8 +2300,11 @@ int Engine::load_weights() {
 
             /* FROM A CHECKPOINT, every weight is staged and its worker reads it: there is no
              * sweep to deliver it, and the stored form is whatever the pool makes of the share --
-             * as it is, widened, or relaid. */
-            if (!e) {
+             * as it is, widened, or relaid. A ZERO SHARE (rad_weight_shard_zero) takes the same
+             * route from a container: nothing in the file is its source, so no sweep run can
+             * deliver it; its worker writes zeros and the pool stores them as it would any share. */
+            const bool zero_share = sh[0].zero;
+            if (!e || zero_share) {
                 StagedWeight sw;
                 sw.prog = &r->program;
                 sw.wi = i;
@@ -2322,9 +2329,17 @@ int Engine::load_weights() {
                 std::vector<int> sel(w.sel, w.sel + w.n_sel);
                 std::vector<int64_t> offs(sw.plane_off, sw.plane_off + w.n_sel);
                 const std::string name = w.name;
-                sw.fill = [cw, shares, sel, offs, name](uint8_t* in) -> int {
-                    return fill_from_checkpoint(*cw, shares, sel, offs, name, in);
-                };
+                if (zero_share) {
+                    const int64_t bytes = in_bytes;
+                    sw.fill = [bytes](uint8_t* in) -> int {
+                        std::memset(in, 0, (size_t)bytes);
+                        return RAD_OK;
+                    };
+                } else {
+                    sw.fill = [cw, shares, sel, offs, name](uint8_t* in) -> int {
+                        return fill_from_checkpoint(*cw, shares, sel, offs, name, in);
+                    };
+                }
                 staged.push_back(std::move(sw));
                 ++n_loaded;
                 continue;

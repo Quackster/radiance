@@ -364,6 +364,23 @@ int rad_buf_concurrent(RadBuilder* b, rad_buf buf);
  * groups the span would cut. */
 int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi);
 
+/* A STACKED weight's span, ONE [lo, hi) PER ROW PART, with each part's whole extent in the
+ * container: the delta net's [q|k|v|z] is 2048, 2048, 6144, 6144 rows on Flash-Next, and parts
+ * that are not the same width cannot take rad_weight_shard_span's one span. `n` is the declared
+ * part count; part g of the container is `total[g]` rows, of which this rank takes [lo[g], hi[g])
+ * and declared `hi[g] - lo[g]`; the totals must sum to the entry's rows. A rank's UNEVEN share of
+ * the heads -- 6 of 16 K heads where three ranks take 6, 5 and 5 -- is declared this way, and
+ * nothing is padded. Additive export: a plugin that does not call it declares as before. */
+int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo, const int64_t* hi,
+                                const int64_t* total, int n);
+
+/* THIS RANK'S SHARE IS ZEROS. The weight is declared with its row or column shard and extent as
+ * on every other rank, and nothing is read for it: the loader writes zeros. It is for a rank the
+ * geometry gives no real heads (rad_arch.h: a world size the KV head count does not divide), so
+ * that rank runs the same program as its peers -- the scheduler sees one program -- and its
+ * projection contributes exactly nothing to the reduce. Additive export. */
+int rad_weight_shard_zero(RadBuilder* b, rad_weight w);
+
 #define RAD_BUFS(...)  ((const rad_buf[]){ __VA_ARGS__ }), \
                        (int)(sizeof((const rad_buf[]){ __VA_ARGS__ }) / sizeof(rad_buf))
 

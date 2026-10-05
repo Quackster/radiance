@@ -163,6 +163,57 @@ TEST(an_uneven_span_is_the_rows_the_plugin_names) {
     CHECK_EQ(s[1].rows, (int64_t)3);
 }
 
+/* PER-PART SPANS: a stacked weight whose parts are not the same width -- the delta net's
+ * [q|k|v|z] -- takes a span per part, each in its own part's rows. Three ranks over 16 K heads of
+ * 128: rank 1 takes K heads [6, 11) of q and of k, and V heads [18, 33) of 48 in v. */
+TEST(per_part_spans_cut_each_stacked_part_by_its_own_rows) {
+    const RadEncoding e = rad_enc_plain(RAD_BF16);
+    /* entry: q 2048 | k 2048 | v 6144 rows; rank 1 of 3 declares 640 + 640 + 1920 */
+    WeightInfo w = decl(e, { 0 }, 2048 + 2048 + 6144, 64, RAD_SHARD_ROW, 3, { 640, 640, 1920 });
+    w.decl.shape[0] = 640 + 640 + 1920;
+    rad_enc_plane_dims(&e.plane[0], w.decl.shape[0], 64, &w.sel_rows[0], &w.sel_cols[0]);
+    w.n_part_spans = 3;
+    const int64_t lo[3] = { 768, 768, 2304 }, hi[3] = { 1408, 1408, 4224 };
+    const int64_t tot[3] = { 2048, 2048, 6144 };
+    for (int g = 0; g < 3; ++g) { w.part_lo[g] = lo[g]; w.part_hi[g] = hi[g]; w.part_total[g] = tot[g]; }
+    PlaneShare s[RAD_ENC_MAX_PLANES];
+    REQUIRE_EQ(share(w, 2048 + 2048 + 6144, 64, 3, 1, s), RAD_OK);
+    REQUIRE_EQ(s[0].rects.size(), (size_t)3);
+    CHECK_EQ(s[0].rects[0].row0, (int64_t)768);
+    CHECK_EQ(s[0].rects[0].rows, (int64_t)640);
+    CHECK_EQ(s[0].rects[1].row0, (int64_t)(2048 + 768));
+    CHECK_EQ(s[0].rects[2].row0, (int64_t)(4096 + 2304));
+    CHECK_EQ(s[0].rects[2].rows, (int64_t)1920);
+    CHECK_EQ(s[0].rows, (int64_t)3200);
+    /* totals that do not sum to the entry are refused */
+    w.part_total[2] = 6000;
+    std::string why;
+    CHECK_EQ(share(w, 2048 + 2048 + 6144, 64, 3, 1, s, &why), RAD_E_SHAPE);
+    CHECK(why.find("stated rows") != std::string::npos);
+}
+
+/* A ZERO SHARE has the declaration's extents and no rectangles: the loader writes zeros and reads
+ * nothing. At one rank there is nothing to zero. */
+TEST(a_zero_share_is_the_declared_extent_and_no_rectangles) {
+    const RadEncoding e = fp8_block();
+    WeightInfo w = decl(e, { 0, 1 }, 1536, 128, RAD_SHARD_ROW, 3);
+    w.shard_zero = true;
+    PlaneShare s[RAD_ENC_MAX_PLANES];
+    REQUIRE_EQ(share(w, 1536, 128, 3, 2, s), RAD_OK);
+    CHECK(s[0].zero);
+    CHECK_EQ(s[0].rects.size(), (size_t)0);
+    CHECK_EQ(s[0].rows, (int64_t)512);
+    CHECK_EQ(s[0].cols, (int64_t)128);
+    CHECK_EQ(s[0].dense_bytes(), (int64_t)(512 * 128));
+    CHECK(s[1].zero);
+    CHECK_EQ(s[1].rows, (int64_t)4);
+    WeightInfo one = decl(e, { 0, 1 }, 1536, 128, RAD_SHARD_ROW, 1);
+    one.shard_zero = true;
+    REQUIRE_EQ(share(one, 1536, 128, 1, 0, s), RAD_OK);
+    CHECK(!s[0].zero);
+    CHECK_EQ(s[0].rows, (int64_t)1536);
+}
+
 /* A per-tensor scale is one value every rank carries whole, once, whatever the codes' cut. */
 TEST(a_per_tensor_scale_is_carried_whole_by_every_rank) {
     RadEncoding e;

@@ -13,6 +13,23 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
         return RAD_E_SHAPE;
     };
     if (w.n_sel < 1 || w.n_sel > RAD_ENC_MAX_PLANES) return refuse("no planes selected");
+    /* A ZERO SHARE: the declaration's own extents of every selected plane, and nothing to read.
+     * At one rank there is no share to zero -- the weight is whole and real. */
+    if (w.shard_zero && world > 1) {
+        for (int k = 0; k < w.n_sel; ++k) {
+            const RadEncPlane& p = enc.plane[w.sel[k]];
+            PlaneShare& s = out[k];
+            s = PlaneShare{};
+            s.dtype = p.dtype;
+            s.rows = w.sel_rows[k];
+            s.cols = w.sel_cols[k];
+            s.row_bytes = rad_enc_row_bytes(p.dtype, s.cols);
+            s.zero = true;
+            if (s.rows <= 0 || s.cols <= 0)
+                return refuse(fmt("a zero share of the '%s' plane has no extent", p.role));
+        }
+        return RAD_OK;
+    }
     int64_t R = 0, C = 0;
     rad_enc_view(rank, shape, &R, &C);
 
@@ -38,7 +55,7 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
 
     struct VRect { int64_t r0, r1, c0, c1; };
     std::vector<VRect> view;
-    const bool span  = w.shard_hi > 0;
+    const bool span  = w.shard_hi > 0 || w.n_part_spans > 0;
     if (whole) {
         view.push_back({ 0, VR, 0, VC });
     } else {
@@ -74,7 +91,21 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
              * a slice of EACH of them, not a contiguous slice of the stack. The parts are THIS
              * RANK'S rows, so a part is `world` times as many rows in the entry. */
             const int np = w.decl.n_row_parts > 1 ? w.decl.n_row_parts : 1;
-            if (span) {
+            if (w.n_part_spans > 0) {
+                /* PER-PART SPANS: the plugin stated each stacked part's rows in the container
+                 * and this rank's [lo, hi) of it, so the parts need not be equal. */
+                if (w.n_part_spans != np)
+                    return refuse(fmt("%d per-part spans for %d stacked parts", w.n_part_spans, np));
+                int64_t sum = 0, soff = 0;
+                for (int g = 0; g < np; ++g) sum += w.part_total[g];
+                if (sum != VR)
+                    return refuse(fmt("the %d stacked parts' stated rows sum to %lld and the entry "
+                                      "has %lld", np, (long long)sum, (long long)VR));
+                for (int g = 0; g < np; ++g) {
+                    view.push_back({ soff + w.part_lo[g], soff + w.part_hi[g], 0, VC });
+                    soff += w.part_total[g];
+                }
+            } else if (span) {
                 if (VR % np) return refuse(fmt("%lld rows do not divide into %d parts",
                                                (long long)VR, np));
                 const int64_t cpart = VR / np;

@@ -146,6 +146,13 @@ struct WeightInfo {
     /* An uneven shard's slice of the split dimension (rad_weight_shard_span); hi 0 is the even
      * split. */
     int64_t        shard_lo = 0, shard_hi = 0;
+    /* rad_weight_shard_span_parts: a span per stacked part and each part's rows in the
+     * container; n_part_spans 0 is shard_lo/hi (one span for every part) or the even share. */
+    int            n_part_spans = 0;
+    int64_t        part_lo[RAD_MAX_ROW_PARTS] = {0}, part_hi[RAD_MAX_ROW_PARTS] = {0};
+    int64_t        part_total[RAD_MAX_ROW_PARTS] = {0};
+    /* rad_weight_shard_zero: this rank reads nothing for it and the loader writes zeros. */
+    bool           shard_zero = false;
 
     /* WHAT IT IS A VIEW OF (RadWeightDecl::source and ::planes, spec §4.3). `enc` is the source's
      * encoding as the model holds it -- or, with nothing behind the builder, plain in the declared
@@ -201,6 +208,11 @@ struct WeightInfo {
     WeightInfo& operator=(const WeightInfo& o) {
         name = o.name; decl = o.decl; logical_bytes = o.logical_bytes;
         shard_lo = o.shard_lo; shard_hi = o.shard_hi;
+        n_part_spans = o.n_part_spans;
+        for (int i = 0; i < RAD_MAX_ROW_PARTS; ++i) {
+            part_lo[i] = o.part_lo[i]; part_hi[i] = o.part_hi[i]; part_total[i] = o.part_total[i];
+        }
+        shard_zero = o.shard_zero;
         source = o.source; enc = o.enc; enc_known = o.enc_known; n_sel = o.n_sel;
         for (int i = 0; i < RAD_ENC_MAX_PLANES; ++i) {
             sel[i] = o.sel[i]; sel_rows[i] = o.sel_rows[i]; sel_cols[i] = o.sel_cols[i];

@@ -27,6 +27,9 @@ struct PlaneShare {
     uint32_t dtype = RAD_DT_INVALID;
     int64_t rows = 0, cols = 0;      /* the share's extents, in the plane's elements */
     int64_t row_bytes = 0;
+    /* rad_weight_shard_zero: the share has its extents and no rectangles; the loader writes
+     * dense_bytes() of zeros and reads nothing. */
+    bool    zero = false;
     int64_t dense_bytes() const;     /* the share laid out dense: rows * a row of `cols` */
 };
 
