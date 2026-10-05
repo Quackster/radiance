@@ -183,6 +183,12 @@ struct MoeFP8 {
          * The arm's stages run behind the routed ones on the same queue (see pass()): a routed
          * GEMM's tail leaves compute units idle, and the arm fills them. */
         int64_t shared_lo = 0, shared_hi = 0;
+        /* THIS RANK'S PLACE WHERE THE PLAIN EXPERTS' 64-WIDE TILES DO NOT DIVIDE over the ranks:
+         * the first places take one tile more. -1 is the rank's own index. A permutation of the
+         * ranks, the same on every rank, so every tile still has exactly one owner; the
+         * architecture sets it above two ranks to keep the extra tiles off the ranks that already
+         * take the routed experts' extra blocks. */
+        int64_t extra_place = -1;
         int     norm_topk    = 1;   /* renormalise the kept routing weights to sum to one */
         /* THE EXPERT WEIGHT AT FOUR BITS rather than E4M3, which for Qwen3.8-Flash-Next is the
          * difference between a model that fits two cards and one that does not (the registry row
@@ -1072,11 +1078,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             /* ONE SLICE A RANK, and it does not have to be the same size on every rank: an uneven
              * share of the 64-wide tiles is still whole tiles, and an uneven share is the only
              * kind available when the width does not divide -- this family's 640 columns are ten
-             * tiles, which four ranks take as 3, 3, 2, 2. Every tile has exactly one owner, each
-             * rank writes its own columns of gate/up and reads its own of down, and the block's
-             * all-reduce sums the partials exactly as it does for the quantised experts and for
-             * the shared arm. The even case keeps the even-split declaration verbatim -- no span
-             * at all -- so a rank count that divides declares exactly as it did before. */
+             * tiles, which four ranks take as 2, 2, 3, 3 (Config::extra_place puts ranks 2 and 3
+             * first, the ranks without a routed extra block). Every tile has exactly one owner,
+             * each rank writes its own columns of gate/up and reads its own of down, and the
+             * block's all-reduce sums the partials exactly as it does for the quantised experts
+             * and for the shared arm. The even case keeps the even-split declaration verbatim --
+             * no span at all -- so a rank count that divides declares exactly as it did before. */
             psh_row = RAD_SHARD_ROW;
             psh_col = RAD_SHARD_COL;
             pparts  = 2;
@@ -1088,8 +1095,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                 return RAD_E_INVAL;
             } else {
                 const int64_t nt = full / 64, base = nt / g.world, extra = nt % g.world;
-                const int64_t t0 = (int64_t)g.rank * base + std::min<int64_t>(g.rank, extra);
-                const int64_t t1 = t0 + base + ((int64_t)g.rank < extra ? 1 : 0);
+                /* Cut by the rank's place (Config::extra_place), not necessarily its index. */
+                const int64_t pr = c.extra_place >= 0 ? c.extra_place : (int64_t)g.rank;
+                if (pr >= g.world) return RAD_E_INVAL;
+                const int64_t t0 = pr * base + std::min<int64_t>(pr, extra);
+                const int64_t t1 = t0 + base + (pr < extra ? 1 : 0);
                 plo = t0 * 64;
                 phi = t1 * 64;
                 wp  = phi - plo;

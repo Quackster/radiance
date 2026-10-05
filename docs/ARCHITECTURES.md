@@ -305,14 +305,15 @@ rank 2, `[4, 5)` on rank 3, and each rank's place on the odd parity shifts by on
 fat block there instead of rank 0 — so no rank takes the extra block of both parities. A world
 above the block count is refused at declare, by name: a rank with an empty slice computes nothing
 and still joins the all-reduce. The shared expert's 640 columns split as evenly as whole blocks
-allow: five blocks over four ranks is rank 0 `[0, 256)` and one block each on ranks 1, 2 and 3.
+allow: five blocks over four ranks is rank 2 `[0, 256)` and one block each on ranks 3, 0 and 1.
 
 **At four ranks the shares are not equal.** Parity gives the extra block only two places to go, so
 ranks 0 and 1 compute three blocks of every even/odd pair of routed experts and ranks 2 and 3
-compute two; the shared expert's extra block is rank 0's, and the protected bf16 experts' ten
-64-wide tiles go 3, 3, 2, 2. Ranks 2 and 3 wait for the other two at every block's all-reduce.
-Equal shares need the extra block rotated by the expert's number mod 4: four slice tables where
-`moe_gemm_q` takes two.
+compute two. What does not divide elsewhere is cut from the other end: the shared expert's extra
+block is rank 2's, and the protected bf16 experts' ten 64-wide tiles go 2, 2, 3, 3. That takes one
+shared block off rank 0, the slowest rank, and leaves ranks 0 and 1 still a routed block per
+even/odd pair ahead of ranks 2 and 3 at every block's all-reduce. Equal shares need the extra block
+rotated by the expert's number mod 4: four slice tables where `moe_gemm_q` takes two.
 Expert parallelism — whole experts a rank — is what this replaced, and why it stays replaced: the
 recipe protects its bf16 experts in pairs precisely so each rank's quantised count stays even, and
 sharding experts by rank breaks that parity property the weight tables rest on.

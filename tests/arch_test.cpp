@@ -2022,20 +2022,29 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
         CHECK_EQ(join(op_names(b[r])), join(op_names(b[0])));
     }
 
-    /* THE SHARED ARM IS SPLIT BY WHOLE BLOCKS AND IS UNEVEN AT FOUR: 640 is five blocks of 128, so
-     * the rank taking the extra block is rank 0 -- [0,256) [256,384) [384,512) [512,640) in the
-     * model's column numbering, the same rule that gives rank 0 three of five blocks at two ranks
-     * (qwen4exp_fp8.cpp's uneven-block branch). This is the one world-4 span that is NOT a KV head. */
+    /* THE SHARED ARM IS SPLIT BY WHOLE BLOCKS AND IS UNEVEN AT FOUR: 640 is five blocks of 128, and
+     * the rank taking the extra block is rank 2, the first rank the routed split gives no extra
+     * block (qwen4exp_fp8.cpp's narrow_place) -- ranks 2, 3, 0, 1 cut [0,256) [256,384) [384,512)
+     * [512,640) in the model's column numbering. At two ranks rank 0 still takes three of five.
+     * This is the one world-4 span that is NOT a KV head. */
+    const int64_t sh_lo[] = { 384, 512, 0,   256 };
+    const int64_t sh_hi[] = { 512, 640, 256, 384 };
     for (int r = 0; r < world; ++r) {
         const RecWeight* sg = find_w(b[r], "blk.0.ffn_gate_up_shexp.weight");
         REQUIRE(sg != nullptr);
         CHECK(sg->span_set);
-        const int64_t want_lo[] = { 0,   256, 384, 512 };
-        const int64_t want_hi[] = { 256, 384, 512, 640 };
-        CHECK_EQ(sg->span_lo, want_lo[r]);
-        CHECK_EQ(sg->span_hi, want_hi[r]);
-        CHECK_EQ(sg->d.shape[0], 2 * (want_hi[r] - want_lo[r]));   /* gate's rows and up's */
-        if (r) CHECK_EQ(sg->span_lo, find_w(b[r - 1], "blk.0.ffn_gate_up_shexp.weight")->span_hi);
+        CHECK_EQ(sg->span_lo, sh_lo[r]);
+        CHECK_EQ(sg->span_hi, sh_hi[r]);
+        CHECK_EQ(sg->d.shape[0], 2 * (sh_hi[r] - sh_lo[r]));   /* gate's rows and up's */
+    }
+    /* Every block of the shared expert has exactly one owner, read off the declared spans. */
+    for (int64_t i = 0; i < 640; i += 128) {
+        int owners = 0;
+        for (int r = 0; r < world; ++r) {
+            const RecWeight* sg = find_w(b[r], "blk.0.ffn_gate_up_shexp.weight");
+            owners += sg->span_lo <= i && i < sg->span_hi;
+        }
+        CHECK_EQ(owners, 1);
     }
 
     /* AT TWO, THE OLD DECLARATION: the KV heads split, so the even shard already selects the right
@@ -2089,17 +2098,18 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
      * it refused the model on the ranks where that number was wrong -- two of four, which then
      * never arrived at the all-reduce's rendezvous and took the whole launch down with it.
      *
-     * Ten tiles over four ranks is 3, 3, 2, 2: an UNEVEN share, still whole tiles, every tile owned
-     * once. Ranks 0 and 1 compute 192 columns of every protected expert, ranks 2 and 3 compute 128.
-     * Two protected experts so the even-count rule the parity tables need holds, as the production
+     * Ten tiles over four ranks is 2, 2, 3, 3: an UNEVEN share, still whole tiles, every tile owned
+     * once. Ranks 2 and 3 compute 192 columns of every protected expert and ranks 0 and 1 compute
+     * 128, because ranks 0 and 1 take the routed experts' extra blocks (narrow_place). Two
+     * protected experts so the even-count rule the parity tables need holds, as the production
      * recipe's pairs make it hold. */
     {
         const RadEncoding w4p = [] { RadEncoding e = rad_enc_affine(RAD_I4, RAD_BF16, 1, 128);
                                      rad_enc_copy_str(e.transform, "fwht128"); return e; }();
         const RadEncoding plain = rad_enc_plain(RAD_BF16);
         /* [lo, hi) of the plain expert's columns, per rank -- literal, for the reason given above. */
-        const int64_t p_lo[4] = { 0, 192, 384, 512 };
-        const int64_t p_hi[4] = { 192, 384, 512, 640 };
+        const int64_t p_lo[4] = { 384, 512, 0,   192 };
+        const int64_t p_hi[4] = { 512, 640, 192, 384 };
         for (int r = 0; r < world; ++r) {
             RadBuilder bp;
             bp.encs = { { "blk.1.ffn_gate_up_exps.3.weight", plain },

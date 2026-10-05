@@ -292,6 +292,28 @@ static int64_t ngram_table_rows(int64_t base, int64_t heads, int64_t divisor) {
     return divisor > 1 ? ((total + divisor - 1) / divisor) * divisor : total;
 }
 
+/* A RANK'S PLACE WHEN A WIDTH THAT DOES NOT DIVIDE IS CUT OVER THE RANKS, the first places taking
+ * one unit more: the ranks in order of how many 128-column blocks of an even/odd pair of routed
+ * experts declare()'s parity split gives each, fewest first, by rank among equals. At four ranks
+ * and five blocks that is ranks 2, 3, 0, 1 -- ranks 0 and 1 hold the routed extra blocks, and
+ * cutting the shared expert and the plain experts from rank 0 as well stacks their extra columns on
+ * the ranks every block's all-reduce already waits for. Where the routed width divides it is the
+ * rank; declare() asks only above two ranks. */
+static int64_t narrow_place(int64_t n_ff_all, int world, int rank) {
+    const int64_t nb = n_ff_all / RAD_FP8_BLOCK;
+    if (n_ff_all % RAD_FP8_BLOCK || nb < world || nb % world == 0) return rank;
+    auto blocks = [&](int r) {
+        int64_t n = 0;
+        for (int q = 0; q < 2; ++q)
+            n += nb / world + ((r - q + world) % world < nb % world ? 1 : 0);
+        return n;
+    };
+    int64_t place = 0;
+    for (int r = 0; r < world; ++r)
+        if (blocks(r) < blocks(rank) || (blocks(r) == blocks(rank) && r < rank)) ++place;
+    return place;
+}
+
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
     if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
@@ -405,9 +427,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         mc.n_ff_exp    = g.n_ff;
         mc.n_ff_shared = meta_int2(meta, "qwen4exp.expert_shared_feed_forward_length",
                                    "shared_expert_intermediate_size", 0);
+        /* This rank's place where a remainder is handed out: the rank itself at one or two ranks,
+         * and above that the narrow ranks first (narrow_place). The plain experts' tile split in
+         * MoeFP8 takes the same place. */
+        const int64_t place = g.world > 2 ? narrow_place(g.n_ff_all, g.world, g.rank) : g.rank;
+        mc.extra_place = g.world > 2 ? place : -1;
         /* THE SHARED ARM IS SPLIT BY WHOLE fp8 SCALE BLOCKS: evenly when its width halves into
          * them, and otherwise as evenly as whole blocks allow -- this family's 640 columns are
-         * five blocks, three on rank 0 and two on rank 1. See MoeFP8::Config::shared_lo. */
+         * five blocks, three on rank 0 and two on rank 1; at four ranks two on rank 2 and one on
+         * each of the others. See MoeFP8::Config::shared_lo. */
         if (mc.n_ff_shared > 0 && g.world > 1 && (mc.n_ff_shared / g.world) % RAD_FP8_BLOCK == 0) {
             int s;
             if ((s = divide_or_fail(mc.n_ff_shared, g.world,
@@ -423,8 +451,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             }
             const int64_t nb = mc.n_ff_shared / RAD_FP8_BLOCK;
             const int64_t base = nb / g.world, extra = nb % g.world;
-            const int64_t b0 = (int64_t)g.rank * base + std::min<int64_t>(g.rank, extra);
-            const int64_t b1 = b0 + base + ((int64_t)g.rank < extra ? 1 : 0);
+            const int64_t b0 = place * base + std::min<int64_t>(place, extra);
+            const int64_t b1 = b0 + base + (place < extra ? 1 : 0);
             mc.shared_lo   = b0 * RAD_FP8_BLOCK;
             mc.shared_hi   = b1 * RAD_FP8_BLOCK;
             mc.n_ff_shared = mc.shared_hi - mc.shared_lo;
@@ -496,7 +524,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * go, so ranks 0 and 1 compute three blocks of every even/odd pair of experts and ranks 2
          * and 3 compute two, and the all-reduce has ranks 2 and 3 wait for the other two. Equal
          * shares need the extra block rotated over four places -- the expert's number mod 4, four
-         * slice tables where moe_gemm_q takes two.
+         * slice tables where moe_gemm_q takes two. What can move without them does: the shared
+         * expert's extra block and the plain experts' extra tiles go to ranks 2 and 3
+         * (narrow_place), so ranks 0 and 1 take one shared block and two plain tiles.
          *
          * WHY NOT EXPERT PARALLELISM, which splits the EXPERTS: rank r owns [r*E/W, (r+1)*E/W)
          * whole. The bytes a rank reads are the same on average either way, but which rank a
