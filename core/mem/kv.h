@@ -168,6 +168,14 @@ public:
     /* The part of every ceiling that is not context: recurrent and conv state for max_seqs
      * sequences, the checkpoint slots and the padding. Set by plan_groups(). */
     int64_t fixed_bytes() const { return fixed_; }
+    /* THE TOKEN COUNT THE PAGED GROUPS SETTLE ON for `budget_bytes` of pool -- carve()'s split
+     * with nothing carved. One block table serves every rank, so every rank's paged groups must
+     * hold the SAME number of blocks; under an uneven tensor-parallel split the ranks' pools are
+     * not the same size (a rank with more delta-net heads holds more state and has less left for
+     * pages, and a rank with no attention weights has more). The engine asks each rank this and
+     * cap_paged_tokens() the least on all of them before carve(). 0 is no cap. */
+    int64_t paged_tokens(int64_t budget_bytes) const { return paged_split(budget_bytes, nullptr); }
+    void    cap_paged_tokens(int64_t tokens) { tokens_cap_ = tokens > 0 ? tokens : 0; }
     int     carve(Pool& kv_pool);
 
     const std::vector<KVGroupPlan>& plans() const { return plans_; }
@@ -497,6 +505,10 @@ private:
      * through cannot leave plans_ answering guards for block state that was never sized. forget()
      * empties both together and is what plan_groups() starts from. */
     int  carve_into(Pool& kv_pool);
+    /* THE PAGED SPLIT, as arithmetic: the token count the paged groups exhaust at together for
+     * `budget_bytes` of pool, under tokens_cap_, and each group's block count in `blocks` (by group
+     * index; a windowed group capped at its window). carve_into() spends what this says. */
+    int64_t paged_split(int64_t budget_bytes, std::vector<int64_t>* blocks) const;
     void forget();
 
     /* One traversal serving both checkpoint directions; see checkpoint_save. */
@@ -550,6 +562,7 @@ private:
     int64_t   fixed_ = 0;      /* the non-negotiable floor: states, conv slots, checkpoints, padding */
     int64_t   ck_total_ = 0;   /* the checkpoint part of fixed_, named for the refusal message */
     int64_t   ckpts_ = 0;      /* --checkpoint-slots, as plan_groups() resolved it */
+    int64_t   tokens_cap_ = 0; /* cap_paged_tokens(): the least any rank can carve; 0 is none */
     /* THE SLOT STRIDE AND WHERE THE SLOTS BEGIN. The stride is checkpoint_bytes_ rounded up to a
      * whole number of commit granules, so a slot can be backed and released without touching a
      * neighbour; the offset is where the eager startup commit stops, because everything from

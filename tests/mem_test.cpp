@@ -473,6 +473,41 @@ TEST(kv_configure_reports_and_sizes) {
              ((1ll << 20) - 8 * 16384 - 4 * 16384 - 2 * RAD_ALIGN_UNIT) / 2048);
 }
 
+TEST(kv_ranks_with_unequal_pools_carve_the_least_ranks_blocks_under_a_cap) {
+    /* One block table serves every rank (Engine::serve), so every rank's paged groups must hold
+     * the same number of blocks. Under an uneven tensor-parallel split the pools are not equal --
+     * here a rank with 1 MiB and one with 2 MiB -- and Engine::configure_kv plans each, asks what
+     * it could page, and caps every rank at the least before any carves. */
+    Fixture a, b;
+    a.cfg.checkpoint_slots = b.cfg.checkpoint_slots = 0;
+    b.cfg.vram_kv_mib = 2;
+    CHECK_OK(a.pools.configure(a.cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator()));
+    CHECK_OK(b.pools.configure(b.cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator()));
+    CHECK_OK(a.kv.plan_groups(hybrid_groups(), a.cfg));
+    CHECK_OK(b.kv.plan_groups(hybrid_groups(), b.cfg));
+    const int64_t ta = a.kv.paged_tokens(a.pools.kv().avail());
+    const int64_t tb = b.kv.paged_tokens(b.pools.kv().avail());
+    CHECK(ta > 0);
+    CHECK(tb > ta);                              /* the larger pool pages more on its own */
+    const int64_t least = ta < tb ? ta : tb;
+    a.kv.cap_paged_tokens(least);
+    b.kv.cap_paged_tokens(least);
+    CHECK_OK(a.kv.carve(a.pools.kv()));
+    CHECK_OK(b.kv.carve(b.pools.kv()));
+    CHECK_EQ(a.kv.plan(G_FULL)->n_blocks, b.kv.plan(G_FULL)->n_blocks);
+    CHECK_EQ(a.kv.plan(G_FULL)->n_blocks, least / 16);
+    /* The cap does not touch what is not paged: each rank's own state count stays its own. */
+    CHECK_EQ(a.kv.plan(G_GDN)->n_states, b.kv.plan(G_GDN)->n_states);
+    /* paged_tokens() carved nothing: the uncapped figure is what carve() spends without a cap. */
+    Fixture c;
+    c.cfg.checkpoint_slots = 0;
+    CHECK_OK(c.pools.configure(c.cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator()));
+    CHECK_OK(c.kv.plan_groups(hybrid_groups(), c.cfg));
+    const int64_t tc = c.kv.paged_tokens(c.pools.kv().avail());
+    CHECK_OK(c.kv.carve(c.pools.kv()));
+    CHECK_EQ(c.kv.plan(G_FULL)->n_blocks, tc / 16);
+}
+
 TEST(kv_refuses_a_group_with_no_block_size) {
     /* Block size comes off the resolved attention kernel. A zero here means the attention op did
      * not resolve, and the manager refuses rather than inventing 16. */

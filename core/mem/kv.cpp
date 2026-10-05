@@ -362,6 +362,44 @@ void KVManager::forget() {
     report_.clear();
 }
 
+int64_t KVManager::paged_split(int64_t budget_bytes, std::vector<int64_t>* blocks) const {
+    /* Not a policy: size the groups to exhaust at the same total token count. Any other split
+     * strands memory in whichever group outlasts the others, and a long-context server would then
+     * run out of full-attention blocks with a window pool still half empty. */
+    std::vector<int64_t> out(plans_.size(), 0);
+    int64_t remaining = budget_bytes - fixed_;
+    std::vector<int32_t> open;
+    for (const auto& p : plans_) if (p.paged()) open.push_back(p.index);
+
+    int64_t tokens = 0;
+    while (!open.empty() && remaining > 0) {
+        double cost = 0;
+        for (int32_t i : open)
+            cost += (double)plans_[i].bytes_per_block / (double)plans_[i].block_size;
+        if (cost <= 0) break;
+        tokens = (int64_t)((double)remaining / cost);
+        /* ONE BLOCK TABLE SERVES EVERY RANK (Engine::serve checks it), so a rank with more pool
+         * than its peers carves no more than the least of them. */
+        if (tokens_cap_ > 0 && tokens > tokens_cap_) tokens = tokens_cap_;
+
+        /* A windowed group cannot use more than window_blocks per sequence; anything past that
+         * is memory nobody will ever address. Cap it and give the bytes back to the others. */
+        int32_t capped = -1;
+        for (int32_t i : open) {
+            const auto& p = plans_[i];
+            if (p.kind != RAD_KV_WINDOW) continue;
+            if (tokens / p.block_size > max_seqs_ * p.window_blocks) { capped = i; break; }
+        }
+        if (capped < 0) break;
+        out[capped] = max_seqs_ * plans_[capped].window_blocks;
+        remaining -= out[capped] * plans_[capped].bytes_per_block;
+        open.erase(std::find(open.begin(), open.end(), capped));
+    }
+    for (int32_t i : open) out[i] = remaining > 0 ? tokens / plans_[i].block_size : 0;
+    if (blocks) *blocks = std::move(out);
+    return tokens;
+}
+
 int KVManager::carve_into(Pool& kv_pool) {
     /* The pool is whatever the operator stated or the resolver derived; nothing here re-decides
      * it. What this does decide is how the groups share it, which is arithmetic, not policy. */
@@ -390,36 +428,11 @@ int KVManager::carve_into(Pool& kv_pool) {
         return RAD_E_NOMEM;
     }
 
-    /* ---- the paged split. Not a policy: size the groups to exhaust at the same total token
-     * count. Any other split strands memory in whichever group outlasts the others, and a
-     * long-context server would then run out of full-attention blocks with a window pool still
-     * half empty. ---- */
-    int64_t remaining = budget_bytes - fixed;
-    std::vector<int32_t> open;
-    for (auto& p : plans_) if (p.paged()) open.push_back(p.index);
-
-    int64_t tokens = 0;
-    while (!open.empty()) {
-        double cost = 0;
-        for (int32_t i : open)
-            cost += (double)plans_[i].bytes_per_block / (double)plans_[i].block_size;
-        if (cost <= 0) break;
-        tokens = (int64_t)((double)remaining / cost);
-
-        /* A windowed group cannot use more than window_blocks per sequence; anything past that
-         * is memory nobody will ever address. Cap it and give the bytes back to the others. */
-        int32_t capped = -1;
-        for (int32_t i : open) {
-            const auto& p = plans_[i];
-            if (p.kind != RAD_KV_WINDOW) continue;
-            if (tokens / p.block_size > max_seqs_ * p.window_blocks) { capped = i; break; }
-        }
-        if (capped < 0) break;
-        plans_[capped].n_blocks = max_seqs_ * plans_[capped].window_blocks;
-        remaining -= plans_[capped].n_blocks * plans_[capped].bytes_per_block;
-        open.erase(std::find(open.begin(), open.end(), capped));
-    }
-    for (int32_t i : open) plans_[i].n_blocks = tokens / plans_[i].block_size;
+    /* ---- the paged split (paged_split below): every rank's share of it is the same arithmetic,
+     * and under a cap it is the least rank's. ---- */
+    std::vector<int64_t> blocks;
+    (void)paged_split(budget_bytes, &blocks);
+    for (auto& p : plans_) if (p.paged()) p.n_blocks = blocks[p.index];
 
     for (auto& p : plans_) {
         if (!p.paged()) continue;

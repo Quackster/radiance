@@ -2499,10 +2499,31 @@ int Engine::configure_kv() {
     /* Resolved once, for the cache below and for Scheduler::init later. Resolving it separately in
      * each is how the two come to disagree, and the interval is the field where that shows. */
     RAD_TRY(chunk_geometry_resolve(ranks_[0]->program, cfg_, &geo_));
+    /* ONE BLOCK TABLE SERVES EVERY RANK (serve() checks it), so every rank carves the SAME number
+     * of paged blocks. The ranks' pools are not the same size under an uneven tensor-parallel
+     * split -- a rank with more delta-net heads holds more recurrent state, a rank with zero
+     * attention weights has more pool -- so each is planned first, asked what it could carve, and
+     * every rank is capped at the least before any carves. At an even split the cap is what
+     * every rank would have carved anyway. */
+    int64_t least = -1;
+    for (auto& r : ranks_) {
+        LogRank lr(r->index);
+        RAD_TRY(r->kv.plan_groups(r->program.kv_groups, cfg_));
+        const int64_t t = r->kv.paged_tokens(r->pools.kv().avail());
+        if (least < 0 || t < least) least = t;
+    }
     for (auto& r : ranks_) {
         LogRank lr(r->index);
         RAD_TRY(rad_dev_set(r->device));   /* allocates on the CURRENT device; see plan() */
-        RAD_TRY(r->kv.configure(r->program.kv_groups, cfg_, r->pools.kv()));
+        if (ranks_.size() > 1) {
+            const int64_t own = r->kv.paged_tokens(r->pools.kv().avail());
+            if (own > least)
+                RAD_INFO("kv: rank %d could page %lld tokens and carves %lld, the least rank's, so "
+                         "that one block table serves every rank", r->index, (long long)own,
+                         (long long)least);
+            r->kv.cap_paged_tokens(least);
+        }
+        RAD_TRY(r->kv.carve(r->pools.kv()));
         /* THE ONE CASE WHERE THE CACHE CANNOT GIVE ANYTHING BACK, said once and named. Every
          * caller is written against the elastic contract and runs unchanged here -- the pool
          * simply holds its whole carve -- so nothing fails, and the only symptom is an expert
