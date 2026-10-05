@@ -30,8 +30,15 @@ codes; below it, one code at a time. The row's layout hook only checks the table
 E4M3 with one bf16 scale, or the checkpoint's plain bf16 — and asks for no re-layout, because the
 gather reads the rows from the container file in the layout they are stored in.
 
+With the op's `resident` parameter (`--ngram-table ram`) the first gather instead starts a copy of
+the whole table into locked huge pages, in the background, and every gather reads the copy once it
+is in place: 47.7 GiB of RAM for Flash-Next, checked against RLIMIT_MEMLOCK, MemAvailable and the
+cgroup's memory.max before a byte is read. A process short of any of them says so and keeps
+reading the file.
+
 `rad-avx-check` runs the op over a file-backed table with two ranks and the reader racing, at
-every level, and compares every row with the file's bytes.
+every level, and compares every row with the file's bytes; and once more with `resident`, before
+and after the copy is in place.
 
 ## The build is the dispatch
 
