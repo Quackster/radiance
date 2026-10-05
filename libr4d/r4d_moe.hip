@@ -1009,14 +1009,18 @@ static_assert(sizeof(MoeTab) == 16, "the code table is four words");
  * UW reads the weight and its scales from a uniform global base -- see the UW note at w4_load.
  * The decode form always takes it. The prefill forms keep the plain loads: the waits UW removes
  * were measured on the decode grid, and the prefill tiles' timing under UW is unmeasured, so
- * their instructions stay as they were.
+ * their instructions stay as they were -- except under EW (R4D_MOE_PF2 64), below, which needs
+ * the uniform base for its early loads and was measured with it.
  *
  * RS finds an ES block's run in one round trip -- see the RS note at the run search. It covers
  * up to kMaxExpert experts; a wider expert count takes the chunked search, which numbers the runs
- * the same way. */
+ * the same way.
+ *
+ * EW issues an AL block's first pass of weight as soon as its map entry has named the expert -- see
+ * the EW note below the map read. */
 template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
           bool ES = false, bool AL = false, bool SK = false, uint32_t FK = kFK, bool UW = false,
-          bool RS = false>
+          bool RS = false, bool EW = false>
 __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
     const uint8_t* __restrict__ Aq, const float* __restrict__ As,
     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
@@ -1064,6 +1068,7 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
      * (expert, first row) and the block serves that run and no other. The grid is the upper bound
      * `n_expert + T/FM`, so the blocks past the real count exit here. */
     uint32_t r0, rN, e_al = 0;
+    [[maybe_unused]] uint32_t al_end = 0;      /* EW: off[e_al + 1], the run's end */
     bool tail = false;
     if constexpr (AL) {
         if (blockIdx.x >= map[0]) return;
@@ -1072,6 +1077,7 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
         r0   = ent[1];
         tail = (e_al == kMapTail);
         const uint32_t lim = tail ? T : (uint32_t)off[e_al + 1];
+        al_end = lim;
         rN = (r0 + FM < lim) ? (r0 + FM) : lim;
     } else {
         r0 = (ES ? (blockIdx.x / FM) : blockIdx.x) * FM;
@@ -1079,6 +1085,74 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
         rN = (r0 + FM < T) ? (r0 + FM) : T;
     }
     const uint32_t n0 = blockIdx.y * FN;
+
+    /* EW: THE FIRST PASS'S WEIGHT, IN FLIGHT AS SOON AS THE MAP HAS NAMED THE EXPERT. Under AL the
+     * map entry names the expert, and nothing the weight's address needs comes later -- not the
+     * tokens, not the run's rows, not the live count. In the run loop, the weight's load waits
+     * behind the token loads, the barrier that publishes them, the live count, the run's end read
+     * again and the table entry: four round trips in front of the one that carries the bytes, on a
+     * block whose whole K is one or two passes at the down projection.
+     *
+     * So the block's loads go out in the order their waits want them. First everything the token
+     * barrier needs -- the block's sorted rows and the live count -- then the table entries
+     * (uniform: scalar) and the first pass's weight. The vector-load counter retires in order, so
+     * the wait for the tokens leaves the weight in flight; the token barrier orders LDS alone; and
+     * the run's end is the one the map read already loaded. The weight comes off UW's uniform global
+     * base, which a block whose expert the map names has as much as a decode block does -- a flat
+     * load would also count against the LDS counter the barrier waits on. The first issue() then
+     * takes these registers instead of loading. The same bytes reach the same registers and the
+     * same tokens the same LDS slots: bit-identical.
+     *
+     * EVERY EARLY LOAD IS UNCONDITIONAL. A load under an exec mask -- `if (live) load` -- may not be
+     * issued at all, and the waitcnt pass, not knowing how many went out, then waits for every one
+     * of them where it needs the first. So a dead row (past the class's width, or the whole of a
+     * tail block) reads the expert's row 0 instead, a dead token slot reads a real one, and the
+     * zero is selected where the value is used -- the first issue() for the weight, the token's
+     * store for the slot. */
+    constexpr uint32_t kEwTPR = FK / 32, kEwRPP = NTHR / kEwTPR;
+    constexpr uint32_t kEwBP = (FN + kEwRPP - 1) / kEwRPP;
+    [[maybe_unused]] uint4    ew_b4[EW && W4 ? kEwBP : 1];
+    [[maybe_unused]] uint32_t ew_sp[EW && W4 == 4 ? kEwBP : 1];
+    [[maybe_unused]] Stage8   ew_b8[EW && !W4 ? kEwBP : 1];
+    [[maybe_unused]] bool     ew_ok[EW ? kEwBP : 1];
+    [[maybe_unused]] const uint8_t*  ew_wp  = nullptr;
+    [[maybe_unused]] const uint16_t* ew_wsp = nullptr;
+    [[maybe_unused]] int32_t  ew_f = -1;
+    [[maybe_unused]] uint32_t ew_live = 0;
+    if constexpr (EW) {
+        static_assert(AL && !ES && !RS && UW && FM <= NTHR,
+                      "EW is the run-aligned form's, on UW's uniform weight base");
+        {
+            const uint32_t i = r0 + tid % FM;           /* a real row whatever the thread */
+            ew_f = sorted[i < T ? i : T - 1u];
+        }
+        ew_live = (uint32_t)off[n_expert];
+        /* Nothing below is scheduled in front of these two: the counter retires in order. */
+        __builtin_amdgcn_sched_barrier(0);
+        const uint32_t ee  = tail ? 0u : e_al;        /* a tail block reads a real entry, unused */
+        const uint32_t cls = ee & ((1u << cshift) - 1u);
+        const MoeCls& C = cls == 0u ? c_even : cls == 1u ? c_odd : cls == 2u ? c_2 : c_3;
+        const uint32_t fy = N / parts, part = n0 / fy, j0 = n0 - part * fy;
+        const uint32_t fc = C.n / parts, wn0 = part * fc + j0;
+        ew_wp  = uw_ptr<true>(wtab_at(C.w, C.w_s0, ee >> cshift));
+        ew_wsp = uw_ptr<true>((const uint16_t*)wtab_at(C.s, C.s_s0, ee >> cshift));
+        const uint32_t sn = tid / kEwTPR, sk = (tid % kEwTPR) * 32u;
+        /* Where a staging pass covers the tile's rows exactly, every thread's every row exists:
+         * no guard, so no exec mask around a load (a thread's `sn` is below kEwRPP). */
+#pragma unroll
+        for (uint32_t p = 0; p < kEwBP; ++p) {
+            const uint32_t r = sn + p * kEwRPP;
+            if constexpr (FN % kEwRPP != 0) { if (r >= FN) continue; }
+            ew_ok[p] = !tail && (j0 + r) < fc;
+            const uint8_t* wr = ew_wp + (size_t)(ew_ok[p] ? wn0 + r : 0u) * C.w_ld;
+            if constexpr (W4) {
+                ew_b4[p] = w4_load_w<true>(wr + (sk >> 1), true);
+                if constexpr (W4 == 4)
+                    ew_sp[p] = u32_load_w<true>((const uint32_t*)(wr + (C.k >> 1) + (sk >> 3)));
+            } else
+                ew_b8[p] = stage8_load_w<true>(wr + sk, true);
+        }
+    }
 
     /* RS: this thread's NPT experts' offsets (and the next one's), which of them hold a run that
      * meets the tile, and its wave's running count of those -- carried from the loads below to the
@@ -1117,6 +1191,15 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
         if (lane == kWave - 1) s_rc[wave] = rs_inc;
         /* Both of RS's barriers order LDS alone -- the tokens, the counts, the selection. */
         lds_barrier();
+    } else if constexpr (EW) {
+        /* The tokens and the live count were loaded with the weight, ahead of it; see EW. A row
+         * past the block's is a dropped slot, as the loop of the plain form writes it. */
+        if (tid < FM) {
+            const int32_t f = r0 + tid < rN ? ew_f : -1;
+            s_tok[tid] = f < 0 ? -1 : (a_sorted ? (int32_t)(r0 + tid) : f / (int32_t)top_k);
+        }
+        lds_barrier();
+        live = ew_live;
     } else {
     /* The token each of the block's sorted rows reads its activation from, resolved once. -1 marks
      * a dropped slot, whose output row is zero. */
@@ -1275,11 +1358,13 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
          * never be walked past the last expert -- `off[e + 1]` is read only for e < n_expert, and
          * off[n_expert] is the live row count, which is the bound the loop already respects.
          * Under RS the search handed over the run's end, and its start meets it: nothing to walk. */
-        if constexpr (!RS) {
+        if constexpr (!RS && !EW) {
             while (e < n_expert && (uint32_t)off[e + 1] <= rs) ++e;
             if (e >= n_expert) break;
         }
-        const uint32_t ehi = RS ? rs_end : (uint32_t)off[e + 1];
+        /* EW: the map's run is e_al's from r0 on, so there is nothing to walk, and its end is the
+         * one the map read loaded. */
+        const uint32_t ehi = RS ? rs_end : EW ? al_end : (uint32_t)off[e + 1];
         const uint32_t re  = rN < live ? (rN < ehi ? rN : ehi) : (live < ehi ? live : ehi);
         if (re <= rs) break;
         /* Not this block's run: walk past it. Block-uniform, so no barrier is skipped by some
@@ -1310,8 +1395,15 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
 
         /* Both table entries are loaded before either is made uniform, so under UW the two
          * readfirstlanes wait on one round trip and not on two. */
-        const uint8_t*  Wp0  = wtab_at(C.w, C.w_s0, e >> cshift);
-        const uint16_t* Wsp0 = (const uint16_t*)wtab_at(C.s, C.s_s0, e >> cshift);
+        const uint8_t*  Wp0;
+        const uint16_t* Wsp0;
+        if constexpr (EW) {
+            Wp0  = ew_wp;                 /* EW: loaded at the map read; AL's run is e_al's */
+            Wsp0 = ew_wsp;
+        } else {
+            Wp0  = wtab_at(C.w, C.w_s0, e >> cshift);
+            Wsp0 = (const uint16_t*)wtab_at(C.s, C.s_s0, e >> cshift);
+        }
         const uint8_t*  Wp   = uw_ptr<UW>(Wp0);
         const uint16_t* Wsp  = uw_ptr<UW>(Wsp0);
 
@@ -1443,6 +1535,24 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
                 const int32_t tok = s_tok[r];
                 const bool    ok  = tok >= 0 && (r0 + r) >= rs && (r0 + r) < re;
                 apre[p] = stage8_load(Aq + (size_t)(ok ? tok : 0) * a_ld + cc + sk, ok);
+            }
+            if constexpr (EW) {
+                static_assert(kEwBP == kBP && kEwRPP == kRPP, "EW stages the pass issue() would");
+                if (cc == 0) {                /* the first pass's weight is already in flight */
+#pragma unroll
+                    for (uint32_t p = 0; p < kBP; ++p) {
+                        if (sn + p * kRPP >= FN) continue;
+                        /* The dead rows' zeros, as w4_load / stage8_load give them. */
+                        if constexpr (W4) {
+                            bpre4[p] = ew_ok[p] ? ew_b4[p] : make_uint4(0, 0, 0, 0);
+                            if constexpr (W4 == 4) spre[p] = ew_ok[p] ? ew_sp[p] : 0u;
+                        } else {
+                            bpre8[p].v = ew_ok[p] ? ew_b8[p].v : make_uint4(0, 0, 0, 0);
+                            bpre8[p].w = ew_ok[p] ? ew_b8[p].w : make_uint4(0, 0, 0, 0);
+                        }
+                    }
+                    return;
+                }
             }
 #pragma unroll
             for (uint32_t p = 0; p < kBP; ++p) {
@@ -2214,12 +2324,14 @@ __global__ __launch_bounds__(NTHR) void scale_rows_kernel(
  *    8  moe_scatter's general form: its scan in parallel and its tail in the placement
  *   16  the run map's prefix in parallel (moe_blockmap_par_kernel)
  *   32  the down projection's prefill tile 256 columns wide over sixteen waves
+ *   64  the run-aligned form's first pass of weight issued at the map read (EW, both projections)
  *
  * Read once, so a recorded pass and a live one take the same kernels. A test pin over it: below
  * zero the switch, anything else the value the switch would hold. */
 static constexpr uint32_t kPf2Gather = 2, kPf2GatherRev = 4, kPf2Scan = 8, kPf2Map = 16,
-                          kPf2DnWide = 32;
-static constexpr uint32_t kPf2All = kPf2Gather | kPf2GatherRev | kPf2Scan | kPf2Map | kPf2DnWide;
+                          kPf2DnWide = 32, kPf2Ew = 64;
+static constexpr uint32_t kPf2All = kPf2Gather | kPf2GatherRev | kPf2Scan | kPf2Map | kPf2DnWide |
+                                    kPf2Ew;
 static uint32_t moe_pf2_mask(long long x) {
     if (x <= 0) return 0u;
     return x == 1 ? kPf2All : (uint32_t)x & kPf2All;
@@ -2970,12 +3082,18 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
                                (const int32_t*)off->data, (uint32_t)n_expert, (uint32_t)T,
                                (uint32_t)kPrefillRows, (uint32_t)cap, map);
             if (emit_rc != RAD_OK) return emit_rc;
+            /* R4D_MOE_PF2 (64): the first pass's weight at the map read -- see EW at the kernel.
+             * The same kernels otherwise; a function pointer picks the instantiation. */
+            const bool ew = (pf & kPf2Ew) != 0;
+            moe_pf2_note(pf & kPf2Ew);
             if (dn_wide) {
                 /* Only a w4 weight takes it (dn_wide is false otherwise), and the block-fp8
                  * instantiation would not compile: its scale is a 128x128 tile's. */
                 moe_pf2_note(kPf2DnWide);
-                if constexpr (W4 != 0)
-                    emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, 2 * kPrefillCols / 16, 2, 8, W4, false, true, true>),
+                if constexpr (W4 != 0) {
+                    auto kd = ew ? &moe_gemm_q_kernel<kPrefillRows / 16, 2 * kPrefillCols / 16, 2, 8, W4, false, true, true, kFK, true, false, true>
+                                 : &moe_gemm_q_kernel<kPrefillRows / 16, 2 * kPrefillCols / 16, 2, 8, W4, false, true, true>;
+                    emit_rc = R4D_EMIT(sk, kd,
                                        dim3((unsigned)cap, (unsigned)(N / (2 * kPrefillCols))),
                                        dim3(16 * kWave), 0,
                                        (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
@@ -2983,22 +3101,28 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
                                        (uint16_t*)Y->data, (const uint32_t*)map,
                                        (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
                                        (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
-            } else if (wide_n)
-                emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, true, true>),
+                }
+            } else if (wide_n) {
+                auto kw = ew ? &moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, true, true, kFK, true, false, true>
+                             : &moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, true, true>;
+                emit_rc = R4D_EMIT(sk, kw,
                                    dim3((unsigned)cap, nyw), dim3(8 * kWave), 0,
                                    (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                                    (const int32_t*)sorted->data, (const int32_t*)off->data,
                                    (uint16_t*)Y->data, (const uint32_t*)map,
                                    (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
                                    (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
-            else
-            emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, true, true>),
-                               dim3((unsigned)cap, ny), dim3(4 * kWave), 0,
-                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
-                               (const int32_t*)sorted->data, (const int32_t*)off->data,
-                               (uint16_t*)Y->data, (const uint32_t*)map,
-                               (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
-                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
+            } else {
+                auto kn = ew ? &moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, true, true, kFK, true, false, true>
+                             : &moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, true, true>;
+                emit_rc = R4D_EMIT(sk, kn,
+                                   dim3((unsigned)cap, ny), dim3(4 * kWave), 0,
+                                   (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
+                                   (const int32_t*)sorted->data, (const int32_t*)off->data,
+                                   (uint16_t*)Y->data, (const uint32_t*)map,
+                                   (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
+                                   (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
+            }
         } else if (wide_n) {
             emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, false, true>),
                                dim3((unsigned)((T + kPrefillRows - 1) / kPrefillRows), nyw),

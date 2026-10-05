@@ -6735,73 +6735,87 @@ static void moe_dec_variants(const Plugin& pl, const RadKernelInfo* row, RadArgs
 }
 
 /* THE RUN-ALIGNED PREFILL FORM UNDER R4D_MOE_PF2, against the same form without it, byte for byte:
- * the run map's prefix in parallel on every shape, and on the sorted operand -- one part, every
- * class's width whole 256-column tiles -- the down projection's 256-column tile. Described first
- * where the row can be: the map's kernel must differ from the default's, and the GEMM's must
- * differ exactly where the wide tile applies, so the bytes below are not one kernel against itself;
- * and the launch must report the parts it took. `base` is the form's own bytes, already held to the
- * host decode by the form loop. */
+ * the run map's prefix in parallel (16) on every shape, the first pass's weight issued at the map
+ * read (64) on every shape, and on the sorted operand -- one part, every class's width whole
+ * 256-column tiles -- the down projection's 256-column tile (32); each alone and all together.
+ * Described first where the row can be: the map's kernel must differ from the default's exactly
+ * when 16 is on, and the GEMM's exactly when 64 is or the wide tile applies, so the bytes below are
+ * never one kernel against itself; and the launch must report the parts it took. `base` is the
+ * form's own bytes, already held to the host decode by the form loop. */
 static void moe_pf2_aligned(const Plugin& pl, const RadKernelInfo* row, RadArgs& a, void* d_y,
                             void* d_map, int64_t map_bytes, size_t elems,
                             const std::vector<uint16_t>& base, bool dn_wide,
                             const std::string& what) {
     if (!pl.pin_pf2 || !pl.pf2_used || !pl.pin_moe || base.empty()) return;
-    const std::string label = what + " aligned prefill form, R4D_MOE_PF2" +
-                              (dn_wide ? " (and the 256-column down tile)" : "");
     void* const sc0 = a.scratch;
     const int64_t sb0 = a.scratch_bytes;
-    a.scratch = d_map;
-    a.scratch_bytes = map_bytes;
-    auto restore = [&] {
-        pl.pin_pf2(-1);
-        pl.pf2_used();
-        pl.pin_moe(0);
-        a.scratch = sc0;
-        a.scratch_bytes = sb0;
+    struct Var { int pin; uint32_t mask; const char* name; };
+    static const Var kVar[] = {
+        { 16, 16u,  "map prefix in parallel" },
+        { 48, 48u,  "map prefix in parallel, 256-column down tile" },
+        { 64, 64u,  "first pass's weight at the map read" },
+        { 1,  112u, "every part" },
     };
-    pl.pin_moe(1);
-    if (row->describe) {
-        static RadLaunchDesc d0[4], d1[4];
-        int n0 = 0, n1 = 0;
-        pl.pin_pf2(0);
-        const int c0 = row->describe(&a, nullptr, d0, 4, &n0);
-        pl.pin_pf2(1);
-        const int c1 = row->describe(&a, nullptr, d1, 4, &n1);
-        if (c0 != RAD_OK || c1 != RAD_OK || n0 != 2 || n1 != 2) {
-            restore();
-            ok(label.c_str(), false, "describe rc " + std::to_string(c0) + "/" + std::to_string(c1) +
-                                     ", launches " + std::to_string(n0) + "/" + std::to_string(n1));
-            return;
+    for (const Var& v : kVar) {
+        if ((v.mask & 32u) && v.mask != 112u && !dn_wide) continue;   /* the same as 16 here */
+        const bool map_new = (v.mask & 16u) != 0;
+        const bool gemm_new = (v.mask & 64u) || (dn_wide && (v.mask & 32u));
+        const uint32_t want = (v.mask & 16u) | (v.mask & 64u) | (dn_wide ? (v.mask & 32u) : 0u);
+        const std::string label = what + " aligned prefill form, R4D_MOE_PF2 " +
+                                  std::to_string(v.pin) + " (" + v.name + ")";
+        a.scratch = d_map;
+        a.scratch_bytes = map_bytes;
+        auto restore = [&] {
+            pl.pin_pf2(-1);
+            pl.pf2_used();
+            pl.pin_moe(0);
+            a.scratch = sc0;
+            a.scratch_bytes = sb0;
+        };
+        pl.pin_moe(1);
+        if (row->describe) {
+            static RadLaunchDesc d0[4], d1[4];
+            int n0 = 0, n1 = 0;
+            pl.pin_pf2(0);
+            const int c0 = row->describe(&a, nullptr, d0, 4, &n0);
+            pl.pin_pf2(v.pin);
+            const int c1 = row->describe(&a, nullptr, d1, 4, &n1);
+            if (c0 != RAD_OK || c1 != RAD_OK || n0 != 2 || n1 != 2) {
+                restore();
+                ok(label.c_str(), false, "describe rc " + std::to_string(c0) + "/" +
+                                         std::to_string(c1) + ", launches " +
+                                         std::to_string(n0) + "/" + std::to_string(n1));
+                continue;
+            }
+            if ((d0[0].func != d1[0].func) != map_new || (d0[1].func != d1[1].func) != gemm_new) {
+                restore();
+                ok(label.c_str(), false, std::string("described kernels: the map's ") +
+                                         (d0[0].func == d1[0].func ? "is the default's" : "differs") +
+                                         ", the GEMM's " +
+                                         (d0[1].func == d1[1].func ? "is the default's" : "differs"));
+                continue;
+            }
         }
-        if (d0[0].func == d1[0].func || (d0[1].func != d1[1].func) != dn_wide) {
-            restore();
-            ok(label.c_str(), false, std::string("described kernels: the map's ") +
-                                     (d0[0].func == d1[0].func ? "is the default's" : "differs") +
-                                     ", the GEMM's " +
-                                     (d0[1].func == d1[1].func ? "is the default's" : "differs"));
-            return;
+        {
+            std::vector<uint16_t> junk(elems, 0x7f7fu);
+            st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
         }
+        pl.pin_pf2(v.pin);
+        pl.pf2_used();
+        const int rc = row->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        const uint32_t used = pl.pf2_used();
+        restore();
+        if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
+        std::vector<uint16_t> got(elems);
+        st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
+        int64_t diff = 0;
+        for (size_t i = 0; i < elems; ++i) diff += got[i] != base[i];
+        ok(label.c_str(), diff == 0 && (used & 112u) == want,
+           std::to_string(diff) + " of " + std::to_string(elems) +
+               " elements differ from the form without it; parts used " + std::to_string(used) +
+               ", expected " + std::to_string(want));
     }
-    {
-        std::vector<uint16_t> junk(elems, 0x7f7fu);
-        st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
-    }
-    pl.pin_pf2(1);
-    pl.pf2_used();
-    const int rc = row->launch(&a, nullptr);
-    st_stream_sync(nullptr);
-    const uint32_t used = pl.pf2_used();
-    restore();
-    if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); return; }
-    std::vector<uint16_t> got(elems);
-    st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
-    int64_t diff = 0;
-    for (size_t i = 0; i < elems; ++i) diff += got[i] != base[i];
-    const uint32_t want = 16u | (dn_wide ? 32u : 0u);
-    ok(label.c_str(), diff == 0 && (used & 48u) == want,
-       std::to_string(diff) + " of " + std::to_string(elems) +
-           " elements differ from the form without it; parts used " + std::to_string(used) +
-           ", expected " + std::to_string(want));
 }
 
 /* EVERY FORM THE LAUNCHER HAS, each against the host decode: the run-aligned prefill form (a run
