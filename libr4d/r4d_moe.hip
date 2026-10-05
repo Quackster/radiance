@@ -617,6 +617,83 @@ __global__ void scatter_tail_kernel(const int32_t* __restrict__ off, int32_t* __
     if (i >= live && i < T) sorted[i] = -1;
 }
 
+/* ---- PF2: THE GENERAL SCATTER'S SCAN AND TAIL, AT A PREFILL CHUNK ----------------------------------
+ *
+ * scatter_scan_kernel gives each thread an expert -- two at 512 -- and walks that expert's column of
+ * `bcnt` one tile at a time: load, add, store, and the next load only after. At a 2048 chunk and top
+ * 10 that is 80 tiles, two experts a thread, 160 dependent round trips on one workgroup, and then
+ * one thread prefixes the 512 totals alone. Here a thread holds one expert, its column comes in
+ * kScanBatch loads at a time, all issued before any is used, and the prefix across experts is the
+ * small sort's: a DPP scan in each wave and one exchange of the wave totals. Integers, and every sum
+ * has one answer whatever order it is formed in: the same bcnt, offsets and counts.
+ *
+ * THE TAIL RIDES IN THE PLACEMENT. scatter_tail_kernel is a launch of its own that writes -1 to the
+ * sorted rows past the live count; those rows are never a placement target (every placed slot lands
+ * below `off[n_expert]`), so the placement's own threads can write them, each its own index, with no
+ * thread able to race another for a row. One dependent launch a layer fewer; the same bytes. */
+constexpr uint32_t kScanBatch = 16;
+
+__global__ __launch_bounds__(kMaxExpert) void scatter_scan_par_kernel(
+    int32_t* __restrict__ bcnt, int32_t* __restrict__ off, int32_t* __restrict__ cnt,
+    uint32_t n_tile, uint32_t n_expert) {
+    constexpr uint32_t NW = kMaxExpert / kWave;
+    __shared__ int32_t s_wt[NW];
+    const uint32_t e = threadIdx.x, lane = e % kWave, wave = e / kWave;
+    int32_t run = 0;
+    if (e < n_expert) {
+        for (uint32_t b0 = 0; b0 < n_tile; b0 += kScanBatch) {
+            /* Every load in bounds -- a row past the last is the last row again, and discarded --
+             * so none of them sits in a branch the next one has to wait behind. */
+            int32_t v[kScanBatch];
+#pragma unroll
+            for (uint32_t k = 0; k < kScanBatch; ++k) {
+                const uint32_t b = b0 + k < n_tile ? b0 + k : n_tile - 1u;
+                v[k] = bcnt[(size_t)b * n_expert + e];
+            }
+#pragma unroll
+            for (uint32_t k = 0; k < kScanBatch; ++k) {
+                if (b0 + k >= n_tile) break;
+                bcnt[(size_t)(b0 + k) * n_expert + e] = run;
+                run += v[k];
+            }
+        }
+        cnt[e] = run;
+    }
+    const int32_t x = wave_incl_scan_i32(run, lane);
+    if (lane == kWave - 1) s_wt[wave] = x;
+    lds_barrier();
+    int32_t below = 0, tot = 0;
+#pragma unroll
+    for (uint32_t w = 0; w < NW; ++w) {
+        const int32_t c = s_wt[w];
+        below += (w < wave) ? c : 0;
+        tot   += c;
+    }
+    if (e < n_expert) off[e] = below + x - run;     /* inclusive -> exclusive */
+    if (e == 0) off[n_expert] = tot;
+}
+
+/* scatter_place_kernel, and the tail scatter_tail_kernel writes. The placement is that kernel's,
+ * line for line. */
+__global__ __launch_bounds__(kScatterTile) void scatter_place_tail_kernel(
+    const int32_t* __restrict__ ids, const int32_t* __restrict__ bcnt,
+    const int32_t* __restrict__ off, int32_t* __restrict__ sorted,
+    uint32_t T, uint32_t n_expert, int32_t base, Protect prot) {
+    __shared__ int32_t s_id[kScatterTile];
+    const uint32_t tid = threadIdx.x, b = blockIdx.x;
+    const uint32_t i = b * kScatterTile + tid;
+    const int32_t  l = (i < T) ? ids[i] - base : -1;
+    const int32_t  e = (l >= 0 && l < (int32_t)n_expert) ? sort_place(l, n_expert, prot) : -1;
+    s_id[tid] = e;
+    const uint32_t live = (uint32_t)off[n_expert];
+    if (i >= live && i < T) sorted[i] = -1;
+    __syncthreads();
+    if (i >= T || e < 0) return;
+    int32_t rank = 0;
+    for (uint32_t j = 0; j < tid; ++j) rank += (s_id[j] == e);
+    sorted[off[e] + bcnt[(size_t)b * n_expert + e] + rank] = (int32_t)i;
+}
+
 
 /* ================================================================== the 4-bit expert weight
  *
@@ -954,7 +1031,10 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
     constexpr uint32_t NTHR = WGM * WGN * kWave;
     constexpr uint32_t WM = MT / WGM, WN = NTL / WGN;
     static_assert(MT % WGM == 0 && NTL % WGN == 0, "the wave grid must divide the tile");
-    static_assert(kBlock % FN == 0, "a block's N rows must sit in one 128-row weight scale row");
+    /* The block-fp8 weight has one scale a 128x128 tile; a w4 weight one a ROW, so its block may
+     * span two of the fp8 grid's scale rows (the 256-column down tile, R4D_MOE_PF2). */
+    static_assert(W4 != 0 || kBlock % FN == 0,
+                  "a block's N rows must sit in one 128-row weight scale row");
     /* Scale groups a 128-wide block: one, or at W4 2, 3 and 4 the 64- or 32-column ones. */
     constexpr uint32_t kSub = W4 == 3 ? 4u : (W4 == 2 || W4 == 4) ? 2u : 1u;
     /* 128-wide blocks a staged pass (one, or two at FK 256), and so scale groups a pass. */
@@ -1990,6 +2070,113 @@ __global__ __launch_bounds__(NTHR) void gather_kernel(
     }
 }
 
+/* ---- PF2: THE PREFILL GATHER, A WAVE A TOKEN AND EIGHT COLUMNS A LANE ----------------------------
+ *
+ * At a prefill chunk this op is a read of `ye` -- one row a routed slot, 105 MB a layer at a 2048
+ * chunk of Qwen3.8-Flash-Next on a rank of four -- and gather_kernel moves it TWO BYTES A LANE: a
+ * block is one token's 256 columns, each of its loads one slot's 64 bytes a wave, and a lane's slots
+ * are a loop whose loads wait on the slot table one after the other. That is about two thirds of
+ * the part's cold-stream rate on the op's bytes.
+ *
+ * Here a wave owns one token and 256 columns, eight a lane. The token's slot table is read first
+ * (uniform: scalar loads), then every slot's sixteen bytes are issued before any is used, then
+ * summed. THE ARITHMETIC IS gather_kernel's: per column, ascending slot order, a dropped slot skipped,
+ * `acc += w * x` in f32, and the shared arm's two narrows exactly as there -- the same bits.
+ *
+ * REV takes the column groups last first. The down projection writes `ye` one 128-column tile at a
+ * time, every routed row of a tile before the next (the tile is its grid's slow axis), so when it
+ * ends, the tiles it wrote last are the ones still in the infinity cache. Taken last first, this
+ * kernel's first column groups are read from there rather than from DRAM. Which block reads which
+ * group moves; no sum does. */
+constexpr uint32_t kGatherWideSlots = 16;      /* top_k at most this: the slots live in registers */
+constexpr uint32_t kGatherWideCols  = 8;       /* columns a lane, one sixteen-byte load */
+static_assert(kGatherWideSlots <= kWave, "slot j is read off lane j");
+
+template <uint32_t NW>
+__global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
+    const uint16_t* __restrict__ ye, const uint16_t* __restrict__ ew,
+    const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
+    uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
+    const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
+    uint32_t sh_ld, uint32_t sg_ld, int sig, int rev) {
+    const uint32_t lane = threadIdx.x % kWave;
+    const uint32_t wave = (uint32_t)__builtin_amdgcn_readfirstlane((int)(threadIdx.x / kWave));
+    const uint32_t t = blockIdx.x * NW + wave;
+    const uint32_t g = rev ? gridDim.y - 1u - blockIdx.y : blockIdx.y;
+    const uint32_t c = (g * kWave + lane) * kGatherWideCols;
+    /* No barrier anywhere below, so a wave past the last token simply leaves. */
+    if (t >= M) return;
+
+    /* THE TOKEN'S SLOTS AND WEIGHTS IN ONE LOAD: lane j fetches slot j (a lane past top_k fetches
+     * slot 0 again, in bounds and never used) and every lane then reads them off the lanes, as
+     * constants into scalar registers. Loaded one a slot, each would be a scalar load waited on
+     * just before its own row's load is issued. Every lane of the wave takes part -- a lane past
+     * the last column leaves only after -- since a value is read off ANY lane. */
+    const uint32_t jl = lane < top_k ? lane : 0u;
+    const int32_t  il = inv[(size_t)t * top_k + jl];
+    const int32_t  wl = (int32_t)ew[(size_t)t * ew_ld + jl];
+    int32_t si[kGatherWideSlots];
+    float   sw[kGatherWideSlots];
+#pragma unroll
+    for (uint32_t j = 0; j < kGatherWideSlots; ++j) {
+        si[j] = __builtin_amdgcn_readlane(il, (int)j);
+        sw[j] = bf16_to_f32((uint16_t)__builtin_amdgcn_readlane(wl, (int)j));
+    }
+    if (c >= n) return;
+    /* NO break AND NO continue IN THESE LOOPS: with an early exit the compiler keeps the slot loop
+     * rolled, `yv[j]` is then indexed at run time, and the whole array goes to scratch. Written as
+     * uniform branches over a constant trip count, every index is a constant and every slot a
+     * register. A slot is live exactly where gather_kernel's loop reaches it and does not skip it. */
+    bool  lv[kGatherWideSlots];
+    uint4 yv[kGatherWideSlots];
+#pragma unroll
+    for (uint32_t j = 0; j < kGatherWideSlots; ++j) {
+        lv[j] = j < top_k && si[j] >= 0;
+        yv[j] = make_uint4(0, 0, 0, 0);
+        if (lv[j]) yv[j] = *(const uint4*)(ye + (size_t)si[j] * ye_ld + c);
+    }
+    /* The shared arm after the slots, so nothing it waits on stands in front of their loads. */
+    float gate = 0.0f;
+    uint4 shv  = make_uint4(0, 0, 0, 0);
+    if (sh) {
+        const float v0 = bf16_to_f32(sg[(size_t)t * sg_ld]);
+        gate = sig ? (1.0f / (1.0f + __expf(-v0))) : v0;
+        shv  = *(const uint4*)(sh + (size_t)t * sh_ld + c);
+    }
+
+    float acc[kGatherWideCols];
+#pragma unroll
+    for (uint32_t q = 0; q < kGatherWideCols; ++q) acc[q] = 0.0f;
+#pragma unroll
+    for (uint32_t j = 0; j < kGatherWideSlots; ++j) {
+        if (lv[j]) {
+            const float    wj   = sw[j];
+            const uint32_t d[4] = { yv[j].x, yv[j].y, yv[j].z, yv[j].w };
+#pragma unroll
+            for (uint32_t q = 0; q < 4; ++q) {
+                acc[2 * q]     += wj * bf16_to_f32((uint16_t)(d[q] & 0xFFFFu));
+                acc[2 * q + 1] += wj * bf16_to_f32((uint16_t)(d[q] >> 16));
+            }
+        }
+    }
+
+    const uint32_t s[4] = { shv.x, shv.y, shv.z, shv.w };
+    uint32_t o[4];
+#pragma unroll
+    for (uint32_t q = 0; q < 4; ++q) {
+        uint16_t lo = f32_to_bf16(acc[2 * q]), hi = f32_to_bf16(acc[2 * q + 1]);
+        if (sh) {
+            /* THE SHARED ARM, FOLDED, with gather_kernel's two narrows. */
+            const uint16_t plo = f32_to_bf16(bf16_to_f32((uint16_t)(s[q] & 0xFFFFu)) * gate);
+            const uint16_t phi = f32_to_bf16(bf16_to_f32((uint16_t)(s[q] >> 16)) * gate);
+            lo = f32_to_bf16(bf16_to_f32(plo) + bf16_to_f32(lo));
+            hi = f32_to_bf16(bf16_to_f32(phi) + bf16_to_f32(hi));
+        }
+        o[q] = (uint32_t)lo | ((uint32_t)hi << 16);
+    }
+    *(uint4*)(y + (size_t)t * y_ld + c) = make_uint4(o[0], o[1], o[2], o[3]);
+}
+
 /* ================================================================== scale_rows
  *
  * y[m, i] = x[m, i] * act(s[m]). One workgroup a row, grid-strided along the row, and the scalar
@@ -2017,6 +2204,47 @@ __global__ __launch_bounds__(NTHR) void scale_rows_kernel(
 }
 
 }  /* namespace */
+
+/* R4D_MOE_PF2: the prefill MoE forms -- the shapes a chunk of thousands of routed rows a layer
+ * takes and a decode step never reaches. Unset or 0: as upstream. 1: every part. Any other value is
+ * a mask of the parts, each bit-identical to the form it replaces:
+ *
+ *    2  moe_gather at a prefill chunk: a wave a token and eight columns a lane (gather_wide_kernel)
+ *    4  ...its column groups last first, so the down projection's last tiles come from the cache
+ *    8  moe_scatter's general form: its scan in parallel and its tail in the placement
+ *   16  the run map's prefix in parallel (moe_blockmap_par_kernel)
+ *   32  the down projection's prefill tile 256 columns wide over sixteen waves
+ *
+ * Read once, so a recorded pass and a live one take the same kernels. A test pin over it: below
+ * zero the switch, anything else the value the switch would hold. */
+static constexpr uint32_t kPf2Gather = 2, kPf2GatherRev = 4, kPf2Scan = 8, kPf2Map = 16,
+                          kPf2DnWide = 32;
+static constexpr uint32_t kPf2All = kPf2Gather | kPf2GatherRev | kPf2Scan | kPf2Map | kPf2DnWide;
+static uint32_t moe_pf2_mask(long long x) {
+    if (x <= 0) return 0u;
+    return x == 1 ? kPf2All : (uint32_t)x & kPf2All;
+}
+static int g_moe_pf2_pin = -1;
+static uint32_t moe_pf2() {
+    static const uint32_t v = [] {
+        const char* e = std::getenv("R4D_MOE_PF2");
+        return moe_pf2_mask(e ? std::atoll(e) : 0);
+    }();
+    return g_moe_pf2_pin >= 0 ? moe_pf2_mask(g_moe_pf2_pin) : v;
+}
+/* WHICH PARTS A PINNED LAUNCH TOOK. A part whose kernel did not run -- a shape it refuses, a
+ * condition that never held -- would match the default trivially, so the test asks. Recorded only
+ * under a pin: the pin is a test's, and a serving process never writes either. */
+static uint32_t g_moe_pf2_used = 0;
+static inline void moe_pf2_note(uint32_t part) {
+    if (g_moe_pf2_pin >= 0) g_moe_pf2_used |= part;
+}
+extern "C" void r4d_moe_pf2_pin(int pin) { g_moe_pf2_pin = pin; }
+extern "C" uint32_t r4d_moe_pf2_used(void) {
+    const uint32_t u = g_moe_pf2_used;
+    g_moe_pf2_used = 0;
+    return u;
+}
 
 /* ============================================================== the plugin ABI entry points */
 
@@ -2235,6 +2463,18 @@ extern "C" int r4d_rad_moe_scatter(const RadArgs* a, RadStream s) {
                        (unsigned)(n_expert * sizeof(int32_t)), (hipStream_t)s,
                        idp, bcnt, (uint32_t)T, (uint32_t)n_expert, (int32_t)base, prot);
     R4D_MOE_CHK();
+    /* R4D_MOE_PF2 (8): the scan in parallel, the tail in the placement -- the same integers. */
+    if (moe_pf2() & kPf2Scan) {
+        moe_pf2_note(kPf2Scan);
+        hipLaunchKernelGGL(scatter_scan_par_kernel, dim3(1), dim3(kMaxExpert), 0, (hipStream_t)s,
+                           bcnt, op, cp, (uint32_t)n_tile, (uint32_t)n_expert);
+        R4D_MOE_CHK();
+        hipLaunchKernelGGL(scatter_place_tail_kernel, dim3((unsigned)n_tile), dim3(kScatterTile), 0,
+                           (hipStream_t)s, idp, bcnt, op, sp, (uint32_t)T, (uint32_t)n_expert,
+                           (int32_t)base, prot);
+        R4D_MOE_CHK();
+        return RAD_OK;
+    }
     hipLaunchKernelGGL(scatter_scan_kernel, dim3(1), dim3(256), 0, (hipStream_t)s,
                        bcnt, op, cp, (uint32_t)n_tile, (uint32_t)n_expert);
     R4D_MOE_CHK();
@@ -2424,6 +2664,70 @@ __global__ __launch_bounds__(256) void moe_blockmap_kernel(
         for (uint32_t e = 0; e <= n_expert; ++e) { const uint32_t c = s_cnt[e]; s_cnt[e] = acc; acc += c; }
         map[0] = acc < cap ? acc : cap;      /* the count, clamped to what the grid can serve */
     }
+    __syncthreads();
+
+    for (uint32_t e = tid; e < n_expert; e += blockDim.x) {
+        const uint32_t run = (uint32_t)(s_off[e + 1] - s_off[e]);
+        uint32_t o = s_cnt[e];
+        for (uint32_t r = 0; r < run; r += FM, ++o) {
+            if (o >= cap) break;
+            map[1 + 2 * o + 0] = e;
+            map[1 + 2 * o + 1] = (uint32_t)s_off[e] + r;
+        }
+    }
+    if (tid == 0) {
+        uint32_t o = s_cnt[n_expert];
+        for (uint32_t r = live; r < T; r += FM, ++o) {
+            if (o >= cap) break;
+            map[1 + 2 * o + 0] = kMapTail;
+            map[1 + 2 * o + 1] = r;
+        }
+    }
+}
+
+/* PF2: THE SAME MAP WITH ITS PREFIX IN PARALLEL. Above, one thread prefixes the n_expert + 1 block
+ * counts alone -- 513 LDS round trips at 512 experts, in front of a GEMM that waits for the map,
+ * and the map is built twice a routed layer. Here the prefix is the small sort's: a DPP scan in each
+ * wave and one exchange of the wave totals, 256 counts a tile. Integers: the same offsets, so the
+ * same map entry for entry, and everything else is the kernel above line for line. */
+__global__ __launch_bounds__(256) void moe_blockmap_par_kernel(
+    const int32_t* __restrict__ off, uint32_t n_expert, uint32_t T, uint32_t FM, uint32_t cap,
+    uint32_t* __restrict__ map) {
+    constexpr uint32_t NT = 256, NW = NT / kWave, kTiles = (kMaxExpert + NT) / NT;
+    __shared__ uint32_t s_cnt[kMaxExpert + 1];
+    __shared__ int32_t  s_off[kMaxExpert + 1];
+    __shared__ int32_t  s_wt[kTiles][NW];
+    const uint32_t tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
+
+    for (uint32_t e = tid; e <= n_expert; e += blockDim.x) s_off[e] = off[e];
+    __syncthreads();
+    for (uint32_t e = tid; e < n_expert; e += blockDim.x) {
+        const uint32_t run = (uint32_t)(s_off[e + 1] - s_off[e]);
+        s_cnt[e] = (run + FM - 1) / FM;
+    }
+    const uint32_t live = (uint32_t)s_off[n_expert];
+    if (tid == 0) s_cnt[n_expert] = T > live ? (T - live + FM - 1) / FM : 0u;
+    __syncthreads();
+
+    /* Exclusive scan over the n_expert + 1 counts, a tile of NT at a time. */
+    uint32_t carry = 0;
+    for (uint32_t b = 0, tl = 0; b <= n_expert; b += NT, ++tl) {
+        const uint32_t e = b + tid;
+        const int32_t  v = e <= n_expert ? (int32_t)s_cnt[e] : 0;
+        const int32_t  x = wave_incl_scan_i32(v, lane);
+        if (lane == kWave - 1) s_wt[tl][wave] = x;
+        lds_barrier();
+        int32_t below = 0, tot = 0;
+#pragma unroll
+        for (uint32_t k = 0; k < NW; ++k) {
+            const int32_t c = s_wt[tl][k];
+            below += (k < wave) ? c : 0;
+            tot   += c;
+        }
+        if (e <= n_expert) s_cnt[e] = carry + (uint32_t)(below + x - v);
+        carry += (uint32_t)tot;
+    }
+    if (tid == 0) map[0] = carry < cap ? carry : cap;
     __syncthreads();
 
     for (uint32_t e = tid; e < n_expert; e += blockDim.x) {
@@ -2650,12 +2954,36 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
         /* The 128-column tile where no column tile straddles two parts of the weight. */
         const bool wide_n = (N / parts) % kPrefillCols == 0;
         const unsigned nyw = (unsigned)(N / kPrefillCols);
+        /* R4D_MOE_PF2: the run map's prefix in parallel (16), and the down projection -- the
+         * sorted operand, one part, a w4 weight whose scale is a row's -- at 256 columns over
+         * sixteen waves where every class's width is whole tiles of it (32). Each wave's share is
+         * the 128-column tile's: one 16-row M tile by two N tiles, the same K passes and the same
+         * fold, so every element is the same sum in the same order. What the wider block buys is
+         * its rows' activation and its run's prologue once for twice the columns. */
+        const uint32_t pf = moe_pf2();
+        bool dn_wide = W4 != 0 && (pf & kPf2DnWide) && a_sorted && parts == 1;
+        for (int q = 0; q < ncls; ++q) dn_wide = dn_wide && Nc[q] % (2 * kPrefillCols) == 0;
         if (map) {
-            emit_rc = R4D_EMIT(sk, moe_blockmap_kernel, dim3(1), dim3(256), 0,
+            auto bmap = (pf & kPf2Map) ? &moe_blockmap_par_kernel : &moe_blockmap_kernel;
+            moe_pf2_note(pf & kPf2Map);
+            emit_rc = R4D_EMIT(sk, bmap, dim3(1), dim3(256), 0,
                                (const int32_t*)off->data, (uint32_t)n_expert, (uint32_t)T,
                                (uint32_t)kPrefillRows, (uint32_t)cap, map);
             if (emit_rc != RAD_OK) return emit_rc;
-            if (wide_n)
+            if (dn_wide) {
+                /* Only a w4 weight takes it (dn_wide is false otherwise), and the block-fp8
+                 * instantiation would not compile: its scale is a 128x128 tile's. */
+                moe_pf2_note(kPf2DnWide);
+                if constexpr (W4 != 0)
+                    emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, 2 * kPrefillCols / 16, 2, 8, W4, false, true, true>),
+                                       dim3((unsigned)cap, (unsigned)(N / (2 * kPrefillCols))),
+                                       dim3(16 * kWave), 0,
+                                       (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
+                                       (const int32_t*)sorted->data, (const int32_t*)off->data,
+                                       (uint16_t*)Y->data, (const uint32_t*)map,
+                                       (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
+                                       (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
+            } else if (wide_n)
                 emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, true, true>),
                                    dim3((unsigned)cap, nyw), dim3(8 * kWave), 0,
                                    (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
@@ -2926,6 +3254,31 @@ extern "C" int r4d_rad_moe_gather(const RadArgs* a, RadStream s) {
         const char* const act = r4d_gets(a, "act");
         if (act && !std::strcmp(act, "sigmoid"))   sig = 1;
         else if (act && std::strcmp(act, "none"))  return R4D_NO(RAD_E_UNSUPPORTED);
+    }
+
+    /* R4D_MOE_PF2 (2, and 4 for the column groups last first): the prefill form a wave a token
+     * and sixteen bytes a lane, where the slots fit its registers and every row it reads or writes
+     * starts on sixteen bytes. The same sums; see gather_wide_kernel. */
+    const uint32_t pf = moe_pf2();
+    auto al16 = [](const void* p, long long ld) {
+        return ((uintptr_t)p % 16) == 0 && ld % (long long)kGatherWideCols == 0;
+    };
+    if (!self && (pf & kPf2Gather) && top_k <= (long long)kGatherWideSlots &&
+        n % (long long)kGatherWideCols == 0 && al16(ye->data, ye_ld) && al16(Y->data, y_ld) &&
+        (!sh || al16(sh->data, sh_ld))) {
+        constexpr uint32_t NW = 8;
+        moe_pf2_note(kPf2Gather | (pf & kPf2GatherRev));
+        const unsigned gw = (unsigned)((n + kWave * kGatherWideCols - 1) / (kWave * kGatherWideCols));
+        hipLaunchKernelGGL((gather_wide_kernel<NW>), dim3((unsigned)((M + NW - 1) / NW), gw),
+                           dim3(NW * kWave), 0, (hipStream_t)s,
+                           (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,
+                           (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,
+                           (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,
+                           sh ? (const uint16_t*)sh->data : nullptr,
+                           sh ? (const uint16_t*)sg->data : nullptr,
+                           (uint32_t)sh_ld, (uint32_t)sg_ld, sig, (pf & kPf2GatherRev) ? 1 : 0);
+        R4D_MOE_CHK();
+        return RAD_OK;
     }
 
     const unsigned gy = (unsigned)((n + 255) / 256);

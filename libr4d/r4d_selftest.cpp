@@ -163,6 +163,8 @@ struct Plugin {
     void (*pin_qsa)(int) = nullptr;
     void (*pin_moe)(int) = nullptr;
     void (*pin_fk)(int) = nullptr;
+    void (*pin_pf2)(int) = nullptr;
+    uint32_t (*pf2_used)(void) = nullptr;
     void (*pin_hc)(int) = nullptr;
     void (*pin_qsel)(int) = nullptr;
 };
@@ -194,6 +196,8 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_qsa_score_pin_form", &pl->pin_qsa);
     okall &= sym(pl->h, "r4d_moe_gemm_pin_prefill", &pl->pin_moe);
     okall &= sym(pl->h, "r4d_moe_gemm_pin_fk", &pl->pin_fk);
+    okall &= sym(pl->h, "r4d_moe_pf2_pin", &pl->pin_pf2);
+    okall &= sym(pl->h, "r4d_moe_pf2_used", &pl->pf2_used);
     okall &= sym(pl->h, "r4d_hc_read_pin_prefill", &pl->pin_hc);
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     return okall;
@@ -2031,11 +2035,30 @@ static void router_gemm_fused_case(const Plugin& pl) {
  * slots is the one-workgroup form, 3000 the three-pass one, and the first, a middle and the last
  * expert of a rank's slice are protected so the closing-up is tested at both ends. The fused
  * decode kernel is held to the standalone pair in topk_scatter_case. */
+/* `pf2` >= 0 pins R4D_MOE_PF2 for the launch (0 off, 1 every part), and the case is then also run
+ * at a prefill chunk's sizes: the general form's scan and tail are what that switch replaces, and
+ * both forms are held to the same host sort. -1 leaves the switch alone. */
+static void scatter_protect_at(const Plugin& pl, const RadKernelInfo* rs, int64_t M, int64_t nl,
+                               int64_t base, int pf2);
+
 static void scatter_protect_case(const Plugin& pl) {
     if (!sel("moe_scatter_i32")) return;
     const RadKernelInfo* rs = find(pl, "moe_scatter_i32");
     if (!rs) { ok("moe_scatter protect", false, "row absent"); return; }
-    const int64_t ne = 512, nl = 254, base = 3, k = 10;
+    for (const int64_t M : { 45, 300 }) scatter_protect_at(pl, rs, M, 254, 3, -1);
+    /* R4D_MOE_PF2, off and on, at a prefill chunk: 79 and 80 tiles of the general form, a rank's
+     * slice and every one of 512 experts local (the mod4 split's case). */
+    if (pl.pin_pf2)
+        for (const int pf : { 0, 1 }) {
+            scatter_protect_at(pl, rs, 300, 254, 3, pf);
+            scatter_protect_at(pl, rs, 2000, 254, 3, pf);
+            scatter_protect_at(pl, rs, 2048, 512, 0, pf);
+        }
+}
+
+static void scatter_protect_at(const Plugin& pl, const RadKernelInfo* rs, int64_t M, int64_t nl,
+                               int64_t base, int pf2) {
+    const int64_t ne = 512, k = 10;
     const std::vector<int64_t> prot = { 0, 17, 101, 253 };
     std::vector<int64_t> place((size_t)nl);
     {
@@ -2044,9 +2067,11 @@ static void scatter_protect_case(const Plugin& pl) {
             if (std::find(prot.begin(), prot.end(), e) == prot.end()) place[(size_t)e] = next++;
         for (int64_t p : prot) place[(size_t)p] = next++;
     }
-    for (const int64_t M : { 45, 300 }) {
+    {
         const int64_t NS = M * k;
-        const std::string at = " (" + std::to_string(NS) + " slots)";
+        const std::string at = " (" + std::to_string(NS) + " slots, slice " + std::to_string(nl) +
+                               (pf2 < 0 ? "" : pf2 ? ", R4D_MOE_PF2 on" : ", R4D_MOE_PF2 off") +
+                               ")";
         /* Each row's k distinct experts from the whole router, a quarter of them in this slice and
          * the protected ones over-represented so their runs are long. */
         std::vector<int32_t> ids((size_t)NS);
@@ -2092,7 +2117,17 @@ static void scatter_protect_case(const Plugin& pl) {
                                       T(d_of, RAD_I32, { nl + 1 }), T(d_cn, RAD_I32, { nl }) };
         std::vector<RadParam> ps = { PI("M", M), PI("n_expert", nl), PI("top_k", k),
                                      PI("expert_base", base), PS("protect", "0,17,101,253") };
+        if (pf2 >= 0) { pl.pin_pf2(pf2); pl.pf2_used(); }
         run_case(rs, ts, ps);
+        if (pf2 >= 0) {
+            /* Pinned on, the general form must have taken the parallel scan -- else the bytes
+             * below would be the default's against itself. The one-workgroup form takes nothing. */
+            const uint32_t u = pl.pf2_used();
+            pl.pin_pf2(-1);
+            const bool want = pf2 != 0 && NS > 1024;
+            ok(("moe_scatter took " + std::string(want ? "the R4D_MOE_PF2 scan" : "the default scan") +
+                at).c_str(), ((u & 8u) != 0) == want, "parts used " + std::to_string(u));
+        }
         std::vector<int32_t> got_s((size_t)NS), got_o((size_t)(nl + 1)), got_c((size_t)nl);
         st_memcpy(got_s.data(), d_so, (size_t)NS * 4, hipMemcpyDeviceToHost);
         st_memcpy(got_o.data(), d_of, (size_t)(nl + 1) * 4, hipMemcpyDeviceToHost);
@@ -2104,12 +2139,183 @@ static void scatter_protect_case(const Plugin& pl) {
                " live; sorted " + (got_s == want_s ? "ok" : "DIFFERS") + ", offsets " +
                (got_o == want_o ? "ok" : "DIFFER") + ", counts " + (got_c == want_c ? "ok" : "DIFFER"));
         /* A list that is not ascending, or reaches past the slice, is refused. */
-        for (const char* badp : { "17,0", "0,254" }) {
+        const std::string past = "0," + std::to_string(nl);
+        for (const char* badp : { "17,0", past.c_str() }) {
             std::vector<RadParam> pb = { PI("M", M), PI("n_expert", nl), PI("top_k", k),
                                          PI("expert_base", base), PS("protect", badp) };
             run_case(rs, ts, pb, RAD_E_SHAPE);
         }
     }
+}
+
+/* moe_gather AT A PREFILL CHUNK: R4D_MOE_PF2 against the form it replaces, byte for byte.
+ *
+ * Past the self-scan cap the op builds the slot inverse in scratch and sums each token's slots a
+ * column a thread. R4D_MOE_PF2 replaces that sum with a wave a token and sixteen bytes a lane (part
+ * 2) and takes the column groups last first (part 4). Each must write the default's bytes: with and
+ * without the shared arm folded in, under both gates, with dropped slots, at a width that ends
+ * inside a column group, and at Qwen3.8-Flash-Next's 2048-token chunk on a rank of four -- where the
+ * case also prints what each form costs. A decode step (under the cap), a top_k past the wide
+ * form's registers and a width it cannot take in sixteen-byte pieces keep the default form, and the
+ * case checks that they did. `wide` is whether the shape takes it. */
+struct MoeGatherShape { int64_t M, n, k; const char* act; bool wide; };
+
+static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGatherShape& sh) {
+    const int64_t M = sh.M, n = sh.n, k = sh.k, NS = M * k;
+    const bool shared = sh.act != nullptr;
+    const std::string at = " (M=" + std::to_string(M) + ", n=" + std::to_string(n) + ", top " +
+                           std::to_string(k) +
+                           (shared ? std::string(", shared arm, ") + sh.act : std::string()) + ")";
+    uint64_t rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)M * 1315423911ull) ^
+                  ((uint64_t)n * 2654435761ull) ^ (uint64_t)k;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    /* Each slot to one of 64 experts or, one in thirty-one, dropped; `sorted` is the stable sort by
+     * expert with the live slots first and -1 after them, as moe_scatter writes it. */
+    std::vector<int32_t> ex((size_t)NS), sorted((size_t)NS, -1);
+    for (int64_t i = 0; i < NS; ++i) {
+        const uint64_t v = rnd();
+        ex[(size_t)i] = (v % 31 == 0) ? -1 : (int32_t)((v >> 8) % 64);
+    }
+    {
+        int64_t pos = 0;
+        for (int32_t e = 0; e < 64; ++e)
+            for (int64_t i = 0; i < NS; ++i)
+                if (ex[(size_t)i] == e) sorted[(size_t)pos++] = (int32_t)i;
+    }
+    std::vector<uint16_t> ye((size_t)(NS * n)), ew((size_t)(M * k)), shv, sgv;
+    for (auto& v : ye) v = h_to_bf16((float)((int64_t)(rnd() % 4001) - 2000) / 512.0f);
+    for (auto& v : ew) v = h_to_bf16((float)(rnd() % 1000 + 1) / 1024.0f);
+    if (shared) {
+        shv.resize((size_t)(M * n));
+        sgv.resize((size_t)M);
+        for (auto& v : shv) v = h_to_bf16((float)((int64_t)(rnd() % 4001) - 2000) / 256.0f);
+        for (auto& v : sgv) v = h_to_bf16((float)((int64_t)(rnd() % 801) - 400) / 100.0f);
+    }
+    void* d_ye = dalloc(ye.size() * 2);
+    void* d_ew = dalloc(ew.size() * 2);
+    void* d_so = dalloc(sorted.size() * 4);
+    void* d_sh = shared ? dalloc(shv.size() * 2) : nullptr;
+    void* d_sg = shared ? dalloc(sgv.size() * 2) : nullptr;
+    void* d_y  = dalloc((size_t)(M * n * 2));
+    if (!d_ye || !d_ew || !d_so || !d_y || (shared && (!d_sh || !d_sg))) {
+        ok(("moe_gather R4D_MOE_PF2" + at).c_str(), false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_ye, ye.data(), ye.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_ew, ew.data(), ew.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_so, sorted.data(), sorted.size() * 4, hipMemcpyHostToDevice);
+    if (shared) {
+        st_memcpy(d_sh, shv.data(), shv.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_sg, sgv.data(), sgv.size() * 2, hipMemcpyHostToDevice);
+    }
+    std::vector<RadTensor> ts = { T(d_ye, RAD_BF16, { NS, n }), T(d_ew, RAD_BF16, { M, k }),
+                                  T(d_so, RAD_I32, { NS }),
+                                  T(d_sh, RAD_BF16, { M, n }), T(d_sg, RAD_BF16, { M, 1 }),
+                                  T(d_y, RAD_BF16, { M, n }) };
+    if (!shared) { absent(ts[3]); absent(ts[4]); }
+    std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("top_k", k) };
+    if (shared) ps.push_back(PS("act", sh.act));
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    a.world_size = 1;
+    const int64_t need = r->scratch ? r->scratch(&a) : 0;
+    if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+
+    /* One launch at a pin, over stale bytes, and the parts it took. */
+    auto run = [&](int pin, std::vector<uint16_t>& out, uint32_t* used) -> bool {
+        std::vector<uint16_t> junk((size_t)(M * n), 0x7f7fu);
+        st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
+        pl.pin_pf2(pin);
+        pl.pf2_used();
+        const int rc = r->launch(&a, nullptr);
+        const hipError_t he = (hipError_t)st_stream_sync(nullptr);
+        *used = pl.pf2_used();
+        pl.pin_pf2(-1);
+        if (rc != RAD_OK || he != hipSuccess) {
+            ok(("moe_gather R4D_MOE_PF2 pin " + std::to_string(pin) + at).c_str(), false,
+               "rc=" + std::to_string(rc) + " hip=" + hipGetErrorString(he));
+            return false;
+        }
+        out.resize((size_t)(M * n));
+        st_memcpy(out.data(), d_y, out.size() * 2, hipMemcpyDeviceToHost);
+        return true;
+    };
+    std::vector<uint16_t> base, got;
+    uint32_t used = 0;
+    if (!run(0, base, &used)) return;
+    ok(("moe_gather, R4D_MOE_PF2 off, takes no part of it" + at).c_str(), used == 0,
+       "parts used " + std::to_string(used));
+    struct Var { int pin; const char* name; uint32_t parts; };
+    static const Var kVar[] = {
+        { 2, "a wave a token",                            2u },
+        { 6, "a wave a token, column groups last first", 6u },
+        { 1, "every part",                               6u },
+    };
+    for (const Var& v : kVar) {
+        if (!run(v.pin, got, &used)) return;
+        int64_t diff = 0;
+        std::string first;
+        for (size_t i = 0; i < got.size(); ++i)
+            if (got[i] != base[i]) {
+                if (!diff)
+                    first = ", first at token " + std::to_string((int64_t)i / n) + " col " +
+                            std::to_string((int64_t)i % n);
+                ++diff;
+            }
+        const uint32_t want = sh.wide ? v.parts : 0u;
+        ok(("moe_gather R4D_MOE_PF2, " + std::string(v.name) +
+            (sh.wide ? "" : " (the default form, which this shape keeps)") + at).c_str(),
+           diff == 0 && (used & 6u) == want,
+           std::to_string(diff) + " of " + std::to_string(M * n) + " differ" + first +
+               "; parts used " + std::to_string(used) + ", expected " + std::to_string(want));
+    }
+
+    if (M >= 2048) {
+        hipEvent_t e0, e1;
+        st_ev_create(&e0);
+        st_ev_create(&e1);
+        auto time = [&](int pin) -> float {
+            const int it = 20;
+            pl.pin_pf2(pin);
+            for (int w = 0; w < 3; ++w) r->launch(&a, nullptr);
+            st_ev_record(e0, nullptr);
+            for (int i = 0; i < it; ++i) r->launch(&a, nullptr);
+            st_ev_record(e1, nullptr);
+            st_ev_sync(e1);
+            float ms = 0.0f;
+            st_ev_elapsed(&ms, e0, e1);
+            pl.pin_pf2(-1);
+            pl.pf2_used();
+            return ms * 1000.0f / (float)it;
+        };
+        const float t0 = time(0), t2 = time(2), t6 = time(6);
+        std::printf("      moe_gather at %lld routed rows x %lld: default %.1f us, a wave a token "
+                    "%.1f us, last first %.1f us a call, prepass included (the cache that last "
+                    "first is for needs the down projection in front, which this does not run)\n",
+                    (long long)NS, (long long)n, t0, t2, t6);
+        st_ev_destroy(e0);
+        st_ev_destroy(e1);
+    }
+}
+
+static void moe_gather_case(const Plugin& pl) {
+    if (!sel("moe_gather_bf16")) return;
+    const RadKernelInfo* r = find(pl, "moe_gather_bf16");
+    if (!r) { ok("moe_gather_bf16", false, "row absent"); return; }
+    if (!pl.pin_pf2 || !pl.pf2_used) { ok("moe_gather_bf16 R4D_MOE_PF2", false, "pin hooks absent"); return; }
+    static const MoeGatherShape kSh[] = {
+        {  600, 2560, 10, "sigmoid", true  },
+        {  600, 2560, 10, nullptr,   true  },
+        {   77,  520, 10, "none",    true  },
+        {  300,  264,  8, "sigmoid", true  },
+        {   40, 2560, 10, "sigmoid", false },   /* a decode step: the self-scan form */
+        {  100,  512, 20, "sigmoid", false },   /* top_k past the wide form's registers */
+        {  100,  260, 10, nullptr,   false },   /* a width sixteen-byte pieces do not tile */
+        { 2048, 2560, 10, "sigmoid", true  },   /* Qwen3.8-Flash-Next's chunk, timed */
+    };
+    for (const MoeGatherShape& sh : kSh) moe_gather_at(pl, r, sh);
 }
 
 static void rowtopk_shard_case(const Plugin& pl) {
@@ -6458,7 +6664,9 @@ static float st_e4m3(uint8_t b) {
  * along the weight rows and the output. One class shape is the plain grouped GEMM; two are a
  * rank's uneven slice of every expert, where the narrower class's gate/up pair writes zeros past
  * its part and its down projection reads a shorter K. */
-struct MoeW4Shape { const char* name; int64_t N0, K0, N1, K1, parts, ne; };
+/* `sorted_a`: the down projection's operand, one row a routed slot in sorted order (a_order
+ * sorted), where the others read the token rows (a_order token). */
+struct MoeW4Shape { const char* name; int64_t N0, K0, N1, K1, parts, ne; bool sorted_a = false; };
 
 /* THE DECODE FORM'S STAGED K, BOTH WAYS, byte for byte: one 128-wide K block a pass and two. Every
  * launch is DESCRIBED first: a pin that named the other's kernel would match it trivially, so two
@@ -6526,6 +6734,76 @@ static void moe_dec_variants(const Plugin& pl, const RadKernelInfo* row, RadArgs
     }
 }
 
+/* THE RUN-ALIGNED PREFILL FORM UNDER R4D_MOE_PF2, against the same form without it, byte for byte:
+ * the run map's prefix in parallel on every shape, and on the sorted operand -- one part, every
+ * class's width whole 256-column tiles -- the down projection's 256-column tile. Described first
+ * where the row can be: the map's kernel must differ from the default's, and the GEMM's must
+ * differ exactly where the wide tile applies, so the bytes below are not one kernel against itself;
+ * and the launch must report the parts it took. `base` is the form's own bytes, already held to the
+ * host decode by the form loop. */
+static void moe_pf2_aligned(const Plugin& pl, const RadKernelInfo* row, RadArgs& a, void* d_y,
+                            void* d_map, int64_t map_bytes, size_t elems,
+                            const std::vector<uint16_t>& base, bool dn_wide,
+                            const std::string& what) {
+    if (!pl.pin_pf2 || !pl.pf2_used || !pl.pin_moe || base.empty()) return;
+    const std::string label = what + " aligned prefill form, R4D_MOE_PF2" +
+                              (dn_wide ? " (and the 256-column down tile)" : "");
+    void* const sc0 = a.scratch;
+    const int64_t sb0 = a.scratch_bytes;
+    a.scratch = d_map;
+    a.scratch_bytes = map_bytes;
+    auto restore = [&] {
+        pl.pin_pf2(-1);
+        pl.pf2_used();
+        pl.pin_moe(0);
+        a.scratch = sc0;
+        a.scratch_bytes = sb0;
+    };
+    pl.pin_moe(1);
+    if (row->describe) {
+        static RadLaunchDesc d0[4], d1[4];
+        int n0 = 0, n1 = 0;
+        pl.pin_pf2(0);
+        const int c0 = row->describe(&a, nullptr, d0, 4, &n0);
+        pl.pin_pf2(1);
+        const int c1 = row->describe(&a, nullptr, d1, 4, &n1);
+        if (c0 != RAD_OK || c1 != RAD_OK || n0 != 2 || n1 != 2) {
+            restore();
+            ok(label.c_str(), false, "describe rc " + std::to_string(c0) + "/" + std::to_string(c1) +
+                                     ", launches " + std::to_string(n0) + "/" + std::to_string(n1));
+            return;
+        }
+        if (d0[0].func == d1[0].func || (d0[1].func != d1[1].func) != dn_wide) {
+            restore();
+            ok(label.c_str(), false, std::string("described kernels: the map's ") +
+                                     (d0[0].func == d1[0].func ? "is the default's" : "differs") +
+                                     ", the GEMM's " +
+                                     (d0[1].func == d1[1].func ? "is the default's" : "differs"));
+            return;
+        }
+    }
+    {
+        std::vector<uint16_t> junk(elems, 0x7f7fu);
+        st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
+    }
+    pl.pin_pf2(1);
+    pl.pf2_used();
+    const int rc = row->launch(&a, nullptr);
+    st_stream_sync(nullptr);
+    const uint32_t used = pl.pf2_used();
+    restore();
+    if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); return; }
+    std::vector<uint16_t> got(elems);
+    st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
+    int64_t diff = 0;
+    for (size_t i = 0; i < elems; ++i) diff += got[i] != base[i];
+    const uint32_t want = 16u | (dn_wide ? 32u : 0u);
+    ok(label.c_str(), diff == 0 && (used & 48u) == want,
+       std::to_string(diff) + " of " + std::to_string(elems) +
+           " elements differ from the form without it; parts used " + std::to_string(used) +
+           ", expected " + std::to_string(want));
+}
+
 /* EVERY FORM THE LAUNCHER HAS, each against the host decode: the run-aligned prefill form (a run
  * map in the scratch it is handed), the (tile, run) decode form, and the uniform prefill grid a
  * caller with no scratch gets. The rule picks one by the routed-row count, so a case that only
@@ -6556,7 +6834,8 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     const int64_t Nc[2] = { sh.N0, sh.N1 }, Kc[2] = { sh.K0, sh.K1 };
     const int64_t nec[2] = { (ne + 1) / 2, ne / 2 };
     const int64_t N = std::max(sh.N0, sh.N1), K = std::max(sh.K0, sh.K1);
-    const int64_t kb = K / group, M = Tr / top_k;
+    const int64_t kb = K / group, M = sh.sorted_a ? Tr : Tr / top_k;
+    const char* aord = sh.sorted_a ? "sorted" : "token";
     const int64_t fy = N / sh.parts;
     std::vector<RadParam> lp = { PI("N", sh.N0), PI("K", sh.K0), PI("N_odd", sh.N1),
                                  PI("K_odd", sh.K1), PI("group", group), PS("dtype", dt) };
@@ -6665,7 +6944,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     std::vector<RadParam> ps = {
         PI("M", M), PI("N", sh.N0), PI("K", sh.K0), PI("N_odd", sh.N1), PI("K_odd", sh.K1),
         PI("parts", sh.parts), PI("n_expert", ne), PI("top_k", top_k), PI("group", group),
-        PS("a_order", "token"), PS("dtype", dt),
+        PS("a_order", aord), PS("dtype", dt),
     };
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
@@ -6688,7 +6967,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
             double want = 0.0;
             const int64_t pp = n / fy, j = n - pp * fy;
             if (f >= 0 && i < live && j < fc) {
-                const int64_t tok = f / top_k, wr = pp * fc + j;
+                const int64_t tok = sh.sorted_a ? i : f / top_k, wr = pp * fc + j;
                 for (int64_t g = 0; g < kbc; ++g) {
                     if (g64) {
                         /* `sub` scale groups a 128, each an E4M3 byte under the fixed constant. */
@@ -6778,8 +7057,13 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
            diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
                       " elements differ");
     }
-    /* The decode form's staged K both ways, where this shape can take two blocks a pass. */
-    const bool fk2 = g64 && sh.K0 % 256 == 0 && sh.K1 % 256 == 0;
+    /* The aligned form under R4D_MOE_PF2: the parallel map prefix always, the 256-column down
+     * tile where the sorted operand's every class is whole tiles of it. */
+    const bool dn_wide = sh.sorted_a && sh.parts == 1 && sh.N0 % 256 == 0 && sh.N1 % 256 == 0;
+    moe_pf2_aligned(pl, r, a, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1], dn_wide, what);
+    /* The decode form's staged K both ways, where this shape can take two blocks a pass --
+     * never on the sorted operand, which the rule keeps at one. */
+    const bool fk2 = !sh.sorted_a && g64 && sh.K0 % 256 == 0 && sh.K1 % 256 == 0;
     moe_dec_variants(pl, r, a, d_y, (size_t)(Tr * N), fk2, what);
     if (!four) return;
 
@@ -6817,7 +7101,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
         PI("M", M), PI("N", sh.N0), PI("K", sh.K0), PI("N_1", sh.N1), PI("K_1", sh.K1),
         PI("N_2", sh.N0), PI("K_2", sh.K0), PI("N_3", sh.N1), PI("K_3", sh.K1),
         PI("parts", sh.parts), PI("n_expert", ne), PI("top_k", top_k), PI("group", group),
-        PS("a_order", "token"), PS("dtype", dt),
+        PS("a_order", aord), PS("dtype", dt),
     };
     RadArgs a4;
     std::memset(&a4, 0, sizeof(a4));
@@ -6844,6 +7128,8 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
         ok(label.c_str(), diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
                                      " elements differ from the two-class op's");
     }
+    moe_pf2_aligned(pl, r4, a4, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1], dn_wide,
+                    what4);
     moe_dec_variants(pl, r4, a4, d_y, (size_t)(Tr * N), fk2, what4);
 }
 
@@ -10951,6 +11237,7 @@ static void device_phase(const Plugin& pl) {
         topk_scatter_case(pl);
         router_gemm_fused_case(pl);
         scatter_protect_case(pl);
+        moe_gather_case(pl);
         if (sel("rowtopk_bf16")) {
             const RadKernelInfo* r = find(pl, "rowtopk_bf16");
             if (!r) ok("rowtopk_bf16", false, "row absent");
@@ -11044,6 +11331,10 @@ static void device_phase(const Plugin& pl) {
              * search hands every wider expert count to. Runs land on experts on both sides of
              * 512, and K 256 lets the two-block pass run on that search as well. */
             { "640 experts, gate/up 2:1, K 256", 256, 256, 128, 256, 2, 640 },
+            /* The down projection as a rank of four runs it: the sorted operand, one part, the
+             * classes at 256 and 128 of K -- and a width of whole 256-column tiles, which is what
+             * R4D_MOE_PF2's wide down tile takes. */
+            { "down, sorted rows, 512 x K 256:128", 512, 256, 512, 128, 1, 10, true },
         };
         for (const MoeW4Shape& sh : kShapes) {
             moe_w4_gemm(pl, 24, sh);
@@ -11069,6 +11360,8 @@ static void device_phase(const Plugin& pl) {
             { "300 experts, gate/up 2:1", 256, 128, 128, 128, 2, 300 },
             { "40 experts, gate/up 2:1, K 768", 256, 768, 128, 768, 2, 40 },
             { "640 experts, gate/up 2:1, K 256", 256, 256, 128, 256, 2, 640 },
+            { "down, sorted rows, 512 x K 256:128", 512, 256, 512, 128, 1, 10, true },
+            { "40 experts, down, sorted rows, 256 x K 128", 256, 128, 256, 128, 1, 40, true },
         };
         for (const MoeW4Shape& sh : kShapes4)
             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 }) {

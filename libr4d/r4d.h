@@ -652,6 +652,14 @@ void r4d_moe_gemm_pin_prefill(int form);
 // every class's K a multiple of 256, a format that folds scale groups). The two are bit-identical,
 // and r4d_selftest compares their bytes.
 void r4d_moe_gemm_pin_fk(int pin);
+// THE PREFILL MoE FORMS (R4D_MOE_PF2), pinned for a test: below zero the switch's rule, otherwise
+// the value the switch would hold -- 0 none, 1 every part, else a mask of the parts (r4d_moe.hip
+// lists them). Every part is bit-identical to the form it replaces, and r4d_selftest compares their
+// bytes: moe_gather and moe_scatter at a prefill chunk, and the GEMM's run-aligned form.
+void r4d_moe_pf2_pin(int pin);
+// The parts the launches since the last call took, under a pin, as R4D_MOE_PF2's mask; cleared by
+// the call. A test reads it to know a part's kernel ran rather than the default's.
+uint32_t r4d_moe_pf2_used(void);
 // THE GATED RESIDUAL READ'S PREFILL TILE, pinned for a test: 0 is the launcher's rule, 1 the decode
 // tiles' kernels at 128 rows (hc_down_tiled, then hc_up_tiled into `ubuf` and hc_mix), 2 the wide
 // kernels (which then refuse a shape they are not built for), 3 the PF2 kernels the rule takes from
