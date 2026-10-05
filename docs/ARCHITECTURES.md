@@ -328,10 +328,14 @@ resolves to, not the same kernel over fewer heads. Any world size above the KV h
 multiple of it: 4 is a multiple of 2, 3 and 5 are not, and those widths are refused at declare
 time.
 
-**The fused all-reduce forms are two-rank.** At four ranks nothing fuses: the hyper-connection pair
-runs the standalone sequence — `all_reduce` (libr4d's 4-rank oneshot/twoshot), then
-`hc_write_bf16`, then `moe_gather` — 2 to 3 extra launches per pair against the two-rank fused
-form. The unfused sequence is declared beside the probe, so nothing is unresolved at boot. The
+**The fused all-reduce forms are two-rank, except the exact write.** At four ranks `ar_hc_write`
+exists on the exact wire only (`ar_hc_write_4rank`, the 4-rank one-shot with the write as its
+epilogue, on the plain all-reduce's buffers). A step takes it where the standalone `all_reduce`
+would have been the exact one-shot: under 1 MiB, and with `--tp-wire wht6` also under
+`--tp-wire-min-kb`. Larger messages, and every lossy one, keep the standalone sequence —
+`all_reduce` (4-rank two-shot or ti8), then `hc_write_bf16`. There is no four-rank
+`ar_gather_hc_write`, so `moe_gather` stays a launch of its own. The unfused sequence is declared
+beside the fused one, so nothing is unresolved at boot. The
 attention's own fusion is not a collective and does carry over: the sparse decode with the output
 gate and the quantiser in its merge (`attn_paged_gate_quant`) has gqa-6, page-4 rows. The per-step cost against tp2 on the
 same cards is unmeasured.

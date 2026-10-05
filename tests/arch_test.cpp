@@ -1853,10 +1853,11 @@ TEST(a_sizing_declare_leaves_the_step_state_alone_and_shrinks_only_rows) {
  *     bf16 expert, leaving an odd count of quantised ones, and the grouped GEMM takes its experts as
  *     two EQUAL tables by parity. The recipe protects experts in pairs for exactly that reason.
  *   - the FUSED all-reduces are world-2 kernels (`ar_wire_is_exact` and `ar_fused_ok` both return
- *     false off two, and `HyperConn` declares `ar_hc_write` only at world 2), so at four the chain
- *     is unfused: a standalone `all_reduce` where the collective happens. The contrast with world 2
- *     in the same test is the contract -- it fails loudly if a fused declare is ever gated on the
- *     wrong condition.
+ *     false off two), with one exception: `ar_hc_write` also exists at four, on the exact wire only
+ *     (no `wire` key, never the rotated form) and with no gather in front of it. Every block still
+ *     declares its standalone `all_reduce`, which serves the steps the fused write declines. The
+ *     contrast with world 2 in the same test is the contract -- it fails loudly if a fused declare
+ *     is ever gated on the wrong condition.
  *
  * Every expected number is derived from the meta this file builds (n_head 24, n_head_kv 2, head_dim
  * 256, num_experts 512), so the fixture and the assertions cannot drift apart. Where a number is
@@ -1983,11 +1984,16 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
         CHECK_EQ(pint(gu, "N_odd"), 2 * (cls_hi[r][1] - cls_lo[r][1]));
         CHECK_EQ(pint(gu, "n_expert"), ne_all);
 
-        /* (4) THE UNFUSED CHAIN: a standalone collective per reduction, and none of the three
-         * fused world-2 forms. */
+        /* (4) A standalone collective per reduction, the exact four-rank ar_hc_write beside it,
+         * and neither of the other two fused forms. */
         CHECK(count_op(b[r], "all_reduce") > 0);
         CHECK_EQ(pint(find_op(b[r], "all_reduce"), "world_size"), world);
-        CHECK_EQ(count_op(b[r], "ar_hc_write"), 0);
+        CHECK(count_op(b[r], "ar_hc_write") > 0);
+        for (const RecOp& o : b[r].ops) {
+            if (o.op != "ar_hc_write") continue;
+            CHECK_EQ(pint(&o, "world_size"), world);
+            CHECK(param(&o, "wire") == nullptr);           /* exact only */
+        }
         CHECK_EQ(count_op(b[r], "ar_gather_hc_write"), 0);
         CHECK_EQ(count_op(b[r], "ar_rmsnorm_quant_fp8"), 0);
     }
@@ -2067,6 +2073,41 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
              * sizes -- asserted so, rather than claimed as part of the contrast. */
             CHECK_EQ(count_op(h[r], "ar_rmsnorm_quant_fp8"), 0);
         }
+    }
+
+    /* THE FOUR-RANK FUSED WRITE'S STEPS: exactly those the standalone collective would have served
+     * as the exact one-shot -- under 1 MiB, and on the lossy wire also under its floor (or off its
+     * 128-element tile). The block in front and the write ask the same predicate. At two ranks it
+     * is ar_wire_is_exact unchanged, and ar_wire_is_exact itself stays false at four. */
+    {
+        rad::arch::Geom g4{};
+        g4.world = 4; g4.n_embd = 2560; g4.wire_exact = 1; g4.wire_min_bytes = 128 * 1024;
+        CHECK(rad::arch::ar_exact_write_takes(g4, 8));      /* a decode step, 40 KiB */
+        CHECK(rad::arch::ar_exact_write_takes(g4, 204));    /* 1020 KiB */
+        CHECK(!rad::arch::ar_exact_write_takes(g4, 205));   /* 1025 KiB: the two-shot's */
+        CHECK(!rad::arch::ar_wire_is_exact(g4, 8));
+        g4.wire_exact = 0;
+        CHECK(rad::arch::ar_exact_write_takes(g4, 25));     /* 125 KiB, under the floor */
+        CHECK(!rad::arch::ar_exact_write_takes(g4, 26));    /* 130 KiB, the ti8 wire's */
+        rad::arch::Geom g2 = g4;
+        g2.world = 2;
+        for (int64_t T : { 1, 8, 25, 26, 205, 4096 })
+            CHECK(rad::arch::ar_exact_write_takes(g2, T) == rad::arch::ar_wire_is_exact(g2, T));
+    }
+    /* ...and the lossy wire at four declares no rotated write and no gather form. */
+    {
+        RadBuilder b4;
+        RadBuildCtx c4 = build_ctx(0, world);
+        c4.max_tok = 2048; c4.max_seqs = 8; c4.max_spec = 3; c4.max_ctx = 200000;
+        c4.tp_wire_lossy = 1;
+        c4.tp_wire_min_bytes = 128 * 1024;
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b4, &meta, &c4), RAD_OK);
+        CHECK(count_op(b4, "ar_hc_write") > 0);
+        for (const RecOp& o : b4.ops) {
+            if (o.op != "ar_hc_write") continue;
+            CHECK(param(&o, "wire") == nullptr);
+        }
+        CHECK_EQ(count_op(b4, "ar_gather_hc_write"), 0);
     }
 
     /* A WORLD THAT CANNOT REPLICATE -- not a multiple of the KV head count -- is refused by name,

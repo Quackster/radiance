@@ -340,6 +340,16 @@ void r4d_ar_oneshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long my_flags, long seq_ctrs, long slot_stride16, long inp,
                                 long out, long n_elem, long dtype, long rank, long stream,
                                 long nblocks, long nthreads, long drain, long acq, long pub);
+// r4d_ar_hc_write at four ranks: the 4-rank exact one-shot of `y` [M][n] bf16, in place, with
+// hc_write as its epilogue -- byte-identical to that all-reduce then hc_write. Same buffer trio,
+// peer order, flag values and slots as r4d_ar_oneshot_4rank_exact, so the two (and the two-shots)
+// may share one instance. `irow`/`hrow` as r4d_ar_hc_write's; y is tight.
+void r4d_ar_hc_write_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                           long peer_flags0, long peer_flags1, long peer_flags2,
+                           long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+                           long y, long inj, long h, long M, long n, long hc, long irow,
+                           long hrow, long rank, long stream, long nblocks, long nthreads,
+                           long drain, long acq, long pub);
 void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers);
 
 // ---- all-reduce: two-shot, 4 or 8 ranks over P2P -------------------------------------------

@@ -381,15 +381,7 @@ extern "C" int r4d_rad_ar_init(const RadParam* p, int n_p, int rank, int world,
 
 /* The fused all-reduce + norm declares `M`(range) and `n` rather than `numel`: its message is the
  * post-projection activation. Same world, same buffers, different arithmetic to get the bound. */
-extern "C" int r4d_rad_ar_ln_init(const RadParam* p, int n_p, int rank, int world,
-                                  void** out) {
-    if (!out) return RAD_E_INVAL;
-    *out = nullptr;
-
-    const long long ws_param = pgeti_hi(p, n_p, "world_size", world);
-    if (ws_param != world) return RAD_E_SHAPE;
-    if (world != 2) return RAD_E_SHAPE;   /* the handshake is one peer flag per block */
-
+static int ar_mn_acquire(const RadParam* p, int n_p, int rank, int world, void** out) {
     const long long M = pgeti_hi(p, n_p, "M", 0);
     const long long K = pgeti_hi(p, n_p, "n", 0);
     if (M <= 0 || K <= 0) return RAD_E_INVAL;
@@ -399,6 +391,36 @@ extern "C" int r4d_rad_ar_ln_init(const RadParam* p, int n_p, int rank, int worl
     if (rc != RAD_OK) return rc;
     *out = in;
     return RAD_OK;
+}
+
+extern "C" int r4d_rad_ar_ln_init(const RadParam* p, int n_p, int rank, int world,
+                                  void** out) {
+    if (!out) return RAD_E_INVAL;
+    *out = nullptr;
+
+    const long long ws_param = pgeti_hi(p, n_p, "world_size", world);
+    if (ws_param != world) return RAD_E_SHAPE;
+    if (world != 2) return RAD_E_SHAPE;   /* the handshake is one peer flag per block */
+
+    return ar_mn_acquire(p, n_p, rank, world, out);
+}
+
+/* The four-rank ar_hc_write. Its key is the one the plain all_reduce at the same call site builds
+ * -- {rank, 4, bf16, M_hi * n}, and the blocks declare that all_reduce's numel up to max_tok * n --
+ * so the fused write and the standalone collective it stands in for run on the SAME scratch, flags
+ * and counters, and a step that takes either one keeps a single launch sequence on that set.
+ * Exact wire only: a declared `wire` 6 is refused here, at declare, rather than at the first step. */
+extern "C" int r4d_rad_ar_hc_wide_init(const RadParam* p, int n_p, int rank, int world,
+                                       void** out) {
+    if (!out) return RAD_E_INVAL;
+    *out = nullptr;
+
+    const long long ws_param = pgeti_hi(p, n_p, "world_size", world);
+    if (ws_param != world) return RAD_E_SHAPE;
+    if (world != 4) return RAD_E_SHAPE;   /* the peer bundle is compiled for four */
+    if (pgeti_hi(p, n_p, "wire", 0) != 0) return RAD_E_UNSUPPORTED;
+
+    return ar_mn_acquire(p, n_p, rank, world, out);
 }
 
 extern "C" void r4d_rad_ar_fini(void* instance) {
@@ -1187,12 +1209,16 @@ extern "C" int64_t r4d_rad_ar_gather_hc_write_scratch(const RadArgs* a) {
     return M > 0 && k > 0 ? M * k * (int64_t)sizeof(int) : 0;
 }
 
-extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
-    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
-    if (!in) return RAD_E_STATE;
-    if (in->world != 2) return RAD_E_SHAPE;
-    if (in->dtype != 0) return RAD_E_DTYPE;
+/* The operand and shape rules ar_hc_write states at every width. */
+struct HcWriteArgs {
+    const RadTensor* y = nullptr;
+    const RadTensor* inj = nullptr;
+    const RadTensor* h = nullptr;
+    long long M = 0, n = 0, hc = 0, irow = 0, hrow = 0;
+    int wire = 0;
+};
 
+static int ar_hc_write_args(const RadArgs* a, const ArInst* in, HcWriteArgs* o) {
     const RadTensor* y   = r4d_opt(a, AH_Y);
     const RadTensor* inj = r4d_opt(a, AH_INJ);
     const RadTensor* h   = r4d_opt(a, AH_H);
@@ -1213,6 +1239,27 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
 
     const int wire = (int)r4d_geti_or(a, "wire", 0);
     if (wire != 0 && wire != 6) return RAD_E_INVAL;
+
+    o->y = y; o->inj = inj; o->h = h;
+    o->M = M; o->n = n; o->hc = hc; o->irow = irow; o->hrow = hrow;
+    o->wire = wire;
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 2) return RAD_E_SHAPE;
+    if (in->dtype != 0) return RAD_E_DTYPE;
+
+    HcWriteArgs w;
+    const int arc = ar_hc_write_args(a, in, &w);
+    if (arc != RAD_OK) return arc;
+    const RadTensor* const y = w.y;
+    const RadTensor* const inj = w.inj;
+    const RadTensor* const h = w.h;
+    const long long M = w.M, n = w.n, hc = w.hc, irow = w.irow, hrow = w.hrow;
+    const int wire = w.wire;
 
     R4dArCfg cfgv;
     r4d_cfg_ar(a, &cfgv);
@@ -1237,5 +1284,43 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
                         in->my_seq, in->slot16, r4d_addr(y), r4d_addr(inj), r4d_addr(h),
                         (long)M, (long)n, (long)hc, (long)irow, (long)hrow, (long)(uintptr_t)s,
                         nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq));
+    return RAD_OK;
+}
+
+/* AT FOUR RANKS, EXACT WIRE ONLY: the wide one-shot with the write as its epilogue. The four-rank
+ * lossy wire is the ti8 two-shot and has no fused form, so a `wire` 6 is refused (init already
+ * refuses to build it). The architecture issues this only for a message the standalone row would
+ * have served with the exact one-shot (ar_wide_write_exact, arch/common/rad_fp8.h); larger exact
+ * messages are still served correctly here, as a one-shot, which the standalone entry would have
+ * replaced by the two-shot above R4D_AR_EXACT_TWOSHOT_MIN_BYTES -- same bytes, more traffic.
+ *
+ * The block count is the plain one-shot's rule (ar_setup's nb_for over the whole message under
+ * nb_cap); a block's words, flags and slot are the one-shot's, which is what lets the two share an
+ * instance. */
+extern "C" int r4d_rad_ar_hc_write_4rank(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 4) return RAD_E_SHAPE;
+    if (in->dtype != 0) return RAD_E_DTYPE;
+
+    HcWriteArgs w;
+    const int arc = ar_hc_write_args(a, in, &w);
+    if (arc != RAD_OK) return arc;
+    if (w.wire != 0) return RAD_E_UNSUPPORTED;
+
+    R4dArCfg cfgv;
+    r4d_cfg_ar(a, &cfgv);
+    const long words16 = (long)(w.M * w.n * 2 / 16);
+    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, in->nb_cap);
+    if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+
+    R4D_TRY("ar_hc_write_4rank",
+        r4d_ar_hc_write_4rank(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                              in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                              in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                              r4d_addr(w.y), r4d_addr(w.inj), r4d_addr(w.h),
+                              (long)w.M, (long)w.n, (long)w.hc, (long)w.irow, (long)w.hrow,
+                              (long)in->rank, (long)(uintptr_t)s, nblocks, cfgv.nthreads,
+                              cfgv.drain, cfgv.acq, cfgv.pub));
     return RAD_OK;
 }

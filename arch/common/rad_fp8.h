@@ -324,13 +324,50 @@ inline bool ar_fused_ok(const Geom& g, int64_t T) {
     return ar_wire_is_exact(g, T) || (g.n_embd % kArWire6Chunk) == 0;
 }
 
+/* THE FOUR-RANK FUSED WRITE'S STEPS. At four ranks ar_hc_write exists on the exact wire only, and
+ * it is the exact ONE-SHOT with the write behind it -- so it may take a message only where the
+ * standalone `all_reduce` would have sent that message exact and as a one-shot:
+ *
+ *   exact     --tp-wire exact, or a message the four-rank lossy row serves exactly itself: its
+ *             tiered-int8 groups of 32 must tile each of the four shards (numel % 128), and below
+ *             `min_bytes` it hands the message to the exact entry. ar_wire_is_exact's three facts,
+ *             with that wire's tile.
+ *   one-shot  under 1 MiB. From there libr4d's exact entry runs the two-shot instead
+ *             (R4D_AR_EXACT_TWOSHOT_MIN_BYTES, r4d_ar_entry.hip), which moves half the bytes, so
+ *             the pair stays. Either way the bytes are the same; this bound is a cost, not a
+ *             correctness line.
+ *
+ * ar_wire_is_exact itself stays false off two ranks: the embedding's collective asks it whether
+ * layer 0's fused norm absorbs that reduction, and at four no norm does. Both ranks evaluate this
+ * on the same T, so neither can take a different branch. */
+static const int64_t kArWideWireTile     = 128;
+static const int64_t kArWideOneshotBytes = 1024 * 1024;
+
+inline bool ar_wide_write_exact(const Geom& g, int64_t T) {
+    if (g.world != 4) return false;
+    const int64_t numel = T * g.n_embd;
+    const int64_t bytes = numel * 2;                      /* bf16 on the wire */
+    if (numel <= 0 || bytes >= kArWideOneshotBytes) return false;
+    if (g.wire_exact) return true;
+    if (numel % kArWideWireTile) return true;
+    return bytes < g.wire_min_bytes;
+}
+
+/* WHETHER A GATED RESIDUAL'S EXACT FUSED WRITE TAKES THE ALL-REDUCE AT T ROWS: at two ranks on every
+ * step whose wire is exact, at four where ar_wide_write_exact says so. The write
+ * (HyperConn::ar_write) and the block in front (ar_taken with kArOutExact) both ask exactly this. */
+inline bool ar_exact_write_takes(const Geom& g, int64_t T) {
+    return g.world == 2 ? ar_wire_is_exact(g, T) : ar_wide_write_exact(g, T);
+}
+
 /* WHICH WIRES THE CONSUMER OF A BLOCK'S ALL-REDUCE TAKES. A block is declared without knowing what
  * follows it, so the architecture tells it:
  *
  *   kArOutNorm   the next block's norm, which takes either wire it has a fused form for
  *                (ar_fused_ok);
  *   kArOutExact  a gated residual's write with the exact fused form only, so a message that would
- *                go out compressed stays with the block;
+ *                go out compressed stays with the block (ar_exact_write_takes -- at four ranks
+ *                also one the standalone row would send as a two-shot);
  *   kArOutBoth   a gated residual's write with a fused form on each wire, which takes every
  *                message (HyperConn::ar_take). */
 enum ArOut : int {
@@ -344,7 +381,7 @@ enum ArOut : int {
 inline bool ar_taken(const Geom& g, int64_t T, bool out, int take) {
     if (!out) return false;
     if (take == kArOutBoth)  return true;
-    if (take == kArOutExact) return ar_wire_is_exact(g, T);
+    if (take == kArOutExact) return ar_exact_write_takes(g, T);
     return ar_fused_ok(g, T);
 }
 

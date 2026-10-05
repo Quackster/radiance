@@ -2105,8 +2105,8 @@ static const RadOpSchema kSchemas[] = {
            "the two-rank all-reduce and the residual add, RMS norm and block-scaled fp8 "
            "quantisation that always follow it, in one kernel. Both wires."),
     SCHEMA("ar_hc_write", pArHcWrite, oArHcWrite,
-           "the two-rank all-reduce and the gated residual's write that follows it, in one "
-           "kernel. Both wires."),
+           "the all-reduce and the gated residual's write that follows it, in one kernel. Both "
+           "wires at two ranks, the exact one at four."),
     SCHEMA("ar_gather_hc_write", pArGatherHcWrite, oArGatherHcWrite,
            "moe_gather, then ar_hc_write, in one kernel: the routed experts' rows summed back to "
            "token order (with the shared arm folded when present) ARE the all-reduce's message, "
@@ -2668,6 +2668,14 @@ static const RadConstraint cArRmsNormQuantFp8[] = {
 static const RadConstraint cArHcWrite[] = {
     C_GE("M", 1), C_DIV("n", 8), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
     C_EQ("world_size", 2),
+    C_P2P,
+};
+/* The same bounds at four ranks, where the handshake is the wide family's (r4d_ar_wide.h). Exact
+ * wire only, and that cannot be a constraint here: the exact op declares no `wire` and an absent
+ * key fails a constraint, so the init and the entry refuse wire 6 instead. */
+static const RadConstraint cArHcWrite4[] = {
+    C_GE("M", 1), C_DIV("n", 8), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
+    C_EQ("world_size", 4),
     C_P2P,
 };
 /* ar_hc_write's bounds and the gather's: top_k up to the 64 slots a row's table holds in LDS. */
@@ -4696,6 +4704,21 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cArHcWrite), ROW(tAr), nullptr,
   r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_hc_write, nullptr, nullptr, nullptr,
+  r4d_shape_ar_hc_write },
+
+{ "ar_hc_write_4rank", "ar_hc_write", "norm",
+  "the four-rank exact all-reduce and the gated residual's write that follows it, in one kernel: "
+  "h[s] += inj[s] * y over the reduced y",
+  "exactly 4 ranks, all peer-accessible; exact wire only; n a multiple of 8 and y unpitched, "
+  "because y is the message and a block pushes it as 16B words; the stream pitch a multiple of 8; "
+  "hc 2..8; the wide one-shot's handshake, slots and block partition, on the plain four-rank "
+  "all-reduce's instance; cudagraph-safe",
+  "bf16 throughout; the sum in fp32 in ascending rank order and rounded to bf16 exactly as the "
+  "four-rank exact all-reduce stores it, and the write in hc_write's arithmetic over that bf16 "
+  "value -- byte-identical to the pair it replaces",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cArHcWrite4), ROW(tAr), nullptr,
+  r4d_rad_ar_hc_wide_init, r4d_rad_ar_fini, r4d_rad_ar_hc_write_4rank, nullptr, nullptr, nullptr,
   r4d_shape_ar_hc_write },
 
 { "ar_gather_hc_write", "ar_gather_hc_write", "norm",

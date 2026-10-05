@@ -751,7 +751,8 @@ and the input, and the reduced sum lands in it.
 `ar_hc_write` is `all_reduce` of `y` followed by `hc_write` of the reduced `y`, for a block whose
 output feeds a gated residual rather than a norm. `y` is INOUT for the same reason `x` is above.
 It serves both wires, one op a wire: a caller declares the rotated form beside the exact one and
-issues whichever the step's message goes out on, and a `wire` of 6 is 6 at every size.
+issues whichever the step's message goes out on, and a `wire` of 6 is 6 at every size. At four
+ranks only the exact form exists.
 
 `ar_gather_hc_write` is `moe_gather` followed by `ar_hc_write`: the gather's output IS the
 message, so `y` is written by the gather half before it is reduced in place, and the five gather

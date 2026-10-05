@@ -156,9 +156,10 @@ struct HyperConn {
 
     int64_t hn() const { return c.hc * g.n_embd; }
     /* THE REDUCING WRITE THIS STEP ISSUES, on the wire its message goes out on; 0 where that wire
-     * has no fused form, and the block's own collective then runs in front of the plain write. */
+     * has no fused form, and the block's own collective then runs in front of the plain write. At
+     * four ranks there is no rotated form, so a step ar_exact_write_takes declines gets 0. */
     rad_op ar_write(int64_t T) const {
-        return ar_wire_is_exact(g, T) ? op_ar_write : op_ar_write6;
+        return ar_exact_write_takes(g, T) ? op_ar_write : op_ar_write6;
     }
     /* WHETHER THIS STEP'S WRITE REDUCES THE BLOCK'S OUTPUT. The block in front asks the same
      * question of the same T -- ar_taken with ar_take() -- before skipping its own collective. */
@@ -293,15 +294,17 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
                      {w.x.x, w.inj, w.h}, {w.h});
         if (!op_write) return RAD_E_INVAL;
         /* A handle that did not resolve is 0 and not an error: a backend without the fused kernel
-         * keeps the pair, and takes_ar() then answers no on every step. */
-        if (c.reduce && g.world == 2)
+         * keeps the pair, and takes_ar() then answers no on every step. At four ranks only the
+         * exact form exists, and it takes a step only where ar_wide_write_exact says the
+         * standalone collective would have been the exact one-shot. */
+        if (c.reduce && (g.world == 2 || g.world == 4))
             op_ar_write = rw(b, RAD_OP(b, "ar_hc_write",
                                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                            RAD_INT("hc", c.hc), RAD_INT("world_size", g.world),
                                            RAD_STR("dtype", g.dtype)),
                                 RAD_NOWEIGHTS),
                              {w.x.x, w.inj, w.h}, {w.x.x, w.h});
-        if (op_ar_write && !g.wire_exact)
+        if (op_ar_write && !g.wire_exact && g.world == 2)
             op_ar_write6 = rw(b, RAD_OP(b, "ar_hc_write",
                                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                             RAD_INT("hc", c.hc), RAD_INT("world_size", g.world),
@@ -314,6 +317,9 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
 
 inline int HyperConn::declare_gather(RadBuilder* b, const GatherSrc& src) {
     if (!op_ar_write || src.top_k <= 0 || !src.ye || !src.ew || !src.sorted) return RAD_OK;
+    /* Two ranks only: there is no four-rank gather form yet, so there the block keeps its gather
+     * and this write takes the reduction alone (both bounds stay 0). */
+    if (g.world != 2) return RAD_OK;
     const bool shared = src.sh && src.sg;
     gsrc = src;
     /* EVERY ROW COUNT ONE PASS CARRIES, prefill chunks included: the kernel reads its slots from

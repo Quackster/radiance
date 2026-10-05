@@ -184,6 +184,9 @@ int  r4d_rad_ar_ln_init(const RadParam*, int, int rank, int world, void** out);
 int  r4d_rad_ar_ln_had_quant_i8(const RadArgs*, RadStream);
 int  r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs*, RadStream);
 int  r4d_rad_ar_hc_write(const RadArgs*, RadStream);
+/* ar_hc_write at four ranks, exact wire only, on the plain four-rank all-reduce's instance. */
+int  r4d_rad_ar_hc_wide_init(const RadParam*, int, int rank, int world, void** out);
+int  r4d_rad_ar_hc_write_4rank(const RadArgs*, RadStream);
 int  r4d_rad_ar_gather_hc_write(const RadArgs*, RadStream);
 int64_t r4d_rad_ar_gather_hc_write_scratch(const RadArgs*);
 

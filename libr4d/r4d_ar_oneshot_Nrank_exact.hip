@@ -9,9 +9,13 @@
 // Sends (ws-1)*N bytes per rank: for small messages only, where latency dominates.
 // The two-shot covers larger sizes.
 //
+// Also r4d_ar_hc_write_4rank: the same one-shot with hc_write as its epilogue (ar_hc_write at
+// width, exact wire only).
+//
 // The IPC helpers live in r4d_ar_oneshot_2rank_exact.hip; this unit links beside it.
 #include "r4d.h"
 #include "r4d_ar_wide.h"
+#include "r4d_ar_hc.h"      // the hc write word, shared with the two-rank fused forms
 #include <stdexcept>
 #include <string>
 
@@ -105,6 +109,75 @@ __global__ void r4d_ar_oneshot_wide_exact_kernel(
       }
     }
     for (; k < end; k += nt) out4[k] = ar_vsum<T, LANES, WS>(src, k);
+  }
+}
+
+// THE SAME ONE-SHOT WITH THE GATED RESIDUAL'S WRITE AS ITS EPILOGUE, bf16 only. `y` is the
+// message and is reduced IN PLACE; everything up to the reduce is the kernel above, step for step,
+// because both run on one instance's buffers in one stream: the same seq take, the same handshake
+// value 2*s, the same (parity, source) slots and the same block partition of the word space. The
+// reduce is the same ar_vsum, so the stored word is the plain all-reduce's to the bit; then
+// h[r][c*n + i] += inj[r][c] * y[r][i] in hc_write's arithmetic over that bf16 word
+// (r4d_ar_hc_write_word, as the two-rank r4d_ar_hc_write_kernel).
+//
+// In place is safe: a thread reads every source of word k before it stores word k, its own block
+// pushed that word to the peers before the handshake, and no peer reads this rank's `y`. A word is
+// eight elements and n is a multiple of eight, so a word never straddles a row and the thread that
+// reduces it owns every stream element behind it.
+template <int WS>
+__global__ void r4d_ar_hc_write_wide_kernel(
+    int4* __restrict__ y4, R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,
+    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
+    const unsigned short* __restrict__ inj, unsigned short* __restrict__ h, int n16, int n,
+    int hc, long irow, long hrow, int slot_stride16, int rank, int drain, int acq, int pub) {
+  constexpr int NPEERS = WS - 1;
+
+  const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ unsigned int s_seq, s_slot;
+  r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);  // device-resident, replay-safe
+  const unsigned int s = s_seq;
+  const int parity = (int)s_slot;
+
+  const int w = (n16 + nb - 1) / nb;
+  const int start = b * w;
+  int end = start + w; if (end > n16) end = n16;
+
+  int4* ps[NPEERS];
+#pragma unroll
+  for (int p = 0; p < NPEERS; ++p)
+    ps[p] = peers.scratch[p] + ((size_t)parity * WS + rank) * (size_t)slot_stride16;
+
+  {
+    int k = start + tid;
+    for (; k + 3 * nt < end; k += 4 * nt) {
+      const int4 v0 = y4[k], v1 = y4[k + nt], v2 = y4[k + 2 * nt], v3 = y4[k + 3 * nt];
+#pragma unroll
+      for (int p = 0; p < NPEERS; ++p) {
+        ps[p][k] = v0; ps[p][k + nt] = v1; ps[p][k + 2 * nt] = v2; ps[p][k + 3 * nt] = v3;
+      }
+    }
+    for (; k < end; k += nt) {
+      const int4 v = y4[k];
+#pragma unroll
+      for (int p = 0; p < NPEERS; ++p) ps[p][k] = v;
+    }
+  }
+
+  r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub);
+
+  const int4* src[WS];
+#pragma unroll
+  for (int r = 0; r < WS; ++r)
+    src[r] = (r == rank) ? (const int4*)y4
+                         : (my_base + ((size_t)parity * WS + r) * (size_t)slot_stride16);
+
+  const int wpr = n >> 3;                 // 16B words a row
+  for (int k = start + tid; k < end; k += nt) {
+    const int4 v = ar_vsum<__hip_bfloat16, 8, WS>(src, k);
+    y4[k] = v;
+    const int row = k / wpr, i0 = (k - row * wpr) * 8;
+    r4d_ar_hc_write_word(inj, h, row, i0, n, hc, irow, hrow,
+                         reinterpret_cast<const unsigned short*>(&v));
   }
 }
 
@@ -203,6 +276,82 @@ void r4d_ar_oneshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
                       peer_flags4, peer_flags5, peer_flags6};
   ar_wide_launch<8>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                     dtype, rank, stream, nblocks, nthreads, drain, acq, pub);
+}
+
+// ar_wide_launch's checks, for the fused write: the same rank range, slot stride, grid clamps and
+// allocation extents, plus the write's own two shape rules.
+template <int WS>
+static void ar_hc_write_wide_launch(const long* peer_scratch, const long* peer_flags,
+                                    long my_scratch, long my_flags, long seq_ctrs,
+                                    long slot_stride16, long y, long inj, long h, long M, long n,
+                                    long hc, long irow, long hrow, long rank, long stream_i,
+                                    long nblocks, long nthreads, long drain, long acq, long pub) {
+  constexpr int NPEERS = WS - 1;
+  static_assert(NPEERS <= R4D_AR_WIDE_MAX_PEERS, "npeers exceeds the peer bundle bound");
+
+  if (rank < 0 || rank >= WS)
+    throw std::runtime_error("ar_hc_write: rank " + std::to_string(rank) +
+                             " out of range for the " + std::to_string(WS) +
+                             " ranks this entry point is compiled for");
+  if (M <= 0 || n <= 0 || n % 8)
+    throw std::runtime_error("ar_hc_write: n must be a positive multiple of 8");
+  if (hc < 1 || hrow % 8)
+    throw std::runtime_error("ar_hc_write: the streams must be whole 16B words");
+
+  const long n16l = M * n / 8;            // bf16: eight elements a 16B word
+  if (n16l > (long)slot_stride16)
+    throw std::runtime_error("ar_hc_write: message (" + std::to_string(n16l) +
+                             " 16B words) exceeds the per-source slot stride (" +
+                             std::to_string(slot_stride16) + ")");
+  const int n16 = (int)n16l;
+
+  int nb = (int)nblocks;
+  if (nb < 1) nb = R4D_AR_NB_DESIGN;
+  if (nb > n16) nb = n16;
+  if (nb > R4D_AR_WIDE_MAX_BLOCKS) nb = R4D_AR_WIDE_MAX_BLOCKS;
+  int nt = (int)nthreads;
+  if (nt < 64) nt = 64;
+  if (nt > 1024) nt = 1024;
+
+  R4DArWidePeers<int4, NPEERS> peers{};
+  for (int i = 0; i < NPEERS; ++i) {
+    if (!peer_scratch[i] || !peer_flags[i])
+      throw std::runtime_error("ar_hc_write: null peer scratch/flag pointer at index " +
+                               std::to_string(i));
+    peers.scratch[i] = (int4*)peer_scratch[i];
+    peers.flags[i] = (unsigned int*)peer_flags[i];
+    peers.rank[i] = (i < (int)rank) ? i : i + 1;
+  }
+
+  const long slot_bytes = 2L * WS * (long)slot_stride16 * 16;
+  const long flag_bytes = (long)nb * WS * (long)sizeof(unsigned int);
+  r4d_ar_check_extent(my_scratch, slot_bytes, "ar_hc_write", "my_scratch");
+  r4d_ar_check_extent(my_flags, flag_bytes, "ar_hc_write", "my_flags");
+  r4d_ar_check_extent(seq_ctrs, 2L * R4D_AR_WIDE_MAX_BLOCKS * (long)sizeof(unsigned int),
+                      "ar_hc_write", "seq_ctrs");
+  for (int i = 0; i < NPEERS; ++i) {
+    r4d_ar_check_extent(peer_scratch[i], slot_bytes, "ar_hc_write", "peer scratch");
+    r4d_ar_check_extent(peer_flags[i], flag_bytes, "ar_hc_write", "peer flags");
+  }
+
+  hipStream_t st = (hipStream_t)stream_i;
+  r4d_ar_hc_write_wide_kernel<WS><<<nb, nt, 0, st>>>(
+      (int4*)y, peers, (const int4*)my_scratch, (unsigned int*)my_flags, (unsigned int*)seq_ctrs,
+      (const unsigned short*)inj, (unsigned short*)h, n16, (int)n, (int)hc, irow, hrow,
+      (int)slot_stride16, (int)rank, (int)drain, (int)acq, (int)pub);
+}
+
+void r4d_ar_hc_write_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                           long peer_flags0, long peer_flags1, long peer_flags2,
+                           long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+                           long y, long inj, long h, long M, long n, long hc, long irow,
+                           long hrow, long rank, long stream, long nblocks, long nthreads,
+                           long drain, long acq, long pub) {
+  const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
+  const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
+  ar_hc_write_wide_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, y, inj, h,
+                             M, n, hc, irow, hrow, rank, stream, nblocks, nthreads, drain, acq,
+                             pub);
 }
 
 void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers) {
