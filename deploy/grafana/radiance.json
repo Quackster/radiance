@@ -1,0 +1,2586 @@
+{
+  "id": null,
+  "uid": "radiance",
+  "title": "radiance",
+  "tags": [
+    "radiance",
+    "llm"
+  ],
+  "timezone": "",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "graphTooltip": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "description": "radiance: throughput, speculation by draft position, scheduler, latency, prefix cache, HTTP. Prometheus or VictoriaMetrics.",
+  "annotations": {
+    "list": []
+  },
+  "links": [],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "options": []
+      },
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(radiance:engine_steps_total, instance)",
+          "refId": "instance"
+        },
+        "definition": "label_values(radiance:engine_steps_total, instance)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {},
+        "refresh": 2,
+        "sort": 1,
+        "options": [],
+        "hide": 0
+      },
+      {
+        "name": "model_name",
+        "label": "Model",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(radiance:engine_steps_total{instance=~\"$instance\"}, model_name)",
+          "refId": "model_name"
+        },
+        "definition": "label_values(radiance:engine_steps_total{instance=~\"$instance\"}, model_name)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {},
+        "refresh": 2,
+        "sort": 1,
+        "options": [],
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Overview",
+      "id": 1,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Running",
+      "id": 2,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(vllm:num_requests_running{instance=~\"$instance\", model_name=~\"$model_name\"})",
+          "legendFormat": "",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Waiting",
+      "id": 3,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(vllm:num_requests_waiting{instance=~\"$instance\", model_name=~\"$model_name\"})",
+          "legendFormat": "",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Decode",
+      "id": 4,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Generated tokens per second, counted when the step commits.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:decode_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Prefill computed",
+      "id": 5,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Prompt tokens per second the engine actually computed; prefix-cache hits are not in it.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:prefill_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "KV cache",
+      "id": 6,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Above about 75% the prefix cache starts evicting prefixes the next turn wants.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(vllm:kv_cache_usage_perc{instance=~\"$instance\", model_name=~\"$model_name\"})",
+          "legendFormat": "",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.75
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Draft acceptance",
+      "id": 7,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Accepted over proposed draft tokens over the time range. Conditional on having drafted: read it together with draft blocks per decode step.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(radiance:draft_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range])) / sum(increase(radiance:draft_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Prompt from attention cache",
+      "id": 8,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Share of prompt tokens served from the paged attention prefix cache over the time range (vllm:gpu_prefix_cache_hit_rate is the same ratio since start).",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(radiance:attn_cached_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range])) / sum(increase(vllm:prompt_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Prompt from linear checkpoint",
+      "id": 9,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Share of prompt tokens whose recurrent state came from a checkpoint over the time range (radiance:linear_prefix_cache_hit_rate since start). A prompt can be fully attention-cached and still re-run every recurrent layer.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(radiance:linear_cached_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range])) / (sum(increase(radiance:linear_cached_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range])) + sum(increase(radiance:prefill_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range])))",
+          "legendFormat": "",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Decode step time",
+      "id": 10,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "engine_step_seconds_decode_total / engine_steps_decode_total over the time range: decode only. Wall clock over steps would charge idle and prefill to it.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(radiance:engine_step_seconds_decode_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range])) / sum(increase(radiance:engine_steps_decode_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Draft blocks per decode step",
+      "id": 11,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Verified draft blocks per decode-only step over the time range. Falls when rows stop drafting, which the acceptance ratio does not show.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"0\"}[$__range])) / sum(increase(radiance:engine_steps_decode_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Prefix evictions",
+      "id": 12,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Over the time range. The leading indicator of a prefix-cache collapse: it rises while a reusable prefix is dropped, before the hit rate falls.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(radiance:prefix_cache_evictions_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range]))",
+          "legendFormat": "blocks",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(radiance:prefix_cache_ckpt_evictions_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range]))",
+          "legendFormat": "checkpoints",
+          "refId": "B",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Refused / failed",
+      "id": 13,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Over the time range.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(radiance:http_admission_rejected_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__range]))",
+          "legendFormat": "429",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(radiance:http_responses_total{instance=~\"$instance\", model_name=~\"$model_name\", class=\"5xx\"}[$__range]))",
+          "legendFormat": "5xx",
+          "refId": "B",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "row",
+      "title": "Throughput",
+      "id": 14,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tokens per second",
+      "id": 15,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 10
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:decode_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "decode {{instance}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:prefill_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "prefill computed {{instance}}",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Prompt tokens by source",
+      "id": 16,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Per second. The two cache series are not additive: one token can be served from both.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:prefill_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "computed {{instance}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:attn_cached_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "attention prefix cache {{instance}}",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:linear_cached_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "linear-state checkpoint {{instance}}",
+          "refId": "C",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Requests finished",
+      "id": 17,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 18
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (finished_reason) (rate(vllm:request_success_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "{{finished_reason}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Request size (mean)",
+      "id": 18,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 18
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(vllm:request_prompt_tokens_sum{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])) / sum(rate(vllm:request_prompt_tokens_count{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "prompt tokens",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(vllm:request_generation_tokens_sum{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])) / sum(rate(vllm:request_generation_tokens_count{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "generated tokens",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Requests in flight",
+      "id": 19,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 18
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (vllm:num_requests_running{instance=~\"$instance\", model_name=~\"$model_name\"})",
+          "legendFormat": "running {{instance}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (vllm:num_requests_waiting{instance=~\"$instance\", model_name=~\"$model_name\"})",
+          "legendFormat": "waiting {{instance}}",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (radiance:num_requests_preempted{instance=~\"$instance\", model_name=~\"$model_name\"})",
+          "legendFormat": "preempted {{instance}}",
+          "refId": "C",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (radiance:http_queue_depth{instance=~\"$instance\", model_name=~\"$model_name\"})",
+          "legendFormat": "HTTP queue {{instance}}",
+          "refId": "D",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Speculative decoding",
+      "id": 20,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Conditional acceptance by draft position",
+      "id": 21,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "In the window: of the verifies that reached position j, the fraction that took j as well. Position j+1 is reached only when j was accepted, so this is reached(j+1) / reached(j); the last position is the total accepted minus every later reach. A late position that collapses while the pooled rate looks fine shows here first.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"1\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"0\"}[$__rate_interval]))",
+          "legendFormat": "position 0",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"2\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"1\"}[$__rate_interval]))",
+          "legendFormat": "position 1",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"3\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"2\"}[$__rate_interval]))",
+          "legendFormat": "position 2",
+          "refId": "C",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"4\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"3\"}[$__rate_interval]))",
+          "legendFormat": "position 3",
+          "refId": "D",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"5\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"4\"}[$__rate_interval]))",
+          "legendFormat": "position 4",
+          "refId": "E",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"6\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"5\"}[$__rate_interval]))",
+          "legendFormat": "position 5",
+          "refId": "F",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"7\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"6\"}[$__rate_interval]))",
+          "legendFormat": "position 6",
+          "refId": "G",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"8\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"7\"}[$__rate_interval]))",
+          "legendFormat": "position 7",
+          "refId": "H",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"9\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"8\"}[$__rate_interval]))",
+          "legendFormat": "position 8",
+          "refId": "I",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"10\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"9\"}[$__rate_interval]))",
+          "legendFormat": "position 9",
+          "refId": "J",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"11\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"10\"}[$__rate_interval]))",
+          "legendFormat": "position 10",
+          "refId": "K",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"12\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"11\"}[$__rate_interval]))",
+          "legendFormat": "position 11",
+          "refId": "L",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"13\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"12\"}[$__rate_interval]))",
+          "legendFormat": "position 12",
+          "refId": "M",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"14\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"13\"}[$__rate_interval]))",
+          "legendFormat": "position 13",
+          "refId": "N",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"15\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"14\"}[$__rate_interval]))",
+          "legendFormat": "position 14",
+          "refId": "O",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(sum(rate(radiance:draft_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])) - sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position!=\"0\"}[$__rate_interval]))) / min(sum by (position) (rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])))",
+          "legendFormat": "last position",
+          "refId": "P",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Conditional acceptance by draft position (since start)",
+      "id": 22,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "The server's own gauge, cumulative since the process started.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 27
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (position) (radiance:draft_position_acceptance_ratio{instance=~\"$instance\", model_name=~\"$model_name\"})",
+          "legendFormat": "position {{position}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tokens per verify",
+      "id": 23,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "What speculation buys one sequence: 1 + accepted tokens per verify.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 27
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "1 + sum(rate(radiance:draft_accepted_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])) / sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"0\"}[$__rate_interval]))",
+          "legendFormat": "tokens committed per verified row",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Draft reach by position",
+      "id": 24,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Verifies that evaluated each position, per second: how much evidence each acceptance carries. High reach with acceptance near zero is a broken draft round.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 35
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (position) (rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "position {{position}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Draft blocks per decode step",
+      "id": 25,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Verified draft blocks over decode-only steps. The acceptance ratio is conditional on having drafted and reads healthy while this collapses.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 35
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:draft_position_reached_total{instance=~\"$instance\", model_name=~\"$model_name\", position=\"0\"}[$__rate_interval])) / sum(rate(radiance:engine_steps_decode_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "blocks per step",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Decode rows without a draft",
+      "id": 26,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Decode rows that took no draft, for any reason, per second.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 35
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:decode_rows_unspeculated_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Scheduler",
+      "id": 27,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Steps per second by kind",
+      "id": 28,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 44
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:engine_steps_prefill_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "prefill only {{instance}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:engine_steps_mixed_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "mixed {{instance}}",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:engine_steps_decode_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "decode only {{instance}}",
+          "refId": "C",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Step time",
+      "id": 29,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Seconds inside one scheduler step; with speculation a step includes its draft rounds. Decode only is the comparable number.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 44
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:engine_step_seconds_decode_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])) / sum by (instance) (rate(radiance:engine_steps_decode_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "decode only {{instance}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:engine_step_seconds_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])) / sum by (instance) (rate(radiance:engine_steps_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "all steps {{instance}}",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Engine busy, steps issued ahead",
+      "id": 30,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Busy: share of wall time inside a step. Issued ahead: share of steps whose forward pass was issued behind the step before, ahead of its commit.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 44
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:engine_step_seconds_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "busy {{instance}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:engine_steps_ahead_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])) / sum by (instance) (rate(radiance:engine_steps_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "issued ahead {{instance}}",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Latency",
+      "id": 31,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 52
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Time to first token",
+      "id": 32,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 53
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le, instance) (rate(vllm:time_to_first_token_seconds_bucket{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{instance}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.9, sum by (le, instance) (rate(vllm:time_to_first_token_seconds_bucket{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{instance}}",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le, instance) (rate(vllm:time_to_first_token_seconds_bucket{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{instance}}",
+          "refId": "C",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Inter-token latency",
+      "id": 33,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 53
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le, instance) (rate(vllm:inter_token_latency_seconds_bucket{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{instance}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.9, sum by (le, instance) (rate(vllm:inter_token_latency_seconds_bucket{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{instance}}",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le, instance) (rate(vllm:inter_token_latency_seconds_bucket{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{instance}}",
+          "refId": "C",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "End-to-end request latency",
+      "id": 34,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 53
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le, instance) (rate(vllm:e2e_request_latency_seconds_bucket{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{instance}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.9, sum by (le, instance) (rate(vllm:e2e_request_latency_seconds_bucket{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{instance}}",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le, instance) (rate(vllm:e2e_request_latency_seconds_bucket{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{instance}}",
+          "refId": "C",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "KV and prefix cache",
+      "id": 35,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 61
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "KV cache usage",
+      "id": 36,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 62
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (instance) (vllm:kv_cache_usage_perc{instance=~\"$instance\", model_name=~\"$model_name\"})",
+          "legendFormat": "{{instance}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Prefix hit rate",
+      "id": 37,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "In the window, with the definitions of vllm:gpu_prefix_cache_hit_rate and radiance:linear_prefix_cache_hit_rate.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 62
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:attn_cached_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])) / sum(rate(vllm:prompt_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "attention",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(radiance:linear_cached_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])) / (sum(rate(radiance:linear_cached_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])) + sum(rate(radiance:prefill_tokens_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval])))",
+          "legendFormat": "linear state",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Evictions, checkpoints, preemptions",
+      "id": 38,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 62
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:prefix_cache_evictions_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "attention blocks evicted {{instance}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:prefix_cache_ckpt_evictions_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "checkpoints evicted {{instance}}",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:linear_checkpoints_written_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "checkpoints written {{instance}}",
+          "refId": "C",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(vllm:num_preemptions_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "preemptions {{instance}}",
+          "refId": "D",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "HTTP",
+      "id": 39,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 70
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Responses by status class",
+      "id": 40,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 71
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (class) (rate(radiance:http_responses_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "{{class}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Refused and cut off",
+      "id": 41,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 71
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:http_admission_rejected_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "429 queue full {{instance}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:client_disconnect_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "client went away {{instance}}",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (rate(radiance:stream_overflow_total{instance=~\"$instance\", model_name=~\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "stream overflow {{instance}}",
+          "refId": "C",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}

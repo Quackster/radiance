@@ -1399,7 +1399,7 @@ under the request's own spelling of each. `server.default_max_tokens` is `null` 
 | `decode_tokens_total`, `prefill_tokens_total` | |
 | `decode_tokens_per_second`, `prefill_tokens_per_second` | |
 | `draft_tokens_total`, `draft_accepted_total`, `draft_acceptance_ratio` | |
-| `draft_position_reached_total`, `draft_position_acceptance_ratio` | acceptance by position in the window |
+| `draft_position_reached_total`, `draft_position_acceptance_ratio` | acceptance by position, since start |
 | `decode_rows_unspeculated_total` | rows that never drafted at all |
 | `attn_cached_tokens_total`, `linear_cached_tokens_total` | prefix reuse, both halves |
 | `linear_checkpoints_written_total`, `linear_prefix_cache_hit_rate` | |
@@ -1415,6 +1415,8 @@ Two traps worth naming:
   `draft_tokens_total / depth` over `engine_steps_decode_total`. `scripts/mcdecl.sh` measures it.
 - **Step time is not wall-clock over steps.** Use `engine_step_seconds_decode_total /
   engine_steps_decode_total`, which charges only decode. Wall-clock charges idle and prefill to it.
+
+`deploy/grafana/radiance.json` charts both families over time, on Prometheus or VictoriaMetrics.
 
 ### 6.4 The live terminal view
 
