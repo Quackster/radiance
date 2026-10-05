@@ -5863,9 +5863,10 @@ struct MoeW4Shape { const char* name; int64_t N0, K0, N1, K1, parts, ne; };
 /* `sub` 2 runs the codebook at E4M3 scales a 64 of K (w4nl64a8h), 4 at a 32 (w4nl32a8h): the
  * codes' values are the table's and each part of a 128-wide group has its own scale, the fold the
  * forms must agree on. `w5` with `sub` 2 runs the five-bit codebook (w5nl64a8h), whose stored row
- * is its nibbles and then its signs. */
+ * is its nibbles and then its signs. `four` also runs `moe_gemm_w4a8_mod4` over the same experts
+ * and holds it to the two-class op's bytes -- that row's own case. */
 static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int sub = 0,
-                        bool w5 = false) {
+                        bool w5 = false, bool four = false) {
     const bool g64 = sub > 1;
     const float* tab = w5 ? kW5nlTable : kW4nlTable;
     static const char* const kForm[] = { "rule", "aligned prefill form", "decode form",
@@ -6094,6 +6095,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
                                     " elements off, worst " + std::to_string(worst) + first);
         two_cls[form] = got;
     }
+    if (!four) return;
 
     /* AND THE SAME EXPERTS AS FOUR CLASSES, by number mod 4 (`moe_gemm_q_mod4`). Each parity table
      * read at twice its stride is two of them -- from its first entry, the experts 0, 4, 8, ... of
@@ -9722,6 +9724,25 @@ static void device_phase(const Plugin& pl) {
             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 })
                 moe_w4_gemm(pl, t, sh, 2, true);
         }
+    }
+
+    if (sel("moe_gemm_w4a8_mod4")) {
+        if (!g_case) std::printf("\nthe 4-bit grouped MoE GEMM over four classes, against its "
+                                 "two-class form\n");
+        /* The same shapes, read as four classes: the even table's halves are classes 0 and 2 and
+         * the odd one's 1 and 3, so the two-class launch is the reference, byte for byte. */
+        static const MoeW4Shape kShapes4[] = {
+            { "one class",   64, 256,  64, 256, 1, 5 },
+            { "gate/up 2:1", 256, 256, 128, 256, 2, 10 },
+            { "down 2:1",    64, 256,  64, 128, 1, 10 },
+            { "300 experts, gate/up 2:1", 256, 128, 128, 128, 2, 300 },
+        };
+        for (const MoeW4Shape& sh : kShapes4)
+            for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 }) {
+                moe_w4_gemm(pl, t, sh, 0, false, true);
+                moe_w4_gemm(pl, t, sh, 2, false, true);
+                moe_w4_gemm(pl, t, sh, 2, true, true);
+            }
     }
 
     if (sel("hc_read_e4m3")) {
