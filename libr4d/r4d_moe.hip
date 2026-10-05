@@ -823,15 +823,26 @@ __device__ __forceinline__ uint4 w4_load(const uint8_t* __restrict__ src, bool l
  * separate operands because every entry of one table has one geometry. Expert e is entry e / 2 of
  * class e % 2. The classes differ when a rank holds an uneven slice of each expert's width -- three
  * 128-column blocks of one parity and two of the other -- and are the same geometry otherwise.
+ * `moe_gemm_q_mod4` has four, by the expert's number mod 4: expert e is entry e / 4 of class e % 4,
+ * which is what lets four ranks take the extra block of a five-block expert in turn.
  *
  * `n` is the weight's rows and `k` its K; `w_ld` the packed byte pitch of a weight row and `s_ld`
  * the scale plane's row pitch in elements. */
 struct MoeCls {
-    const void* const* w;  size_t w_s0;
-    const void* const* s;  size_t s_s0;
+    const void* const* w;
+    const void* const* s;
+    uint32_t w_s0, s_s0;   /* bytes an entry of a stacked plane; 0 marks a pointer table */
     uint32_t n, k, w_ld, s_ld;
-    uint32_t tab[4];       /* W4: the code table, r4d_args.h's kW4IntPerm, kW4nlPerm or kW5nlMagPerm */
 };
+/* W4: the code table, r4d_args.h's kW4IntPerm, kW4nlPerm or kW5nlMagPerm -- one for every class,
+ * since every class is one format.
+ *
+ * FOUR CLASSES AND THE TABLE MUST FIT RAD_KPARAM_BLOB (256 bytes) BESIDE EVERYTHING ELSE, because
+ * a kernel's arguments are packed into one descriptor whether it is launched or described: four
+ * classes at 40 bytes, the five operand pointers and the map, eight words and this. That is why a
+ * class carries 32-bit entry strides and no table of its own, and why `mode` packs three small
+ * values into one word. */
+struct MoeTab { uint32_t v[4]; };
 
 /* W4 IS THE WEIGHT'S FORM: 0 block E4M3, 1 four-bit with one bf16 scale a (row, 128 of K), 2 the
  * same codes with one E4M3 scale a (row, 64 of K) times the fixed kW4G64Scale (w4nl64a8h), 3 the
@@ -843,12 +854,14 @@ template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
           bool ES = false, bool AL = false, bool SK = false>
 __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
     const uint8_t* __restrict__ Aq, const float* __restrict__ As,
-    const MoeCls c_even, const MoeCls c_odd,
+    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
     const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
-    uint16_t* __restrict__ Y,
-    uint32_t T, uint32_t N, uint32_t parts, uint32_t n_expert, uint32_t top_k, uint32_t a_sorted,
-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld,
-    const uint32_t* __restrict__ map) {
+    uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,
+    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
+    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+    /* `mode`: bit 0 `a_sorted`, bits 1-2 the class shift (1 for two classes, 2 for four), bits
+     * 8 up `parts`. */
+    const uint32_t a_sorted = mode & 1u, cshift = (mode >> 1) & 3u, parts = mode >> 8;
     constexpr uint32_t FM = MT * 16, FN = NTL * 16;
     constexpr uint32_t NTHR = WGM * WGN * kWave;
     constexpr uint32_t WM = MT / WGM, WN = NTL / WGN;
@@ -1014,8 +1027,10 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
         if (ES && run != jrun) { rs = re; ++run; continue; }
 
         /* The expert's class, and where this block's columns sit in its weight. Block-uniform: a
-         * pad tile zeroes the run's rows and moves on without touching LDS or a barrier. */
-        const MoeCls& C = (e & 1u) ? c_odd : c_even;
+         * pad tile zeroes the run's rows and moves on without touching LDS or a barrier. `cshift`
+         * is 1 for two classes and 2 for four; c_2 and c_3 are never read at two. */
+        const uint32_t cls = e & ((1u << cshift) - 1u);
+        const MoeCls& C = cls == 0u ? c_even : cls == 1u ? c_odd : cls == 2u ? c_2 : c_3;
         const uint32_t fc = C.n / parts;
         if (j0 >= fc) {
             const uint32_t nr = re - rs;
@@ -1033,8 +1048,8 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
         const uint32_t kb_n = wn0 / kBlock;           /* the weight scale's N row for this block */
         if constexpr (W4) (void)kb_n;                 /* w4 scales vary per ROW, not per N block */
 
-        const uint8_t*  Wp  = wtab_at(C.w, C.w_s0, e >> 1);
-        const uint16_t* Wsp = (const uint16_t*)wtab_at(C.s, C.s_s0, e >> 1);
+        const uint8_t*  Wp  = wtab_at(C.w, C.w_s0, e >> cshift);
+        const uint16_t* Wsp = (const uint16_t*)wtab_at(C.s, C.s_s0, e >> cshift);
 
         /* SK: A WAVE WHOSE M TILES ARE ALL PAST THE RUN has nothing to accumulate. Under AL the
          * run is the block's rows [rs, re) from its first row, so that is a wave-uniform test;
@@ -1152,9 +1167,9 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
                 const uint32_t r = sn + p * kRPP;
                 if (r >= FN) continue;
                 if constexpr (W4 == 4)
-                    stage8_store<kFK>(s_b, r, sk, w5_expand(bpre4[p], spre[p], C.tab));
+                    stage8_store<kFK>(s_b, r, sk, w5_expand(bpre4[p], spre[p], tab.v));
                 else if constexpr (W4)
-                    stage8_store<kFK>(s_b, r, sk, w4_expand(bpre4[p], C.tab));
+                    stage8_store<kFK>(s_b, r, sk, w4_expand(bpre4[p], tab.v));
                 else
                     stage8_store<kFK>(s_b, r, sk, bpre8[p]);
             }
@@ -2117,42 +2132,56 @@ static int g_moe_prefill_form = 0;
 /* Both instantiations, from one body. The only things that differ are the weight table's dtype and
  * its two pitches, so the fp8 launcher and the w4 one are the same forty lines with three values
  * swapped -- and writing them twice is how a shape check drifts between two paths that must agree.
- */
+ *
+ * `ncls` is the op's class count: 2 for `moe_gemm_q`, whose odd class is operands 6 and 7 at
+ * N_odd/K_odd, and 4 for `moe_gemm_q_mod4`, whose classes 1..3 are operands 6/7, 8/9 and 10/11 at
+ * N_1/K_1, N_2/K_2 and N_3/K_3, with `y` after them at 12. Everything else is one body. */
 template <int W4>
-static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk) {
+static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
     int emit_rc = RAD_OK;
+    if (ncls != 2 && ncls != 4) return R4D_NO(RAD_E_INVAL);
     const RadTensor* Aq     = r4d_opt(a, 0);
     const RadTensor* As     = r4d_opt(a, 1);
-    const RadTensor* W      = r4d_opt(a, 2);
-    const RadTensor* Ws     = r4d_opt(a, 3);
     const RadTensor* sorted = r4d_opt(a, 4);
     const RadTensor* off    = r4d_opt(a, 5);
-    const RadTensor* W1     = r4d_opt(a, 6);
-    const RadTensor* Ws1    = r4d_opt(a, 7);
-    const RadTensor* Y      = r4d_opt(a, 8);
-    if (!Aq || !As || !W || !Ws || !sorted || !off || !Y || !W1 || !Ws1)
-        return R4D_NO(RAD_E_INVAL);
+    const RadTensor* Wc[4]  = { r4d_opt(a, 2), r4d_opt(a, 6),
+                                ncls == 4 ? r4d_opt(a, 8) : nullptr,
+                                ncls == 4 ? r4d_opt(a, 10) : nullptr };
+    const RadTensor* Wsc[4] = { r4d_opt(a, 3), r4d_opt(a, 7),
+                                ncls == 4 ? r4d_opt(a, 9) : nullptr,
+                                ncls == 4 ? r4d_opt(a, 11) : nullptr };
+    const RadTensor* Y      = r4d_opt(a, ncls == 4 ? 12 : 8);
+    if (!Aq || !As || !sorted || !off || !Y) return R4D_NO(RAD_E_INVAL);
+    for (int q = 0; q < ncls; ++q)
+        if (!Wc[q] || !Wsc[q]) return R4D_NO(RAD_E_INVAL);
     if (!Aq->data || !As->data || !sorted->data || !off->data || !Y->data)
         return R4D_NO(RAD_E_INVAL);
 
-    /* Each class's weight geometry, the odd one defaulting to the even one's; the output is as
-     * wide as the wider class and the activation as long as the longer K. */
-    const long long N0 = r4d_geti_or(a, "N", 0);
-    const long long K0 = r4d_geti_or(a, "K", 0);
-    const long long N1 = r4d_geti_or(a, "N_odd", N0);
-    const long long K1 = r4d_geti_or(a, "K_odd", K0);
+    /* Each class's weight geometry, the others defaulting to class 0's; the output is as wide as
+     * the widest class and the activation as long as the longest K. */
+    static const char* const kNk[4][2] = { { "N", "K" }, { "N_1", "K_1" }, { "N_2", "K_2" },
+                                           { "N_3", "K_3" } };
+    long long Nc[4] = { 0, 0, 0, 0 }, Kc[4] = { 0, 0, 0, 0 };
+    Nc[0] = r4d_geti_or(a, "N", 0);
+    Kc[0] = r4d_geti_or(a, "K", 0);
+    for (int q = 1; q < ncls; ++q) {
+        Nc[q] = r4d_geti_or(a, ncls == 4 ? kNk[q][0] : "N_odd", Nc[0]);
+        Kc[q] = r4d_geti_or(a, ncls == 4 ? kNk[q][1] : "K_odd", Kc[0]);
+    }
     const long long parts = r4d_geti_or(a, "parts", 1);
     const long long n_expert = r4d_geti_or(a, "n_expert", 0);
     const long long top_k = r4d_geti_or(a, "top_k", 0);
     const long long group = r4d_geti_or(a, "group", kBlock);
-    if (N0 <= 0 || K0 <= 0 || N1 <= 0 || K1 <= 0 || parts <= 0 || n_expert <= 0 || top_k <= 0)
-        return R4D_NO(RAD_E_SHAPE);
+    if (parts <= 0 || n_expert <= 0 || top_k <= 0) return R4D_NO(RAD_E_SHAPE);
     if (group != (long long)kBlock) return R4D_NO(RAD_E_SHAPE);
-    /* A part of either class is whole 64-column tiles, so a tile is all weight or all padding. */
-    if (K0 % kBlock || K1 % kBlock || N0 % (64 * parts) || N1 % (64 * parts))
-        return R4D_NO(RAD_E_SHAPE);
-    const long long N = N0 > N1 ? N0 : N1;
-    const long long K = K0 > K1 ? K0 : K1;
+    long long N = 0, K = 0;
+    for (int q = 0; q < ncls; ++q) {
+        if (Nc[q] <= 0 || Kc[q] <= 0) return R4D_NO(RAD_E_SHAPE);
+        /* A part of every class is whole 64-column tiles, so a tile is all weight or all padding. */
+        if (Kc[q] % kBlock || Nc[q] % (64 * parts)) return R4D_NO(RAD_E_SHAPE);
+        if (Nc[q] > N) N = Nc[q];
+        if (Kc[q] > K) K = Kc[q];
+    }
     if (Aq->dtype != RAD_F8E4M3 || As->dtype != RAD_F32 || Y->dtype != RAD_BF16)
         return R4D_NO(RAD_E_DTYPE);
     if (sorted->dtype != RAD_I32 || off->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
@@ -2192,9 +2221,10 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk) {
     auto cls_of = [&](const RadTensor* w, const RadTensor* ws, long long cnt, long long n,
                       long long k, MoeCls* c) -> int {
         long long w_ld = 0, ws_ld = 0;
+        size_t w_s0 = 0, s_s0 = 0;
         int rc = wtab_of(w, W4 == 4 ? (uint32_t)R4D_DT_MOEW5
                             : W4 ? (uint32_t)R4D_DT_MOEW4 : (uint32_t)RAD_F8E4M3,
-                         W4 == 4 ? 5 : W4 ? 4 : 8, cnt, n, k, &c->w, &c->w_s0, &w_ld);
+                         W4 == 4 ? 5 : W4 ? 4 : 8, cnt, n, k, &c->w, &w_s0, &w_ld);
         if (rc != RAD_OK) return rc;
         if constexpr (W4 >= 2) {
             /* One E4M3 byte per (row, group of 64 or 32 K), and the stored row is exactly those
@@ -2203,7 +2233,7 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk) {
              * its row stride is k, the stored row k/64 or k/32 (r4d_layout.cpp). A tile's scales
              * are one sixteen- or thirty-two-bit word, so the kernel's pitch is k/128 words. */
             rc = wtab_of(ws, RAD_F8E4M3, 8, cnt, n, k / (kBlock / (W4 == 3 ? 4 : 2)), &c->s,
-                         &c->s_s0, &ws_ld);
+                         &s_s0, &ws_ld);
             if (rc != RAD_OK) return rc;
             /* A 5-bit row is its nibbles then its sign bits, so its pitch is whole bytes of both;
              * the kernel finds the signs K/2 bytes in. */
@@ -2212,27 +2242,42 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk) {
             ws_ld = k / kBlock;
         } else if constexpr (W4) {
             /* The scale plane is one bf16 per (row, group of 128 K) -- not per 128x128 tile. */
-            rc = wtab_of(ws, RAD_BF16, 16, cnt, n, k / kBlock, &c->s, &c->s_s0, &ws_ld);
+            rc = wtab_of(ws, RAD_BF16, 16, cnt, n, k / kBlock, &c->s, &s_s0, &ws_ld);
             if (rc != RAD_OK) return rc;
             if (w_ld % 2) return R4D_NO(RAD_E_STRIDE);
             w_ld /= 2;
         } else {
             rc = wtab_of(ws, RAD_BF16, 16, cnt, (n + kBlock - 1) / kBlock, k / kBlock, &c->s,
-                         &c->s_s0, &ws_ld);
+                         &s_s0, &ws_ld);
             if (rc != RAD_OK) return rc;
         }
+        /* A stacked entry is one expert's plane, far below 4 GiB; a pointer table is 0. */
+        if (w_s0 > 0xFFFFFFFFull || s_s0 > 0xFFFFFFFFull) return R4D_NO(RAD_E_STRIDE);
+        c->w_s0 = (uint32_t)w_s0;
+        c->s_s0 = (uint32_t)s_s0;
         c->n = (uint32_t)n;
         c->k = (uint32_t)k;
         c->w_ld = (uint32_t)w_ld;
         c->s_ld = (uint32_t)ws_ld;
-        for (int i = 0; i < 4; ++i) c->tab[i] = tab[i];
         return RAD_OK;
     };
-    MoeCls ce{}, co{};
-    int rc = cls_of(W, Ws, (n_expert + 1) / 2, N0, K0, &ce);
-    if (rc != RAD_OK) return rc;
-    rc = cls_of(W1, Ws1, n_expert / 2, N1, K1, &co);
-    if (rc != RAD_OK) return rc;
+    /* Class q holds the experts e with e % ncls == q, entry e / ncls: ceil((n - q) / ncls) of
+     * them. At two classes the last two are never read and stay zero. */
+    MoeCls cl[4]{};
+    for (int q = 0; q < ncls; ++q) {
+        const int rc = cls_of(Wc[q], Wsc[q], (n_expert + ncls - 1 - q) / ncls, Nc[q], Kc[q],
+                              &cl[q]);
+        if (rc != RAD_OK) return rc;
+    }
+    const MoeCls& ce = cl[0];
+    const MoeCls& co = cl[1];
+    const MoeCls& c2 = cl[2];
+    const MoeCls& c3 = cl[3];
+    const uint32_t cshift = ncls == 4 ? 2u : 1u;
+    if (parts > 0xFFFFFF) return R4D_NO(RAD_E_SHAPE);
+    const uint32_t mode = (a_sorted ? 1u : 0u) | (cshift << 1) | ((uint32_t)parts << 8);
+    MoeTab tabv{};
+    for (int i = 0; i < 4; ++i) tabv.v[i] = tab[i];
 
     /* THE BAND: a decode step takes the (tile, run) form -- one 16-row tile of runs spread over
      * blocks, see the kernel's ES note -- and anything with runs of several rows takes the aligned
@@ -2245,11 +2290,11 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk) {
         const unsigned tiles = (unsigned)((T + 15) / 16);
         emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<1, 4, 1, 4, W4, true>),
                            dim3(tiles * 16u, ny), dim3(4 * kWave), 0,
-                           (const uint8_t*)Aq->data, (const float*)As->data, ce, co,
+                           (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                            (const int32_t*)sorted->data, (const int32_t*)off->data,
-                           (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)parts,
-                           (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0),
-                           (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, nullptr);
+                           (uint16_t*)Y->data, nullptr,
+                           (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
+                           (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
     } else {
         /* THE PREFILL FORM IS ALIGNED TO RUNS when the scratch for a map is there, and uniform
          * when it is not. A caller that never asked the scratch hook -- a tool replaying a
@@ -2274,39 +2319,37 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk) {
             if (wide_n)
                 emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, true, true>),
                                    dim3((unsigned)cap, nyw), dim3(8 * kWave), 0,
-                                   (const uint8_t*)Aq->data, (const float*)As->data, ce, co,
+                                   (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                                    (const int32_t*)sorted->data, (const int32_t*)off->data,
-                                   (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)parts,
-                                   (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0),
-                                   (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld,
-                                   (const uint32_t*)map);
+                                   (uint16_t*)Y->data, (const uint32_t*)map,
+                                   (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
+                                   (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
             else
             emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, true, true>),
                                dim3((unsigned)cap, ny), dim3(4 * kWave), 0,
-                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co,
+                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                                (const int32_t*)sorted->data, (const int32_t*)off->data,
-                               (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)parts,
-                               (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0),
-                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld,
-                               (const uint32_t*)map);
+                               (uint16_t*)Y->data, (const uint32_t*)map,
+                               (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
+                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
         } else if (wide_n) {
             emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, false, true>),
                                dim3((unsigned)((T + kPrefillRows - 1) / kPrefillRows), nyw),
                                dim3(8 * kWave), 0,
-                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co,
+                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                                (const int32_t*)sorted->data, (const int32_t*)off->data,
-                               (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)parts,
-                               (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0),
-                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, nullptr);
+                               (uint16_t*)Y->data, nullptr,
+                               (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
+                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
         } else {
             emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, false, true>),
                                dim3((unsigned)((T + kPrefillRows - 1) / kPrefillRows), ny),
                                dim3(4 * kWave), 0,
-                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co,
+                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                                (const int32_t*)sorted->data, (const int32_t*)off->data,
-                               (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)parts,
-                               (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0),
-                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, nullptr);
+                               (uint16_t*)Y->data, nullptr,
+                               (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
+                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
         }
     }
     if (emit_rc != RAD_OK) return emit_rc;
@@ -2355,6 +2398,20 @@ static int rad_moe_gemm_w4a8_body(const RadArgs* a, const R4dSink& sk) {
     return moe_gemm_launch<1>(a, sk);
 }
 R4D_ENTRY(r4d_rad_moe_gemm_w4a8, rad_moe_gemm_w4a8_body)
+
+/* `moe_gemm_q_mod4`: the same launches over four classes, by the expert's number mod 4. The run
+ * map and its scratch are the two-class op's -- they depend on the offsets and nothing else. */
+extern "C" int r4d_rad_moe_gemm_q_mod4(const RadArgs* a, RadStream s) {
+    return moe_gemm_launch<0>(a, r4d_stream_sink(s), 4);
+}
+static int rad_moe_gemm_w4a8_mod4_body(const RadArgs* a, const R4dSink& sk) {
+    const char* wdt = r4d_gets(a, "dtype");
+    if (wdt && !std::strcmp(wdt, "w4nl64a8h")) return moe_gemm_launch<2>(a, sk, 4);
+    if (wdt && !std::strcmp(wdt, "w4nl32a8h")) return moe_gemm_launch<3>(a, sk, 4);
+    if (wdt && !std::strcmp(wdt, "w5nl64a8h")) return moe_gemm_launch<4>(a, sk, 4);
+    return moe_gemm_launch<1>(a, sk, 4);
+}
+R4D_ENTRY(r4d_rad_moe_gemm_w4a8_mod4, rad_moe_gemm_w4a8_mod4_body)
 
 /* `moe_gemm` at bf16: operands a, w (one table), sorted_tok, expert_offset -> y. The band and the
  * three forms are moe_gemm_launch's and are chosen by the same rule from the same arguments, so the

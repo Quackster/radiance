@@ -685,20 +685,25 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
      * say how the list divides. The rule is EQUAL DIVISION: whatever is left after the fixed
      * weight positions have taken one each is split evenly across the table positions, in
      * declaration order. That is exactly right for the case tables exist for -- `moe_gemm_q`'s
-     * codes and scale planes are one of each per expert, always the same count -- and a division
-     * that does not come out whole is refused here rather than silently mis-grouped, which is the
-     * only failure the rule can have. */
-    int per_tab = 0;
+     * codes and scale planes are one of each per expert, always the same count.
+     *
+     * WHERE IT DOES NOT COME OUT WHOLE, THE FIRST POSITIONS TAKE ONE MORE. A grouped GEMM whose
+     * experts are classes by number mod C -- `moe_gemm_q_mod4` -- gives its first `n % C` classes
+     * one expert more than the rest, and its tables are each class's codes then its scales, so
+     * that is exactly the first `2 * (n % C)` positions. Any other grouping is still refused, at
+     * issue, by the run checks: a table that is not one contiguous run of one shape. A list
+     * shorter than the tables is refused here. */
+    int per_tab = 0, tab_extra = 0;
     if (n_tab > 0) {
         const int rest = n_w - w_max;
-        if (rest <= 0 || rest % n_tab != 0) {
+        if (rest < n_tab) {
             err(RAD_E_SCHEMA,
                 "op '%s': %d weight operands declared; the schema has %d fixed weight operands and "
-                "%d weight TABLE operands, so %d must divide evenly among the tables and it does "
-                "not. A table takes one weight per expert and every table of one op takes the same "
-                "number", opname, n_w, w_max, n_tab, rest);
+                "%d weight TABLE operands, so %d leaves a table empty. A table takes one weight "
+                "per expert", opname, n_w, w_max, n_tab, rest);
         } else {
             per_tab = rest / n_tab;
+            tab_extra = rest % n_tab;
         }
     } else if (n_w < w_req || n_w > w_max) {
         err(RAD_E_SCHEMA, "op '%s': %d weight operands declared, but the schema has %d (%d "
@@ -727,14 +732,16 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
     oi.weights.assign(w, w + n_w);
     /* The many-to-one map from declared weight to schema operand position, built here so the
      * layout pass, the converter and the issue path all read one answer. A fixed weight position
-     * takes one; a table position takes `per_tab` in a row. */
+     * takes one; a table position takes `per_tab` in a row, and the first `tab_extra` of them one
+     * more. */
     oi.weight_opd.assign((size_t)n_w, -1);
     {
-        int wi = 0;
+        int wi = 0, ti = 0;
         for (int k = 0; sc->operands && k < sc->n_operands && wi < n_w; ++k) {
             const int role = sc->operands[k].role;
             if (role == RAD_OPD_WTAB) {
-                for (int j = 0; j < per_tab && wi < n_w; ++j) oi.weight_opd[(size_t)wi++] = k;
+                const int run = per_tab + (ti++ < tab_extra ? 1 : 0);
+                for (int j = 0; j < run && wi < n_w; ++j) oi.weight_opd[(size_t)wi++] = k;
             } else if (role == RAD_OPD_WEIGHT) {
                 oi.weight_opd[(size_t)wi++] = k;
             }

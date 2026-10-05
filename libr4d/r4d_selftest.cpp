@@ -6049,6 +6049,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     }
 
     const int f_lo = pl.pin_moe ? 1 : 0, f_hi = pl.pin_moe ? 3 : 0;
+    std::vector<uint16_t> two_cls[4];      /* each form's bytes, for the four-class pass below */
     for (int form = f_lo; form <= f_hi; ++form) {
         const std::string label = what + " " + kForm[form];
         if (pl.pin_moe) pl.pin_moe(form);
@@ -6091,6 +6092,69 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
             }
         ok(label.c_str(), bad == 0, std::to_string(bad) + " of " + std::to_string(Tr * N) +
                                     " elements off, worst " + std::to_string(worst) + first);
+        two_cls[form] = got;
+    }
+
+    /* AND THE SAME EXPERTS AS FOUR CLASSES, by number mod 4 (`moe_gemm_q_mod4`). Each parity table
+     * read at twice its stride is two of them -- from its first entry, the experts 0, 4, 8, ... of
+     * its parity's numbers mod 4, and from its second the others -- so classes 0 and 2 are the even
+     * table's halves and 1 and 3 the odd one's, at the even and the odd geometry. The same experts
+     * at the same geometry, read in the same order: every form must give the two-class op's bytes,
+     * byte for byte. What this checks is the class and entry each run resolves to. */
+    const RadKernelInfo* r4 = find(pl, "moe_gemm_w4a8_mod4");
+    const std::string what4 = what + ", four classes";
+    if (!r4) {
+        ok(what4.c_str(), false, "row moe_gemm_w4a8_mod4 absent");
+        return;
+    }
+    auto halves = [](const RadTensor& t, int bits, RadTensor* lo, RadTensor* hi) {
+        const int64_t n = t.shape[0];
+        *lo = t;
+        *hi = t;
+        lo->shape[0] = (n + 1) / 2;
+        hi->shape[0] = n / 2;
+        lo->stride[0] = t.stride[0] * 2;
+        hi->stride[0] = t.stride[0] * 2;
+        hi->data = (char*)t.data + t.stride[0] * bits / 8;
+    };
+    const int wbits = w5 ? 5 : 4, sbits = g64 ? 8 : 16;
+    RadTensor c4w[4], c4s[4];
+    halves(ts[2], wbits, &c4w[0], &c4w[2]);
+    halves(ts[3], sbits, &c4s[0], &c4s[2]);
+    halves(ts[6], wbits, &c4w[1], &c4w[3]);
+    halves(ts[7], sbits, &c4s[1], &c4s[3]);
+    std::vector<RadTensor> ts4 = { ts[0], ts[1], c4w[0], c4s[0], ts[4], ts[5], c4w[1], c4s[1],
+                                   c4w[2], c4s[2], c4w[3], c4s[3], ts[8] };
+    std::vector<RadParam> ps4 = {
+        PI("M", M), PI("N", sh.N0), PI("K", sh.K0), PI("N_1", sh.N1), PI("K_1", sh.K1),
+        PI("N_2", sh.N0), PI("K_2", sh.K0), PI("N_3", sh.N1), PI("K_3", sh.K1),
+        PI("parts", sh.parts), PI("n_expert", ne), PI("top_k", top_k), PI("group", group),
+        PS("a_order", "token"), PS("dtype", dt),
+    };
+    RadArgs a4;
+    std::memset(&a4, 0, sizeof(a4));
+    a4.t = ts4.data(); a4.n_t = (int)ts4.size();
+    a4.p = ps4.data(); a4.n_p = (int)ps4.size();
+    for (int form = f_lo; form <= f_hi; ++form) {
+        const std::string label = what4 + " " + kForm[form];
+        if (two_cls[form].empty()) continue;      /* the two-class launch failed, and said so */
+        if (pl.pin_moe) pl.pin_moe(form);
+        {
+            std::vector<uint16_t> junk((size_t)(Tr * N), 0x7f7fu);
+            st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
+        }
+        a4.scratch = form == 3 ? nullptr : d_map;
+        a4.scratch_bytes = form == 3 ? 0 : map_bytes;
+        const int rc = r4->launch(&a4, nullptr);
+        st_stream_sync(nullptr);
+        if (pl.pin_moe) pl.pin_moe(0);
+        if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
+        std::vector<uint16_t> got((size_t)(Tr * N));
+        st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
+        int64_t diff = 0;
+        for (size_t i = 0; i < got.size(); ++i) diff += got[i] != two_cls[form][i];
+        ok(label.c_str(), diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
+                                     " elements differ from the two-class op's");
     }
 }
 

@@ -1145,6 +1145,44 @@ int ref_moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("moe_gemm_q", operand, out);
 }
 
+/* The four-class form: class q at [N_q, K_q], defaulting to class 0's, holds the experts e with
+ * e % 4 == q -- ceil((n - q) / 4) of them -- and `y` follows the last class. */
+int ref_moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M  = gi(p, n_p, "M", 0);
+    const int64_t N0 = gi(p, n_p, "N", 0), K0 = gi(p, n_p, "K", 0);
+    const int64_t Nq[4] = { N0, gi(p, n_p, "N_1", N0), gi(p, n_p, "N_2", N0), gi(p, n_p, "N_3", N0) };
+    const int64_t Kq[4] = { K0, gi(p, n_p, "K_1", K0), gi(p, n_p, "K_2", K0), gi(p, n_p, "K_3", K0) };
+    const int64_t ne = gi(p, n_p, "n_expert", 0);
+    const int64_t k  = gi(p, n_p, "top_k", 0);
+    int64_t g = gi(p, n_p, "group", 0);
+    if (M <= 0 || ne <= 0 || k <= 0) return RAD_E_UNSUPPORTED;
+    int64_t N = 0, K = 0;
+    for (int q = 0; q < 4; ++q) {
+        if (Nq[q] <= 0 || Kq[q] <= 0) return RAD_E_UNSUPPORTED;
+        if (Nq[q] > N) N = Nq[q];
+        if (Kq[q] > K) K = Kq[q];
+    }
+    if (g <= 0) g = K;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
+    auto cls = [&](int q) {
+        const int64_t nq = (ne + 3 - q) / 4;
+        o.t((uint32_t)RAD_F8E4M3, { nq, Nq[q], Kq[q] });
+        o.t(D, { nq, (Nq[q] + g - 1) / g, (Kq[q] + g - 1) / g });
+    };
+    o.t((uint32_t)RAD_F8E4M3, { AR, K });             /* a -- E4M3 codes, see `a_order` */
+    o.t((uint32_t)RAD_F32, { AR, (K + g - 1) / g });   /* a_scale */
+    cls(0);                                           /* w, w_scale -- class 0 */
+    o.t_idx({ M * k }, M * k, -1, 0);                 /* sorted_tok */
+    o.t_idx({ ne + 1 }, M * k + 1, -1, 0);            /* expert_offset */
+    cls(1);
+    cls(2);
+    cls(3);
+    o.t(D, { M * k, N });                             /* y -- in SORTED order */
+    return o.finish("moe_gemm_q_mod4", operand, out);
+}
+
 int ref_moe_gather_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
     const int64_t k = gi(p, n_p, "top_k", 0);

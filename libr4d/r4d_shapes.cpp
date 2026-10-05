@@ -1310,6 +1310,49 @@ extern "C" int r4d_shape_moe_gemm_q(const RadParam* p, int n_p, int operand, Rad
     R4D_PICK(l);
 }
 
+/* The four-class form: class q holds the experts e with e % 4 == q at [N_q, K_q], defaulting to
+ * class 0's, ceil((n - q) / 4) of them; `y` follows the last class. */
+extern "C" int r4d_shape_moe_gemm_q_mod4(const RadParam* p, int n_p, int operand,
+                                         RadOpdDesc* out) {
+    const int64_t M  = pi(p, n_p, "M");
+    int64_t Nc[4], Kc[4];
+    Nc[0] = pi(p, n_p, "N");
+    Kc[0] = pi(p, n_p, "K");
+    Nc[1] = pi(p, n_p, "N_1", Nc[0]); Kc[1] = pi(p, n_p, "K_1", Kc[0]);
+    Nc[2] = pi(p, n_p, "N_2", Nc[0]); Kc[2] = pi(p, n_p, "K_2", Kc[0]);
+    Nc[3] = pi(p, n_p, "N_3", Nc[0]); Kc[3] = pi(p, n_p, "K_3", Kc[0]);
+    const int64_t ne = pi(p, n_p, "n_expert");
+    const int64_t k  = pi(p, n_p, "top_k");
+    int64_t g = pi(p, n_p, "group");
+    if (ne <= 0 || k <= 0) return RAD_E_UNSUPPORTED;
+    if (g <= 0) g = 128;
+    int64_t N = 0, K = 0;
+    for (int q = 0; q < 4; ++q) {
+        if (Nc[q] <= 0 || Kc[q] <= 0) return RAD_E_UNSUPPORTED;
+        if (Nc[q] > N) N = Nc[q];
+        if (Kc[q] > K) K = Kc[q];
+    }
+    int64_t nq[4];
+    for (int q = 0; q < 4; ++q) nq[q] = (ne + 3 - q) / 4;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const char* ord = rad_param_gets(p, n_p, "a_order", nullptr);
+    const int64_t AR = (ord && !std::strcmp(ord, "sorted")) ? M * k : M;
+    auto wq = [&](int q) { return opd((uint32_t)RAD_F8E4M3, nq[q], Nc[q], Kc[q]); };
+    auto sq = [&](int q) {
+        return opd((uint32_t)RAD_BF16, nq[q], (Nc[q] + g - 1) / g, (Kc[q] + g - 1) / g);
+    };
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_F8E4M3, AR, K),                 /* a -- see `a_order` */
+        opd((uint32_t)RAD_F32, AR, (K + g - 1) / g),      /* a_scale */
+        wq(0), sq(0),                                     /* w, w_scale -- class 0 */
+        opd_idx(M * k, 0, M * k, -1),                     /* sorted_tok */
+        opd_idx(ne + 1, 0, M * k + 1, -1),                /* expert_offset */
+        wq(1), sq(1), wq(2), sq(2), wq(3), sq(3),         /* classes 1, 2, 3 */
+        opd(D, M * k, N),                                 /* y -- in SORTED order */
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_moe_gather(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
     const int64_t k = pi(p, n_p, "top_k");

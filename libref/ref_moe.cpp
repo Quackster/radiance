@@ -173,8 +173,8 @@ int ref_moe_scatter(const RadArgs* a, RadStream) {
  * here. Only the WEIGHT scale grid is block-shaped -- one scale per 128x128 tile of an expert --
  * while the activation's is per row per group of K, which is `rblk = 1`, which is what
  * make_scales derives on its own from the two extents. */
-static int moe_gemm_impl(const RadArgs* a, bool quant) {
-    const int n_opd = quant ? 9 : 5;
+static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
+    const int n_opd = quant ? (ncls == 4 ? 13 : 9) : 5;
     if (!have(a, n_opd)) return RAD_E_INVAL;
     const RadTensor* A      = &a->t[0];
     const RadTensor* as_    = quant ? t_in(a, 1) : nullptr;
@@ -182,12 +182,18 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
     const RadTensor* ws_    = quant ? t_in(a, 3) : nullptr;
     const RadTensor* sorted = &a->t[quant ? 4 : 2];
     const RadTensor* off    = &a->t[quant ? 5 : 3];
-    const RadTensor* Y      = &a->t[quant ? 8 : 4];
-    /* THE QUANTISED ARM'S EXPERTS ARE TWO TABLES BY PARITY -- see ref_registry.cpp -- and the
-     * plain arm's are one, which is the same walk with every expert in the first class. */
+    const RadTensor* Y      = &a->t[quant ? (ncls == 4 ? 12 : 8) : 4];
+    /* THE QUANTISED ARM'S EXPERTS ARE TWO TABLES BY PARITY -- see ref_registry.cpp -- or, for
+     * `moe_gemm_q_mod4`, four by the expert's number mod 4; the plain arm's are one, which is the
+     * same walk with every expert in the first class. */
     const RadTensor* W1     = quant ? &a->t[6] : W;
     const RadTensor* ws1_   = quant ? t_in(a, 7) : nullptr;
     const bool two = quant;
+    const int  nc  = quant ? ncls : 1;
+    const RadTensor* Wq[4]  = { W, W1, quant && nc == 4 ? &a->t[8] : W,
+                                quant && nc == 4 ? &a->t[10] : W };
+    const RadTensor* wsq[4] = { ws_, ws1_, quant && nc == 4 ? t_in(a, 9) : nullptr,
+                                quant && nc == 4 ? t_in(a, 11) : nullptr };
 
     /* "sorted" means `a` already has one row per (token, slot) in the scatter's order, which is
      * what the DOWN projection of a routed block reads -- its input is the first projection's
@@ -199,19 +205,29 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
 
     const int64_t N0 = p_int(a, "N", W->rank >= 3 ? W->shape[1] : 0);
     const int64_t K0 = p_int(a, "K", W->rank >= 3 ? W->shape[2] : 0);
-    const int64_t N1 = two ? p_int(a, "N_odd", N0) : N0;
-    const int64_t K1 = two ? p_int(a, "K_odd", K0) : K0;
+    /* Each class's geometry, defaulting to class 0's: N_odd/K_odd at two classes, N_q/K_q at
+     * four. */
+    static const char* const kN4[4] = { "N", "N_1", "N_2", "N_3" };
+    static const char* const kK4[4] = { "K", "K_1", "K_2", "K_3" };
+    int64_t Nq[4] = { N0, N0, N0, N0 }, Kq[4] = { K0, K0, K0, K0 };
+    for (int q = 1; q < nc; ++q) {
+        Nq[q] = p_int(a, nc == 4 ? kN4[q] : "N_odd", N0);
+        Kq[q] = p_int(a, nc == 4 ? kK4[q] : "K_odd", K0);
+    }
     const int64_t parts = two ? p_int(a, "parts", 1) : 1;
     const int64_t n_expert = p_int(a, "n_expert", W->rank >= 3 ? W->shape[0] : 0);
     const int64_t top_k = p_int(a, "top_k", 1);
-    if (N0 <= 0 || K0 <= 0 || N1 <= 0 || K1 <= 0 || parts <= 0 || n_expert <= 0 || top_k <= 0)
-        return RAD_E_SHAPE;
-    if (N0 % parts || N1 % parts) return RAD_E_SHAPE;
-    /* The output is the wider class's width, the activation the longer class's K. */
-    const int64_t N = N0 > N1 ? N0 : N1, K = K0 > K1 ? K0 : K1;
-    const int64_t ne0 = two ? (n_expert + 1) / 2 : n_expert, ne1 = two ? n_expert / 2 : 0;
-    if (W->rank < 3 || W->shape[0] < ne0) return RAD_E_SHAPE;
-    if (two && (W1->rank < 3 || W1->shape[0] < ne1)) return RAD_E_SHAPE;
+    if (parts <= 0 || n_expert <= 0 || top_k <= 0) return RAD_E_SHAPE;
+    /* The output is the widest class's width, the activation the longest class's K. Class q
+     * holds ceil((n - q) / nc) experts. */
+    int64_t N = 0, K = 0;
+    for (int q = 0; q < nc; ++q) {
+        if (Nq[q] <= 0 || Kq[q] <= 0 || Nq[q] % parts) return RAD_E_SHAPE;
+        if (Nq[q] > N) N = Nq[q];
+        if (Kq[q] > K) K = Kq[q];
+        const int64_t neq = (n_expert + nc - 1 - q) / nc;
+        if (neq > 0 && (Wq[q]->rank < 3 || Wq[q]->shape[0] < neq)) return RAD_E_SHAPE;
+    }
     const int64_t T = numel(Y) / N;
     if (T <= 0 || numel(sorted) < T || numel(off) < n_expert + 1) return RAD_E_SHAPE;
 
@@ -235,17 +251,17 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
     /* Per-expert readings, built once outside the row loop: a table lookup and a Scales are cheap,
      * and doing them per row would be T of them against n_expert. A null `data` means the operand
      * could not be read as a table at all, which is refused before the loop because an OpenMP body
-     * cannot return. Expert e is entry e / 2 of class e % 2 when there are two classes. */
+     * cannot return. Expert e is entry e / nc of class e % nc. */
     std::vector<RadTensor> we((size_t)n_expert), wse((size_t)n_expert);
     std::vector<Mat>       mw((size_t)n_expert);
     std::vector<Scales>    SW((size_t)n_expert);
     std::vector<int64_t>   en((size_t)n_expert), ek((size_t)n_expert);
     for (int64_t e = 0; e < n_expert; ++e) {
-        const bool odd = two && (e & 1);
-        const RadTensor* tw = odd ? W1 : W;
-        const RadTensor* ts = odd ? ws1_ : ws_;
-        const int64_t ix = two ? e / 2 : e;
-        const int64_t n = odd ? N1 : N0, k = odd ? K1 : K0;
+        const int q = (int)(e % nc);
+        const RadTensor* tw = Wq[q];
+        const RadTensor* ts = wsq[q];
+        const int64_t ix = e / nc;
+        const int64_t n = Nq[q], k = Kq[q];
         en[(size_t)e] = n;
         ek[(size_t)e] = k;
         we[(size_t)e] = expert_entry(tw, ix);
@@ -301,6 +317,7 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
 
 int ref_moe_gemm(const RadArgs* a, RadStream)   { return moe_gemm_impl(a, false); }
 int ref_moe_gemm_q(const RadArgs* a, RadStream) { return moe_gemm_impl(a, true); }
+int ref_moe_gemm_q_mod4(const RadArgs* a, RadStream) { return moe_gemm_impl(a, true, 4); }
 
 /* ------------------------------------------------------------------ moe_gather */
 /* y[t] = sum over the token's slots of expert_w[t, j] * y_expert[position of (t, j)].

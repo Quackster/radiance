@@ -344,6 +344,19 @@ static const RadParamSpec pMoeGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_
 static const RadOperandSpec oMoeGemmQ[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"), WTAB("w_scale"),
                                             OPD("sorted_tok"), OPD("expert_offset"),
                                             WTAB("w_odd"), WTAB("w_odd_scale"), OUT("y") };
+/* THE SAME OP OVER FOUR CLASSES, by the expert's number mod 4: `w`/`w_scale` class 0 at [N, K],
+ * `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry e / 4 of class e % 4 -- how four
+ * ranks take turns with the extra block of a five-block expert. libr4d's schema states the same. */
+static const RadParamSpec pMoeGemmQMod4[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"),
+                                              P_INT("top_k"), P_INT("group"), P_STR("a_order"),
+                                              P_STR("dtype"), P_INTO("N_1"), P_INTO("K_1"),
+                                              P_INTO("N_2"), P_INTO("K_2"), P_INTO("N_3"),
+                                              P_INTO("K_3"), P_INTO("parts") };
+static const RadOperandSpec oMoeGemmQMod4[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"),
+                                                WTAB("w_scale"), OPD("sorted_tok"),
+                                                OPD("expert_offset"), WTAB("w_1"),
+                                                WTAB("w_1_scale"), WTAB("w_2"), WTAB("w_2_scale"),
+                                                WTAB("w_3"), WTAB("w_3_scale"), OUT("y") };
 
 /* `shared` and `shared_gate` PRESENT = the shared arm folded in, `y = bf16(shared * act(gate)) +
  * bf16(gathered)`, which is scale_rows' fused gate-and-add taken one op further back. `act` is
@@ -770,6 +783,11 @@ static const RadOpSchema kSchemas[] = {
   "two tables by parity: `w` the even ones at [N, K], `w_odd` the odd ones at [N_odd, K_odd], "
   "expert e at entry e/2. The output is max(N, N_odd) wide in `parts` stacked parts, and a "
   "narrower class fills each part's leading columns and zeros the rest." },
+{ "moe_gemm_q_mod4", ARR(pMoeGemmQMod4), ARR(oMoeGemmQMod4),
+  "moe_gemm_q over FOUR weight-table classes by the expert's number mod 4: `w` class 0 at [N, K], "
+  "`w_q` class q at [N_q, K_q], expert e at entry e/4 of class e%4. The output is as wide as the "
+  "widest class in `parts` stacked parts, and a narrower class fills each part's leading columns "
+  "and zeros the rest." },
 { "moe_gather", ARR(pMoeGather), ARR(oMoeGather),
   "Scatters the sorted expert output back and weights it. The sum over a token's slots runs in "
   "ASCENDING SLOT order, which is what makes it reproducible." },
@@ -1048,6 +1066,9 @@ SIMPLE("ref_moe_gemm", "moe_gemm", "moe", "grouped GEMM over the expert-sorted r
        ref_moe_gemm),
 SIMPLE("ref_moe_gemm_q", "moe_gemm_q", "moe",
        "grouped GEMM over the expert-sorted rows, quantised operands", DT_FLOAT, ref_moe_gemm_q),
+SIMPLE("ref_moe_gemm_q_mod4", "moe_gemm_q_mod4", "moe",
+       "grouped GEMM over the expert-sorted rows, quantised operands, four classes by number mod 4",
+       DT_FLOAT, ref_moe_gemm_q_mod4),
 SIMPLE("ref_moe_gather", "moe_gather", "moe", "weighted scatter back to token order", DT_FLOAT,
        ref_moe_gather),
 SIMPLE("ref_rope_table", "rope_table", "attn", "cos/sin at each position's own row", DT_FLOAT, ref_rope_table),

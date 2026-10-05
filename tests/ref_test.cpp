@@ -269,7 +269,8 @@ TEST(op_vocabulary) {
         "dequant",
         "gemm_nt", "gemm_nt_bias", "gemm_nt_q", "gemm_nt_q_bias", "grid_embed",
         "attn_paged", "attn_dense", "kv_store", "rope", "rope_table", "qk_norm_rope",
-        "router_topk", "moe_scatter", "moe_gemm", "moe_gemm_q", "moe_gather", "row_topk",
+        "router_topk", "moe_scatter", "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
+        "row_topk",
         "row_topk_merge", "logit_rerank",
         "gdn_conv_prep", "gdn_conv_update", "gdn_kkt_solve", "gdn_chunk_scan",
         "gdn_recurrent_update", "gdn_conv_recurrent_update", "gdn_gated_rmsnorm",
@@ -1923,6 +1924,59 @@ TEST(op_router_topk) {
     CHECK_OK(run("router_topk", b));
     CHECK_NEAR(w2.at(0), 0.73105858f, 1e-6);
     CHECK_NEAR(w2.at(1), 0.26894142f, 1e-6);
+}
+
+/* THE FOUR-CLASS GROUPED GEMM: expert e is entry e / 4 of class e % 4, each class at its own
+ * width, and a narrower class's columns past its width are zero. Ten experts, so classes 0 and 1
+ * hold three and 2 and 3 hold two -- the shape a layer with 510 quantised experts has -- and class
+ * 1 is the wide one, as it is on rank 1. Every value is a small integer, so the sums are exact. */
+TEST(op_moe_gemm_q_mod4) {
+    const int64_t K = 3, top_k = 2, M = 3, ne = 10;
+    const int64_t Nq[4] = { 2, 4, 2, 2 };
+    auto wv = [](int64_t e, int64_t n, int64_t k) { return (float)(e * 100 + n * 10 + k); };
+    std::vector<T> w, ws;
+    w.reserve(4);
+    ws.reserve(4);
+    for (int q = 0; q < 4; ++q) {
+        const int64_t cnt = (ne + 3 - q) / 4;
+        w.emplace_back(RAD_F32, std::vector<int64_t>{ cnt, Nq[q], K });
+        std::vector<float> v;
+        for (int64_t j = 0; j < cnt; ++j)
+            for (int64_t n = 0; n < Nq[q]; ++n)
+                for (int64_t k = 0; k < K; ++k) v.push_back(wv(q + 4 * j, n, k));
+        w.back().f(v);
+        /* One unit scale an expert: the arithmetic under test is which weight a row reads. */
+        ws.emplace_back(RAD_F32, std::vector<int64_t>{ cnt, 1, 1 });
+        ws.back().f(std::vector<float>((size_t)cnt, 1.0f));
+    }
+    T act(RAD_F32, {M, K});
+    act.f({ 1, 2, 3,  4, 5, 6,  7, 8, 9 });
+    T as(RAD_F32, {M, 1});
+    as.f({ 1, 1, 1 });
+    /* Rows by expert: 1 owns rows 0-1, 2 row 2, 6 row 3, 9 rows 4-5, the rest none. */
+    const std::vector<int64_t> eoff = { 0, 0, 2, 3, 3, 3, 3, 4, 4, 4, 6 };
+    const std::vector<int64_t> flat = { 0, 2, 1, 4, 3, 5 };
+    T sorted(RAD_I32, {6}); sorted.n(flat);
+    T off(RAD_I32, {ne + 1}); off.n(eoff);
+    T y(RAD_F32, {6, 4});
+    A a;
+    a.t(act).t(as).t(w[0]).t(ws[0]).t(sorted).t(off).t(w[1]).t(ws[1]).t(w[2]).t(ws[2]).t(w[3])
+     .t(ws[3]).t(y)
+     .i("M", M).i("N", Nq[0]).i("K", K).i("N_1", Nq[1]).i("K_1", K).i("N_2", Nq[2]).i("K_2", K)
+     .i("N_3", Nq[3]).i("K_3", K).i("n_expert", ne).i("top_k", top_k).s("a_order", "token")
+     .s("dtype", "f32");
+    CHECK_OK(run("moe_gemm_q_mod4", a));
+    for (int64_t i = 0; i < 6; ++i) {
+        int64_t e = 0;
+        while (eoff[(size_t)(e + 1)] <= i) ++e;
+        const int64_t tok = flat[(size_t)i] / top_k;
+        for (int64_t n = 0; n < 4; ++n) {
+            float want = 0.0f;
+            if (n < Nq[e % 4])
+                for (int64_t k = 0; k < K; ++k) want += act.at(tok * K + k) * wv(e, n, k);
+            CHECK_EQ(y.at(i * 4 + n), want);
+        }
+    }
 }
 
 TEST(op_moe_chain) {

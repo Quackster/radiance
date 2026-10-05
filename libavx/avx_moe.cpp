@@ -294,8 +294,8 @@ AVX_KERNEL(moe_scatter) {
  * whose meaning changes with its extent is exactly the shape a checker cannot see: if both
  * implementations gather they agree with each other, and a harness that sizes the operand the way
  * the gather wants never exercises the other reading. */
-static int moe_gemm_impl(const RadArgs* a, bool quant) {
-    const int n_opd = quant ? 9 : 5;
+static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
+    const int n_opd = quant ? (ncls == 4 ? 13 : 9) : 5;
     if (!rad_args_have(a, n_opd)) return RAD_E_INVAL;
     const RadTensor* A = &a->t[0];
     const RadTensor* as_ = quant ? rad_arg_in(a, 1) : nullptr;
@@ -303,12 +303,18 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
     const RadTensor* ws_ = quant ? rad_arg_in(a, 3) : nullptr;
     const RadTensor* sorted = &a->t[quant ? 4 : 2];
     const RadTensor* off = &a->t[quant ? 5 : 3];
-    const RadTensor* Y = &a->t[quant ? 8 : 4];
+    const RadTensor* Y = &a->t[quant ? (ncls == 4 ? 12 : 8) : 4];
     /* THE QUANTISED ARM'S EXPERTS ARE TWO TABLES BY PARITY, expert e at entry e / 2 of class
-     * e % 2; the plain arm's are one. */
+     * e % 2 -- or for `moe_gemm_q_mod4` four, entry e / 4 of class e % 4; the plain arm's are
+     * one. */
     const bool two = quant;
+    const int  nc  = quant ? ncls : 1;
     const RadTensor* W1 = two ? &a->t[6] : W;
     const RadTensor* ws1_ = two ? rad_arg_in(a, 7) : nullptr;
+    const RadTensor* Wq[4]  = { W, W1, quant && nc == 4 ? &a->t[8] : W,
+                                quant && nc == 4 ? &a->t[10] : W };
+    const RadTensor* wsq[4] = { ws_, ws1_, quant && nc == 4 ? rad_arg_in(a, 9) : nullptr,
+                                quant && nc == 4 ? rad_arg_in(a, 11) : nullptr };
 
     const char* ord = p_str(a, "a_order", "token");
     const bool sorted_a = ord && std::strcmp(ord, "sorted") == 0;
@@ -316,19 +322,28 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
 
     const int64_t N0 = p_int(a, "N", W->rank >= 3 ? W->shape[1] : 0);
     const int64_t K0 = p_int(a, "K", W->rank >= 3 ? W->shape[2] : 0);
-    const int64_t N1 = two ? p_int(a, "N_odd", N0) : N0;
-    const int64_t K1 = two ? p_int(a, "K_odd", K0) : K0;
+    /* Each class's geometry, defaulting to class 0's: N_odd/K_odd at two, N_q/K_q at four. */
+    static const char* const kN4[4] = { "N", "N_1", "N_2", "N_3" };
+    static const char* const kK4[4] = { "K", "K_1", "K_2", "K_3" };
+    int64_t Nq[4] = { N0, N0, N0, N0 }, Kq[4] = { K0, K0, K0, K0 };
+    for (int q = 1; q < nc; ++q) {
+        Nq[q] = p_int(a, nc == 4 ? kN4[q] : "N_odd", N0);
+        Kq[q] = p_int(a, nc == 4 ? kK4[q] : "K_odd", K0);
+    }
     const int64_t parts = two ? p_int(a, "parts", 1) : 1;
     const int64_t n_expert = p_int(a, "n_expert", W->rank >= 3 ? W->shape[0] : 0);
     const int64_t top_k = p_int(a, "top_k", 1);
-    if (N0 <= 0 || K0 <= 0 || N1 <= 0 || K1 <= 0 || parts <= 0 || n_expert <= 0 || top_k <= 0)
-        return RAD_E_SHAPE;
-    if (N0 % parts || N1 % parts) return RAD_E_SHAPE;
-    /* The output is the wider class's width, the activation the longer class's K. */
-    const int64_t N = N0 > N1 ? N0 : N1, K = K0 > K1 ? K0 : K1;
-    const int64_t ne0 = two ? (n_expert + 1) / 2 : n_expert, ne1 = two ? n_expert / 2 : 0;
-    if (W->rank < 3 || W->shape[0] < ne0) return RAD_E_SHAPE;
-    if (two && (W1->rank < 3 || W1->shape[0] < ne1)) return RAD_E_SHAPE;
+    if (parts <= 0 || n_expert <= 0 || top_k <= 0) return RAD_E_SHAPE;
+    /* The output is the widest class's width, the activation the longest class's K; class q
+     * holds ceil((n - q) / nc) experts. */
+    int64_t N = 0, K = 0;
+    for (int q = 0; q < nc; ++q) {
+        if (Nq[q] <= 0 || Kq[q] <= 0 || Nq[q] % parts) return RAD_E_SHAPE;
+        if (Nq[q] > N) N = Nq[q];
+        if (Kq[q] > K) K = Kq[q];
+        const int64_t neq = (n_expert + nc - 1 - q) / nc;
+        if (neq > 0 && (Wq[q]->rank < 3 || Wq[q]->shape[0] < neq)) return RAD_E_SHAPE;
+    }
     const int64_t T = numel(Y) / N;
     if (T <= 0 || numel(sorted) < T || numel(off) < n_expert + 1) return RAD_E_SHAPE;
 
@@ -371,11 +386,11 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
      * be read as a table at all, which is refused BEFORE any parallel region because an OpenMP
      * body cannot return. */
     for (int64_t e = 0; e < n_expert; ++e) {
-        const bool odd = two && (e & 1);
-        const RadTensor* tw = odd ? W1 : W;
-        const RadTensor* ts = odd ? ws1_ : ws_;
-        const int64_t ix = two ? e / 2 : e;
-        const int64_t n = odd ? N1 : N0, k = odd ? K1 : K0;
+        const int q = (int)(e % nc);
+        const RadTensor* tw = Wq[q];
+        const RadTensor* ts = wsq[q];
+        const int64_t ix = e / nc;
+        const int64_t n = Nq[q], k = Kq[q];
         we[e] = expert_entry(tw, ix);
         if (!we[e].data) return RAD_E_STRIDE;
         if (we[e].rank < 2 || we[e].shape[0] < n || we[e].shape[1] < k) return RAD_E_SHAPE;
@@ -427,8 +442,8 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
         for (int64_t i = 0; i < T; ++i) {
             if (atok[i] < 0) { stt(Y, i * y_rs + n * y_cs, 0.0f); continue; }
             const int64_t e = aexp[i];
-            const bool odd = two && (e & 1);
-            const int64_t fc = (odd ? N1 : N0) / parts, ke = odd ? K1 : K0;
+            const int q = (int)(e % nc);
+            const int64_t fc = Nq[q] / parts, ke = Kq[q];
             if (j >= fc) { stt(Y, i * y_rs + n * y_cs, 0.0f); continue; }
             const int64_t wr = pp * fc + j;
             /* The expert's weight row is packed when the expert CHANGES, which -- because the
@@ -454,6 +469,7 @@ static int moe_gemm_impl(const RadArgs* a, bool quant) {
 
 AVX_KERNEL(moe_gemm)   { return moe_gemm_impl(a, false); }
 AVX_KERNEL(moe_gemm_q) { return moe_gemm_impl(a, true); }
+AVX_KERNEL(moe_gemm_q_mod4) { return moe_gemm_impl(a, true, 4); }
 
 /* ------------------------------------------------------------------ moe_gather */
 /* y[t] = sum over the token's slots of expert_w[t, j] * y_expert[position of (t, j)].

@@ -263,6 +263,18 @@ static const RadParamSpec pMoeGemmQ[]   = { P_INT("M"), P_INT("N"), P_INT("K"), 
 static const RadOperandSpec oMoeGemmQ[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"), WTAB("w_scale"),
                                             OPD("sorted_tok"), OPD("expert_offset"),
                                             WTAB("w_odd"), WTAB("w_odd_scale"), OUT("y") };
+/* The same over four classes by the expert's number mod 4, `w_q` class q at [N_q, K_q]. Mirrors
+ * libref's and libr4d's schema exactly. */
+static const RadParamSpec pMoeGemmQMod4[]   = { P_INT("M"), P_INT("N"), P_INT("K"),
+                                                P_INT("n_expert"), P_INT("top_k"), P_INT("group"),
+                                                P_STR("a_order"), P_STR("dtype"), P_INTO("N_1"),
+                                                P_INTO("K_1"), P_INTO("N_2"), P_INTO("K_2"),
+                                                P_INTO("N_3"), P_INTO("K_3"), P_INTO("parts") };
+static const RadOperandSpec oMoeGemmQMod4[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"),
+                                                WTAB("w_scale"), OPD("sorted_tok"),
+                                                OPD("expert_offset"), WTAB("w_1"),
+                                                WTAB("w_1_scale"), WTAB("w_2"), WTAB("w_2_scale"),
+                                                WTAB("w_3"), WTAB("w_3_scale"), OUT("y") };
 
 /* `shared` + `shared_gate` present = the shared arm folded in: y = narrow(shared *
  * act(gate)) + narrow(gathered), the unfused pair's two narrows carried in the stores. `act` is
@@ -500,6 +512,8 @@ static const RadOpSchema kSchemas[] = {
 { "moe_gemm", ARR(pMoeGemm), ARR(oMoeGemm), "grouped GEMM over the expert-sorted rows." },
 { "moe_gemm_q", ARR(pMoeGemmQ), ARR(oMoeGemmQ),
   "grouped GEMM over the expert-sorted rows, quantised operands." },
+{ "moe_gemm_q_mod4", ARR(pMoeGemmQMod4), ARR(oMoeGemmQMod4),
+  "grouped GEMM over the expert-sorted rows, quantised operands, four classes by number mod 4." },
 { "moe_gather", ARR(pMoeGather), ARR(oMoeGather), "weighted scatter back to token order." },
 { "row_topk", ARR(pRowTopk), ARR(oRowTopk), "exact per-row top-R." },
 { "row_topk_merge", ARR(pRowTopkMerge), ARR(oRowTopkMerge),
@@ -685,6 +699,9 @@ SIMPLE("avx_moe_gemm", "moe_gemm", "moe", "grouped GEMM over the expert-sorted r
        L(moe_gemm)),
 SIMPLE("avx_moe_gemm_q", "moe_gemm_q", "moe",
        "grouped GEMM over the expert-sorted rows, quantised operands", DT_FLOAT, L(moe_gemm_q)),
+SIMPLE("avx_moe_gemm_q_mod4", "moe_gemm_q_mod4", "moe",
+       "grouped GEMM over the expert-sorted rows, quantised operands, four classes by number mod 4",
+       DT_FLOAT, L(moe_gemm_q_mod4)),
 SIMPLE("avx_moe_gather", "moe_gather", "moe", "weighted scatter back to token order", DT_FLOAT,
        L(moe_gather)),
 SIMPLE("avx_row_topk", "row_topk", "moe", "exact per-row top-R", DT_FLOAT, L(row_topk)),

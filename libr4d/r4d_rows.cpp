@@ -859,6 +859,34 @@ static const RadOperandSpec oMoeGemmQ[] = {
     { "w_odd_scale",   RAD_OPD_WTAB, 0 },
     { "y",             RAD_OPD_OUT,  0 },
 };
+/* THE SAME GEMM OVER FOUR CLASSES, BY THE EXPERT'S NUMBER MOD 4: `w`/`w_scale` hold class 0 at
+ * [N, K] and `w_q`/`w_q_scale` class q at [N_q, K_q], expert e being entry e / 4 of class e % 4.
+ * Four ranks splitting a five-block expert cannot share the extra block evenly over two classes --
+ * whichever two ranks take it carry three blocks of every even/odd pair against the others' two --
+ * and over four they can: rank r takes two blocks of class r and one of each other, five of every
+ * four experts. A separate op and not a parameter on `moe_gemm_q`, because the declaration divides
+ * a table op's weights over its table operands by count alone (core/build/rad_builder.cpp): the
+ * operand list is the class count. `y` follows the last class. */
+static const RadParamSpec pMoeGemmQMod4[] = {
+    P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"), P_INT("top_k"), P_INT("group"),
+    P_STR("a_order"), P_STR("dtype"), P_INTO("N_1"), P_INTO("K_1"), P_INTO("N_2"), P_INTO("K_2"),
+    P_INTO("N_3"), P_INTO("K_3"), P_INTO("parts"),
+};
+static const RadOperandSpec oMoeGemmQMod4[] = {
+    { "a",             RAD_OPD_IN,   0 },
+    { "a_scale",       RAD_OPD_IN,   1 },
+    { "w",             RAD_OPD_WTAB, 0 },
+    { "w_scale",       RAD_OPD_WTAB, 0 },
+    { "sorted_tok",    RAD_OPD_IN,   0 },
+    { "expert_offset", RAD_OPD_IN,   0 },
+    { "w_1",           RAD_OPD_WTAB, 0 },
+    { "w_1_scale",     RAD_OPD_WTAB, 0 },
+    { "w_2",           RAD_OPD_WTAB, 0 },
+    { "w_2_scale",     RAD_OPD_WTAB, 0 },
+    { "w_3",           RAD_OPD_WTAB, 0 },
+    { "w_3_scale",     RAD_OPD_WTAB, 0 },
+    { "y",             RAD_OPD_OUT,  0 },
+};
 static const RadParamSpec pMoeGather[] = {
     P_INT("M"), P_INT("n"), P_INT("top_k"), P_STR("dtype"),
     /* The shared arm's gate, and it is present exactly when `shared` and `shared_gate` are.
@@ -1970,6 +1998,11 @@ static const RadOpSchema kSchemas[] = {
            "[N, K] and `w_odd`/`w_odd_scale` the odd ones at [N_odd, K_odd], expert e at entry "
            "e/2. The output is max(N, N_odd) wide in `parts` stacked parts, and a class narrower "
            "than that fills each part's leading columns and zeros the rest."),
+    SCHEMA("moe_gemm_q_mod4", pMoeGemmQMod4, oMoeGemmQMod4,
+           "moe_gemm_q over FOUR weight-table classes by the expert's number mod 4: `w`/`w_scale` "
+           "hold class 0 at [N, K] and `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry "
+           "e/4 of class e%4. The output is as wide as the widest class in `parts` stacked parts, "
+           "and a narrower class fills each part's leading columns and zeros the rest."),
     SCHEMA("moe_gather", pMoeGather, oMoeGather,
            "scatters the sorted expert output back to token order and weights it. The sum over a "
            "token's slots runs in ASCENDING SLOT order, which is what makes it reproducible -- "
@@ -4291,6 +4324,28 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_moe_gemm_w4a8, r4d_rad_moe_gemm_w4a8_scratch,
   r4d_rad_layout_moe_w4, r4d_rad_relayout_moe_w4, nullptr, r4d_rad_unrelayout_moe_w4, nullptr,
   r4d_rad_moe_gemm_w4a8_describe },
+
+{ "moe_gemm_fp8a8_mod4", "moe_gemm_q_mod4", "moe",
+  "moe_gemm_fp8a8 over four classes of experts by number mod 4: the same kernel, each run reading "
+  "its class's table",
+  "as moe_gemm_fp8a8, every class",
+  "as moe_gemm_fp8a8",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cMoeGemmQ), NOTUNE,
+  nullptr, nullptr, r4d_rad_moe_gemm_q_mod4, r4d_rad_moe_gemm_q_scratch,
+  r4d_rad_layout_moe_fp8_mod4, nullptr,
+  r4d_shape_moe_gemm_q_mod4, nullptr },
+
+{ "moe_gemm_w4a8_mod4", "moe_gemm_q_mod4", "moe",
+  "moe_gemm_w4a8 over four classes of experts by number mod 4: the same kernel, each run reading "
+  "its class's table",
+  "as moe_gemm_w4a8, every class",
+  "as moe_gemm_w4a8",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cMoeGemmW4), NOTUNE,
+  nullptr, nullptr, r4d_rad_moe_gemm_w4a8_mod4, r4d_rad_moe_gemm_w4a8_scratch,
+  r4d_rad_layout_moe_w4_mod4, r4d_rad_relayout_moe_w4_mod4, nullptr,
+  r4d_rad_unrelayout_moe_w4_mod4, nullptr, r4d_rad_moe_gemm_w4a8_mod4_describe },
 
 { "moe_gemm_bf16", "moe_gemm", "moe",
   "the grouped GEMM with unquantised experts: one run of expert-sorted rows a block, bf16 WMMA over "

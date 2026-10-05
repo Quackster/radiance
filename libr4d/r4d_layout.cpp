@@ -256,6 +256,29 @@ int moe_view(const RadParam* p, int n_p, int operand, MoeView* v) {
     }
     return RAD_OK;
 }
+
+/* `moe_gemm_q_mod4`'s four classes: operands 6/7, 8/9 and 10/11 are classes 1, 2 and 3 at
+ * N_1/K_1, N_2/K_2 and N_3/K_3, answered as 2/3 at that geometry -- the same view, one class
+ * further along. */
+int moe_view_mod4(const RadParam* p, int n_p, int operand, MoeView* v) {
+    if (n_p < 0 || n_p > 32 || (n_p > 0 && !p)) return RAD_E_INVAL;
+    v->n = n_p;
+    v->operand = operand;
+    for (int i = 0; i < n_p; ++i) v->p[i] = p[i];
+    if (operand < 6 || operand > 11) return RAD_OK;
+    static const char* const kN[4] = { "N", "N_1", "N_2", "N_3" };
+    static const char* const kK[4] = { "K", "K_1", "K_2", "K_3" };
+    const int q = (operand - 4) / 2;                 /* 6/7 -> 1, 8/9 -> 2, 10/11 -> 3 */
+    v->operand = 2 + (operand & 1);
+    const long long nq = r4d_pgeti_or(p, n_p, kN[q], -1);
+    const long long kq = r4d_pgeti_or(p, n_p, kK[q], -1);
+    for (int i = 0; i < n_p; ++i) {
+        if (!v->p[i].key) continue;
+        if (nq > 0 && std::strcmp(v->p[i].key, "N") == 0) v->p[i].ival = nq;
+        if (kq > 0 && std::strcmp(v->p[i].key, "K") == 0) v->p[i].ival = kq;
+    }
+    return RAD_OK;
+}
 }  /* namespace */
 
 /* ================================================================== the hooks
@@ -819,21 +842,24 @@ void moew5_row(const uint8_t* s, uint8_t* d, int64_t K, uint8_t* nib, bool forwa
 }
 }  /* namespace */
 
-extern "C" int r4d_rad_layout_moe_w4(const RadParam* p, int n_p, int operand,
-                                         const RadEncoding* enc, const int* sel,
-                                         const RadTensor* pl, int n, RadLayout* out) {
+namespace {
+using MoeViewFn = int (*)(const RadParam*, int, int, MoeView*);
+
+int moew4_layout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
+                    const RadEncoding* enc, const int* sel, const RadTensor* pl, int n,
+                    RadLayout* out) {
     MoeView v;
-    const int rc = moe_view(p, n_p, operand, &v);
+    const int rc = view(p, n_p, operand, &v);
     return rc != RAD_OK ? rc : moew4_enc_layout(v.p, v.n, v.operand, enc, sel, pl, n, out, nullptr);
 }
 
-extern "C" int r4d_rad_relayout_moe_w4(const RadParam* p, int n_p, int operand,
-                                       const RadEncoding* enc, const int* sel,
-                                       const RadTensor* pl, int n, void* dst, int64_t dst_bytes) {
+int moew4_relayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
+                      const RadEncoding* enc, const int* sel, const RadTensor* pl, int n,
+                      void* dst, int64_t dst_bytes) {
     MoeView v;
     RadLayout L;
     WGeom g;
-    int rc = moe_view(p, n_p, operand, &v);
+    int rc = view(p, n_p, operand, &v);
     if (rc == RAD_OK) rc = moew4_enc_layout(v.p, v.n, v.operand, enc, sel, pl, n, &L, &g);
     if (rc != RAD_OK) return rc;
     if (dst_bytes != L.bytes) return RAD_E_SHAPE;
@@ -857,13 +883,13 @@ extern "C" int r4d_rad_relayout_moe_w4(const RadParam* p, int n_p, int operand,
     return RAD_OK;
 }
 
-extern "C" int r4d_rad_unrelayout_moe_w4(const RadParam* p, int n_p, int operand,
-                                         const RadEncoding* enc, const int* sel, const void* src,
-                                         int64_t src_bytes, const RadTensor* pl, int n) {
+int moew4_unrelayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
+                        const RadEncoding* enc, const int* sel, const void* src,
+                        int64_t src_bytes, const RadTensor* pl, int n) {
     MoeView v;
     RadLayout L;
     WGeom g;
-    int rc = moe_view(p, n_p, operand, &v);
+    int rc = view(p, n_p, operand, &v);
     if (rc == RAD_OK) rc = moew4_enc_layout(v.p, v.n, v.operand, enc, sel, pl, n, &L, &g);
     if (rc != RAD_OK) return rc;
     if (src_bytes != L.bytes) return RAD_E_SHAPE;
@@ -887,11 +913,54 @@ extern "C" int r4d_rad_unrelayout_moe_w4(const RadParam* p, int n_p, int operand
     return RAD_OK;
 }
 
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_moe_w4(const RadParam* p, int n_p, int operand,
+                                     const RadEncoding* enc, const int* sel,
+                                     const RadTensor* pl, int n, RadLayout* out) {
+    return moew4_layout_by(moe_view, p, n_p, operand, enc, sel, pl, n, out);
+}
+extern "C" int r4d_rad_relayout_moe_w4(const RadParam* p, int n_p, int operand,
+                                       const RadEncoding* enc, const int* sel,
+                                       const RadTensor* pl, int n, void* dst, int64_t dst_bytes) {
+    return moew4_relayout_by(moe_view, p, n_p, operand, enc, sel, pl, n, dst, dst_bytes);
+}
+extern "C" int r4d_rad_unrelayout_moe_w4(const RadParam* p, int n_p, int operand,
+                                         const RadEncoding* enc, const int* sel, const void* src,
+                                         int64_t src_bytes, const RadTensor* pl, int n) {
+    return moew4_unrelayout_by(moe_view, p, n_p, operand, enc, sel, src, src_bytes, pl, n);
+}
+extern "C" int r4d_rad_layout_moe_w4_mod4(const RadParam* p, int n_p, int operand,
+                                          const RadEncoding* enc, const int* sel,
+                                          const RadTensor* pl, int n, RadLayout* out) {
+    return moew4_layout_by(moe_view_mod4, p, n_p, operand, enc, sel, pl, n, out);
+}
+extern "C" int r4d_rad_relayout_moe_w4_mod4(const RadParam* p, int n_p, int operand,
+                                            const RadEncoding* enc, const int* sel,
+                                            const RadTensor* pl, int n, void* dst,
+                                            int64_t dst_bytes) {
+    return moew4_relayout_by(moe_view_mod4, p, n_p, operand, enc, sel, pl, n, dst, dst_bytes);
+}
+extern "C" int r4d_rad_unrelayout_moe_w4_mod4(const RadParam* p, int n_p, int operand,
+                                              const RadEncoding* enc, const int* sel,
+                                              const void* src, int64_t src_bytes,
+                                              const RadTensor* pl, int n) {
+    return moew4_unrelayout_by(moe_view_mod4, p, n_p, operand, enc, sel, src, src_bytes, pl, n);
+}
+
 extern "C" int r4d_rad_layout_moe_fp8(const RadParam* p, int n_p, int operand,
                                           const RadEncoding* enc, const int* sel,
                                           const RadTensor* pl, int n, RadLayout* out) {
     MoeView v;
     const int rc = moe_view(p, n_p, operand, &v);
+    return rc != RAD_OK ? rc : r4d_rad_layout_fp8_rowmajor(v.p, v.n, v.operand, enc, sel, pl,
+                                                               n, out);
+}
+extern "C" int r4d_rad_layout_moe_fp8_mod4(const RadParam* p, int n_p, int operand,
+                                           const RadEncoding* enc, const int* sel,
+                                           const RadTensor* pl, int n, RadLayout* out) {
+    MoeView v;
+    const int rc = moe_view_mod4(p, n_p, operand, &v);
     return rc != RAD_OK ? rc : r4d_rad_layout_fp8_rowmajor(v.p, v.n, v.operand, enc, sel, pl,
                                                                n, out);
 }

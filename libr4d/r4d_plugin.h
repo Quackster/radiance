@@ -231,6 +231,11 @@ int64_t r4d_rad_moe_gemm_w4a8_scratch(const RadArgs*);
  * section for the stored plane. */
 int     r4d_rad_moe_gemm_w4a8      (const RadArgs*, RadStream);
 int r4d_rad_moe_gemm_w4a8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+/* `moe_gemm_q_mod4`: the same two kernels over four classes of experts, by the expert's number
+ * mod 4. The scratch hooks are the two-class ones. */
+int     r4d_rad_moe_gemm_q_mod4    (const RadArgs*, RadStream);
+int     r4d_rad_moe_gemm_w4a8_mod4 (const RadArgs*, RadStream);
+int r4d_rad_moe_gemm_w4a8_mod4_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 /* `moe_gemm` at bf16: one weight table of the checkpoint's own row-major planes, no scales. The
  * same grouping and the same three forms; its scratch hook sizes the same run map. */
 int     r4d_rad_moe_gemm_bf16      (const RadArgs*, RadStream);
@@ -326,11 +331,14 @@ R4D_HOOKS(mtp_e4m3)
 R4D_HOOKS(w4)
 R4D_HOOKS(w2a8)
 R4D_HOOKS(moe_w4)
+R4D_HOOKS(moe_w4_mod4)
 #undef R4D_HOOKS
 int r4d_rad_layout_fp8_rowmajor(const RadParam*, int, int, const RadEncoding*, const int*,
                                 const RadTensor*, int, RadLayout*);
 int r4d_rad_layout_moe_fp8(const RadParam*, int, int, const RadEncoding*, const int*,
                            const RadTensor*, int, RadLayout*);
+int r4d_rad_layout_moe_fp8_mod4(const RadParam*, int, int, const RadEncoding*, const int*,
+                                const RadTensor*, int, RadLayout*);
 int r4d_rad_layout_w8a16(const RadParam*, int, int, const RadEncoding*, const int*,
                          const RadTensor*, int, RadLayout*);
 int r4d_rad_layout_w8a8(const RadParam*, int, int, const RadEncoding*, const int*,
@@ -467,6 +475,7 @@ int r4d_shape_router_topk    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_router_topk_scatter(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_moe_scatter    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gemm_q     (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_moe_gemm_q_mod4(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gather     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_scale_rows     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_row_topk_merge (const RadParam*, int, int operand, RadOpdDesc*);

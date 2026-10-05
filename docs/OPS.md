@@ -127,9 +127,12 @@ hand it.
 
 **How the declaration divides.** An op may carry several table operands — `moe_gemm_q` has four,
 the codes and the scale planes of its even experts and of its odd ones. Whatever is left after the fixed weight positions have taken one each
-is split EVENLY across the table positions, in declaration order, and a division that does not come
-out whole is refused at declare. That is exactly right for the case tables exist for: every table of
-one MoE op takes one weight per expert.
+is split EVENLY across the table positions, in declaration order, and where it does not come out
+whole the first positions take one more each: `moe_gemm_q_mod4`'s first `n_expert % 4` classes hold
+one expert more than the rest, and their codes and scales are its first table positions. A list too
+short to give every table an entry is refused at declare, and a run that is not one contiguous,
+same-shaped table is refused at issue. That is exactly right for the case tables exist for: every
+table of one MoE op takes one weight per expert of its class.
 
 ## What the loader enforces
 
@@ -553,6 +556,7 @@ every other rank waits out inside the block's all-reduce.
 | op | params | operands |
 |---|---|---|
 | `moe_gemm_q` | `M`(range) `N` `K` `n_expert` `top_k` `group` `a_order` `dtype` `N_odd`/opt `K_odd`/opt `parts`/opt | `a`, `a_scale`?, `w`wt, `w_scale`wt, `sorted_tok`, `expert_offset`, `w_odd`wt, `w_odd_scale`wt → `y` |
+| `moe_gemm_q_mod4` | `M`(range) `N` `K` `n_expert` `top_k` `group` `a_order` `dtype` `N_1`/opt `K_1`/opt `N_2`/opt `K_2`/opt `N_3`/opt `K_3`/opt `parts`/opt | `a`, `a_scale`?, `w`wt, `w_scale`wt, `sorted_tok`, `expert_offset`, `w_1`wt, `w_1_scale`wt, `w_2`wt, `w_2_scale`wt, `w_3`wt, `w_3_scale`wt → `y` |
 | `scale_rows` | `M`(range) `n` `act` `dtype` | `x`, `s`, `add`? → `y` |
 
 The `wt` suffix is the table form and `w` alone is an ordinary weight operand; `moe_gemm`'s row
@@ -570,6 +574,18 @@ for a fused gate/up); the output is `max(N, N_odd)` wide, and a narrower class f
 columns of each output part and writes zeros after them, so the gated quantiser behind it reads
 one layout for every row. Under the equal-division rule above the op's weight list is the even
 class's codes, its scales, then the odd class's codes and scales.
+
+**`moe_gemm_q_mod4` is the same GEMM over four classes, by the expert's number mod 4.**
+`w`/`w_scale` hold class 0 at `[N, K]` and `w_q`/`w_q_scale` class `q` at `[N_q, K_q]` (defaulting
+to `N`, `K`); expert `e` is entry `e / 4` of class `e % 4`, so class `q` holds `ceil((n_expert - q) /
+4)` of them. Four ranks splitting a five-block expert cannot share the extra block evenly over two
+classes -- whichever two ranks take it carry three blocks of every even/odd pair against the other
+two's two -- and over four they can: rank `r` takes two blocks of class `r` and one of each other,
+five of every four experts on every rank. It is a separate op and not a parameter on `moe_gemm_q`
+because the declaration divides a table op's weights over its table operands by count alone: the
+operand list is the class count. Everything else -- `parts`, the zero fill of a narrower class, `a_order`
+-- is `moe_gemm_q`'s, and the weight list is class 0's codes and scales, then class 1's, 2's and
+3's.
 
 ### `a_order`: which rows a grouped GEMM's activation has
 
