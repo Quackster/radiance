@@ -45,6 +45,11 @@ struct RecWeight {
      * checked. A weight with no span -- every even shard -- has `span_set` false. */
     bool            span_set = false;
     int64_t         span_lo = 0, span_hi = 0;
+    /* rad_weight_shard_span_parts and rad_weight_shard_zero, recorded the same way. */
+    int             n_part_spans = 0;
+    int64_t         part_lo[RAD_MAX_ROW_PARTS] = {0}, part_hi[RAD_MAX_ROW_PARTS] = {0};
+    int64_t         part_total[RAD_MAX_ROW_PARTS] = {0};
+    bool            zero = false;
 };
 struct RecBuf    { std::string name; RadBufDecl    d{}; };
 struct RecOp {
@@ -215,6 +220,29 @@ extern "C" int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, in
     rw.span_set = true;
     rw.span_lo  = lo;
     rw.span_hi  = hi;
+    return RAD_OK;
+}
+extern "C" int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo,
+                                           const int64_t* hi, const int64_t* total, int n) {
+    if (!b || w == 0 || w > b->weights.size() || !lo || !hi || !total) return RAD_E_INVAL;
+    if (n < 2 || n > RAD_MAX_ROW_PARTS) return RAD_E_INVAL;
+    RecWeight& rw = b->weights[w - 1];
+    if (rw.d.n_row_parts != n) return RAD_E_INVAL;
+    for (int g = 0; g < n; ++g) {
+        if (lo[g] < 0 || hi[g] <= lo[g] || hi[g] > total[g]) return RAD_E_INVAL;
+        if (rw.d.row_parts[g] != hi[g] - lo[g]) return RAD_E_SHAPE;
+        rw.part_lo[g] = lo[g];
+        rw.part_hi[g] = hi[g];
+        rw.part_total[g] = total[g];
+    }
+    rw.n_part_spans = n;
+    return RAD_OK;
+}
+extern "C" int rad_weight_shard_zero(RadBuilder* b, rad_weight w) {
+    if (!b || w == 0 || w > b->weights.size()) return RAD_E_INVAL;
+    RecWeight& rw = b->weights[w - 1];
+    if (rw.d.shard != RAD_SHARD_ROW && rw.d.shard != RAD_SHARD_COL) return RAD_E_INVAL;
+    rw.zero = true;
     return RAD_OK;
 }
 extern "C" int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {
@@ -2210,13 +2238,16 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
         }
     }
 
-    /* A WORLD THAT CANNOT REPLICATE -- not a multiple of the KV head count -- is refused by name,
-     * not rounded into a half head. */
+    /* A WORLD THAT CANNOT REPLICATE -- not a multiple of the KV head count -- is no longer
+     * refused: it serves attention on the largest multiple under it and the rest of the ranks
+     * carry zero attention (the tp3 case below holds the shapes). Nothing is rounded into a
+     * half head: the replication rule itself is unchanged and still refuses an attention world
+     * that is not a multiple, which cannot arise from geom_from's construction. */
     {
         RadBuilder b3;
         RadBuildCtx c3 = build_ctx(0, 3);
         c3.max_tok = 2048; c3.max_seqs = 8; c3.max_spec = 3; c3.max_ctx = 200000;
-        CHECK(qwen4exp_fp8::declare(&b3, &meta, &c3) != RAD_OK);
+        CHECK_EQ(qwen4exp_fp8::declare(&b3, &meta, &c3), RAD_OK);
     }
 
     /* ---- A LAYER THAT KEEPS EXPERTS PLAIN STAYS AT FOUR CLASSES. Two plain experts leave 510
@@ -2441,6 +2472,140 @@ const RecIssue* issue_of(const RadBuilder& b, const RadCtx& c, const std::string
 }
 
 }  /* namespace */
+
+/* THREE RANKS OVER TWO KV HEADS: the attention world is 2 (rad_arch.h), rank 2 declares the same
+ * attention as its peers and reads zeros for it, and the delta net's 16 K heads go 6, 5, 5 with
+ * the V heads at the same multiple -- declared as spans of the container, nothing padded. On the
+ * tree before this, geom_from refuses world 3 ("cannot replicate n_head_kv = 2") and nothing
+ * below runs. */
+TEST(flashnext_tp3_zeroes_the_third_ranks_attention_and_splits_gdn_heads_unevenly) {
+    RadModelMeta meta = qwen4exp_meta();
+    const int      world     = 3;
+    const int64_t  n_head    = meta.n_head;       /* 24 */
+    const int64_t  n_head_kv = meta.n_head_kv;    /* 2: neither divides 3 nor divides into it */
+    const int64_t  head_dim  = meta.head_dim;     /* 256 */
+    const int64_t  nk = atoll(rad_meta_gets(&meta, "linear_num_key_heads", "0"));     /* 16 */
+    const int64_t  nv = atoll(rad_meta_gets(&meta, "linear_num_value_heads", "0"));   /* 48 */
+    const int64_t  hk = atoll(rad_meta_gets(&meta, "linear_key_head_dim", "0"));      /* 128 */
+    const int64_t  hv = atoll(rad_meta_gets(&meta, "linear_value_head_dim", "0"));    /* 128 */
+    REQUIRE(n_head_kv < world && world % n_head_kv != 0);
+    REQUIRE(nk % world != 0);
+    const int attn_world = (int)(n_head_kv * (world / n_head_kv));   /* 2 */
+
+    const int lfull = 3;
+    const std::string kq = "blk." + std::to_string(lfull) + ".attn_k.weight";
+    const std::string kv = "blk." + std::to_string(lfull) + ".attn_v.weight";
+    const std::string qg = "blk." + std::to_string(lfull) + ".attn_qg.weight";
+    const std::string oo = "blk." + std::to_string(lfull) + ".attn_output.weight";
+
+    RadBuilder b[world];
+    RadBuildCtx  c[world];
+    for (int r = 0; r < world; ++r) {
+        c[r] = build_ctx(r, world);
+        c[r].max_tok  = 2048;
+        c[r].max_seqs = 8;
+        c[r].max_spec = 3;
+        c[r].max_ctx  = 200000;
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b[r], &meta, &c[r]), RAD_OK);
+    }
+
+    /* The three programs declare the same ops in the same order and the same KV groups: the
+     * scheduler sees one program. */
+    for (int r = 1; r < world; ++r) {
+        REQUIRE_EQ(b[r].ops.size(), b[0].ops.size());
+        REQUIRE_EQ(b[r].kv_groups.size(), b[0].kv_groups.size());
+        for (size_t i = 0; i < b[0].ops.size(); ++i) CHECK_EQ(b[r].ops[i].op, b[0].ops[i].op);
+        for (size_t g = 0; g < b[0].kv_groups.size(); ++g) {
+            CHECK_EQ(b[r].kv_groups[g].name, b[0].kv_groups[g].name);
+            CHECK_EQ(b[r].kv_groups[g].d.kind, b[0].kv_groups[g].d.kind);
+        }
+    }
+
+    for (int r = 0; r < world; ++r) {
+        const bool zero = r >= attn_world;
+        /* (1) ATTENTION: every rank the two-rank geometry -- 12 heads, one KV head, gqa 12. */
+        const RecOp* at = find_op(b[r], "attn_paged");
+        REQUIRE(at != nullptr);
+        CHECK_EQ(pint(at, "n_head"), n_head / attn_world);
+        CHECK_EQ(pint(at, "gqa"), n_head / attn_world);
+        CHECK_EQ(b[r].kv_groups[0].d.n_head_kv, 1);
+        /* (2) THE PROJECTIONS: the span of this rank's heads in the container on every rank --
+         * rank 2 the last attention rank's, so its shapes match -- and zeros on rank 2. */
+        for (const std::string& wn : {kq, kv}) {
+            const RecWeight* w = find_w(b[r], wn);
+            REQUIRE(w != nullptr);
+            CHECK_EQ(w->d.shape[0], head_dim);
+            CHECK(w->span_set);
+            const int ar = zero ? attn_world - 1 : r;
+            CHECK_EQ(w->span_lo, (int64_t)ar * head_dim);
+            CHECK_EQ(w->span_hi, w->span_lo + head_dim);
+            CHECK_EQ(w->zero, zero);
+        }
+        {
+            const RecWeight* w = find_w(b[r], qg);
+            REQUIRE(w != nullptr);
+            const int ar = zero ? attn_world - 1 : r;
+            const int64_t qg_rows = 2 * (n_head / attn_world) * head_dim;
+            CHECK_EQ(w->d.shape[0], qg_rows);
+            CHECK(w->span_set);
+            CHECK_EQ(w->span_lo, (int64_t)ar * qg_rows);
+            CHECK_EQ(w->zero, zero);
+            const RecWeight* o = find_w(b[r], oo);
+            REQUIRE(o != nullptr);
+            CHECK_EQ(o->d.shard, RAD_SHARD_COL);
+            CHECK(o->span_set);
+            CHECK_EQ(o->span_lo, (int64_t)ar * (n_head / attn_world) * head_dim);
+            CHECK_EQ(o->zero, zero);
+        }
+        /* (3) THE DELTA NET: 6, 5, 5 K heads and 18, 15, 15 V heads, real on every rank, as
+         * per-part spans of [q|k|v|z] and of the conv channels, a one-span of A_log. */
+        const int64_t base = nk / world, rem = nk % world;
+        const int64_t my_k = base + (r < rem ? 1 : 0);
+        const int64_t k0   = r * base + (r < rem ? r : rem);
+        const int64_t my_v = (nv / nk) * my_k, v0 = (nv / nk) * k0;
+        const RecWeight* in = find_w(b[r], "blk.0.ssm_inz.weight");
+        REQUIRE(in != nullptr);
+        REQUIRE_EQ(in->d.n_row_parts, 4);
+        CHECK_EQ(in->d.row_parts[0], my_k * hk);
+        CHECK_EQ(in->d.row_parts[2], my_v * hv);
+        REQUIRE_EQ(in->n_part_spans, 4);
+        CHECK_EQ(in->part_lo[0], k0 * hk);
+        CHECK_EQ(in->part_lo[1], k0 * hk);
+        CHECK_EQ(in->part_lo[2], v0 * hv);
+        CHECK_EQ(in->part_lo[3], v0 * hv);
+        CHECK_EQ(in->part_total[0], nk * hk);
+        CHECK_EQ(in->part_total[2], nv * hv);
+        CHECK(!in->zero);
+        const RecWeight* cv = find_w(b[r], "blk.0.ssm_conv1d.weight");
+        REQUIRE(cv != nullptr);
+        REQUIRE_EQ(cv->n_part_spans, 3);
+        CHECK_EQ(cv->part_lo[2], v0 * hv);
+        CHECK_EQ(cv->part_hi[2], (v0 + my_v) * hv);
+        const RecWeight* al = find_w(b[r], "blk.0.ssm_a_log");
+        REQUIRE(al != nullptr);
+        CHECK_EQ(al->d.shape[0], my_v);
+        CHECK(al->span_set);
+        CHECK_EQ(al->span_lo, v0);
+        CHECK_EQ(al->span_hi, v0 + my_v);
+        const RecWeight* ow = find_w(b[r], "blk.0.ssm_out.weight");
+        REQUIRE(ow != nullptr);
+        CHECK_EQ(ow->d.shard, RAD_SHARD_COL);
+        CHECK(ow->span_set);
+        CHECK_EQ(ow->span_lo, v0 * hv);
+        CHECK_EQ(ow->span_hi, (v0 + my_v) * hv);
+        /* The GDN state group holds this rank's V heads, uneven across ranks. */
+        bool seen = false;
+        for (const auto& g : b[r].kv_groups)
+            if (g.name == "kv_gdn_state") { seen = true; CHECK_EQ(g.d.n_head_kv, (int)my_v); }
+        CHECK(seen);
+    }
+    /* The three ranks' K heads are the container's 16, once each. */
+    {
+        int64_t sum = 0;
+        for (int r = 0; r < world; ++r) sum += nk / world + (r < nk % world ? 1 : 0);
+        CHECK_EQ(sum, nk);
+    }
+}
 
 TEST(a_vision_container_declares_the_tower_when_the_engine_asks_for_it) {
     /* No encoder budget: the tower is not declared, whatever the container carries. */
