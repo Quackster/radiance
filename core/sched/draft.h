@@ -82,13 +82,20 @@ public:
         float half_life = 16.0f;  /* of each position's estimate, in verifies that evaluate it */
         float prior     = 0.8f;   /* for a position too few verifies have evaluated to say */
         int   min_depth = 1;      /* the policy never drafts fewer */
+        /* THE LOAD CAP. The cost table is a step's cost at ONE sequence, and a deeper window costs
+         * more under load than it says -- every row a step adds is expert bandwidth all its
+         * neighbours wait on. So with more than `busy` sequences running, every window is capped
+         * at `busy_depth`; the estimates go on learning underneath and the windows come back when
+         * the load does. 0 is no cap. */
+        int   busy       = 0;
+        int   busy_depth = 3;
     };
 
     int  configure(const Params& p);
     const Params& params() const { return p_; }
 
     /* RADIANCE_DRAFT_ADAPT and its companions (RADIANCE_DRAFT_COST, _HYST, _HOLD, _HALFLIFE,
-     * _PRIOR, _MIN), parsed ONCE per process and copied into the adaptive fields of `p`;
+     * _PRIOR, _MIN, _BUSY, _BUSY_DEPTH), parsed ONCE per process and copied into the adaptive fields of `p`;
      * max_depth is left alone. Once, so that every step of a run is decided by the same rule --
      * a pass recorded under one setting and played under another is a pass the audit fails. */
     static void from_env(Params* p);
@@ -105,6 +112,11 @@ public:
     /* One verify of this sequence: `drafted` proposed, a prefix of `accepted` taken. Moves its
      * estimate, and its depth when that clears the hysteresis. Returns the depth after. */
     int  adapt_observe(DraftAdapt& s, int drafted, int accepted) const;
+    /* The load cap for a cycle with `n_running` sequences running: busy_depth past the threshold,
+     * 0 for none. The scheduler asks once a cycle and holds the answer (Scheduler::draft_cycle). */
+    int  busy_cap(int n_running) const {
+        return (adapt_ && p_.busy > 0 && n_running > p_.busy) ? p_.busy_depth : 0;
+    }
     /* What the policy maximises, E(d) / T(d), for `s`'s estimate as it stands. For tests and logs. */
     double gain(const DraftAdapt& s, int d) const;
     /* The cost table as configured, T(1..max_depth). */

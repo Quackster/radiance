@@ -103,6 +103,8 @@ void DraftController::from_env(Params* p) {
         env_real("RADIANCE_DRAFT_ADAPT_HALFLIFE", 0.5, 1e6, &e.half_life);
         env_real("RADIANCE_DRAFT_ADAPT_PRIOR", 0.0, 1.0, &e.prior);
         env_int ("RADIANCE_DRAFT_ADAPT_MIN", 1, RAD_SCHED_MAX_SPEC, &e.min_depth);
+        env_int ("RADIANCE_DRAFT_ADAPT_BUSY", 0, 1000000, &e.busy);
+        env_int ("RADIANCE_DRAFT_ADAPT_BUSY_DEPTH", 1, RAD_SCHED_MAX_SPEC, &e.busy_depth);
         return e;
     }();
     p->adapt     = env.adapt;
@@ -112,6 +114,8 @@ void DraftController::from_env(Params* p) {
     p->half_life = env.half_life;
     p->prior     = env.prior;
     p->min_depth = env.min_depth;
+    p->busy       = env.busy;
+    p->busy_depth = env.busy_depth;
 }
 
 int DraftController::configure(const Params& p) {
@@ -121,10 +125,12 @@ int DraftController::configure(const Params& p) {
         return RAD_E_INVAL;
     }
     if (p.adapt && (!(p.hyst >= 0.0f) || p.hold < 0 || !(p.half_life > 0.0f) ||
-                    !(p.prior >= 0.0f && p.prior <= 1.0f) || p.min_depth < 1)) {
-        RAD_ERR("adaptive draft depth: hysteresis %g, hold %d, half-life %g, prior %g, minimum %d "
-                "-- they want >= 0, >= 0, > 0, 0..1 and >= 1", (double)p.hyst, p.hold,
-                (double)p.half_life, (double)p.prior, p.min_depth);
+                    !(p.prior >= 0.0f && p.prior <= 1.0f) || p.min_depth < 1 || p.busy < 0 ||
+                    p.busy_depth < 1)) {
+        RAD_ERR("adaptive draft depth: hysteresis %g, hold %d, half-life %g, prior %g, minimum %d, "
+                "busy %d, busy depth %d -- they want >= 0, >= 0, > 0, 0..1, >= 1, >= 0 and >= 1",
+                (double)p.hyst, p.hold, (double)p.half_life, (double)p.prior, p.min_depth, p.busy,
+                p.busy_depth);
         return RAD_E_INVAL;
     }
     p_ = p;
@@ -180,6 +186,9 @@ int DraftController::configure(const Params& p) {
              "acceptance half-life %.1f verifies, prior %.2f",
              p_.min_depth, p_.max_depth, t.c_str(), table ? "" : " (the default model)",
              100.0 * (double)p_.hyst, p_.hold, (double)p_.half_life, (double)p_.prior);
+    if (p_.busy > 0)
+        RAD_INFO("draft depth: above %d running sequences every window is capped at %d "
+                 "(RADIANCE_DRAFT_ADAPT_BUSY)", p_.busy, p_.busy_depth);
     return RAD_OK;
 }
 

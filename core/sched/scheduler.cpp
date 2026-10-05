@@ -100,6 +100,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     /* The adaptive window's switch and knobs, read once per process (draft.h). Off unless set. */
     DraftController::from_env(&dp);
     RAD_TRY(draft_.configure(dp));
+    draft_busy_cap_ = 0;
 
     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
     /* The builder's bound and not a second derivation of it: it is what the block tables were
@@ -936,6 +937,8 @@ void Scheduler::undo_hit(SchedReq& s) {
 /* ------------------------------------------------------------------ the step */
 const RadBatch* Scheduler::step() {
     std::lock_guard<std::mutex> lk(mu_);
+    /* A cycle opens here, so its load cap is counted here (scheduler.h, draft_busy_cap_). */
+    draft_cycle();
 
     /* The drafter's snapshots describe the step before this one and nothing reads them from here
      * on. block_end() and serial_end() clear them already; this covers a drafter that stopped
@@ -996,7 +999,7 @@ const RadBatch* Scheduler::step() {
              * AND THE CAP IS THE SEQUENCE'S OWN WINDOW, which is `depth` unless the adaptive
              * policy is on -- then it is what this sequence's acceptance pays for, and the n-gram
              * fallback is held to it like any other proposal. */
-            const int cap = draft_.adaptive() ? draft_.depth_for(s.adapt) : depth;
+            const int cap = draft_.adaptive() ? draft_cap(s) : depth;
             if (!r.may_speculate) s.n_draft = 0;
             else if (s.n_draft == 0) s.n_draft = (int32_t)draft_ngram(s, cap);
             if (s.n_draft > cap) s.n_draft = cap;
@@ -1337,6 +1340,15 @@ void Scheduler::take_encodes(std::vector<std::shared_ptr<mm::Item>>* out) {
     out->swap(enc_want_);
 }
 
+/* ------------------------------------------------------------------ the load cap */
+void Scheduler::draft_cycle() {
+    const int32_t cap = (int32_t)draft_.busy_cap((int)running_.size());
+    if (cap != draft_busy_cap_)
+        RAD_DEBUG("draft window: %zu running, %s", running_.size(),
+                  cap > 0 ? "every window capped at the busy depth" : "the cap is lifted");
+    draft_busy_cap_ = cap;
+}
+
 /* ------------------------------------------------------------------ the next step */
 void Scheduler::expect_draft(uint64_t id, int n) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -1345,9 +1357,9 @@ void Scheduler::expect_draft(uint64_t id, int n) {
     SchedReq& s = *reqs_[(size_t)it->second];
     /* UNDER THE ADAPTIVE WINDOW THE ROUNDS RAN FOR THE DEEPEST SEQUENCE, and this one verifies the
      * first of them up to its own window -- the cap serial_begin sized the rounds from, unchanged
-     * since, because nothing commits between the two. */
+     * since: nothing commits between the two, and the load cap is the cycle's (draft_busy_cap_). */
     if (draft_.adaptive() && n > 0) {
-        const int cap = draft_.depth_for(s.adapt);
+        const int cap = draft_cap(s);
         if (n > cap) n = cap;
     }
     s.draft_next = n > 0 ? n : 0;
@@ -1434,6 +1446,10 @@ const RadBatch* Scheduler::step_next_locked() {
 void Scheduler::promote_next() {
     std::lock_guard<std::mutex> lk(mu_);
     if (!next_open_) return;
+    /* The other place a cycle opens: the step issued ahead becomes this one, and step() is not
+     * called. Its proposals were counted under the last cycle's cap; the next ones are drafted
+     * under this one. */
+    draft_cycle();
     std::swap(plan_, plan_next_);
     plan_next_.reset();
     step_prefill_tok_ = 0;
@@ -1783,7 +1799,7 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
             if (!s.req || s.req->state != ReqState::Running || !s.running ||
                 !s.req->may_speculate)
                 continue;
-            const int c = draft_.depth_for(s.adapt);
+            const int c = draft_cap(s);
             if (c > want) want = c;
         }
         if (want > 0 && *rounds > want) *rounds = want;
@@ -2349,7 +2365,11 @@ SchedMetrics Scheduler::metrics_locked() const {
         int64_t sum = 0, n = 0;
         for (int32_t slot : running_) {
             const SchedReq& s = *reqs_[(size_t)slot];
-            if (s.adapt.depth > 0) { sum += s.adapt.depth; ++n; }
+            if (s.adapt.depth <= 0) continue;
+            /* The window it drafts into, which under load is the cap and not its estimate. */
+            sum += (draft_busy_cap_ > 0 && s.adapt.depth > draft_busy_cap_) ? draft_busy_cap_
+                                                                           : s.adapt.depth;
+            ++n;
         }
         m.draft_depth_adaptive = n ? (float)((double)sum / (double)n) : 0.0f;
         const int kDepth = (int)(sizeof m.draft_verify_depth / sizeof m.draft_verify_depth[0]);

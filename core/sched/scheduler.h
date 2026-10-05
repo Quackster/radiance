@@ -501,12 +501,27 @@ private:
 
     /* THE WINDOW A SEQUENCE MAY DRAFT INTO: the configured depth, or under RADIANCE_DRAFT_ADAPT
      * the one its own acceptance pays for (DraftController::depth_for, which starts the estimate
-     * on the first ask). It is the rule every site that caps a proposal applies -- step(),
-     * set_draft(), expect_draft() and the rounds in serial_begin() -- and with the policy off it
-     * is next_depth(), exactly as before. */
+     * on the first ask), under this cycle's load cap. It is the rule every site that caps a
+     * proposal applies -- step(), set_draft(), expect_draft() and the rounds in serial_begin() --
+     * and with the policy off it is next_depth(), exactly as before. */
     int draft_cap(SchedReq& s) const {
-        return draft_.adaptive() ? draft_.depth_for(s.adapt) : draft_.next_depth();
+        if (!draft_.adaptive()) return draft_.next_depth();
+        const int d = draft_.depth_for(s.adapt);
+        return (draft_busy_cap_ > 0 && d > draft_busy_cap_) ? draft_busy_cap_ : d;
     }
+
+    /* THE LOAD CAP OF THE CYCLE IN FLIGHT (RADIANCE_DRAFT_ADAPT_BUSY, draft.h), 0 for none.
+     *
+     * COUNTED ONCE A CYCLE AND HELD, by draft_cycle(), which is the first thing step() and
+     * promote_next() do -- every cycle opens with exactly one of the two. A cycle's proposal
+     * passes through four sites -- the plan that verifies it, the rounds that draft the next one,
+     * expect_draft() and set_draft() -- and the step issued ahead holds them to agree: it was
+     * built with the count expect_draft() gave it, and set_draft() refuses a different one. A
+     * cap read live could move between them, because a commit or a client hanging up takes a
+     * sequence out of running_ mid-cycle; held, it moves only where a cycle starts, and a
+     * proposal drafted under one cap and planned under the next is only ever cut shorter. */
+    int32_t draft_busy_cap_ = 0;
+    void    draft_cycle();
 
     /* The built-in prompt-lookup drafter (scheduler.cpp). Fills s.draft and returns how many
      * tokens it proposed; 0 when the sequence has no repeated pattern to extend. The pattern

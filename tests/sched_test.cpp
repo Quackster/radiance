@@ -1867,6 +1867,151 @@ TEST(the_adaptive_window_is_per_sequence_and_the_rounds_follow_the_deepest) {
     CHECK(f.sch.metrics().draft_verify_depth[4] > 0);
 }
 
+/* THE LOAD CAP (RADIANCE_DRAFT_ADAPT_BUSY) IS COUNTED ONCE A CYCLE AND HELD FOR IT. The load moves
+ * between cycles -- a sequence admitted, a client hanging up -- and the cap follows it from the
+ * next cycle on; within one, the plan, the rounds, the step issued ahead and the proposal
+ * published after the commit all see the same cap, so a count that changes mid-cycle is never a
+ * mismatch. The estimates learn on underneath: the windows come back with the load. */
+TEST(the_busy_cap_is_counted_once_a_cycle_and_follows_the_load_between_cycles) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    DraftController::Params p;
+    p.max_depth = 4;
+    p.adapt = true;
+    p.busy = 2;                                        /* more than two running is busy */
+    p.busy_depth = 2;
+    CHECK_OK(f.sch.draft().configure(p));
+    CHECK_EQ(f.sch.draft().busy_cap(2), 0);
+    CHECK_EQ(f.sch.draft().busy_cap(3), 2);
+
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    /* Every draft taken, so every estimate stays at the whole window. */
+    auto commit_all = [&]() {
+        const StepPlan& pl = f.sch.plan();
+        std::vector<int32_t> acc(pl.e.size(), 0), tok(pl.e.size(), 9);
+        std::vector<uint8_t> eos(pl.e.size(), 0);
+        for (size_t i = 0; i < pl.e.size(); ++i) acc[i] = pl.e[i].is_prefill ? 0 : pl.e[i].n_spec;
+        Scheduler::StepResult r;
+        r.n_seq = (int)pl.e.size();
+        r.n_accepted = acc.data();
+        r.token = tok.data();
+        r.eos = eos.data();
+        CHECK_OK(f.sch.commit(r));
+    };
+    auto spec_of = [&](uint64_t id) {
+        for (const StepEntry& e : f.sch.plan().e) if (e.seq == id) return (int)e.n_spec;
+        return -1;
+    };
+
+    const uint64_t a = f.submit(160, 2000);
+    const uint64_t b = f.submit(160, 2000);
+    REQUIRE(f.sch.step() != nullptr);                 /* both prompts */
+    commit_all();
+
+    /* Two running is not busy: each takes its own window. */
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    CHECK_OK(f.sch.set_draft(b, draft, 4));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(spec_of(a), 4);
+    CHECK_EQ(spec_of(b), 4);
+    commit_all();
+
+    /* A third arrives. The plan that admits it counted two when its cycle opened, so that cycle
+     * is not busy yet... */
+    const uint64_t c = f.submit(160, 2000);
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    CHECK_OK(f.sch.set_draft(b, draft, 4));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(spec_of(a), 4);
+    CHECK_EQ(spec_of(c), 0);                          /* its prompt */
+    commit_all();
+
+    /* ...and the next one is: three running, every window capped, no estimate moved. The
+     * proposals were published under the last cycle, four long; this plan cuts them. */
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    CHECK_OK(f.sch.set_draft(b, draft, 4));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(spec_of(a), 2);
+    CHECK_EQ(spec_of(b), 2);
+    CHECK(spec_of(c) <= 2);
+    CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 2.0, 1e-6);
+    int rounds = 4;
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 3);
+    CHECK_EQ(rounds, 2);
+    REQUIRE(f.sch.serial_batch(0, 1) != nullptr);
+    REQUIRE(f.sch.serial_batch(2, 1) != nullptr);
+
+    /* The step issued ahead verifies the cycle's count... */
+    for (uint64_t id : { a, b, c }) f.sch.find(id)->speculation_fixed = true;
+    for (uint64_t id : { a, b, c }) f.sch.expect_draft(id, rounds);
+    const RadBatch* nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 2);
+
+    /* ...and a client hangs up before the commit. Two running would not be busy, and the cycle
+     * keeps its cap anyway: the proposal published after the commit matches the step that is
+     * already on the card, so set_draft has nothing to refuse. */
+    CHECK_OK(f.sch.cancel(c));
+    CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 2.0, 1e-6);
+    commit_all();
+    f.sch.serial_end(rounds);
+    CHECK_OK(f.sch.set_draft(a, draft, rounds));
+    CHECK_OK(f.sch.set_draft(b, draft, rounds));
+    CHECK_EQ(f.sch.find(a)->n_draft, 2);
+
+    /* The next cycle opens on the load as it now is: two running, the cap lifted, and the
+     * windows are the whole window again at once -- the estimates never stopped learning. */
+    f.sch.promote_next();
+    CHECK_EQ(spec_of(a), 2);                          /* planned last cycle */
+    rounds = 4;
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 2);
+    CHECK_EQ(rounds, 4);
+    REQUIRE(f.sch.serial_batch(0, 1) != nullptr);
+    for (int rd = 2; rd <= rounds; ++rd) REQUIRE(f.sch.serial_batch(rd, 1) != nullptr);
+    commit_all();
+    f.sch.serial_end(rounds);
+    CHECK_OK(f.sch.set_draft(a, draft, rounds));
+    CHECK_OK(f.sch.set_draft(b, draft, rounds));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(spec_of(a), 4);
+    CHECK_EQ(spec_of(b), 4);
+    CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 4.0, 1e-6);
+    commit_all();
+
+    /* THE SAME HANG-UP WITH NO STEP ISSUED AHEAD, where the held cap is what the proposal gets: a
+     * busy cycle stays busy to its end, and the next plan is the first to see the load fall. */
+    const uint64_t e = f.submit(160, 2000);
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    CHECK_OK(f.sch.set_draft(b, draft, 4));
+    REQUIRE(f.sch.step() != nullptr);                 /* admits it; counted two */
+    commit_all();
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    CHECK_OK(f.sch.set_draft(b, draft, 4));
+    REQUIRE(f.sch.step() != nullptr);                 /* counted three: busy */
+    CHECK_EQ(spec_of(a), 2);
+    CHECK_OK(f.sch.cancel(e));
+    commit_all();
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    CHECK_EQ(f.sch.find(a)->n_draft, 2);              /* the cycle's cap, not the live count's */
+    REQUIRE(f.sch.step() != nullptr);                 /* counted two: lifted */
+    CHECK_EQ(spec_of(a), 2);                          /* drafted under the busy cycle */
+    rounds = 4;
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 2);
+    CHECK_EQ(rounds, 4);
+    f.sch.serial_end(0);
+
+    /* No threshold set: no cap, whatever the load. */
+    DraftController::Params q;
+    q.max_depth = 4;
+    q.adapt = true;
+    DraftController d;
+    CHECK_OK(d.configure(q));
+    CHECK_EQ(d.busy_cap(1000), 0);
+}
+
 /* ================================================================== the step path */
 TEST(the_step_path_does_not_allocate) {
     Fixture f;
