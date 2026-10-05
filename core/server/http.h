@@ -31,6 +31,7 @@ struct HttpRequest {
     std::map<std::string, std::string, CiLess> headers;
     std::map<std::string, std::string> query;
     std::map<std::string, std::string> params;           /* from a ":name" route segment */
+    std::string peer;                                    /* "addr:port"; empty in-process */
 
     /* True once the peer is gone. The transport supplies it; in-process it is absent and the
      * waiting paths simply never see a drop. A dropped connection is a cancellation (spec §14),

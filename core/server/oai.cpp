@@ -1273,6 +1273,24 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
     auto mit = b.find("messages");
     if (mit == b.end()) { *err = err_bad("messages", "is required"); return RAD_E_INVAL; }
     json messages = *mit;
+    if (messages.is_array()) {
+        out->n_messages = (int)messages.size();
+        for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+            if (!it->is_object() || !it->contains("role") || it->at("role") != "user") continue;
+            const auto cit = it->find("content");
+            if (cit == it->end()) break;
+            std::string t;
+            if (cit->is_string()) t = cit->get<std::string>();
+            else if (cit->is_array())
+                for (const auto& part : *cit)
+                    if (part.is_object() && part.value("type", "") == "text")
+                        t += part.value("text", "");
+            for (char& c : t) if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+            if (t.size() > 160) { t.resize(157); t += "..."; }
+            out->last_user = std::move(t);
+            break;
+        }
+    }
 
     /* tools and tool_choice. */
     json tools = json::array();
@@ -1290,6 +1308,7 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
             }
         }
         tools = *tit;
+        out->n_tools = (int)tools.size();
     }
 
     /* FORCING A CALL IS REFUSED, and not because the grammar is out of reach -- the template

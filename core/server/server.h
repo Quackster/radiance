@@ -189,7 +189,11 @@ private:
     HttpResponse handle_stats(const HttpRequest& req);
     HttpResponse handle_graph(const HttpRequest& req);
 
-    HttpResponse error_response(const ApiError& e);
+    HttpResponse error_response(const ApiError& e, const std::string& peer = std::string());
+    /* THE REQUEST LOG. One line when a request is admitted and one from record() when it ends,
+     * at the info level, so `docker logs` answers "who asked what, how long, how did it end"
+     * without the engine's own levels. The debug level adds the last user message's opening. */
+    void log_admitted(const OaiRequest& r) const;
 
     /* Admission. Returns false when the queue is full; the caller answers 429. */
     bool  admit(int64_t n);

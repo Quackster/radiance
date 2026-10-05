@@ -88,6 +88,14 @@ struct OaiRequest {
     bool want_logprobs = false;
 
     bool tools_present = false;
+    /* FOR THE REQUEST LOG, counted while the parse walks the body anyway: the messages and tools
+     * a chat request carried, and the last user message's opening (one line, bounded) that the
+     * debug level prints so a log line can be matched to what was typed. Completion requests
+     * leave them at zero and empty. */
+    int         n_messages = 0;
+    int         n_tools = 0;
+    std::string last_user;
+    std::string peer;             /* the handler sets it from the transport; "" in-process */
     bool parse_tools = false;
     /* The reply parser this request's render produced. Per request and not per server: it is the
      * model's format bound to the tools THIS call sent, so two concurrent requests against the

@@ -382,6 +382,7 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         req.method = hreq.method;
         req.path = hreq.path;
         req.body = std::move(body);
+        req.peer = hreq.remote_addr + ":" + std::to_string(hreq.remote_port);
         for (auto& h : hreq.headers) req.headers[h.first] = h.second;
         for (auto& p : hreq.params) req.query[p.first] = p.second;
         req.closed = [&hreq] { return hreq.is_connection_closed(); };
