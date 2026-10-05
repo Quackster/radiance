@@ -413,6 +413,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     /* A row at every token of the step and the sampler's row a sequence before them
      * (core/kld.h); the KL mode has no speculation, so a sequence samples one. */
     bc.max_out_rows = cfg_.kld() ? max_tok + cfg_.max_seqs : 0;
+    bc.ngram_table_ram = cfg_.ngram_table_ram ? 1 : 0;
     return bc;
 }
 

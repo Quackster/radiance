@@ -614,6 +614,14 @@ struct Config {
      * is a server that is correct and several orders of magnitude slow. The tier needs no directory
      * of its own; the container is the file. */
     bool    weights_disk_tier = false;
+    /* --ngram-table disk|ram: where the host gather of a table too large for any card -- the n-gram
+     * embedding, 47.7 GiB in Qwen3.8-Flash-Next -- reads its rows. disk, the default, reads them
+     * from the container through a row cache and holds no more of the table than that. ram copies
+     * the table once into locked host memory, in the background from the first request, and reads
+     * the copy: a faster prefill and a few percent of throughput, for the table's size in RAM. A
+     * process that cannot lock that much says so and stays on disk. A deployment choice and not a
+     * tuning one, because only the operator knows what else the host's memory is for. */
+    bool    ngram_table_ram = false;
 
     std::string placement = "auto";    /* all_vram | layer_offload | expert_tiered | auto */
     bool    deterministic = false;

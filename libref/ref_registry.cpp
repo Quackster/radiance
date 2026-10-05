@@ -476,7 +476,13 @@ static const RadParamSpec pEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_voc
                                        P_F64O("wscale") };
 static const RadOperandSpec oEmbed[] = { OPD("tokens"), WGT("wte"), OUT("x") };
 /* The quantised table: one scale for all of it. A SEPARATE OP and not a dtype on the above --
- * the operand list differs and operands are positional, the same argument gemm_nt_q makes. */
+ * the operand list differs and operands are positional, the same argument gemm_nt_q makes.
+ * `resident` asks a kernel that reads a file-backed table from disk to keep a copy of it in RAM
+ * instead (--ngram-table ram). It changes where the rows come from and not what they are, and a
+ * kernel that reads the table as memory, as this one does, has nothing to do for it. */
+static const RadParamSpec pEmbedQ[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
+                                        P_STR("dtype"), P_INTO("vocab_offset"), P_F64O("wscale"),
+                                        P_INTO("resident") };
 static const RadOperandSpec oEmbedQ[] = { OPD("tokens"), WGT("wte"), WGT_O("scale"), OUT("x"),
                                           OPD_O("ahead") };
 
@@ -851,7 +857,7 @@ static const RadOpSchema kSchemas[] = {
 { "embed_lookup", ARR(pEmbed), ARR(oEmbed),
   "A gather from wte[n_vocab, n_embd]. A negative token id writes a zero row (padding); an id at "
   "or above n_vocab fails the launch." },
-{ "embed_lookup_q", ARR(pEmbed), ARR(oEmbedQ),
+{ "embed_lookup_q", ARR(pEmbedQ), ARR(oEmbedQ),
   "The same gather from a table quantised with ONE scale for all of it: x[m] = wte[id] * scale[0]. "
   "Qwen3.8-Flash-Next-FP8's 320-million-row n-gram embedding is stored that way -- E4M3 codes and a "
   "single bf16 `weight_scale` -- and it can be, because E4M3 carries its own exponent and a row's "

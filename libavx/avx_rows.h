@@ -26,7 +26,8 @@ typedef void (*RowDecode)(const uint8_t* const* src, uint16_t* const* dst, int64
  * elements -- E4M3 codes, or bf16 as stored -- `row_bytes` apart, `out` M rows of n_embd bf16
  * `x_ld` elements apart. The row cache and the reads deal in `row_bytes`; the decode in elements.
  * `ahead` holds n_ahead ids a later call will gather, or is null. rank and world_size are the
- * call's. */
+ * call's. `resident` is the op's parameter of that name: keep a copy of the table in RAM and read
+ * that, once it is there (avx_ngram.cpp). */
 struct RowGather {
     const int32_t* ids;
     int64_t        M;
@@ -39,10 +40,12 @@ struct RowGather {
     const int32_t* ahead;
     int64_t        n_ahead;
     int            rank, world_size;
+    int            resident;
 };
 
-/* The gather, through the row cache when a file backs the table and from the table's memory when
- * none does. Returns a RAD_* status; on anything but RAD_OK the output is not complete. */
+/* The gather, through the row cache when a file backs the table, from its copy in RAM once
+ * `resident` has made one, and from the table's memory when no file backs it. Returns a RAD_*
+ * status; on anything but RAD_OK the output is not complete. */
 int row_gather(const RowGather& g, RowDecode decode);
 
 }  /* namespace avx */

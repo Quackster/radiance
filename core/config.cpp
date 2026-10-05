@@ -58,6 +58,10 @@ static const Flag g_flags[] = {
     { "--weights-disk-tier",  nullptr,  "read weights that fit neither VRAM nor the host pool from the\n"
     "                                    container on disk (O_DIRECT); a routed expert is read a layer\n"
     "                                    at a time, so a step is paced by the drive" },
+    { "--ngram-table",        "MODE",   "disk (default) or ram: where the n-gram embedding's host gather\n"
+    "                                    reads its rows. ram copies the table into locked host memory\n"
+    "                                    in the background from the first request and reads the copy\n"
+    "                                    (Qwen3.8-Flash-Next: 47.7 GiB; needs a memlock limit that large)" },
     { "--prefix-cache-host-mib", "N",   "copy finished conversations' KV to host memory, up to N MiB,\n"
     "                                    so their VRAM can go to experts and a return restores\n"
     "                                    instead of re-prefilling. 0 is off. Part of it holds\n"
@@ -376,6 +380,12 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--host-pool-mib"))         { if (!(v = need(i))) return RAD_E_INVAL; c->host_pool_mib = atoll(v); }
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
+        else if (S("--ngram-table")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "disk")) c->ngram_table_ram = false;
+            else if (!std::strcmp(v, "ram"))  c->ngram_table_ram = true;
+            else { RAD_ERR("--ngram-table takes disk or ram, not '%s'", v); return RAD_E_INVAL; }
+        }
         else if (S("--prefix-cache-host-mib"))     { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_host_mib = atoll(v); }
         else if (S("--prefix-cache-dir"))          { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_dir = v; }
         else if (S("--prefix-cache-disk-mib"))     { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_disk_mib = atoll(v); }

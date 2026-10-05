@@ -763,7 +763,7 @@ either wire, byte-identical to the three kernels it stands in for.
 | op | params | operands |
 |---|---|---|
 | `embed_lookup` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt | `tokens`, `wte`w → `x` |
-| `embed_lookup_q` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt | `tokens`, `wte`w, `scale`w? → `x`, `ahead`? |
+| `embed_lookup_q` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt `resident`/opt | `tokens`, `wte`w, `scale`w? → `x`, `ahead`? |
 | `logits_gemm` | `M`(range) `n_vocab` `n_embd` `dtype` | `x`, `lm_head`w → `logits` |
 | `ngram_ids` | `M`(range) `heads` `ngram` `eos` | `tok`, `state`:inout, `cu`, `mult`w, `vocab_sizes`w, `offsets`w, `cache_idx`?, `has_init`?, `num_accepted`? → `ids`, `ahead_ids`? |
 | `ple_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `gate_eps`:f64/opt | `k`, `q`, `v`, `w_key`w, `w_query`w, `w_conv`w → `gv`, `gvn` |
@@ -870,6 +870,12 @@ has touched in a row cache of its own and reads a miss straight from the file wi
 the alignment the filesystem reports for direct I/O, or its block size where it reports none, as
 btrfs does; one read of the table proves it before the first row is served. A filesystem with no
 direct I/O at all cannot hold a container with this table.
+
+**`resident` keeps the table in RAM instead**, for a deployment that has the memory: libavx copies
+it once into locked huge pages, in the background from the first gather that carries it, and reads
+the copy from then on; until the copy is in place, and wherever the process cannot lock that much,
+the rows come from the file as above. The result is the same either way. An architecture sets it
+from `RadBuildCtx::ngram_table_ram` (`--ngram-table ram`).
 
 The placement planner runs an op on the host when **every weight operand of it** is `Site::Host`,
 which is why the table must be a weight operand at all: `gather_rows` takes a plain `IN` operand and

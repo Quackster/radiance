@@ -595,6 +595,9 @@ struct Geom {
      * message anyway. Straight through to `all_reduce`'s `min_bytes`; 0 leaves the choice to
      * the kernel plugin, which has the measured default. */
     int64_t wire_min_bytes = 0;
+    /* 1 = keep a file-backed table a host gather reads in RAM (--ngram-table ram). Straight
+     * through to `embed_lookup_q`'s `resident`; RadBuildCtx says what it costs and buys. */
+    int     ngram_ram  = 0;
     float   eps        = 1e-6f;
     /* GemmaRMSNorm's `1 +`. Qwen3.5, Qwen3-Next and Gemma normalise with `x_hat * (1 + w)` and
      * store `w` around 0.1, not around 1.0 -- so reading the gain as a plain RMSNorm gain shrinks
@@ -732,6 +735,7 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     g.world     = c->world_size ? c->world_size : 1;
     g.wire_exact= c->tp_wire_lossy ? 0 : 1;
     g.wire_min_bytes = c->tp_wire_min_bytes;
+    g.ngram_ram = c->ngram_table_ram ? 1 : 0;
     g.eps       = m->rms_eps;
     g.theta     = m->rope_theta;
     g.rope_scale= m->rope_scale ? m->rope_scale : 1.0f;

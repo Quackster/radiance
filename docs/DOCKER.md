@@ -91,6 +91,11 @@ Every one of these options is needed:
 - **`--network host`**: the server binds the host's addresses directly, IPv4 and IPv6, with no
   NAT in front of it.
 
+And one more for `--ngram-table ram`: **`--ulimit memlock=-1`**. The copy of the n-gram table is
+locked in RAM, and Docker's default memlock limit is far below its 47.7 GiB; without it the server
+says so at the first request and reads the table from the container as it does by default.
+`deploy/compose/common.yaml` sets it.
+
 The image sets `GPU_MAX_ALLOC_PERCENT=100` and `GPU_MAX_HEAP_SIZE=100`. The HIP runtime's defaults
 cap one allocation, and the heap, below what the placement plan hands out.
 

@@ -20,10 +20,17 @@
  * takes one full 32-code step and a masked tail. The table is a file in `dir`, and the filesystem
  * there decides how the gather aligns its direct reads: by the alignment the filesystem reports
  * (ext4, XFS), or by its block size where it reports none (btrfs, and a tmpfs since Linux 6.6). The
- * case says which it ran. */
+ * case says which it ran.
+ *
+ * With `resident` the op is asked to copy the table into locked RAM (--ngram-table ram), over a
+ * table small enough for a default memlock limit. The calls run while the copy is being made, then
+ * the case waits for the process's locked memory to grow by the table and runs them again, from
+ * the copy. Where the process may not lock that much the gather says so and keeps reading the file,
+ * and the case says which of the two it checked; either way every row must be the file's. */
 #include "avx_harness.h"
 
 #include <barrier>
+#include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <thread>
@@ -126,10 +133,23 @@ bool ngram_init_case(const Lib& avx) {
     return ok && right;
 }
 
+/* This process's locked memory, in bytes: VmLck. */
+static long long locked_bytes() {
+    long long kb = 0;
+    if (std::FILE* f = std::fopen("/proc/self/status", "re")) {
+        char line[256];
+        while (std::fgets(line, sizeof line, f)) (void)std::sscanf(line, "VmLck: %lld", &kb);
+        std::fclose(f);
+    }
+    return kb << 10;
+}
+
 bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool verbose,
-                     bool bf16) {
+                     bool bf16, bool resident) {
     const RadKernelInfo* r = avx.row("embed_lookup_q");
-    const char* what = bf16 ? "embed_lookup_q from a file, bf16 table" : "embed_lookup_q from a file";
+    const char* what = resident ? "embed_lookup_q from a file, resident"
+                     : bf16     ? "embed_lookup_q from a file, bf16 table"
+                                : "embed_lookup_q from a file";
     if (!r || !r->launch) {
         std::printf("  %s: no row\n", what);
         return false;
@@ -150,7 +170,8 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
         }
         ::close((int)ring);
     }
-    const int64_t n = 40, V = int64_t(1) << 21, M = 512, hot = 4096;
+    /* 2.5 MiB resident, which a default memlock limit of 8 MiB holds. */
+    const int64_t n = 40, V = int64_t(1) << (resident ? 16 : 21), M = 512, hot = 4096;
     const int64_t rb = bf16 ? 2 * n : n;
     const float scale = 0.375f;
 
@@ -238,13 +259,14 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
             tensor(const_cast<uint8_t*>(tab), bf16 ? RAD_BF16 : RAD_F8E4M3, {V, n}),
             tensor(bf16 ? nullptr : &sc, RAD_BF16, {1}), tensor(out.data(), RAD_BF16, {M, n}),
             tensor(nullptr, RAD_I32, {M}) };
-        RadParam ps[3] = {};
-        ps[0].key = "M";       ps[0].kind = RAD_P_INT; ps[0].ival = M;
-        ps[1].key = "n_embd";  ps[1].kind = RAD_P_INT; ps[1].ival = n;
-        ps[2].key = "n_vocab"; ps[2].kind = RAD_P_INT; ps[2].ival = V;
+        RadParam ps[4] = {};
+        ps[0].key = "M";        ps[0].kind = RAD_P_INT; ps[0].ival = M;
+        ps[1].key = "n_embd";   ps[1].kind = RAD_P_INT; ps[1].ival = n;
+        ps[2].key = "n_vocab";  ps[2].kind = RAD_P_INT; ps[2].ival = V;
+        ps[3].key = "resident"; ps[3].kind = RAD_P_INT; ps[3].ival = 1;
         RadArgs a{};
         a.t = ts.data(); a.n_t = (int)ts.size();
-        a.p = ps; a.n_p = 3;
+        a.p = ps; a.n_p = resident ? 4 : 3;
         a.rank = rk; a.world_size = 2;
         for (int64_t c = 0; c < calls; ++c) {
             ts[0].data = &ids[(size_t)(c * M)];
@@ -264,9 +286,23 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
             }
         }
     };
-    std::thread t0(rank, 0), t1(rank, 1);
-    t0.join();
-    t1.join();
+    const long long locked0 = locked_bytes();
+    auto round = [&] {
+        std::thread t0(rank, 0), t1(rank, 1);
+        t0.join();
+        t1.join();
+    };
+    round();
+    /* The copy is made in the background from the first call. Once the locked memory has grown
+     * by the table it is in place, or about to be, so a short wait more and every call reads it. */
+    bool copied = false;
+    if (resident) {
+        for (int i = 0; i < 300 && !copied; ++i) {
+            copied = locked_bytes() - locked0 >= V * rb;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (copied) round();
+    }
     /* THE ADDRESS RANGE STAYS RESERVED. libavx resolves a table to its file once, by the address
      * range of its mapping, for the life of the process (avx_ngram.cpp, table_file) -- the
      * engine's container mapping is one. A case that unmapped here could have the next case's file
@@ -279,13 +315,16 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
     ::unlink(path.c_str());
 
     const bool pass = bad[0] + bad[1] + refused[0] + refused[1] == 0;
+    const char* from = !resident ? ""
+                     : copied    ? ", then as many again from the copy in RAM"
+                                 : ", all from the file: the copy was not made here (above)";
     if (verbose || !pass)
-        std::printf("  %s in %s (%s): %lld calls x 2 ranks, rows wrong %lld/%lld, "
+        std::printf("  %s in %s (%s): %lld calls x 2 ranks%s, rows wrong %lld/%lld, "
                     "calls refused %lld/%lld %s\n", what, dir.c_str(), granule, (long long)calls,
-                    (long long)bad[0], (long long)bad[1], (long long)refused[0],
+                    from, (long long)bad[0], (long long)bad[1], (long long)refused[0],
                     (long long)refused[1], pass ? "ok" : "FAIL");
     else
-        std::printf("  %s in %s (%s): %lld calls x 2 ranks, every row exact\n", what, dir.c_str(),
-                    granule, (long long)calls);
+        std::printf("  %s in %s (%s): %lld calls x 2 ranks%s, every row exact\n", what,
+                    dir.c_str(), granule, (long long)calls, from);
     return pass;
 }

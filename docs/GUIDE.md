@@ -844,6 +844,7 @@ one line naming each one the command line moved.
 | `--kv-cache-dtype T` | bf16 | `bf16` or `fp8` |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
+| `--ngram-table MODE` | disk | where the n-gram embedding's host gather reads its rows: `disk` from the container through a row cache, `ram` from a copy of the whole table in locked host memory (Qwen3.8-Flash-Next: 47.7 GiB), made in the background from the first request. `ram` needs the memory and a memlock limit that large (`--ulimit memlock=-1` in Docker); short of either it says so and stays on `disk` |
 
 **Idle session tiers**
 

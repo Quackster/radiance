@@ -57,7 +57,18 @@
  * plugin ABI carries no file, so /proc/self/maps says which file and offset back that address, once
  * a table. A table no file backs -- a test's heap buffer -- is read as the memory it is. A file on a
  * filesystem that cannot do direct I/O is refused; direct_granule below finds the alignment the
- * reads keep, including on a filesystem that does not report one. */
+ * reads keep, including on a filesystem that does not report one.
+ *
+ * ============================== OR THE WHOLE TABLE IN RAM ==============================
+ *
+ * All of the above is the default, and it holds no more of the table than the row cache does.
+ * With `resident` set on the op -- the engine's --ngram-table ram -- the table is copied once into
+ * locked host memory and every gather reads the copy, so a miss is a load instead of a read: on
+ * Flash-Next at four ranks a 2k-token prompt prefills 24% faster and 16 to 32 streams gain 4 to 5%,
+ * for 47.7 GiB of RAM. The first gather that asks starts the copy in the background and, until it
+ * is in place, every gather reads the file exactly as it does without it, so serving never waits
+ * for the copy. A process that cannot hold it -- RLIMIT_MEMLOCK, the memory available, a cgroup's
+ * limit -- says so once and keeps reading the file. make_resident has the detail. */
 #include "avx_rows.h"
 #include "avx_common.h"
 
@@ -68,7 +79,9 @@
 #include <cstring>
 #include <cstdlib>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -82,6 +95,7 @@
 #include <fcntl.h>
 #include <linux/io_uring.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -158,6 +172,15 @@ struct TableFile {
     int            fd    = -1;
     long long      off   = 0;
     long long      align = 0;
+    std::string    path;
+    /* --ngram-table ram: the table's own copy, [copy, copy + copy_n) holding [copy_lo, copy_lo +
+     * copy_n) of the mapping. `copy` is stored last, once the copy is filled, locked and checked;
+     * null, the gather reads the file. One copy a file, of the table the first resident gather
+     * names, which in every container so far is the only table in it. */
+    std::once_flag              copy_once;
+    std::atomic<const uint8_t*> copy{nullptr};
+    const uint8_t*              copy_lo = nullptr;
+    long long                   copy_n  = 0;
 };
 
 /* THE GRANULE OF A DIRECT READ of `t`'s file, opened for them as `t.fd`: the alignment a read's
@@ -237,10 +260,12 @@ long long direct_granule(const TableFile& t, const uint8_t* p, long long n, unsi
 /* The file behind [p, p + n): the mapping holding `p`, extended over the mappings that continue it
  * in the same file (a madvise over a sub-range splits one mapping into several). Looked up once per
  * table and kept for the life of the process; every rank thread shares the entry and the fd, and a
- * read at an explicit offset has no file position to share. */
-const TableFile* table_file(const uint8_t* p, long long n, int* err) {
-    static std::mutex mu;
-    static std::vector<std::unique_ptr<TableFile>> known;
+ * read at an explicit offset has no file position to share. The list is never destroyed: a copy
+ * thread (make_resident) may still be filling an entry when the process exits. */
+TableFile* table_file(const uint8_t* p, long long n, int* err) {
+    static std::mutex& mu = *new std::mutex;
+    static std::vector<std::unique_ptr<TableFile>>& known =
+        *new std::vector<std::unique_ptr<TableFile>>;
     std::lock_guard<std::mutex> lk(mu);
     for (const auto& t : known)
         if (p >= t->lo && p + n <= t->hi) return t.get();
@@ -287,6 +312,7 @@ const TableFile* table_file(const uint8_t* p, long long n, int* err) {
     if (found) {
         if ((uintptr_t)(p + n) > end) { *err = RAD_E_IO; return nullptr; }
         t->hi = (const uint8_t*)end;
+        t->path = path;
         t->fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         const char* why = t->fd < 0 ? std::strerror(errno) : nullptr;
         if (t->fd >= 0) t->align = direct_granule(*t, p, n, ino, path.c_str(), &why);
@@ -301,6 +327,155 @@ const TableFile* table_file(const uint8_t* p, long long n, int* err) {
     }
     known.push_back(std::move(t));
     return known.back().get();
+}
+
+/* A size for a message: GiB from one up, MiB below. */
+std::string size_str(unsigned long long b) {
+    char s[32];
+    if (b >= 1ull << 30) std::snprintf(s, sizeof s, "%.1f GiB", (double)b / (1ull << 30));
+    else                 std::snprintf(s, sizeof s, "%.1f MiB", (double)b / (1ull << 20));
+    return s;
+}
+
+/* WHETHER `bytes` MORE CAN BE LOCKED IN RAM, or why not. Each limit is one the copy would
+ * otherwise meet after reading the whole table: RLIMIT_MEMLOCK, unless the process has
+ * CAP_IPC_LOCK; what the kernel says is available, less a margin for everything else; and the
+ * cgroup's memory.max, which Docker's --memory sets and which the kernel enforces by killing the
+ * process. A limit that cannot be read is not one. */
+bool room_to_lock(unsigned long long bytes, std::string* why) {
+    const unsigned long long margin = 4ull << 30;
+    unsigned long long locked = 0, caps = 0, avail = 0;
+    bool have_avail = false;
+    char line[256];
+    if (std::FILE* f = std::fopen("/proc/self/status", "re")) {
+        while (std::fgets(line, sizeof line, f)) {
+            (void)std::sscanf(line, "VmLck: %llu", &locked);
+            (void)std::sscanf(line, "CapEff: %llx", &caps);
+        }
+        std::fclose(f);
+    }
+    struct rlimit rl {};
+    if (!(caps >> 14 & 1) && ::getrlimit(RLIMIT_MEMLOCK, &rl) == 0 &&
+        rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < (locked << 10) + bytes) {
+        *why = "the copy locks " + size_str(bytes) + " and RLIMIT_MEMLOCK allows " +
+               size_str(rl.rlim_cur) + " (in Docker, --ulimit memlock=-1 lifts it)";
+        return false;
+    }
+    if (std::FILE* f = std::fopen("/proc/meminfo", "re")) {
+        while (!have_avail && std::fgets(line, sizeof line, f))
+            have_avail = std::sscanf(line, "MemAvailable: %llu", &avail) == 1;
+        std::fclose(f);
+    }
+    if (have_avail && (avail << 10) < bytes + margin) {
+        *why = size_str(avail << 10) + " of memory is available, and the copy wants " +
+               size_str(bytes) + " with " + size_str(margin) + " to spare";
+        return false;
+    }
+    /* cgroup v2: the process's group is the "0::" line. */
+    std::string cg;
+    if (std::FILE* f = std::fopen("/proc/self/cgroup", "re")) {
+        while (std::fgets(line, sizeof line, f))
+            if (std::strncmp(line, "0::", 3) == 0) {
+                cg = line + 3;
+                while (!cg.empty() && cg.back() == '\n') cg.pop_back();
+            }
+        std::fclose(f);
+    }
+    auto read_ull = [](const std::string& file, unsigned long long* v) {
+        std::FILE* f = std::fopen(file.c_str(), "re");
+        if (!f) return false;
+        const bool got = std::fscanf(f, "%llu", v) == 1;    /* "max" reads as no limit */
+        std::fclose(f);
+        return got;
+    };
+    unsigned long long max = 0, cur = 0;
+    const std::string dir = "/sys/fs/cgroup" + (cg == "/" ? std::string() : cg);
+    if (!cg.empty() && read_ull(dir + "/memory.max", &max) &&
+        read_ull(dir + "/memory.current", &cur) && (cur > max || max - cur < bytes + margin)) {
+        *why = "the cgroup's memory.max leaves " + size_str(cur > max ? 0 : max - cur) +
+               ", and the copy wants " + size_str(bytes) + " with " + size_str(margin) +
+               " to spare";
+        return false;
+    }
+    return true;
+}
+
+/* --ngram-table ram: KEEP THE WHOLE TABLE IN RAM, [p, p + n) of `t`'s mapping. Called once a table,
+ * by the first gather whose op carries `resident`.
+ *
+ * A COPY IN HUGE PAGES, NOT THE MAPPING LOCKED. Faulting the mapping in costs a fault a 4 KiB page
+ * -- 12.5 million of them, ~140 s inside a VM -- and leaves every row behind a 4 KiB translation,
+ * so a gather of scattered rows walks the page tables on nearly every row. Parallel buffered reads
+ * into an anonymous MADV_HUGEPAGE region fill it in 18.7 s for Flash-Next's 47.7 GiB, a 2 MiB page
+ * covers 13,000 rows, and the pages read are dropped from the page cache behind them, so the copy
+ * does not hold the table twice. A thread fills, locks and checks the copy and only then
+ * stores `copy`; until it does the gather reads the file. Whatever stops it -- a limit checked here
+ * before a byte is read, or a failure on the way -- leaves the table on the file path and says
+ * why, once. */
+void make_resident(TableFile* t, const uint8_t* p, long long n) {
+    auto refuse = [n](const std::string& why) {
+        std::fprintf(stderr, "libavx: --ngram-table ram: the n-gram table (%s) stays on disk and is "
+                     "read from the container: %s\n", size_str((unsigned long long)n).c_str(),
+                     why.c_str());
+    };
+    const size_t huge = (size_t)2 << 20;
+    const size_t sz = ((size_t)n + huge - 1) & ~(huge - 1);
+    std::string why;
+    if (!room_to_lock(sz, &why)) { refuse(why); return; }
+    const long long foff = t->off + (long long)(p - t->lo);
+    std::thread([t, p, n, sz, foff, refuse] {
+        const auto t0 = std::chrono::steady_clock::now();
+        auto fail = [&](const char* what, int e) {
+            refuse(std::string(what) + " failed (" + std::strerror(e) + ")");
+        };
+        void* m = ::mmap(nullptr, sz, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (m == MAP_FAILED) { fail("mmap", errno); return; }
+        uint8_t* buf = static_cast<uint8_t*>(m);
+        (void)::madvise(buf, sz, MADV_HUGEPAGE);
+        const int fd = ::open(t->path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) { fail("open", errno); ::munmap(m, sz); return; }
+        const int nt = 16;
+        const long long step = (n / nt + (long long)huge - 1) & ~((long long)huge - 1);
+        std::atomic<int> err{0};
+        std::vector<std::thread> fill;
+        for (int i = 0; i < nt; ++i) {
+            const long long lo = (long long)i * step, hi = std::min(n, lo + step);
+            if (lo >= hi) break;
+            fill.emplace_back([&, lo, hi] {
+                for (long long o = lo; o < hi && !err.load();) {
+                    const size_t want = (size_t)std::min(hi - o, (long long)(64 << 20));
+                    const ssize_t r = ::pread(fd, buf + o, want, (off_t)(foff + o));
+                    if (r <= 0) { err.store(r < 0 ? errno : EIO); return; }
+                    (void)::posix_fadvise(fd, (off_t)(foff + o), (off_t)r, POSIX_FADV_DONTNEED);
+                    o += r;
+                }
+            });
+        }
+        for (auto& th : fill) th.join();
+        ::close(fd);
+        if (err.load()) { fail("reading the container", err.load()); ::munmap(m, sz); return; }
+        if (::mlock(buf, sz) != 0) { fail("mlock", errno); ::munmap(m, sz); return; }
+        /* The copy has to be the mapping's bytes: a wrong offset would serve every row from the
+         * wrong place without an error. Both ends and a stride of rows in between. */
+        const long long probe = std::min(n, (long long)4096);
+        bool same = std::memcmp(buf, p, (size_t)probe) == 0 &&
+                    std::memcmp(buf + n - probe, p + n - probe, (size_t)probe) == 0;
+        for (long long o = 0; same && o + 4096 <= n; o += n / 64)
+            same = std::memcmp(buf + o, p + o, 4096) == 0;
+        if (!same) {
+            fail("checking the copy against the mapping", EIO);
+            ::munlock(buf, sz);
+            ::munmap(m, sz);
+            return;
+        }
+        t->copy_lo = p;
+        t->copy_n = n;
+        t->copy.store(buf, std::memory_order_release);
+        std::fprintf(stderr, "libavx: n-gram table resident in RAM: %s copied to locked huge pages "
+                     "in %.1f s\n", size_str((unsigned long long)n).c_str(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }).detach();
 }
 
 /* ============================== THE ROW CACHE ==============================
@@ -861,7 +1036,7 @@ inline std::FILE* trace_file() {
 
 #else   /* not Linux: no file reads; a table is read as memory */
 struct TableFile { int fd = -1; };
-inline const TableFile* table_file(const uint8_t*, long long, int*) { static TableFile m; return &m; }
+inline TableFile* table_file(const uint8_t*, long long, int*) { static TableFile m; return &m; }
 inline std::FILE* trace_file() { return nullptr; }
 #endif
 
@@ -888,14 +1063,24 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
     for (int b = 0; b < 256; ++b)
         lut[b] = rad_f32_to_bf16(rad_fp8e4m3_to_f32((uint8_t)b) * q.scale);
 
-    /* The rows: through the shared cache from the file behind the table, or, for a table no file
-     * backs, from the table itself. The caller has refused an id past the table already; an id
-     * turned into a file offset has to be one. */
+    /* The rows: through the shared cache from the file behind the table, or from the table's copy
+     * in RAM once there is one, or, for a table no file backs, from the table itself. The caller
+     * has refused an id past the table already; an id turned into a file offset has to be one. */
     int ferr = RAD_OK;
-    const TableFile* tfile = table_file(q.tab, q.n_vocab * q.row_bytes, &ferr);
+    const long long bytes = q.n_vocab * q.row_bytes;
+    TableFile* tfile = table_file(q.tab, bytes, &ferr);
     if (!tfile) return ferr;
+    const uint8_t* tab = q.tab;
 #if defined(__linux__)
-    if (tfile->fd >= 0) {
+    bool from_copy = false;
+    if (q.resident && tfile->fd >= 0)
+        std::call_once(tfile->copy_once, [&] { make_resident(tfile, q.tab, bytes); });
+    if (const uint8_t* copy = tfile->copy.load(std::memory_order_acquire))
+        if (q.tab >= tfile->copy_lo && q.tab + bytes <= tfile->copy_lo + tfile->copy_n) {
+            tab = copy + (q.tab - tfile->copy_lo);
+            from_copy = true;
+        }
+    if (tfile->fd >= 0 && !from_copy) {
         int why = 0;
         ReadRing* rr = read_ring(&why);
         if (!rr) {
@@ -926,7 +1111,7 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
             std::memset(dst, 0, (size_t)q.n_embd * sizeof(uint16_t));
             continue;
         }
-        g.src.push_back(q.tab + id * q.row_bytes);
+        g.src.push_back(tab + id * q.row_bytes);
         g.dst.push_back(dst);
     }
     if (!g.src.empty()) decode(g.src.data(), g.dst.data(), (int64_t)g.src.size(), q.n_embd, lut);

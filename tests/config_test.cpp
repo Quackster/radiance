@@ -324,6 +324,23 @@ TEST(the_kv_cache_dtype_is_one_of_two_names) {
     CHECK_EQ(d.kv_cache_dtype, std::string("bf16"));
 }
 
+TEST(the_ngram_table_is_on_disk_or_in_ram) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.ngram_table_ram);
+    Config c;
+    CHECK_EQ(parse({ "--ngram-table", "ram" }, &c), RAD_OK);
+    CHECK(c.ngram_table_ram);
+    CHECK_EQ(parse({ "--ngram-table", "disk" }, &c), RAD_OK);
+    CHECK(!c.ngram_table_ram);
+    /* 47.7 GiB of locked memory is the operator's to give, so a name this build does not know
+     * stops the server rather than picking either side. */
+    CHECK_EQ(parse({ "--ngram-table", "memory" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--ngram-table", "RAM" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--ngram-table", "" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--ngram-table" }, &c), RAD_E_INVAL);
+}
+
 /* THE FLAG THAT DECIDES WHETHER MULTI-TURN WORKS. It is the WEIGHTS share, strictly inside
  * (0, 1): either endpoint gives one side of the split nothing at all, and the server would come
  * up and then fail to place either the experts or the cache. */
@@ -797,6 +814,7 @@ TEST(usage_names_every_flag_it_documents) {
     CHECK(text.find("--checkpoint-policy") != std::string::npos);
     CHECK(text.find("--prefix-cache-host-mib") != std::string::npos);
     CHECK(text.find("--tp-wire") != std::string::npos);
+    CHECK(text.find("--ngram-table") != std::string::npos);
     CHECK(text.find("--kld-record") != std::string::npos);
     CHECK(text.find("--kld-ref") != std::string::npos);
     for (const char* f : { "--default-max-tokens", "--max-tokens-cap", "--presence-penalty",

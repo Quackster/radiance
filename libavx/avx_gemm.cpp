@@ -700,6 +700,7 @@ static bool rows_form(const RadArgs* a, RowGather* g) {
     g->n_ahead = ahead ? numel(ahd) : 0;
     g->rank = a->rank;
     g->world_size = a->world_size;
+    g->resident = p_int(a, "resident", 0) != 0;
     return true;
 }
 

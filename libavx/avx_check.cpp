@@ -799,9 +799,10 @@ static bool schema_same(const RadOpSchema& a, const RadOpSchema& b, std::string*
     return true;
 }
 
-/* embed_lookup_q over a file-backed table, two ranks and the reader racing (avx_check_rows.cpp). */
+/* embed_lookup_q over a file-backed table, two ranks and the reader racing, or with the table
+ * copied into RAM (avx_check_rows.cpp). */
 bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool verbose,
-                     bool bf16);
+                     bool bf16, bool resident);
 /* embed_lookup_q's init, where io_uring is refused and here (avx_check_rows.cpp). */
 bool ngram_init_case(const Lib& avx);
 
@@ -945,13 +946,16 @@ int main(int argc, char** argv) {
             const std::string at = sl == std::string::npos ? "." : self.substr(0, sl);
             /* The E4M3 table the quantised containers carry, and the plain bf16 one a checkpoint
              * served as it ships carries: one path, two row sizes. */
-            if (!row_gather_case(avx, at, 1000, verbose, false)) rc = 1;
-            if (!row_gather_case(avx, at, 1000, verbose, true)) rc = 1;
+            if (!row_gather_case(avx, at, 1000, verbose, false, false)) rc = 1;
+            if (!row_gather_case(avx, at, 1000, verbose, true, false)) rc = 1;
+            /* The copy in RAM is the process's, made once a table, so at one level: the last. */
+            if (lvl == hi && !row_gather_case(avx, at, 1000, verbose, false, true)) rc = 1;
             /* And in TMPDIR, which is a tmpfs on most machines: since Linux 6.6 a tmpfs does
              * direct reads and reports no alignment for them, as btrfs does, so the gather finds
              * its granule from the block size there. */
             const char* tmp = std::getenv("TMPDIR");
-            if (!row_gather_case(avx, tmp && *tmp ? tmp : "/tmp", 1000, verbose, false)) rc = 1;
+            if (!row_gather_case(avx, tmp && *tmp ? tmp : "/tmp", 1000, verbose, false, false))
+                rc = 1;
         }
     }
     if (!declined_ops.empty()) {

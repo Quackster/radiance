@@ -130,6 +130,17 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int64_t  max_out_rows;
+
+    /* WHERE A HOST GATHER OVER A FILE-BACKED TABLE READS ITS ROWS. 0 -- what a zero-initialised
+     * context gives -- reads them from the container through the kernel's own row cache, holding
+     * no more of the table than that. Nonzero asks for the whole table copied into locked host
+     * memory and read from there: a deployment choice, because it costs the table's size in RAM
+     * (Qwen3.8-Flash-Next's n-gram table is 47.7 GiB) and buys prefill and throughput, and it
+     * changes no result. The plugin passes it to `embed_lookup_q` as `resident`; a kernel that
+     * cannot hold the copy says so and reads the file. --ngram-table disk|ram.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    int      ngram_table_ram;
 } RadBuildCtx;
 
 /* ================================================================== weights */

@@ -367,19 +367,18 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
                {}, {b_ids});
 
     /* M IS T * heads HERE, not T: the gather fetches one table row per HEAD per token, and the
-     * band this op resolves on is that count. */
+     * band this op resolves on is that count. `resident` only when the deployment asked for the
+     * table in RAM (--ngram-table ram), so the default declares exactly the op it always has. */
+    const RadParam gp[] = { RAD_RANGE("M", 1, g.max_tok * c.heads), RAD_INT("n_embd", HD),
+                            RAD_INT("n_vocab", c.rows), RAD_STR("dtype", g.dtype),
+                            RAD_INT("resident", 1) };
+    const int n_gp = g.ngram_ram ? 5 : 4;
     if (table_bf16)
-        op_gather = rw(b, RAD_OP(b, "embed_lookup_q",
-                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * c.heads), RAD_INT("n_embd", HD),
-                                     RAD_INT("n_vocab", c.rows), RAD_STR("dtype", g.dtype)),
-                          RAD_WEIGHTS(w_table)),
-                      {b_ids}, {b_emb});
+        op_gather = rw(b, RAD_OP(b, "embed_lookup_q", gp, n_gp, RAD_WEIGHTS(w_table)),
+                       {b_ids}, {b_emb});
     else
-    op_gather = rw(b, RAD_OP(b, "embed_lookup_q",
-                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * c.heads), RAD_INT("n_embd", HD),
-                                 RAD_INT("n_vocab", c.rows), RAD_STR("dtype", g.dtype)),
-                      RAD_WEIGHTS(w_table, w_scale)),
-                  {b_ids}, {b_emb});
+        op_gather = rw(b, RAD_OP(b, "embed_lookup_q", gp, n_gp, RAD_WEIGHTS(w_table, w_scale)),
+                       {b_ids}, {b_emb});
 
     op_embd = rw(b, RAD_OP(b, "cast",
                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", c.embed_dim),

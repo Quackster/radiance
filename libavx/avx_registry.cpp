@@ -361,6 +361,10 @@ static const RadParamSpec pEmbed[]    = { P_INT("M"), P_INT("n_embd"), P_INT("n_
                                           P_STR("dtype"), P_INTO("vocab_offset"),
                                           P_F64O("wscale") };
 static const RadOperandSpec oEmbed[]  = { OPD("tokens"), WGT("wte"), OUT("x") };
+/* embed_lookup_q's, and `resident`: keep the table's copy in RAM (avx_ngram.cpp). */
+static const RadParamSpec pEmbedQ[]   = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
+                                          P_STR("dtype"), P_INTO("vocab_offset"),
+                                          P_F64O("wscale"), P_INTO("resident") };
 static const RadOperandSpec oEmbedQ[] = { OPD("tokens"), WGT("wte"), WGT_O("scale"), OUT("x"),
                                           OPD_O("ahead") };
 
@@ -525,7 +529,7 @@ static const RadOpSchema kSchemas[] = {
   "sum across ranks, f32, ascending rank order." },
 { "all_gather", ARR(pAllGather), ARR(oAllGather), "gather every rank's shard." },
 { "embed_lookup", ARR(pEmbed), ARR(oEmbed), "embedding gather, vocab-parallel with an offset." },
-{ "embed_lookup_q", ARR(pEmbed), ARR(oEmbedQ),
+{ "embed_lookup_q", ARR(pEmbedQ), ARR(oEmbedQ),
   "embedding gather, one scale for the table; without a scale the table is read as it is." },
 { "logits_gemm", ARR(pLogits), ARR(oLogits), "the lm_head projection." },
 { "sample_penalties", ARR(pPenal), ARR(oPenalties),
@@ -725,12 +729,13 @@ SIMPLE("avx_all_gather", "all_gather", "ar", "gather every rank's shard; world_s
 SIMPLE("avx_embed_lookup", "embed_lookup", "vocab", "embedding gather", DT_FLOAT, L(embed_lookup)),
 /* THE ONE ROW WITH A LAYOUT HOOK, and it only checks: the table is read as it is stored, and the
  * hook refuses a table encoded any other way (avx_ngram.cpp). An E4M3 table into bf16 goes through
- * the row cache; every other dtype pair takes the general gather. Its init refuses a process that
- * may not make the io_uring ring the cache's misses are read through, at declare and not at the
- * first request. */
+ * the row cache, or with `resident` from a copy in RAM once there is one; every other dtype pair
+ * takes the general gather. Its init refuses a process that may not make the io_uring ring the
+ * cache's misses are read through, at declare and not at the first request. */
 { "avx_embed_lookup_q", "embed_lookup_q", "vocab",
   "embedding gather, one scale for the table: an E4M3 table into bf16 through a shared row cache "
-  "and direct reads of the container, a later call's rows read ahead",
+  "and direct reads of the container, a later call's rows read ahead, or with `resident` from a "
+  "copy of the table in locked RAM",
   SHAPE_ANY, DT_ANY, RAD_DOMAIN_HOST, 0,
   nullptr, 0, nullptr, 0, nullptr,
   /* INIT, fini, LAUNCH, scratch, layout, relayout, opd_shape, unrelayout */
