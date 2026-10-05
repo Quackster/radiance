@@ -163,6 +163,7 @@ struct Plugin {
     void (*pin_qsa)(int) = nullptr;
     void (*pin_moe)(int) = nullptr;
     void (*pin_fk)(int) = nullptr;
+    void (*pin_dn2)(int) = nullptr;
     void (*pin_hc)(int) = nullptr;
     void (*pin_qsel)(int) = nullptr;
 };
@@ -194,6 +195,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_qsa_score_pin_form", &pl->pin_qsa);
     okall &= sym(pl->h, "r4d_moe_gemm_pin_prefill", &pl->pin_moe);
     okall &= sym(pl->h, "r4d_moe_gemm_pin_fk", &pl->pin_fk);
+    okall &= sym(pl->h, "r4d_moe_gemm_pin_down2", &pl->pin_dn2);
     okall &= sym(pl->h, "r4d_hc_read_pin_prefill", &pl->pin_hc);
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     return okall;
@@ -7112,6 +7114,367 @@ static void moe_q4_gemm(const Plugin& pl, int64_t Tr, const MoeQ4Shape& sh, cons
     moe_dec_variants(pl, r, a, d_y, (size_t)(Tr * N), fk2, what);
 }
 
+/* A DECODE STEP'S ROUTING, the way router_topk_scatter leaves it: M tokens, `top_k` distinct experts
+ * each -- half of the picks from thirty-two popular experts, the rest anywhere -- and, with `hot`,
+ * every token's first slot on one expert, whose run is then M rows long and crosses 16-row tiles.
+ * Every 37th slot goes to another rank (dropped, so the live count is short of T). Then the
+ * scatter's stable counting sort: runs in expert order, a run's slots in slot order. */
+static void moe_route(int64_t M, int64_t top_k, int64_t ne, uint64_t seed, bool hot,
+                      std::vector<int32_t>& off, std::vector<int32_t>& sorted) {
+    const int64_t T = M * top_k;
+    std::vector<int32_t> ids((size_t)T, -1);
+    uint64_t s = seed;
+    auto rnd = [&]() {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        return (uint32_t)(s >> 33);
+    };
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t k = 0; k < top_k; ++k) {
+            int32_t e = 0;
+            bool dup = true;
+            while (dup) {
+                const uint32_t x = rnd();
+                e = (x & 1u) ? (int32_t)((((x >> 1) % 32u) * 13u) % (uint32_t)ne)
+                             : (int32_t)((x >> 1) % (uint32_t)ne);
+                if (hot && k == 0) e = (int32_t)(ne / 3);
+                dup = false;
+                for (int64_t q = 0; q < k; ++q) dup = dup || ids[(size_t)(m * top_k + q)] == e;
+            }
+            ids[(size_t)(m * top_k + k)] = e;
+        }
+    for (int64_t i = 5; i < T; i += 37) ids[(size_t)i] = -1;
+    std::vector<int32_t> cnt((size_t)ne, 0);
+    for (const int32_t e : ids)
+        if (e >= 0) ++cnt[(size_t)e];
+    off.assign((size_t)(ne + 1), 0);
+    for (int64_t e = 0; e < ne; ++e) off[(size_t)(e + 1)] = off[(size_t)e] + cnt[(size_t)e];
+    sorted.assign((size_t)T, -1);
+    std::vector<int32_t> at(off.begin(), off.end() - 1);
+    for (int64_t i = 0; i < T; ++i)
+        if (ids[(size_t)i] >= 0) sorted[(size_t)(at[(size_t)ids[(size_t)i]]++)] = (int32_t)i;
+}
+
+/* THE SORTED OPERAND -- the down projection -- AT DECODE, every form against a host decode, and
+ * moe_down_dec_kernel (R4D_MOE_DOWN2) against the (tile, run) form BYTE FOR BYTE.
+ *
+ * moe_q4_gemm reads the activation in token order; down reads it in sorted order, one row a routed
+ * slot, so that is the operand here, with a routing shaped like a decode step's (moe_route): at
+ * T = 40 one sequence at depth 3, at T = 640 sixteen, a run longer than a tile, runs that cross
+ * tile boundaries, a dropped tail. Each class has its own [N_q, K_q]; one class narrower than the
+ * output puts a column tile past its width, which both forms must zero. The decode kernel runs at
+ * several column groups, three of them uneven over the output's 64-column tiles; and the (tile,
+ * run) form itself against the uniform prefill grid, byte for byte, on the sorted-operand path the
+ * token-order cases never take. Every pinned variant is DESCRIBED first where the row can be: one
+ * that named the reference's kernel would match it trivially. */
+struct MoeDnShape { const char* name; int64_t N[4], K[4], ne, top_k; };
+
+static void moe_down2_case(const Plugin& pl, const MoeDnShape& sh, const char* dt,
+                           std::initializer_list<int64_t> Ts) {
+    const bool fp8 = std::strcmp(dt, "fp8a8") == 0, w5 = std::strcmp(dt, "w5nl64a8h") == 0;
+    const int64_t sub = std::strcmp(dt, "w4nl32a8h") == 0 ? 4
+                      : (w5 || std::strcmp(dt, "w4nl64a8h") == 0) ? 2 : 0;
+    const bool g64 = sub > 1;
+    const float* tab = w5 ? kW5nlTable : kW4nlTable;
+    static const char* const kForm[] = { "rule", "aligned prefill form", "decode form",
+                                         "uniform prefill grid" };
+    const char* row = fp8 ? "moe_gemm_fp8a8_mod4" : "moe_gemm_w4a8_mod4";
+    const std::string head = std::string(row) + ", sorted operand (" + sh.name + ", " + dt + ")";
+    const RadKernelInfo* r = find(pl, row);
+    if (!r || !r->layout || (!fp8 && !r->relayout)) {
+        ok(head.c_str(), false, "row or hooks absent");
+        return;
+    }
+    if (!pl.pin_moe || !pl.pin_dn2) {
+        skip(head.c_str(), "the plugin exports no form pins");
+        return;
+    }
+
+    const int64_t ne = sh.ne, group = 128, top_k = sh.top_k;
+    int64_t N = 0, K = 0;
+    for (int q = 0; q < 4; ++q) {
+        N = std::max(N, sh.N[q]);
+        K = std::max(K, sh.K[q]);
+    }
+    const int64_t kb = K / group;
+    const std::vector<RadParam> lp = {
+        PI("N", sh.N[0]), PI("K", sh.K[0]), PI("N_1", sh.N[1]), PI("K_1", sh.K[1]),
+        PI("N_2", sh.N[2]), PI("K_2", sh.K[2]), PI("N_3", sh.N[3]), PI("K_3", sh.K[3]),
+        PI("group", group), PS("dtype", dt),
+    };
+
+    /* The experts, as moe_q4_gemm builds them: e = 4x + q, each class at its own geometry, the
+     * bytes the row's own hooks store for them at the class's operands. */
+    std::vector<uint8_t> wq[4], ws[4];
+    std::vector<Planes>  cp[4];
+    int64_t nec[4] = { 0, 0, 0, 0 };
+    for (int q = 0; q < 4; ++q) {
+        const int64_t Nq = sh.N[q], Kq = sh.K[q], kbq = Kq / group;
+        const int ow = q ? 4 + 2 * q : 2, os = ow + 1;
+        const int64_t wbytes = fp8 ? Nq * Kq : w5 ? Nq * Kq / 8 * 5 : Nq * Kq / 2;
+        const int64_t sbytes = fp8 ? (Nq + group - 1) / group * kbq * 2
+                                   : Nq * kbq * (g64 ? sub : 2);
+        nec[q] = (ne + 3 - q) / 4;
+        std::vector<float> wsrc((size_t)(Nq * Kq));
+        for (int64_t x = 0; x < nec[q]; ++x) {
+            const int64_t e = 4 * x + q;
+            for (int64_t n = 0; n < Nq; ++n)
+                for (int64_t k = 0; k < Kq; ++k)
+                    wsrc[(size_t)(n * Kq + k)] =
+                        (float)(((e * 7 + n * 31 + k * 17) % 61) - 30) / 37.0f;
+            cp[q].push_back(fp8 ? fp8_block_planes(wsrc, Nq, Kq)
+                            : g64 ? nl64_planes(wsrc, Nq, Kq, group / sub, w5)
+                                  : int4_planes(wsrc, Nq, Kq, group, RAD_BF16, false));
+            std::vector<uint8_t> w, sc;
+            const int rw = g64 ? stored(r, lp, ow, cp[q].back(), { "codes", "table" }, &w)
+                               : stored(r, lp, ow, cp[q].back(), { "codes" }, &w);
+            const int rs = g64 ? stored(r, lp, os, cp[q].back(), { "scale", "scale.1" }, &sc)
+                               : stored(r, lp, os, cp[q].back(), { "scale" }, &sc);
+            if (rw != (fp8 ? RAD_E_UNSUPPORTED : RAD_OK) ||
+                rs != (g64 ? RAD_OK : RAD_E_UNSUPPORTED) ||
+                (int64_t)w.size() != wbytes || (int64_t)sc.size() != sbytes) {
+                ok(head.c_str(), false, "class " + std::to_string(q) + " relayout rc " +
+                                        std::to_string(rw) + "/" + std::to_string(rs) + ", " +
+                                        std::to_string(w.size()) + " and " +
+                                        std::to_string(sc.size()) + " bytes an expert");
+                return;
+            }
+            wq[q].insert(wq[q].end(), w.begin(), w.end());
+            ws[q].insert(ws[q].end(), sc.begin(), sc.end());
+        }
+    }
+    void* d_w[4];
+    void* d_ws[4];
+    for (int q = 0; q < 4; ++q) {
+        d_w[q]  = dalloc(wq[q].size());
+        d_ws[q] = dalloc(ws[q].size());
+        st_memcpy(d_w[q],  wq[q].data(), wq[q].size(), hipMemcpyHostToDevice);
+        st_memcpy(d_ws[q], ws[q].data(), ws[q].size(), hipMemcpyHostToDevice);
+    }
+    auto codes_t = [&](int q) {
+        return T(d_w[q], fp8 ? (uint32_t)RAD_F8E4M3 : w5 ? (uint32_t)R4D_DT_MOEW5
+                                                         : (uint32_t)R4D_DT_MOEW4,
+                 { nec[q], sh.N[q], sh.K[q] });
+    };
+    auto scale_t = [&](int q) {
+        const int64_t kbq = sh.K[q] / group;
+        return fp8 ? T(d_ws[q], RAD_BF16, { nec[q], (sh.N[q] + group - 1) / group, kbq })
+             : g64 ? T(d_ws[q], RAD_F8E4M3, { nec[q], sh.N[q], sub * kbq })
+                   : T(d_ws[q], RAD_BF16, { nec[q], sh.N[q], kbq });
+    };
+
+    for (const int64_t Tr : Ts) {
+        const int64_t M = Tr / top_k;
+        const std::string what = head + " T=" + std::to_string(Tr);
+        std::vector<int32_t> off, sorted;
+        moe_route(M, top_k, ne, 0x9E3779B97F4A7C15ull ^ (uint64_t)Tr, M > 16, off, sorted);
+        const int64_t live = off[(size_t)ne];
+        int64_t nrun = 0, longest = 0;
+        for (int64_t e = 0; e < ne; ++e) {
+            const int64_t n = off[(size_t)(e + 1)] - off[(size_t)e];
+            nrun += n > 0;
+            longest = std::max(longest, n);
+        }
+
+        /* One activation row a routed slot: E4M3 bytes with no subnormal and no NaN, an f32 scale
+         * a (row, group). */
+        std::vector<uint8_t> aq((size_t)(Tr * K));
+        std::vector<float>   as((size_t)(Tr * kb));
+        for (int64_t m = 0; m < Tr; ++m) {
+            for (int64_t g = 0; g < kb; ++g) as[(size_t)(m * kb + g)] = 0.011f + 0.003f * (float)g;
+            for (int64_t k = 0; k < K; ++k) {
+                const uint32_t c = (uint32_t)((m * 13 + k * 5) % 119) + 8;
+                aq[(size_t)(m * K + k)] = (uint8_t)(((m + k) & 1) ? (c | 0x80u) : c);
+            }
+        }
+        void* d_a  = dalloc(aq.size());
+        void* d_as = dalloc(as.size() * 4);
+        void* d_s  = dalloc(sorted.size() * 4);
+        void* d_o  = dalloc(off.size() * 4);
+        void* d_y  = dalloc((size_t)(Tr * N * 2));
+        st_memcpy(d_a,  aq.data(),     aq.size(),         hipMemcpyHostToDevice);
+        st_memcpy(d_as, as.data(),     as.size() * 4,     hipMemcpyHostToDevice);
+        st_memcpy(d_s,  sorted.data(), sorted.size() * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_o,  off.data(),    off.size() * 4,    hipMemcpyHostToDevice);
+        std::vector<RadTensor> ts = {
+            T(d_a, RAD_F8E4M3, { Tr, K }), T(d_as, RAD_F32, { Tr, kb }), codes_t(0), scale_t(0),
+            T(d_s, RAD_I32, { Tr }), T(d_o, RAD_I32, { ne + 1 }), codes_t(1), scale_t(1),
+            codes_t(2), scale_t(2), codes_t(3), scale_t(3), T(d_y, RAD_BF16, { Tr, N }),
+        };
+        std::vector<RadParam> ps = {
+            PI("M", M), PI("N", sh.N[0]), PI("K", sh.K[0]), PI("N_1", sh.N[1]),
+            PI("K_1", sh.K[1]), PI("N_2", sh.N[2]), PI("K_2", sh.K[2]), PI("N_3", sh.N[3]),
+            PI("K_3", sh.K[3]), PI("parts", 1), PI("n_expert", ne), PI("top_k", top_k),
+            PI("group", group), PS("a_order", "sorted"), PS("dtype", dt),
+        };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        const int64_t map_bytes = (1 + 2 * (ne + Tr / 16 + 2)) * 4;
+        void* d_map = dalloc((size_t)map_bytes);
+
+        /* The reference: sorted row i reads activation row i, its expert e from the offsets. */
+        std::vector<double> ref((size_t)(Tr * N), 0.0);
+        for (int64_t i = 0; i < live; ++i) {
+            if (sorted[(size_t)i] < 0) continue;
+            int64_t e = 0;
+            while (e + 1 < ne && off[(size_t)(e + 1)] <= i) ++e;
+            const int q = (int)(e % 4);
+            const Planes& p = cp[q][(size_t)(e / 4)];
+            const int64_t fc = sh.N[q], Kq = sh.K[q], kbq = Kq / group;
+            for (int64_t n = 0; n < fc; ++n) {
+                double want = 0.0;
+                for (int64_t g = 0; g < kbq; ++g) {
+                    const double a_s = (double)as[(size_t)(i * kb + g)];
+                    if (fp8) {
+                        double part = 0.0;
+                        for (int64_t k = g * group; k < (g + 1) * group; ++k)
+                            part += (double)h_e4m3(p.data[0][(size_t)(n * Kq + k)]) *
+                                    (double)st_e4m3(aq[(size_t)(i * K + k)]);
+                        want += part * (double)rad_load_f32(p.data[1].data(), RAD_BF16,
+                                                            (n / group) * kbq + g) * a_s;
+                    } else if (g64) {
+                        const int64_t gw = group / sub;
+                        for (int64_t h = 0; h < sub; ++h) {
+                            double part = 0.0;
+                            for (int64_t k = g * group + h * gw; k < g * group + (h + 1) * gw; ++k)
+                                part += (double)tab[code_at(p, n, k)] *
+                                        (double)st_e4m3(aq[(size_t)(i * K + k)]);
+                            const uint8_t sb = p.data[1][(size_t)(n * p.row_bytes(1) + sub * g + h)];
+                            want += part * (double)h_e4m3(sb) * (double)kW4G64Scale * a_s;
+                        }
+                    } else {
+                        double part = 0.0;
+                        for (int64_t k = g * group; k < (g + 1) * group; ++k)
+                            part += (double)code_at(p, n, k) *
+                                    (double)st_e4m3(aq[(size_t)(i * K + k)]);
+                        want += part * (double)rad_load_f32(p.data[1].data(), RAD_BF16,
+                                                            n * kbq + g) * a_s;
+                    }
+                }
+                ref[(size_t)(i * N + n)] = want;
+            }
+        }
+
+        /* One pinned launch into stale bytes, its output back. `pins` is (form, down2). */
+        auto run = [&](const int (&pins)[2], std::vector<uint16_t>* got) {
+            {
+                std::vector<uint16_t> junk((size_t)(Tr * N), 0x7f7fu);
+                st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
+            }
+            a.scratch = pins[0] == 3 ? nullptr : d_map;
+            a.scratch_bytes = pins[0] == 3 ? 0 : map_bytes;
+            pl.pin_moe(pins[0]);
+            pl.pin_dn2(pins[1]);
+            const int rc = r->launch(&a, nullptr);
+            st_stream_sync(nullptr);
+            pl.pin_moe(0);
+            pl.pin_dn2(0);
+            got->assign((size_t)(Tr * N), 0);
+            st_memcpy(got->data(), d_y, got->size() * 2, hipMemcpyDeviceToHost);
+            return rc;
+        };
+        auto described = [&](const int (&pins)[2]) -> const void* {
+            if (!r->describe) return nullptr;
+            static RadLaunchDesc d[4];
+            int n = 0;
+            a.scratch = pins[0] == 3 ? nullptr : d_map;
+            a.scratch_bytes = pins[0] == 3 ? 0 : map_bytes;
+            pl.pin_moe(pins[0]);
+            pl.pin_dn2(pins[1]);
+            const int drc = r->describe(&a, nullptr, d, 4, &n);
+            pl.pin_moe(0);
+            pl.pin_dn2(0);
+            return drc == RAD_OK && n >= 1 ? d[n - 1].func : nullptr;
+        };
+
+        /* Every form with the decode kernel off, against the host. */
+        std::vector<uint16_t> base, grid;
+        for (int form = 1; form <= 3; ++form) {
+            const std::string label = what + " " + kForm[form];
+            const int pins[2] = { form, -1 };
+            std::vector<uint16_t> got;
+            const int rc = run(pins, &got);
+            if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
+            double worst = 0.0;
+            int64_t bad = 0;
+            std::string first;
+            for (int64_t i = 0; i < Tr; ++i)
+                for (int64_t n = 0; n < N; ++n) {
+                    const double want = ref[(size_t)(i * N + n)];
+                    const double err = std::fabs((double)h_bf16(got[(size_t)(i * N + n)]) - want);
+                    if (!(err <= 0.004 * std::fabs(want) + 1e-4)) {
+                        if (!bad++)
+                            first = ", first at row " + std::to_string(i) + " col " +
+                                    std::to_string(n) + ": " +
+                                    std::to_string(h_bf16(got[(size_t)(i * N + n)])) + " for " +
+                                    std::to_string(want);
+                        if (!(err <= worst)) worst = err;
+                    }
+                }
+            ok(label.c_str(), bad == 0, std::to_string(bad) + " of " + std::to_string(Tr * N) +
+                                        " elements off, worst " + std::to_string(worst) + first);
+            if (form == 2) base = got;
+            if (form == 3) grid = got;
+        }
+        if (base.empty()) continue;
+
+        /* The (tile, run) form on the sorted operand against the uniform prefill grid, byte for
+         * byte: every form keeps each output element's accumulation order, and the grid finds the
+         * runs a third way. */
+        if (!grid.empty()) {
+            int64_t diff = 0;
+            for (size_t i = 0; i < grid.size(); ++i) diff += grid[i] != base[i];
+            ok((what + " decode form, byte for byte with the uniform prefill grid").c_str(),
+               diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
+                          " elements differ");
+        }
+
+        /* The sorted operand's own decode kernel at several column groups, each against the
+         * (tile, run) form's bytes. */
+        struct Var { int dn2; const char* name; };
+        static const Var kVar[] = {
+            { 1, "down kernel, one column tile a block" },
+            { 2, "down kernel, two column tiles a block" },
+            { 3, "down kernel, three column tiles a block" },
+            { 4, "down kernel, four column tiles a block" },
+            { 8, "down kernel, eight column tiles a block" },
+        };
+        const int ref_pins[2] = { 2, -1 };
+        const void* fn0 = described(ref_pins);
+        for (const Var& v : kVar) {
+            const std::string label = what + " decode form, " + v.name + " (" +
+                                      std::to_string(nrun) + " runs, longest " +
+                                      std::to_string(longest) + ")" +
+                                      (r->describe ? "" : " (launch not described)");
+            const int pins[2] = { 2, v.dn2 };
+            if (r->describe) {
+                const void* fn = described(pins);
+                if (!fn || fn == fn0) {
+                    ok(label.c_str(), false, fn ? "named the (tile, run) form's kernel"
+                                                : "describe failed");
+                    continue;
+                }
+            }
+            std::vector<uint16_t> got;
+            const int rc = run(pins, &got);
+            if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
+            int64_t diff = 0;
+            for (size_t i = 0; i < got.size(); ++i) diff += got[i] != base[i];
+            ok(label.c_str(), diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
+                                         " elements differ from the (tile, run) form");
+        }
+    }
+}
+
+/* QFN's down projection at rank 0 of four, narrowed: 512 experts at top 10, K 256 for class 0 and
+ * 128 for the others -- and 384 for class 3, so a run takes three K blocks -- and N five 64-column
+ * tiles, class 2 one short of it. The other formats at 64 experts, top 4. */
+static const MoeDnShape kMoeDnShapes[] = {
+    { "512 experts, top 10", { 320, 320, 256, 320 }, { 256, 128, 128, 384 }, 512, 10 },
+    { "64 experts, top 4",   { 320, 320, 256, 320 }, { 256, 128, 128, 384 }, 64, 4 },
+};
+
 /* THE ARRANGED PLANE, AGAINST THE FORMAT IT STATES, AND BACK.
  *
  * `moe_gemm_w4a8` is the one large weight of a routed model, and what a checker reads it through is
@@ -11082,6 +11445,11 @@ static void device_phase(const Plugin& pl) {
             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 })
                 for (const char* dt : { "w4a8", "w4nl64a8h", "w4nl32a8h", "w5nl64a8h" })
                     moe_q4_gemm(pl, t, sh, dt);
+        /* The sorted operand at decode, and its own kernel (R4D_MOE_DOWN2) against the (tile, run)
+         * form: one sequence at depth 3 (T 40), five, sixteen and nineteen. */
+        moe_down2_case(pl, kMoeDnShapes[0], "w4nl64a8h", { 40, 200, 640, 760 });
+        for (const char* dt : { "w4a8", "w4nl64a8h", "w4nl32a8h", "w5nl64a8h" })
+            moe_down2_case(pl, kMoeDnShapes[1], dt, { 40, 96 });
     }
 
     if (sel("moe_gemm_fp8a8_mod4")) {
@@ -11090,6 +11458,7 @@ static void device_phase(const Plugin& pl) {
         for (const MoeQ4Shape& sh : kMoeQ4Shapes)
             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 })
                 moe_q4_gemm(pl, t, sh, "fp8a8");
+        moe_down2_case(pl, kMoeDnShapes[1], "fp8a8", { 40, 96 });
     }
 
     if (sel("hc_read_e4m3")) {
