@@ -706,7 +706,8 @@ extern "C" int r4d_fuse_attn_paged_gate_quant(const RadParam* p, int n_p, uint64
 
 /* ==========================================================================================
  * ar_gather_hc_write -- moe_gather, then ar_hc_write.
- * (kernel: libr4d/r4d_ar_oneshot_2rank_exact.hip, r4d_ar_gather_hc_write_kernel; shim: r4d_ar_entry.hip)
+ * (kernel: libr4d/r4d_ar_oneshot_2rank_exact.hip, r4d_ar_gather_hc_write_kernel, and at four ranks
+ * libr4d/r4d_ar_oneshot_Nrank_exact.hip, r4d_ar_gather_hc_write_wide_kernel; shim: r4d_ar_entry.hip)
  *
  * Operands: [0] y_expert  [1] expert_w  [2] sorted_tok  [3] shared?  [4] shared_gate?  [5] y (inout)
  *           [6] inj  [7] h (inout)
@@ -714,7 +715,8 @@ extern "C" int r4d_fuse_attn_paged_gate_quant(const RadParam* p, int n_p, uint64
  * Two declared ops and nothing in between: the gather writes `y`, which is the reduction's message
  * and is then reduced in place and written into the streams. The shared-arm pair is optional in
  * both ops at the same positions, so its absence propagates through the wiring. `wire` is the
- * reducing write's, and it goes to that step unchanged.
+ * reducing write's, and it goes to that step unchanged; so does `world_size`, which at four selects
+ * ar_hc_write_4rank, the reduction and write the four-rank row runs.
  */
 extern "C" int r4d_fuse_ar_gather_hc_write(const RadParam* p, int n_p, uint64_t present, int step,
                                            RadFuseStep* out) {

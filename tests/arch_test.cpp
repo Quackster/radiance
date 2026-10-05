@@ -1853,11 +1853,12 @@ TEST(a_sizing_declare_leaves_the_step_state_alone_and_shrinks_only_rows) {
  *     bf16 expert, leaving an odd count of quantised ones, and the grouped GEMM takes its experts as
  *     two EQUAL tables by parity. The recipe protects experts in pairs for exactly that reason.
  *   - the FUSED all-reduces are world-2 kernels (`ar_wire_is_exact` and `ar_fused_ok` both return
- *     false off two), with one exception: `ar_hc_write` also exists at four, on the exact wire only
- *     (no `wire` key, never the rotated form) and with no gather in front of it. Every block still
- *     declares its standalone `all_reduce`, which serves the steps the fused write declines. The
- *     contrast with world 2 in the same test is the contract -- it fails loudly if a fused declare
- *     is ever gated on the wrong condition.
+ *     false off two), with one exception: the gated residual's write. `ar_hc_write` and
+ *     `ar_gather_hc_write` also exist at four, on the exact wire only (no `wire` key, never the
+ *     rotated form). Every block still declares its standalone `all_reduce`, and every MoE block
+ *     its `moe_gather`, which serve the steps the fused write declines. The contrast with world 2
+ *     in the same test is the contract -- it fails loudly if a fused declare is ever gated on the
+ *     wrong condition.
  *
  * Every expected number is derived from the meta this file builds (n_head 24, n_head_kv 2, head_dim
  * 256, num_experts 512), so the fixture and the assertions cannot drift apart. Where a number is
@@ -1984,17 +1985,20 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
         CHECK_EQ(pint(gu, "N_odd"), 2 * (cls_hi[r][1] - cls_lo[r][1]));
         CHECK_EQ(pint(gu, "n_expert"), ne_all);
 
-        /* (4) A standalone collective per reduction, the exact four-rank ar_hc_write beside it,
-         * and neither of the other two fused forms. */
+        /* (4) A standalone collective per reduction, the exact four-rank ar_hc_write and
+         * ar_gather_hc_write beside it -- the gather form on every MoE connection, so one a layer
+         * plus the MTP head's if there is one -- and not the fused norm. */
         CHECK(count_op(b[r], "all_reduce") > 0);
         CHECK_EQ(pint(find_op(b[r], "all_reduce"), "world_size"), world);
         CHECK(count_op(b[r], "ar_hc_write") > 0);
+        CHECK(count_op(b[r], "moe_gather") > 0);
+        CHECK(count_op(b[r], "ar_gather_hc_write") > 0);
+        CHECK(count_op(b[r], "ar_gather_hc_write") <= count_op(b[r], "moe_gather"));
         for (const RecOp& o : b[r].ops) {
-            if (o.op != "ar_hc_write") continue;
+            if (o.op != "ar_hc_write" && o.op != "ar_gather_hc_write") continue;
             CHECK_EQ(pint(&o, "world_size"), world);
             CHECK(param(&o, "wire") == nullptr);           /* exact only */
         }
-        CHECK_EQ(count_op(b[r], "ar_gather_hc_write"), 0);
         CHECK_EQ(count_op(b[r], "ar_rmsnorm_quant_fp8"), 0);
     }
 
@@ -2094,7 +2098,31 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
         for (int64_t T : { 1, 8, 25, 26, 205, 4096 })
             CHECK(rad::arch::ar_exact_write_takes(g2, T) == rad::arch::ar_wire_is_exact(g2, T));
     }
-    /* ...and the lossy wire at four declares no rotated write and no gather form. */
+    /* THE FOUR-RANK GATHER'S STEPS: the fused write's, and within one MoE pass. The exact bound
+     * is the only one at four (the rotated form is never declared there, so `rows6` is 0), and a
+     * step the write declines keeps its gather. At two ranks the bound is still picked by
+     * ar_wire_is_exact. */
+    {
+        rad::arch::Geom g4{};
+        g4.world = 4; g4.n_embd = 2560; g4.wire_exact = 1; g4.wire_min_bytes = 128 * 1024;
+        CHECK(rad::arch::gather_taken(g4, 8, 2048, 0));      /* a decode step */
+        CHECK(rad::arch::gather_taken(g4, 204, 2048, 0));    /* 1020 KiB, one pass */
+        CHECK(!rad::arch::gather_taken(g4, 205, 2048, 0));   /* the two-shot's */
+        CHECK(!rad::arch::gather_taken(g4, 8, 0, 0));        /* not declared */
+        CHECK(!rad::arch::gather_taken(g4, 100, 64, 0));     /* two passes */
+        g4.wire_exact = 0;
+        CHECK(rad::arch::gather_taken(g4, 25, 2048, 0));     /* under the floor */
+        CHECK(!rad::arch::gather_taken(g4, 26, 2048, 0));    /* the ti8 wire's */
+        rad::arch::Geom g2 = g4;
+        g2.world = 2;
+        for (int64_t T : { 1, 8, 25, 26, 205, 4096 })
+            for (int64_t r6 : { 0, 2048 }) {
+                const int64_t r = rad::arch::ar_wire_is_exact(g2, T) ? 2048 : r6;
+                CHECK(rad::arch::gather_taken(g2, T, 2048, r6) == (r > 0 && T <= r));
+            }
+    }
+    /* ...and the lossy wire at four declares no rotated write and no rotated gather form: the
+     * exact ones only, for the steps under the floor. */
     {
         RadBuilder b4;
         RadBuildCtx c4 = build_ctx(0, world);
@@ -2103,11 +2131,11 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
         c4.tp_wire_min_bytes = 128 * 1024;
         REQUIRE_EQ(qwen4exp_fp8::declare(&b4, &meta, &c4), RAD_OK);
         CHECK(count_op(b4, "ar_hc_write") > 0);
+        CHECK(count_op(b4, "ar_gather_hc_write") > 0);
         for (const RecOp& o : b4.ops) {
-            if (o.op != "ar_hc_write") continue;
+            if (o.op != "ar_hc_write" && o.op != "ar_gather_hc_write") continue;
             CHECK(param(&o, "wire") == nullptr);
         }
-        CHECK_EQ(count_op(b4, "ar_gather_hc_write"), 0);
     }
 
     /* A WORLD THAT CANNOT REPLICATE -- not a multiple of the KV head count -- is refused by name,

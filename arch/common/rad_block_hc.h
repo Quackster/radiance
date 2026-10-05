@@ -317,9 +317,10 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
 
 inline int HyperConn::declare_gather(RadBuilder* b, const GatherSrc& src) {
     if (!op_ar_write || src.top_k <= 0 || !src.ye || !src.ew || !src.sorted) return RAD_OK;
-    /* Two ranks only: there is no four-rank gather form yet, so there the block keeps its gather
-     * and this write takes the reduction alone (both bounds stay 0). */
-    if (g.world != 2) return RAD_OK;
+    /* Two ranks, and four on the exact wire: there the fused write exists in its exact form only,
+     * so the gather does too -- op_ar_write6 is 0 at four and the rotated form below is never
+     * declared. Any other width keeps its gather and both bounds stay 0. */
+    if (g.world != 2 && g.world != 4) return RAD_OK;
     const bool shared = src.sh && src.sg;
     gsrc = src;
     /* EVERY ROW COUNT ONE PASS CARRIES, prefill chunks included: the kernel reads its slots from
@@ -386,7 +387,8 @@ inline void HyperConn::write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) co
     if (takes_gather(T)) {
         const int64_t k = gsrc.top_k;
         const bool shared = gsrc.sh && gsrc.sg;
-        RAD_ISSUE_N(c_, ar_wire_is_exact(g, T) ? op_ar_gather_write : op_ar_gather_write6, rows,
+        const rad_op op = ar_exact_write_takes(g, T) ? op_ar_gather_write : op_ar_gather_write6;
+        RAD_ISSUE_N(c_, op, rows,
                     brows(gsrc.ye, rows * k), brow_slice(gsrc.ew, r0, rows, k),
                     brows(gsrc.sorted, rows * k),
                     shared ? brow_slice(gsrc.sh, r0, rows, g.n_embd) : RAD_NONE,

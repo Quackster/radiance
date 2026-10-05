@@ -2110,7 +2110,8 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("ar_gather_hc_write", pArGatherHcWrite, oArGatherHcWrite,
            "moe_gather, then ar_hc_write, in one kernel: the routed experts' rows summed back to "
            "token order (with the shared arm folded when present) ARE the all-reduce's message, "
-           "and the gated residual's write follows the reduction. Both wires."),
+           "and the gated residual's write follows the reduction. Both wires at two ranks, the "
+           "exact one at four."),
 };
 
 /* ================================================================================ constraints
@@ -2682,6 +2683,13 @@ static const RadConstraint cArHcWrite4[] = {
 static const RadConstraint cArGatherHcWrite[] = {
     C_GE("M", 1), C_DIV("n", 8), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
     C_EQ("world_size", 2), C_GE("top_k", 1), C_LE("top_k", 64),
+    C_P2P,
+};
+/* The same at four ranks, exact wire only for cArHcWrite4's reason: the init and the entry refuse a
+ * declared `wire` 6, since the exact op declares no `wire` and an absent key fails a constraint. */
+static const RadConstraint cArGatherHcWrite4[] = {
+    C_GE("M", 1), C_DIV("n", 8), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
+    C_EQ("world_size", 4), C_GE("top_k", 1), C_LE("top_k", 64),
     C_P2P,
 };
 static const RadConstraint cGatedQuantFp8[] = {
@@ -4735,6 +4743,26 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cArGatherHcWrite), ROW(tAr), nullptr,
   r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_gather_hc_write,
+  r4d_rad_ar_gather_hc_write_scratch, nullptr, nullptr,
+  r4d_shape_ar_gather_hc_write, nullptr, r4d_fuse_ar_gather_hc_write },
+
+{ "ar_gather_hc_write_4rank", "ar_gather_hc_write", "norm",
+  "moe_gather folded in front of the four-rank ar_hc_write: each block sums its words' tokens "
+  "back from the routed experts' rows, keeps the result as its message and pushes it, and then "
+  "reduces and writes exactly as ar_hc_write_4rank does",
+  "exactly 4 ranks, all peer-accessible; exact wire only; n a multiple of 8, y unpitched and "
+  "y_expert's pitch a multiple of 8, because both move as 16B words; top_k <= 64; the stream "
+  "pitch a multiple of 8; hc 2..8; the wide one-shot's handshake and slots on the plain four-rank "
+  "all-reduce's instance; the grid widened until a block's slot table fits in LDS, or the "
+  "inverse table in the scratch where that would take more blocks than the reduction asks for; "
+  "cudagraph-safe",
+  "bf16 throughout; the gather's sums and narrows are moe_gather's (round-to-nearest-even, the "
+  "shared arm's product rounded before the add), the sum in fp32 in ascending rank order and "
+  "rounded to bf16 exactly as the four-rank exact all-reduce stores it, and the write in "
+  "hc_write's arithmetic over that bf16 value -- byte-identical to the three kernels it replaces",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cArGatherHcWrite4), ROW(tAr), nullptr,
+  r4d_rad_ar_hc_wide_init, r4d_rad_ar_fini, r4d_rad_ar_gather_hc_write_4rank,
   r4d_rad_ar_gather_hc_write_scratch, nullptr, nullptr,
   r4d_shape_ar_gather_hc_write, nullptr, r4d_fuse_ar_gather_hc_write },
 

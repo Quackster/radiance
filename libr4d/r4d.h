@@ -350,6 +350,23 @@ void r4d_ar_hc_write_4rank(long peer_scratch0, long peer_scratch1, long peer_scr
                            long y, long inj, long h, long M, long n, long hc, long irow,
                            long hrow, long rank, long stream, long nblocks, long nthreads,
                            long drain, long acq, long pub);
+// r4d_ar_gather_hc_write at four ranks: r4d_ar_hc_write_4rank with the MoE gather as its prologue
+// -- byte-identical to moe_gather, then the 4-rank exact all-reduce, then hc_write. The gather's
+// operands, `inv` and the grid rule are r4d_ar_gather_hc_write's; the buffers, peer order, flag
+// values and slots are r4d_ar_oneshot_4rank_exact's. Exact wire only.
+void r4d_ar_gather_hc_write_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                  long peer_flags0, long peer_flags1, long peer_flags2,
+                                  long my_scratch, long my_flags, long seq_ctrs,
+                                  long slot_stride16, long y, long inj, long h, long M, long n,
+                                  long hc, long irow, long hrow, long ye, long ew, long sorted,
+                                  long sh, long sg, long ye_ld, long ew_ld, long sh_ld,
+                                  long sg_ld, long top_k, long sig, long rank, long stream,
+                                  long nblocks, long nthreads, long drain, long acq, long pub,
+                                  long inv);
+// The inverse slot table both widths' gather forms read at a prefill-sized call: inv[f] = the
+// sorted row holding slot f, -1 where none does, over T = M*top_k int32. One block, on `stream`.
+// Returns 0 or a negative / HIP error code.
+int  r4d_ar_gather_inv(long inv, long sorted, long T, long stream);
 void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers);
 
 // ---- all-reduce: two-shot, 4 or 8 ranks over P2P -------------------------------------------

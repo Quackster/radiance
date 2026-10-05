@@ -757,7 +757,8 @@ ranks only the exact form exists.
 `ar_gather_hc_write` is `moe_gather` followed by `ar_hc_write`: the gather's output IS the
 message, so `y` is written by the gather half before it is reduced in place, and the five gather
 operands and `act` mean exactly what they mean on `moe_gather`. `wire` is `ar_hc_write`'s. On
-either wire, byte-identical to the three kernels it stands in for.
+either wire, byte-identical to the three kernels it stands in for. At four ranks only the exact
+form exists, as for `ar_hc_write`.
 
 ## Vocabulary edges
 

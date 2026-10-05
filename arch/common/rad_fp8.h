@@ -388,11 +388,13 @@ inline bool ar_taken(const Geom& g, int64_t T, bool out, int take) {
 /* WHETHER A MoE BLOCK'S GATHER RIDES IN FRONT OF THE REDUCTION THAT FOLLOWS IT (ar_gather_hc_write).
  * `rows` and `rows6` are the bounds the fused op was declared for on the exact and on the rotated
  * wire, 0 where it was not: at most the tokens one MoE pass carries, so a step it serves is one
- * pass whose gather is the whole step's. The wire the step's message goes out on picks the bound.
+ * pass whose gather is the whole step's. The wire the step's message goes out on picks the bound:
+ * the exact one wherever the exact fused write takes the step (ar_exact_write_takes -- at two
+ * ranks ar_wire_is_exact itself, at four the exact one-shot's steps, where `rows6` is always 0).
  * The block that would issue the gather and the write that would absorb it ask this of the same T
  * and the same bounds, so neither can skip it while the other issues it. */
 inline bool gather_taken(const Geom& g, int64_t T, int64_t rows, int64_t rows6) {
-    const int64_t r = ar_wire_is_exact(g, T) ? rows : rows6;
+    const int64_t r = ar_exact_write_takes(g, T) ? rows : rows6;
     return r > 0 && T <= r;
 }
 

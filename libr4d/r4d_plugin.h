@@ -189,6 +189,8 @@ int  r4d_rad_ar_hc_wide_init(const RadParam*, int, int rank, int world, void** o
 int  r4d_rad_ar_hc_write_4rank(const RadArgs*, RadStream);
 int  r4d_rad_ar_gather_hc_write(const RadArgs*, RadStream);
 int64_t r4d_rad_ar_gather_hc_write_scratch(const RadArgs*);
+/* ar_gather_hc_write at four ranks, exact wire only, on ar_hc_write_4rank's instance. */
+int  r4d_rad_ar_gather_hc_write_4rank(const RadArgs*, RadStream);
 
 /* -- GEMM (r4d_gemm_*.hip) -- */
 int r4d_rad_gemm_bf16_m16   (const RadArgs*, RadStream);

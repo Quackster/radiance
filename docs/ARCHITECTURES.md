@@ -330,12 +330,14 @@ time.
 
 **The fused all-reduce forms are two-rank, except the exact write.** At four ranks `ar_hc_write`
 exists on the exact wire only (`ar_hc_write_4rank`, the 4-rank one-shot with the write as its
-epilogue, on the plain all-reduce's buffers). A step takes it where the standalone `all_reduce`
-would have been the exact one-shot: under 1 MiB, and with `--tp-wire wht6` also under
-`--tp-wire-min-kb`. Larger messages, and every lossy one, keep the standalone sequence —
-`all_reduce` (4-rank two-shot or ti8), then `hc_write_bf16`. There is no four-rank
-`ar_gather_hc_write`, so `moe_gather` stays a launch of its own. The unfused sequence is declared
-beside the fused one, so nothing is unresolved at boot. The
+epilogue, on the plain all-reduce's buffers), and so does `ar_gather_hc_write`
+(`ar_gather_hc_write_4rank`, the same with `moe_gather` as its prologue), which the MoE
+connections take wherever the step is one MoE pass. A step takes either where the standalone
+`all_reduce` would have been the exact one-shot: under 1 MiB, and with `--tp-wire wht6` also
+under `--tp-wire-min-kb`. Larger messages, and every lossy one, keep the standalone sequence —
+`moe_gather` on the MoE connections, `all_reduce` (4-rank two-shot or ti8), then
+`hc_write_bf16`. The unfused sequence is declared beside the fused one, so nothing is unresolved
+at boot. The
 attention's own fusion is not a collective and does carry over: the sparse decode with the output
 gate and the quantiser in its merge (`attn_paged_gate_quant`) has gqa-6, page-4 rows. The per-step cost against tp2 on the
 same cards is unmeasured.

@@ -474,6 +474,15 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
   return (int)hipGetLastError();
 }
 
+/* The inverse slot table alone, on `stream`, for the wide fused gather (r4d_ar_oneshot_Nrank_exact.hip):
+ * the same kernel and the same launch as above, so both widths read one table. */
+int r4d_ar_gather_inv(long inv, long sorted, long T, long stream_i) {
+  if (!inv || !sorted || T < 1) return -1;
+  r4d_ar_gather_inv_kernel<<<1, 1024, 0, (hipStream_t)stream_i>>>((int*)inv, (const int*)sorted,
+                                                                  (int)T);
+  return (int)hipGetLastError();
+}
+
 void r4d_ar_ipc_free(long p) { if (p) (void)hipFree((void*)p); }
 void r4d_ar_ipc_memzero(long p, long size) { if (p) HIPOK(hipMemset((void*)p, 0, size)); }
 

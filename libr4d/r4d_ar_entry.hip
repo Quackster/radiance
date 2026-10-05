@@ -1116,12 +1116,18 @@ enum { AH_Y = 0, AH_INJ, AH_H };
  * ar_hc_write's; wire 6 builds its slot table in LDS at every size and takes no scratch. */
 enum { AG_YE = 0, AG_EW, AG_SORTED, AG_SH, AG_SG, AG_Y, AG_INJ, AG_H };
 
-extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
-    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
-    if (!in) return RAD_E_STATE;
-    if (in->world != 2) return RAD_E_SHAPE;
-    if (in->dtype != 0) return RAD_E_DTYPE;
+/* The operand and shape rules ar_gather_hc_write states at every width: moe_gather's five and
+ * ar_hc_write's three, and the inverse table's scratch. */
+struct GatherHcWriteArgs {
+    const RadTensor *ye = nullptr, *ew = nullptr, *so = nullptr, *sh = nullptr, *sg = nullptr;
+    const RadTensor *y = nullptr, *inj = nullptr, *h = nullptr;
+    long long M = 0, n = 0, hc = 0, top_k = 0, irow = 0, hrow = 0;
+    long long ye_ld = 0, ew_ld = 0, sh_ld = 0, sg_ld = 0;
+    int sig = 0, wire = 0;
+    bool has_inv = false;
+};
 
+static int ar_gather_hc_write_args(const RadArgs* a, const ArInst* in, GatherHcWriteArgs* o) {
     const RadTensor* ye  = r4d_opt(a, AG_YE);
     const RadTensor* ew  = r4d_opt(a, AG_EW);
     const RadTensor* so  = r4d_opt(a, AG_SORTED);
@@ -1170,7 +1176,37 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
 
     const int wire = (int)r4d_geti_or(a, "wire", 0);
     if (wire != 0 && wire != 6) return RAD_E_INVAL;
-    const bool has_inv = a->scratch && a->scratch_bytes >= T * (long long)sizeof(int);
+
+    o->ye = ye; o->ew = ew; o->so = so; o->sh = sh; o->sg = sg;
+    o->y = y; o->inj = inj; o->h = h;
+    o->M = M; o->n = n; o->hc = hc; o->top_k = top_k; o->irow = irow; o->hrow = hrow;
+    o->ye_ld = ye_ld; o->ew_ld = ew_ld; o->sh_ld = sh_ld; o->sg_ld = sg_ld;
+    o->sig = sig; o->wire = wire;
+    o->has_inv = a->scratch && a->scratch_bytes >= T * (long long)sizeof(int);
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 2) return RAD_E_SHAPE;
+    if (in->dtype != 0) return RAD_E_DTYPE;
+
+    GatherHcWriteArgs g;
+    const int arc = ar_gather_hc_write_args(a, in, &g);
+    if (arc != RAD_OK) return arc;
+    const RadTensor* const ye = g.ye;
+    const RadTensor* const ew = g.ew;
+    const RadTensor* const so = g.so;
+    const RadTensor* const sh = g.sh;
+    const RadTensor* const sg = g.sg;
+    const RadTensor* const y = g.y;
+    const RadTensor* const inj = g.inj;
+    const RadTensor* const h = g.h;
+    const long long M = g.M, n = g.n, hc = g.hc, top_k = g.top_k, irow = g.irow, hrow = g.hrow;
+    const long long ye_ld = g.ye_ld, ew_ld = g.ew_ld, sh_ld = g.sh_ld, sg_ld = g.sg_ld;
+    const int sig = g.sig, wire = g.wire;
+    const bool has_inv = g.has_inv;
 
     R4dArCfg cfgv;
     r4d_cfg_ar(a, &cfgv);
@@ -1199,6 +1235,43 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
         (long)sg_ld, (long)top_k, (long)sig, (long)(uintptr_t)s, nblocks, cfgv.nthreads,
         cfgv.drain, cfgv.acq, has_inv ? (long)(uintptr_t)a->scratch : 0L);
     return rc == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+/* AT FOUR RANKS, EXACT WIRE ONLY: r4d_rad_ar_hc_write_4rank with the gather in front, on the same
+ * instance (r4d_rad_ar_hc_wide_init). The architecture issues it only on a step whose write takes
+ * the exact one-shot (ar_exact_write_takes, arch/common/rad_fp8.h) and whose gather is one pass's.
+ * The block count is that write's rule, widened by the launcher until a block's slot table fits in
+ * LDS -- or, where that would take more blocks than the rule asks for and the scratch is there,
+ * kept and served from the inverse table, as at two ranks. */
+extern "C" int r4d_rad_ar_gather_hc_write_4rank(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 4) return RAD_E_SHAPE;
+    if (in->dtype != 0) return RAD_E_DTYPE;
+
+    GatherHcWriteArgs g;
+    const int arc = ar_gather_hc_write_args(a, in, &g);
+    if (arc != RAD_OK) return arc;
+    if (g.wire != 0) return RAD_E_UNSUPPORTED;
+
+    R4dArCfg cfgv;
+    r4d_cfg_ar(a, &cfgv);
+    const long words16 = (long)(g.M * g.n * 2 / 16);
+    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, in->nb_cap);
+    if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+
+    R4D_TRY("ar_gather_hc_write_4rank",
+        r4d_ar_gather_hc_write_4rank(
+            in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+            in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+            in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+            r4d_addr(g.y), r4d_addr(g.inj), r4d_addr(g.h), (long)g.M, (long)g.n, (long)g.hc,
+            (long)g.irow, (long)g.hrow, r4d_addr(g.ye), r4d_addr(g.ew), r4d_addr(g.so),
+            g.sh ? r4d_addr(g.sh) : 0L, g.sh ? r4d_addr(g.sg) : 0L, (long)g.ye_ld,
+            (long)g.ew_ld, (long)g.sh_ld, (long)g.sg_ld, (long)g.top_k, (long)g.sig,
+            (long)in->rank, (long)(uintptr_t)s, nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq,
+            cfgv.pub, g.has_inv ? (long)(uintptr_t)a->scratch : 0L));
+    return RAD_OK;
 }
 
 /* The inverse slot table the exact wire's prefill form reads: one int a (token, slot) at the
