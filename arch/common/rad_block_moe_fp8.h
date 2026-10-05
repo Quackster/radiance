@@ -45,7 +45,9 @@
  * Config::ff_lo). So the arrays are declared in separate loops -- gate_up codes, gate_up scales,
  * down codes, down scales, each for the even experts and then the odd ones -- and NOT as a group
  * per expert. Interleaving them would give runs of stride two or four, which the operand cannot
- * express; the failure would be a table whose second entry is a scale plane.
+ * express; the failure would be a table whose second entry is a scale plane. Where four ranks split
+ * every expert the classes are four, by number mod 4 (`moe_gemm_q_mod4`, Config::ff_lo4), and the
+ * runs sixteen, declared the same way class by class.
  *
  * The codes run and the scale run of a projection are two VIEWS of one stored weight -- its codes
  * plane and its scale plane (RadWeightDecl::source) -- so an expert holds two logical weights,
@@ -163,6 +165,19 @@ struct MoeFP8 {
          * and the sum of the partials is the expert's output. Rounding moves (two partial sums
          * where there was one), so this is checked by agreement rather than byte for byte. */
         int64_t ff_lo[2] = { 0, 0 }, ff_hi[2] = { 0, 0 };
+        /* OR BY THE EXPERT'S NUMBER MOD 4, where four ranks split it: expert e's columns
+         * [ff_lo4[e % 4], ff_hi4[e % 4]), served by `moe_gemm_q_mod4`, and taking precedence over
+         * the parity slices. hi 0 offers none.
+         *
+         * Parity gives the extra block of a five-block expert two places to go, so at four ranks
+         * two of them carry three blocks of every even/odd pair and two carry two -- and the
+         * block's all-reduce has the narrow ranks wait for the wide ones. Four classes give it
+         * four: each rank takes two blocks of one class and one of each other, five of every four
+         * experts. Any count of quantised experts serves: a layer that keeps two plain bf16 has
+         * 510, and its first two classes hold one expert more than the last two (the declaration
+         * gives a table op's first tables the remainder). `n_ff_exp` is the widest slice. "e" is
+         * the expert's place in the sort, as for the parity classes. */
+        int64_t ff_lo4[4] = { 0, 0, 0, 0 }, ff_hi4[4] = { 0, 0, 0, 0 };
         int64_t n_ff_shared  = 0;   /* the shared expert's, per rank; 0 = no shared expert */
         /* THE SHARED ARM'S SLICE ON THIS RANK, when its width does not halve into whole fp8 scale
          * blocks: [shared_lo, shared_hi) of its columns in the model's numbering, with
@@ -368,6 +383,9 @@ struct MoeFP8 {
     std::vector<int64_t>    prot;
     const char*             prot_list = nullptr;
     int64_t                 n_reg = 0;
+    /* How many weight-table classes the quantised GEMMs take: 2 by parity (`moe_gemm_q`), or 4 by
+     * number mod 4 (`moe_gemm_q_mod4`, Config::ff_lo4). */
+    int                     ncls = 2;
     /* THIS LAYER'S gate_up AND down FORMATS (format_of's numbers), resolved by declare(): the
      * probed layer's for both, except that among the codebook forms at E4M3 scales -- w4nl64a8h,
      * w4nl32a8h, w5nl64a8h -- each projection of each layer takes its own experts'. */
@@ -653,8 +671,10 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                             "places at most %lld last\n", l, prot.size(), (long long)kMaxProtected);
             return RAD_E_INVAL;
         }
-        /* The quantised GEMM takes its experts as two equal tables by parity. */
-        if (n_reg % 2) {
+        /* The quantised GEMM takes its experts as two equal tables by parity -- at four classes
+         * (Config::ff_lo4) as four tables, the first n_reg % 4 one expert longer, which any count
+         * gives. */
+        if (!(c.ff_hi[0] > 0 && c.ff_hi4[0] > 0) && n_reg % 2) {
             fprintf(stderr, "radiance: layer %d keeps %zu experts plain bf16 on this rank, which "
                             "leaves %lld quantised; they come in pairs on a rank so the rest split "
                             "into two equal tables by parity\n", l, prot.size(), (long long)n_reg);
@@ -784,21 +804,43 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         if (std::find(prot.begin(), prot.end(), e) == prot.end()) reg.push_back(e);
     w_gu.resize((size_t)ne); w_gus.resize((size_t)ne);
     w_dn.resize((size_t)ne); w_dns.resize((size_t)ne);
-    /* Each parity's width on this rank: the Config's slice when the width is split unevenly, and
-     * `n_ff_exp` for both otherwise. The buffers between the two GEMMs are the wider one's. */
-    const bool split = c.ff_hi[0] > 0;
-    int64_t wq[2] = { c.n_ff_exp, c.n_ff_exp };
-    if (split)
-        for (int q = 0; q < 2; ++q) wq[q] = c.ff_hi[q] - c.ff_lo[q];
-    if (split && (wq[0] <= 0 || wq[1] <= 0 || c.n_ff_exp != (wq[0] > wq[1] ? wq[0] : wq[1]))) {
-        fprintf(stderr, "radiance: the routed experts' slices [%lld, %lld) and [%lld, %lld) do not "
-                        "describe a width of %lld\n", (long long)c.ff_lo[0], (long long)c.ff_hi[0],
-                (long long)c.ff_lo[1], (long long)c.ff_hi[1], (long long)c.n_ff_exp);
+    /* Each class's width on this rank: the Config's slice when the width is split unevenly, and
+     * `n_ff_exp` for every class otherwise. The buffers between the two GEMMs are the widest
+     * one's. FOUR CLASSES where the Config offers them (Config::ff_lo4), the parity classes
+     * otherwise. */
+    const bool split = c.ff_hi[0] > 0 || c.ff_hi4[0] > 0;
+    ncls = c.ff_hi4[0] > 0 ? 4 : 2;
+    if (ncls == 4 && n_reg < 4) {
+        fprintf(stderr, "radiance: layer %d serves %lld quantised experts on this rank; four "
+                        "classes need at least one each\n", l, (long long)n_reg);
         return RAD_E_INVAL;
     }
-    for (int q = 0; q < 2; ++q)
+    int64_t qlo[4] = { 0, 0, 0, 0 }, qhi[4] = { 0, 0, 0, 0 };
+    int64_t wq[4] = { c.n_ff_exp, c.n_ff_exp, c.n_ff_exp, c.n_ff_exp };
+    if (split)
+        for (int q = 0; q < ncls; ++q) {
+            qlo[q] = ncls == 4 ? c.ff_lo4[q] : c.ff_lo[q];
+            qhi[q] = ncls == 4 ? c.ff_hi4[q] : c.ff_hi[q];
+            wq[q]  = qhi[q] - qlo[q];
+        }
+    if (split) {
+        int64_t widest = 0;
+        bool    bad = false;
+        for (int q = 0; q < ncls; ++q) {
+            bad = bad || wq[q] <= 0;
+            widest = wq[q] > widest ? wq[q] : widest;
+        }
+        if (bad || c.n_ff_exp != widest) {
+            fprintf(stderr, "radiance: the routed experts' %d class slices, the first [%lld, %lld) "
+                            "and [%lld, %lld), do not describe a width of %lld\n", ncls,
+                    (long long)qlo[0], (long long)qhi[0], (long long)qlo[1], (long long)qhi[1],
+                    (long long)c.n_ff_exp);
+            return RAD_E_INVAL;
+        }
+    }
+    for (int q = 0; q < ncls; ++q)
         if (wq[q] % RAD_FP8_BLOCK || g.n_embd % RAD_FP8_BLOCK ||
-            (split && c.ff_lo[q] % RAD_FP8_BLOCK)) {
+            (split && qlo[q] % RAD_FP8_BLOCK)) {
             fprintf(stderr, "radiance: an expert is %lldx%lld per rank, which is not a whole number "
                             "of %dx%d scale blocks\n",
                     (long long)wq[q], (long long)g.n_embd, RAD_FP8_BLOCK, RAD_FP8_BLOCK);
@@ -858,11 +900,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     const uint32_t sdt    = c.expert_g64 ? (uint32_t)RAD_F8E4M3 : (uint32_t)RAD_BF16;
     const int64_t  sgk    = c.expert_g64 ? 1 : RAD_FP8_BLOCK;
     const char*    escale = c.expert_g64 ? "scale,scale.1" : "scale";
-    /* A slice of each expert: the gate and up rows [lo, hi) of this parity for the gate/up pair,
+    /* A slice of each expert: the gate and up rows [lo, hi) of this class for the gate/up pair,
      * columns [lo, hi) for down, and the scale planes the same slice in their own units. */
     auto span = [&](rad_weight h, int q, int64_t unit) -> int {
         if (!split || !h) return RAD_OK;
-        return rad_weight_shard_span(b, h, c.ff_lo[q] / unit, c.ff_hi[q] / unit);
+        return rad_weight_shard_span(b, h, qlo[q] / unit, qhi[q] / unit);
     };
     const bool rot = c.expert_rot != 0;
     if (c.expert_bf16) {
@@ -916,9 +958,10 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                    {w.eff.x, w.sorted, w.eoff}, {w.edn});
         if (!op_gu || !op_dn) return RAD_E_INVAL;
     } else {
-    /* ---- the eight runs, declared as the views the header describes. */
-    for (int q = 0; q < 2; ++q)
-        for (int64_t s = q; s < n_reg; s += 2) {
+    /* ---- the eight runs -- sixteen at four classes -- declared as the views the header
+     * describes, class by class. */
+    for (int q = 0; q < ncls; ++q)
+        for (int64_t s = q; s < n_reg; s += ncls) {
             const int64_t e = reg[(size_t)s];
             const int64_t parts[2] = { wq[q], wq[q] };
             rad_weight& h = w_gu[(size_t)s];
@@ -930,8 +973,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             if (!h) return RAD_E_INVAL;
             RAD_ARCH_TRY(span(h, q, 1));
         }
-    for (int q = 0; q < 2; ++q)
-        for (int64_t s = q; s < n_reg; s += 2) {
+    for (int q = 0; q < ncls; ++q)
+        for (int64_t s = q; s < n_reg; s += ncls) {
             const int64_t e = reg[(size_t)s];
             const int64_t parts[2] = { wq[q] / sdiv, wq[q] / sdiv };
             rad_weight& h = w_gus[(size_t)s];
@@ -947,8 +990,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             if (!h) return RAD_E_INVAL;
             RAD_ARCH_TRY(span(h, q, sdiv));
         }
-    for (int q = 0; q < 2; ++q)
-        for (int64_t s = q; s < n_reg; s += 2) {
+    for (int q = 0; q < ncls; ++q)
+        for (int64_t s = q; s < n_reg; s += ncls) {
             const int64_t e = reg[(size_t)s];
             rad_weight& h = w_dn[(size_t)s];
             h = decl_view(b, nm.f("blk.%d.ffn_down_exps.%lld.weight", l,
@@ -958,8 +1001,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             if (!h) return RAD_E_INVAL;
             RAD_ARCH_TRY(span(h, q, 1));
         }
-    for (int q = 0; q < 2; ++q)
-        for (int64_t s = q; s < n_reg; s += 2) {
+    for (int q = 0; q < ncls; ++q)
+        for (int64_t s = q; s < n_reg; s += ncls) {
             const int64_t e = reg[(size_t)s];
             rad_weight& h = w_dns[(size_t)s];
             h = decl_view(b, nm.f("blk.%d.ffn_down_exps.%lld.scale", l,
@@ -1004,13 +1047,14 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                       {w.h.x}, {w.hr.q, w.hr.s});
     }
     /* A table op's weights, in its table operands' order: the even experts' codes and scales, then
-     * the odd experts' (`w`, `w_scale`, `w_odd`, `w_odd_scale`). */
+     * the odd experts' (`w`, `w_scale`, `w_odd`, `w_odd_scale`) -- or at four classes class 0's,
+     * then 1's, 2's and 3's. */
     auto tables = [&](const std::vector<rad_weight>& wc, const std::vector<rad_weight>& ws) {
         std::vector<rad_weight> tab;
         tab.reserve((size_t)n_reg * 2);
-        for (int q = 0; q < 2; ++q) {
-            for (int64_t s = q; s < n_reg; s += 2) tab.push_back(wc[(size_t)s]);
-            for (int64_t s = q; s < n_reg; s += 2) tab.push_back(ws[(size_t)s]);
+        for (int q = 0; q < ncls; ++q) {
+            for (int64_t s = q; s < n_reg; s += ncls) tab.push_back(wc[(size_t)s]);
+            for (int64_t s = q; s < n_reg; s += ncls) tab.push_back(ws[(size_t)s]);
         }
         return tab;
     };
@@ -1020,7 +1064,18 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * width, which its down projection does not read. */
     {
         const std::vector<rad_weight> tab = tables(w_gu, w_gus);
-        rad_op h = rad_decl_op(b, "moe_gemm_q",
+        rad_op h = ncls == 4
+            ? rad_decl_op(b, "moe_gemm_q_mod4",
+                  RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * wq[0]),
+                             RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
+                             RAD_INT("top_k", c.top_k), RAD_INT("group", RAD_FP8_BLOCK),
+                             RAD_STR("a_order", "token"), RAD_STR("dtype", edtype[0]),
+                             RAD_INT("N_1", 2 * wq[1]), RAD_INT("K_1", g.n_embd),
+                             RAD_INT("N_2", 2 * wq[2]), RAD_INT("K_2", g.n_embd),
+                             RAD_INT("N_3", 2 * wq[3]), RAD_INT("K_3", g.n_embd),
+                             RAD_INT("parts", 2)),
+                  tab.data(), (int)tab.size())
+            : rad_decl_op(b, "moe_gemm_q",
                        RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * wq[0]),
                                   RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
                                   RAD_INT("top_k", c.top_k), RAD_INT("group", RAD_FP8_BLOCK),
@@ -1038,7 +1093,18 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                 false, rot));
     {
         const std::vector<rad_weight> tab = tables(w_dn, w_dns);
-        rad_op h = rad_decl_op(b, "moe_gemm_q",
+        rad_op h = ncls == 4
+            ? rad_decl_op(b, "moe_gemm_q_mod4",
+                  RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
+                             RAD_INT("K", wq[0]), RAD_INT("n_expert", n_reg),
+                             RAD_INT("top_k", c.top_k), RAD_INT("group", RAD_FP8_BLOCK),
+                             RAD_STR("a_order", "sorted"), RAD_STR("dtype", edtype[1]),
+                             RAD_INT("N_1", g.n_embd), RAD_INT("K_1", wq[1]),
+                             RAD_INT("N_2", g.n_embd), RAD_INT("K_2", wq[2]),
+                             RAD_INT("N_3", g.n_embd), RAD_INT("K_3", wq[3]),
+                             RAD_INT("parts", 1)),
+                  tab.data(), (int)tab.size())
+            : rad_decl_op(b, "moe_gemm_q",
                        RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
                                   RAD_INT("K", wq[0]), RAD_INT("n_expert", n_reg),
                                   RAD_INT("top_k", c.top_k), RAD_INT("group", RAD_FP8_BLOCK),
@@ -1095,8 +1161,13 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                 return RAD_E_INVAL;
             } else {
                 const int64_t nt = full / 64, base = nt / g.world, extra = nt % g.world;
-                /* Cut by the rank's place (Config::extra_place), not necessarily its index. */
-                const int64_t pr = c.extra_place >= 0 ? c.extra_place : (int64_t)g.rank;
+                /* Cut by the rank's place (Config::extra_place), not necessarily its index --
+                 * except in a layer served at four classes. The place exists to keep these tiles
+                 * off the ranks holding the routed extra blocks, and at four classes every rank
+                 * holds one; the shared expert's extra block is cut by the same place, so the
+                 * rank's own index keeps the two remainders apart instead. */
+                const int64_t pr = (c.extra_place >= 0 && ncls != 4) ? c.extra_place
+                                                                     : (int64_t)g.rank;
                 if (pr >= g.world) return RAD_E_INVAL;
                 const int64_t t0 = pr * base + std::min<int64_t>(pr, extra);
                 const int64_t t1 = t0 + base + (pr < extra ? 1 : 0);
@@ -1400,11 +1471,23 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const 
 
     /* The two grouped GEMMs, and the weight tables: the FIRST handle of each run and its length.
      * The runs are contiguous by construction -- see declare -- so `w_gu[q] + i` is expert
-     * 2 * i + q, and each parity is its own pair of table operands. */
+     * 2 * i + q, and each parity is its own pair of table operands; at four classes expert
+     * 4 * i + q, class q holding ceil((n_reg - q) / 4). */
+    const int64_t n4[4] = { (n_reg + 3) / 4, (n_reg + 2) / 4, (n_reg + 1) / 4, n_reg / 4 };
     if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
                     brows(w.egu, rows * k));
+    else if (ncls == 4)
+    RAD_ISSUE_N(c_, op_gu, rows,
+                brow_slice(rot ? w.hr.q : w.h.q, r0, rows, g.n_embd),
+                brow_slice(rot ? w.hr.s : w.h.s, r0, rows, g.n_embd / RAD_FP8_BLOCK),
+                RAD_WTAB(w_gu[0], n4[0]), RAD_WTAB(w_gus[0], n4[0]),
+                brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                RAD_WTAB(w_gu[1], n4[1]), RAD_WTAB(w_gus[1], n4[1]),
+                RAD_WTAB(w_gu[2], n4[2]), RAD_WTAB(w_gus[2], n4[2]),
+                RAD_WTAB(w_gu[3], n4[3]), RAD_WTAB(w_gus[3], n4[3]),
+                brows(w.egu, rows * k));
     else
     RAD_ISSUE_N(c_, op_gu, rows,
                 brow_slice(rot ? w.hr.q : w.h.q, r0, rows, g.n_embd),
@@ -1419,6 +1502,15 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const 
     if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
+    else if (ncls == 4)
+    RAD_ISSUE_N(c_, op_dn, rows,
+                brows(w.eff.q, rows * k), brows(w.eff.s, rows * k),
+                RAD_WTAB(w_dn[0], n4[0]), RAD_WTAB(w_dns[0], n4[0]),
+                brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                RAD_WTAB(w_dn[1], n4[1]), RAD_WTAB(w_dns[1], n4[1]),
+                RAD_WTAB(w_dn[2], n4[2]), RAD_WTAB(w_dns[2], n4[2]),
+                RAD_WTAB(w_dn[3], n4[3]), RAD_WTAB(w_dns[3], n4[3]),
+                brows(w.edn, rows * k));
     else
     RAD_ISSUE_N(c_, op_dn, rows,
                 brows(w.eff.q, rows * k), brows(w.eff.s, rows * k),

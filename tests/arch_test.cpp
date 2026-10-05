@@ -1846,9 +1846,11 @@ TEST(a_sizing_declare_leaves_the_step_state_alone_and_shrinks_only_rows) {
  *     rank names the container rows it wants -- so it is asserted here as a pair of agreeing spans
  *     whose union is the whole projection.
  *   - an expert of this model is 640 columns = five 128-column scale blocks, which four ranks
- *     cannot cut evenly, so the split is UNEVEN BY PARITY and it is the width that divides, not the
+ *     cannot cut evenly, so the split is UNEVEN BY CLASS and it is the width that divides, not the
  *     expert set: every rank routes every one of the 512 experts and computes [lo, hi) of each, the
- *     rank taking the odd block alternating with the expert's parity. Sharding the experts instead
+ *     rank taking the odd block going round with the expert's number mod 4 -- five blocks of every
+ *     four experts on every rank -- and with its parity in a layer whose quantised experts do not
+ *     come in fours. Sharding the experts instead
  *     was tried and is wrong here -- protection is per-rank, so a rank can end up owning one plain
  *     bf16 expert, leaving an odd count of quantised ones, and the grouped GEMM takes its experts as
  *     two EQUAL tables by parity. The recipe protects experts in pairs for exactly that reason.
@@ -1939,49 +1941,62 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
             CHECK_EQ(pint(ts, "n_expert"), ne_all);
             CHECK_EQ(pint(ts, "expert_base"), (int64_t)0);
         }
-        /* THE WIDTH EACH RANK TAKES OF EACH PARITY, as a span on every expert's down projection --
-         * the fixture protects no expert, so an expert's class is its own parity. These six numbers
-         * per rank are the whole TP4 MoE contract: five blocks of 128, four ranks, and the rank
-         * taking the odd block alternating with the parity. They are LITERAL here on purpose --
-         * recomputing them from the plugin's formula would only prove the test agrees with the
-         * code, not that either agrees with the model. */
+        /* THE WIDTH EACH RANK TAKES OF EACH CLASS, as a span on every expert's down projection --
+         * the fixture protects no expert, so an expert's class is its own number mod 4. These
+         * eight numbers per rank are the whole TP4 MoE contract: five blocks of 128, four ranks,
+         * and the rank taking the odd block going round with the class. They are LITERAL here on
+         * purpose -- recomputing them from the plugin's formula would only prove the test agrees
+         * with the code, not that either agrees with the model. */
         const int64_t blk = 128;                    /* RAD_FP8_BLOCK, the scale block's width */
         const int64_t nblk = meta.n_ff / blk;        /* five, at the fixture's 640 */
-        const int64_t cls_lo[4][2] = { { 0, 512 }, { 256, 0 }, { 384, 256 }, { 512, 384 } };
-        const int64_t cls_hi[4][2] = { { 256, 640 }, { 384, 256 }, { 512, 384 }, { 640, 512 } };
+        const int64_t cls_lo[4][4] = { { 0, 512, 384, 256 }, { 256, 0, 512, 384 },
+                                       { 384, 256, 0, 512 }, { 512, 384, 256, 0 } };
+        const int64_t cls_hi[4][4] = { { 256, 640, 512, 384 }, { 384, 256, 640, 512 },
+                                       { 512, 384, 256, 640 }, { 640, 512, 384, 256 } };
         REQUIRE_EQ(nblk, (int64_t)5);
-        int spanned[2] = { 0, 0 };
+        int spanned[4] = { 0, 0, 0, 0 };
         for (const RecWeight& w : b[r].weights) {
             if (w.name.rfind("blk.0.ffn_down_exps.", 0) != 0) continue;
             if (w.name.compare(w.name.size() - 7, 7, ".weight") != 0) continue;
-            const int q = atoi(w.name.c_str() + 20) % 2;      /* the expert's parity */
+            const int q = atoi(w.name.c_str() + 20) % 4;      /* the expert's class */
             CHECK(w.span_set);
             CHECK_EQ(w.span_lo, cls_lo[r][q]);
             CHECK_EQ(w.span_hi, cls_hi[r][q]);
             ++spanned[q];
         }
-        CHECK_EQ(spanned[0], ne_all / 2);                /* every expert of each class is declared */
-        CHECK_EQ(spanned[1], ne_all / 2);
-        /* AND THE FOUR RANKS' SLICES OF ONE PARITY TILE ITS WIDTH EXACTLY: no block unserved (a
+        for (int q = 0; q < 4; ++q)
+            CHECK_EQ(spanned[q], ne_all / 4);            /* every expert of each class is declared */
+        /* AND THE FOUR RANKS' SLICES OF ONE CLASS TILE ITS WIDTH EXACTLY: no block unserved (a
          * rank silently dropping a fifth of every expert's output), none claimed twice (the
          * all-reduce then sums that block twice and the number is wrong by its own size). Read off
          * the declared spans, not off the formula that produced them. */
-        for (int q = 0; q < 2; ++q) {
+        for (int q = 0; q < 4; ++q) {
             int64_t covered = 0;
             for (int r2 = 0; r2 < world; ++r2)
                 for (int64_t i = 0; i < nblk; ++i) {
                     const int64_t lo = cls_lo[r2][q], hi = cls_hi[r2][q];
                     if (lo <= i * blk && i * blk < hi) ++covered;
                 }
-            CHECK_EQ(covered, nblk);   /* per parity, exactly once each */
+            CHECK_EQ(covered, nblk);   /* per class, exactly once each */
         }
-        /* The gate/up GEMM's two classes follow the same split, doubled because the operand stacks
-         * gate and up, and the op's buffers take the WIDER class. */
-        const RecOp* gu = find_op(b[r], "moe_gemm_q");
+        /* AND EVERY RANK TAKES THE SAME WIDTH: five blocks of every four experts -- the point of
+         * four classes. Two would leave ranks 0 and 1 three blocks of every pair and 2 and 3 two. */
+        {
+            int64_t sum = 0;
+            for (int q = 0; q < 4; ++q) sum += cls_hi[r][q] - cls_lo[r][q];
+            CHECK_EQ(sum, nblk * blk);
+        }
+        /* The gate/up GEMM's four classes follow the same split, doubled because the operand
+         * stacks gate and up, and the op's buffers take the WIDEST class. No parity op is left. */
+        const RecOp* gu = find_op(b[r], "moe_gemm_q_mod4");
         REQUIRE(gu != nullptr);
         CHECK_EQ(pint(gu, "N"), 2 * (cls_hi[r][0] - cls_lo[r][0]));
-        CHECK_EQ(pint(gu, "N_odd"), 2 * (cls_hi[r][1] - cls_lo[r][1]));
+        CHECK_EQ(pint(gu, "N_1"), 2 * (cls_hi[r][1] - cls_lo[r][1]));
+        CHECK_EQ(pint(gu, "N_2"), 2 * (cls_hi[r][2] - cls_lo[r][2]));
+        CHECK_EQ(pint(gu, "N_3"), 2 * (cls_hi[r][3] - cls_lo[r][3]));
         CHECK_EQ(pint(gu, "n_expert"), ne_all);
+        CHECK_EQ(gu->w.size(), (size_t)(2 * ne_all));   /* codes and scales, every expert once */
+        CHECK_EQ(count_op(b[r], "moe_gemm_q"), 0);
 
         /* (4) THE UNFUSED CHAIN: a standalone collective per reduction, and none of the three
          * fused world-2 forms. */
@@ -2087,6 +2102,110 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
         CHECK(qwen4exp_fp8::declare(&b3, &meta, &c3) != RAD_OK);
     }
 
+    /* ---- A LAYER THAT KEEPS EXPERTS PLAIN STAYS AT FOUR CLASSES. Two plain experts leave 510
+     * quantised ones, four leave 508; either way the layer is served by `moe_gemm_q_mod4`, the
+     * class being the expert's PLACE in the sort mod 4 (the plain ones sorted last), and at 510
+     * classes 0 and 1 hold 128 experts and 2 and 3 hold 127 -- the declaration hands a table op's
+     * first tables the remainder. The plain experts' extra tiles go to ranks 0 and 1: every rank
+     * holds the same routed width, and the shared expert's extra block is rank 2's. */
+    {
+        const RadEncoding w4p = [] { RadEncoding e = rad_enc_affine(RAD_I4, RAD_BF16, 1, 128);
+                                     rad_enc_copy_str(e.transform, "fwht128"); return e; }();
+        const RadEncoding plain = rad_enc_plain(RAD_BF16);
+        /* The parity slices, [lo, hi) by place parity, and the four-class ones by place mod 4. */
+        const int64_t par_lo[4][2] = { { 0, 512 }, { 256, 0 }, { 384, 256 }, { 512, 384 } };
+        const int64_t par_hi[4][2] = { { 256, 640 }, { 384, 256 }, { 512, 384 }, { 640, 512 } };
+        const int64_t c4_lo[4][4] = { { 0, 512, 384, 256 }, { 256, 0, 512, 384 },
+                                      { 384, 256, 0, 512 }, { 512, 384, 256, 0 } };
+        const int64_t c4_hi[4][4] = { { 256, 640, 512, 384 }, { 384, 256, 640, 512 },
+                                      { 512, 384, 256, 640 }, { 640, 512, 384, 256 } };
+        for (int nprot : { 2, 4 }) {
+            const std::vector<int> pe = nprot == 2 ? std::vector<int>{ 3, 10 }
+                                                   : std::vector<int>{ 3, 10, 21, 40 };
+            for (int r = 0; r < world; ++r) {
+                RadBuilder bp;
+                for (int e : pe) {
+                    bp.encs.push_back({ "blk.1.ffn_gate_up_exps." + std::to_string(e) + ".weight",
+                                        plain });
+                    bp.encs.push_back({ "blk.1.ffn_down_exps." + std::to_string(e) + ".weight",
+                                        plain });
+                }
+                bp.encs.push_back({ "ffn_gate_up_exps", w4p });
+                bp.encs.push_back({ "ffn_down_exps", w4p });
+                RadBuildCtx cp = build_ctx(r, world);
+                cp.max_tok = 2048; cp.max_seqs = 8; cp.max_spec = 3; cp.max_ctx = 200000;
+                REQUIRE_EQ(qwen4exp_fp8::declare(&bp, &meta, &cp), RAD_OK);
+                const int ncls = 4;
+                const int64_t n_reg = ne_all - nprot;
+                /* layer 1's quantised GEMMs, and nobody else's */
+                int l1_ops = 0, other_ops = 0;
+                for (const RecOp& o : bp.ops) {
+                    if (o.op != "moe_gemm_q" && o.op != "moe_gemm_q_mod4") continue;
+                    bool l1 = false;
+                    for (rad_weight wh : o.w)
+                        l1 = l1 || bp.weights[wh - 1].name.rfind("blk.1.", 0) == 0;
+                    if (!l1) { CHECK_EQ(o.op, std::string("moe_gemm_q_mod4")); ++other_ops; continue; }
+                    ++l1_ops;
+                    CHECK_EQ(o.op, std::string(ncls == 4 ? "moe_gemm_q_mod4" : "moe_gemm_q"));
+                    CHECK_EQ(pint(&o, "n_expert"), n_reg);
+                    CHECK_EQ(o.w.size(), (size_t)(2 * n_reg));
+                    /* the four runs, read off the declaration: codes then scales, class by class,
+                     * each class the places q, q + 4, ... -- 128, 128, 127, 127 at 510 */
+                    size_t at = 0;
+                    for (int q = 0; q < 4; ++q) {
+                        const int64_t nq = (n_reg + 3 - q) / 4;
+                        for (int half = 0; half < 2; ++half)
+                            for (int64_t j = 0; j < nq && at < o.w.size(); ++j, ++at) {
+                                const std::string& wn = bp.weights[o.w[at] - 1].name;
+                                const int e = atoi(wn.c_str() + wn.find("_exps.") + 6);
+                                int place = e;
+                                for (int x : pe) place -= x < e ? 1 : 0;
+                                CHECK_EQ(place, (int)(q + 4 * j));
+                                CHECK((wn.find(".scale") != std::string::npos) == (half == 1));
+                            }
+                    }
+                    CHECK_EQ(at, o.w.size());
+                }
+                CHECK_EQ(l1_ops, 2);
+                CHECK(other_ops > 0);
+                /* every quantised expert of layer 1 by its place: the class's slice */
+                int seen = 0;
+                for (const RecWeight& w : bp.weights) {
+                    if (w.name.rfind("blk.1.ffn_down_exps.", 0) != 0) continue;
+                    if (w.name.compare(w.name.size() - 7, 7, ".weight") != 0) continue;
+                    if (w.d.dtype == RAD_BF16) continue;          /* the plain ones, below */
+                    const int e = atoi(w.name.c_str() + 20);
+                    int place = e;
+                    for (int x : pe) place -= x < e ? 1 : 0;
+                    CHECK(w.span_set);
+                    if (ncls == 4) {
+                        CHECK_EQ(w.span_lo, c4_lo[r][place % 4]);
+                        CHECK_EQ(w.span_hi, c4_hi[r][place % 4]);
+                    } else {
+                        CHECK_EQ(w.span_lo, par_lo[r][place % 2]);
+                        CHECK_EQ(w.span_hi, par_hi[r][place % 2]);
+                    }
+                    ++seen;
+                }
+                CHECK_EQ(seen, (int)n_reg);
+                /* the plain experts' tiles: by narrow_place at two classes, by rank at four */
+                const int64_t p2_lo[4] = { 384, 512, 0,   192 }, p2_hi[4] = { 512, 640, 192, 384 };
+                const int64_t p4_lo[4] = { 0, 192, 384, 512 },   p4_hi[4] = { 192, 384, 512, 640 };
+                int pseen = 0;
+                for (const RecWeight& w : bp.weights) {
+                    if (w.name.rfind("blk.1.ffn_", 0) != 0 || w.d.dtype != RAD_BF16) continue;
+                    if (w.name.find("_exps.") == std::string::npos) continue;
+                    if (w.name.compare(w.name.size() - 7, 7, ".weight") != 0) continue;
+                    CHECK(w.span_set);
+                    CHECK_EQ(w.span_lo, ncls == 4 ? p4_lo[r] : p2_lo[r]);
+                    CHECK_EQ(w.span_hi, ncls == 4 ? p4_hi[r] : p2_hi[r]);
+                    ++pseen;
+                }
+                CHECK_EQ(pseen, 2 * nprot);
+            }
+        }
+    }
+
     /* ---- THE PLAIN bf16 EXPERTS AT FOUR RANKS.
      *
      * They are declared beside the quantised ones by a SECOND grouped GEMM, over their own slice of
@@ -2098,18 +2217,19 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
      * it refused the model on the ranks where that number was wrong -- two of four, which then
      * never arrived at the all-reduce's rendezvous and took the whole launch down with it.
      *
-     * Ten tiles over four ranks is 2, 2, 3, 3: an UNEVEN share, still whole tiles, every tile owned
-     * once. Ranks 2 and 3 compute 192 columns of every protected expert and ranks 0 and 1 compute
-     * 128, because ranks 0 and 1 take the routed experts' extra blocks (narrow_place). Two
-     * protected experts so the even-count rule the parity tables need holds, as the production
-     * recipe's pairs make it hold. */
+     * Ten tiles over four ranks is 3, 3, 2, 2: an UNEVEN share, still whole tiles, every tile owned
+     * once. Ranks 0 and 1 compute 192 columns of every protected expert and ranks 2 and 3 compute
+     * 128: the routed experts are split in four classes, so every rank holds the same routed
+     * width, and rank 2 holds the shared expert's extra block (narrow_place). Two protected
+     * experts, as the production recipe's pairs have it. */
     {
         const RadEncoding w4p = [] { RadEncoding e = rad_enc_affine(RAD_I4, RAD_BF16, 1, 128);
                                      rad_enc_copy_str(e.transform, "fwht128"); return e; }();
         const RadEncoding plain = rad_enc_plain(RAD_BF16);
-        /* [lo, hi) of the plain expert's columns, per rank -- literal, for the reason given above. */
-        const int64_t p_lo[4] = { 384, 512, 0,   192 };
-        const int64_t p_hi[4] = { 512, 640, 192, 384 };
+        /* [lo, hi) of the plain expert's columns, per rank -- literal, for the reason given above.
+         * The layer is served at four classes, so the extra tiles are cut by rank: 3, 3, 2, 2. */
+        const int64_t p_lo[4] = { 0,   192, 384, 512 };
+        const int64_t p_hi[4] = { 192, 384, 512, 640 };
         for (int r = 0; r < world; ++r) {
             RadBuilder bp;
             bp.encs = { { "blk.1.ffn_gate_up_exps.3.weight", plain },

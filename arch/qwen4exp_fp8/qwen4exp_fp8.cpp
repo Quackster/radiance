@@ -295,10 +295,12 @@ static int64_t ngram_table_rows(int64_t base, int64_t heads, int64_t divisor) {
 /* A RANK'S PLACE WHEN A WIDTH THAT DOES NOT DIVIDE IS CUT OVER THE RANKS, the first places taking
  * one unit more: the ranks in order of how many 128-column blocks of an even/odd pair of routed
  * experts declare()'s parity split gives each, fewest first, by rank among equals. At four ranks
- * and five blocks that is ranks 2, 3, 0, 1 -- ranks 0 and 1 hold the routed extra blocks, and
- * cutting the shared expert and the plain experts from rank 0 as well stacks their extra columns on
- * the ranks every block's all-reduce already waits for. Where the routed width divides it is the
- * rank; declare() asks only above two ranks. */
+ * and five blocks that is ranks 2, 3, 0, 1 -- under parity ranks 0 and 1 hold the routed extra
+ * blocks, and cutting the shared expert from rank 0 as well would stack its extra columns on the
+ * ranks every block's all-reduce already waits for. The four-class split that four ranks serve
+ * gives every rank the same routed width, and the shared expert's extra block stays rank 2's: the
+ * plain experts' extra tiles are cut by rank there (MoeFP8::declare), so the two do not stack.
+ * Where the routed width divides it is the rank; declare() asks only above two ranks. */
 static int64_t narrow_place(int64_t n_ff_all, int world, int rank) {
     const int64_t nb = n_ff_all / RAD_FP8_BLOCK;
     if (n_ff_all % RAD_FP8_BLOCK || nb < world || nb % world == 0) return rank;
@@ -520,13 +522,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * replicated, every rank computes its slice of every routed expert, and the block's
          * all-reduce sums the partials.
          *
-         * AT FOUR RANKS THE SHARES ARE NOT EQUAL. Parity gives the extra block only two places to
-         * go, so ranks 0 and 1 compute three blocks of every even/odd pair of experts and ranks 2
-         * and 3 compute two, and the all-reduce has ranks 2 and 3 wait for the other two. Equal
-         * shares need the extra block rotated over four places -- the expert's number mod 4, four
-         * slice tables where moe_gemm_q takes two. What can move without them does: the shared
-         * expert's extra block and the plain experts' extra tiles go to ranks 2 and 3
-         * (narrow_place), so ranks 0 and 1 take one shared block and two plain tiles.
+         * AT FOUR RANKS PARITY IS NOT ENOUGH. It gives the extra block only two places to go, so
+         * ranks 0 and 1 would compute three blocks of every even/odd pair of experts and ranks 2
+         * and 3 two, and the all-reduce would have ranks 2 and 3 wait for the other two. So at four
+         * the extra block is rotated over four places, by the expert's number mod 4: four slice
+         * tables (`moe_gemm_q_mod4`), and every rank computes five blocks of every four experts.
+         * A layer keeping two experts plain bf16 has 510 quantised ones, and its first two classes
+         * are one expert longer. What does not divide elsewhere stays apart: the shared expert's
+         * extra block is rank 2's (narrow_place) and the plain experts' extra tiles ranks 0 and
+         * 1's (MoeFP8::declare).
          *
          * WHY NOT EXPERT PARALLELISM, which splits the EXPERTS: rank r owns [r*E/W, (r+1)*E/W)
          * whole. The bytes a rank reads are the same on average either way, but which rank a
@@ -596,6 +600,29 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          g.rank, (long long)mc.ff_lo[0], (long long)mc.ff_hi[0],
                          (long long)mc.ff_lo[1], (long long)mc.ff_hi[1], (long long)g.n_ff_all,
                          (long long)nb, RAD_FP8_BLOCK, (long long)g.world);
+                /* AND AT FOUR RANKS FOUR CLASSES, by the expert's number mod 4 (MoeFP8::Config::
+                 * ff_lo4), which every layer then takes instead: the same cut with the rank's place
+                 * shifted by the class, so the extra block goes round all four ranks instead of
+                 * two. Every block of every expert still has one owner, and each slice is one a
+                 * rank already takes of some parity. */
+                if (g.world == 4) {
+                    for (int q = 0; q < 4; ++q) {
+                        const int64_t p = (g.rank - q + 4) % 4;
+                        const int64_t b0 = p * base + std::min<int64_t>(p, extra);
+                        const int64_t b1 = b0 + base + (p < extra ? 1 : 0);
+                        mc.ff_lo4[q] = b0 * RAD_FP8_BLOCK;
+                        mc.ff_hi4[q] = b1 * RAD_FP8_BLOCK;
+                        mc.n_ff_exp  = std::max(mc.n_ff_exp, mc.ff_hi4[q] - mc.ff_lo4[q]);
+                    }
+                    rad_note(b, "routed experts at four classes: rank %d computes columns [%lld, "
+                                "%lld) [%lld, %lld) [%lld, %lld) [%lld, %lld) of the experts of "
+                                "number 0, 1, 2 and 3 mod 4 -- %lld blocks of every four experts, "
+                                "as every rank does.",
+                             g.rank, (long long)mc.ff_lo4[0], (long long)mc.ff_hi4[0],
+                             (long long)mc.ff_lo4[1], (long long)mc.ff_hi4[1],
+                             (long long)mc.ff_lo4[2], (long long)mc.ff_hi4[2],
+                             (long long)mc.ff_lo4[3], (long long)mc.ff_hi4[3], (long long)nb);
+                }
             } else {
                 fprintf(stderr, "radiance: qwen4exp: an expert is %lld blocks of %d, which %d ranks "
                                 "cannot each take a whole block of in both parities. Lower the rank "
