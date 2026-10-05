@@ -109,6 +109,12 @@ struct SchedReq {
         draft_hi     = 0;
     }
 
+    /* THE ADAPTIVE DRAFT WINDOW'S ESTIMATE FOR THIS REQUEST (RADIANCE_DRAFT_ADAPT, draft.h), and
+     * deliberately NOT in drafter_reset(): it describes the text the request is writing, which a
+     * preemption does not change, rather than any cache the request holds. A recycled slot starts
+     * it over in add_locked. Untouched while the policy is off. */
+    DraftAdapt adapt;
+
     int32_t  sched_tokens = 0;   /* tokens given to this request in the current step */
     int32_t  entry = -1;         /* its index in the current StepPlan, or -1 */
     /* Its index in the NEXT step, already issued while this one runs (step_next), or -1; and the
@@ -280,7 +286,8 @@ public:
      * the one that is stuck. Returns how many were written. */
     int requests(ReqStat* out, int max) const;
 
-    /* The drafter's proposal for a request's next step. n is clamped to the controller's depth. */
+    /* The drafter's proposal for a request's next step. n is clamped to the sequence's window
+     * (draft_cap): the controller's depth, or what the adaptive policy gives the sequence. */
     int      set_draft(uint64_t id, const int32_t* tokens, int n);
 
     /* ---------------------------------------------------------- media the encoder owes
@@ -318,7 +325,8 @@ public:
      * from one to the other.
      *
      *   expect_draft   after the drafter is issued: how many drafts it proposes for a sequence,
-     *               which is how many the next step verifies.
+     *               which is how many the next step verifies -- capped at the sequence's window,
+     *               which under the adaptive policy can be fewer than the rounds that ran.
      *   step_next      plans and builds that step: every row of this one, as a device row, at
      *               the furthest context it can reach. Null -- and the engine plans with step()
      *               after this one commits -- whenever the step needs a decision only a
@@ -489,6 +497,15 @@ private:
     int64_t draft_floor(const SchedReq& s, int64_t ctx_len) const {
         if (s.draft_hi != 0 || s.draft_lo != 0) return s.draft_lo;
         return hit_holes_draft_ ? ctx_len : 0;
+    }
+
+    /* THE WINDOW A SEQUENCE MAY DRAFT INTO: the configured depth, or under RADIANCE_DRAFT_ADAPT
+     * the one its own acceptance pays for (DraftController::depth_for, which starts the estimate
+     * on the first ask). It is the rule every site that caps a proposal applies -- step(),
+     * set_draft(), expect_draft() and the rounds in serial_begin() -- and with the policy off it
+     * is next_depth(), exactly as before. */
+    int draft_cap(SchedReq& s) const {
+        return draft_.adaptive() ? draft_.depth_for(s.adapt) : draft_.next_depth();
     }
 
     /* The built-in prompt-lookup drafter (scheduler.cpp). Fills s.draft and returns how many

@@ -137,6 +137,13 @@ struct SchedMetrics {
     int     draft_depth_seen = 0;
     int64_t draft_pos_reached [RAD_METRICS_MAX_SPEC] = {};
     int64_t draft_pos_accepted[RAD_METRICS_MAX_SPEC] = {};
+    /* THE ADAPTIVE WINDOW (RADIANCE_DRAFT_ADAPT, draft.h), all zero while it is off. The mean
+     * window it gives the sequences running now -- at one sequence, that sequence's window -- and
+     * the verifies by the window they carried, index = drafts verified, cumulative: the gauge says
+     * where the policy stands, the histogram where it has been. */
+    bool    draft_adaptive = false;
+    float   draft_depth_adaptive = 0.0f;
+    int64_t draft_verify_depth[RAD_METRICS_MAX_SPEC + 1] = {};
 };
 
 }  /* namespace rad */

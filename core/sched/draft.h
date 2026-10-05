@@ -16,6 +16,29 @@
  *
  * What survives is the accounting, because the acceptance rate is a reported metric (spec §14)
  * and because a verify that accepts nothing has to be visible.
+ *
+ * UNLESS RADIANCE_DRAFT_ADAPT=1, and then the premise above is what does not hold. On a model
+ * whose weights stream -- a MoE that reads experts per verify row, a head that runs one pass a
+ * round -- a step is NOT flat in depth: each draft is one more round of the head and one more
+ * verify row, and on QFN at tp4 a step measured 12.0 ms at depth 3 and 15.0 ms at depth 5. And
+ * the best depth is not a property of the model pair but of the TEXT: per-position acceptance
+ * holds at ~0.9 to position five on code and JSON, sits near 0.6 on prose and falls to 0.2-0.4
+ * past the third position on a summary. No constant is right for all of them, and the one that is
+ * right for one costs the others either rounds nobody accepts or tokens nobody drafted.
+ *
+ * So the switch adds a policy, per sequence and on the host: a smoothed estimate of each
+ * position's conditional acceptance, fed by the same verify outcomes observe() counts (DraftAdapt),
+ * and before every draft the window d that maximises E(d) / T(d) -- the tokens a step of that
+ * window is expected to emit, 1 + sum_k prod_{j<=k} a_j, over what such a step costs. It moves
+ * only when the gain is worth a re-recorded pass (Params::hyst, Params::hold). `max_depth` stays
+ * the ceiling, and everything sized for it stays sized for it.
+ *
+ * IT CHANGES HOW MANY DRAFTS A STEP VERIFIES AND NOTHING ELSE. Acceptance is the rule in
+ * core/sample/accept.h, so what a step emits is the target's own token at every position whatever
+ * window it verified. At temperature 0 that is the same text at every window, to exactly the
+ * degree a speculative run matches a plain one at all: exact given the same logits, and a verify
+ * row's logits are computed at an M that now moves with the window (accept.h says what that does
+ * and does not change).
  */
 #pragma once
 #include "rad_core.h"
@@ -26,17 +49,73 @@ namespace rad {
  * band (spec §10), so 64 is the largest window any batch can carry. */
 enum { RAD_SCHED_MAX_SPEC = 64 };
 
+/* ONE SEQUENCE'S HALF OF THE ADAPTIVE POLICY: what the drafter has done on this sequence's own
+ * text, and the window that buys. It lives in the scheduler's per-request state and the controller
+ * does the arithmetic, so neither has to look the other up.
+ *
+ * `depth` 0 is "not started": the first ask fills the estimate from the prior and picks a window.
+ * It belongs to the REQUEST, not to the cache it holds -- a preemption keeps it, because the text
+ * it describes is still the text the request is writing -- and a recycled slot starts it over. */
+struct DraftAdapt {
+    int32_t  depth = 0;                       /* the window the sequence gets now; 0 = not started */
+    int32_t  held  = 0;                       /* verifies since `depth` last moved */
+    float    a[RAD_SCHED_MAX_SPEC] = {};      /* conditional acceptance at each draft position */
+    uint16_t n[RAD_SCHED_MAX_SPEC] = {};      /* verifies that evaluated each one, saturating */
+};
+
 class DraftController {
 public:
     struct Params {
         int max_depth = 0;        /* the deployment's window; 0 disables speculation entirely */
+
+        /* THE ADAPTIVE POLICY (see the top of this file), off unless RADIANCE_DRAFT_ADAPT=1 --
+         * from_env() is where the switch and the knobs below are read, once per process. With it
+         * off every field below is ignored and the depth is max_depth, as it always was. */
+        bool  adapt     = false;
+        /* T(d), what a step verifying d drafts costs, by d; any unit, only ratios are read. An
+         * entry above zero is a measured point, the rest are interpolated between the points and
+         * extrapolated past them along the nearest two. Fewer than two points is no table, and
+         * then T(d) = 1 + 0.06 d. Index 0 is unused. */
+        float cost[RAD_SCHED_MAX_SPEC + 1] = {};
+        float hyst      = 0.02f;  /* a move must buy this much more E/T than the window it leaves */
+        int   hold      = 8;      /* and come at least this many verifies after the last move */
+        float half_life = 16.0f;  /* of each position's estimate, in verifies that evaluate it */
+        float prior     = 0.8f;   /* for a position too few verifies have evaluated to say */
+        int   min_depth = 1;      /* the policy never drafts fewer */
     };
 
     int  configure(const Params& p);
     const Params& params() const { return p_; }
 
-    /* The draft depth for the next step. 0 means "do not speculate". Constant by construction. */
+    /* RADIANCE_DRAFT_ADAPT and its companions (RADIANCE_DRAFT_COST, _HYST, _HOLD, _HALFLIFE,
+     * _PRIOR, _MIN), parsed ONCE per process and copied into the adaptive fields of `p`;
+     * max_depth is left alone. Once, so that every step of a run is decided by the same rule --
+     * a pass recorded under one setting and played under another is a pass the audit fails. */
+    static void from_env(Params* p);
+
+    /* The draft depth for the next step. 0 means "do not speculate". Constant by construction:
+     * under the adaptive policy it is the CEILING, and depth_for() is the window. */
     int  next_depth() const { return p_.max_depth; }
+
+    /* ---------------------------------------------------------- the adaptive policy */
+    bool adaptive() const { return adapt_; }
+    /* The window this sequence may draft into: its policy depth, starting the estimate on the
+     * first ask; max_depth when the policy is off. */
+    int  depth_for(DraftAdapt& s) const;
+    /* One verify of this sequence: `drafted` proposed, a prefix of `accepted` taken. Moves its
+     * estimate, and its depth when that clears the hysteresis. Returns the depth after. */
+    int  adapt_observe(DraftAdapt& s, int drafted, int accepted) const;
+    /* What the policy maximises, E(d) / T(d), for `s`'s estimate as it stands. For tests and logs. */
+    double gain(const DraftAdapt& s, int d) const;
+    /* The cost table as configured, T(1..max_depth). */
+    double cost(int d) const {
+        return (d >= 1 && d <= RAD_SCHED_MAX_SPEC) ? cost_[d] : 0.0;
+    }
+    /* Verifies by the window they carried, counted only under the policy: the histogram of the
+     * depths it actually chose, which the mean gauge on its own cannot show. */
+    int64_t verified_at(int d) const {
+        return (d >= 0 && d <= RAD_SCHED_MAX_SPEC) ? by_depth_[d] : 0;
+    }
 
     /* One verify's outcome: `drafted` tokens were proposed and a prefix of `accepted` of them was
      * taken. Feeds the reported metrics and nothing else. */
@@ -76,6 +155,16 @@ private:
     int64_t reach_[RAD_SCHED_MAX_SPEC] = {};
     int64_t hit_  [RAD_SCHED_MAX_SPEC] = {};
     int     seen_ = 0;
+
+    /* The adaptive policy as configure() resolved it. */
+    bool    adapt_ = false;
+    double  cost_[RAD_SCHED_MAX_SPEC + 1] = {};   /* T(d), resolved for 1..max_depth */
+    double  alpha_ = 0.0;                         /* the smoothing step from half_life */
+    int64_t by_depth_[RAD_SCHED_MAX_SPEC + 1] = {};
+
+    /* The window in [min_depth, max_depth] that maximises E/T for estimate `a`, the smaller on a
+     * tie; its E/T in *best, and the E/T of window `at` in *at_gain. */
+    int     best_depth(const float* a, int at, double* best, double* at_gain) const;
 };
 
 }  /* namespace rad */

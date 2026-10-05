@@ -2308,6 +2308,38 @@ TEST(concurrent_scrapes_count_each_total_once) {
     CHECK_EQ(value("radiance:prefill_tokens_total"), 5000.0);
 }
 
+/* THE ADAPTIVE DRAFT WINDOW (RADIANCE_DRAFT_ADAPT) IS EXPOSED ONLY WHILE IT IS ON, so a deployment
+ * without it scrapes exactly what it always did -- and when it is on, the gauge and the histogram
+ * are well-formed families with the labels every other sample carries. */
+TEST(the_adaptive_draft_window_is_exposed_only_while_it_is_on) {
+    Metrics m("m", 1024);
+    server::SchedMetrics s;
+    m.sample(s);
+    std::string body = m.render();
+    CHECK(body.find("radiance:draft_depth_adaptive") == std::string::npos);
+    CHECK(body.find("radiance:draft_verify_depth_total") == std::string::npos);
+
+    s.draft_adaptive = true;
+    s.draft_depth_adaptive = 2.5;
+    s.draft_verify_depth[2] = 7;
+    s.draft_verify_depth[5] = 3;
+    m.sample(s);
+    PromDoc d = parse_prom(m.render());
+    CHECK_EQ((int)d.errors.size(), 0);
+    CHECK_EQ(d.type["radiance:draft_depth_adaptive"], std::string("gauge"));
+    CHECK_EQ(d.type["radiance:draft_verify_depth_total"], std::string("counter"));
+    auto value = [&d](const std::string& name) {
+        auto it = d.samples.find(name);
+        return it == d.samples.end() ? -1.0 : it->second;
+    };
+    const std::string L = "{model_name=\"m\",engine=\"0\"";
+    CHECK_NEAR(value("radiance:draft_depth_adaptive" + L + "}"), 2.5, 1e-9);
+    CHECK_NEAR(value("radiance:draft_verify_depth_total" + L + ",depth=\"1\"}"), 0.0, 1e-9);
+    CHECK_NEAR(value("radiance:draft_verify_depth_total" + L + ",depth=\"2\"}"), 7.0, 1e-9);
+    CHECK_NEAR(value("radiance:draft_verify_depth_total" + L + ",depth=\"5\"}"), 3.0, 1e-9);
+    CHECK_NEAR(value("radiance:draft_verify_depth_total" + L + ",depth=\"6\"}"), -1.0, 1e-9);
+}
+
 TEST(models_and_health_answer) {
     Fixture f;
     HttpResponse r = f.get("/v1/models");

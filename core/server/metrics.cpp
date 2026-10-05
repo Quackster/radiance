@@ -145,6 +145,17 @@ void Metrics::sample(const SchedMetrics& m) {
     /* Published after the gauges it bounds, so a concurrent render never lists a position whose
      * gauge has not been written yet. */
     draft_pos_seen_.store(seen, std::memory_order_release);
+    if (m.draft_adaptive) {
+        g_draft_depth_adapt_.set(m.draft_depth_adaptive);
+        int top = 0;
+        for (int d = 1; d <= (int)MAX_DRAFT_POS; ++d) {
+            g_draft_vdepth_[d].set((double)m.draft_verify_depth[d]);
+            if (m.draft_verify_depth[d] > 0) top = d;
+        }
+        /* After the gauges, for the reason above. */
+        draft_vdepth_top_.store(top, std::memory_order_release);
+        draft_adapt_on_.store(true, std::memory_order_release);
+    }
     c_preemptions_.inc(std::max(0.0, (double)m.preemptions - c_preemptions_.get()));
     c_steps_.inc(std::max(0.0, (double)m.steps - c_steps_.get()));
     c_steps_prefill_.inc(std::max(0.0, (double)m.steps_prefill - c_steps_prefill_.get()));
@@ -397,6 +408,24 @@ std::string Metrics::render() const {
         for (int j = 0; j < seen; ++j)
             w.out += "radiance:draft_position_reached_total" + base + ",position=\"" +
                      std::to_string(j) + "\"} " + num(g_draft_pos_reached_[j].get()) + '\n';
+    }
+    /* THE ADAPTIVE DRAFT WINDOW, only while RADIANCE_DRAFT_ADAPT is on: where the policy stands --
+     * at one sequence, that sequence's window -- and where it has been, as verifies by the
+     * number of drafts they carried. */
+    if (draft_adapt_on_.load(std::memory_order_acquire)) {
+        w.gauge("radiance:draft_depth_adaptive",
+                "Mean draft window the adaptive policy gives the running sequences.",
+                L, g_draft_depth_adapt_.get());
+        const int top = draft_vdepth_top_.load(std::memory_order_acquire);
+        if (top > 0) {
+            const std::string base = L.substr(0, L.size() - 1);
+            w.help("radiance:draft_verify_depth_total",
+                   "Verifies by the number of drafts they carried, under the adaptive window.",
+                   "counter");
+            for (int d = 1; d <= top; ++d)
+                w.out += "radiance:draft_verify_depth_total" + base + ",depth=\"" +
+                         std::to_string(d) + "\"} " + num(g_draft_vdepth_[d].get()) + '\n';
+        }
     }
     w.gauge("radiance:num_requests_preempted",
             "Requests currently preempted and awaiting recompute.", L, g_preempted_.get());

@@ -97,6 +97,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
+    /* The adaptive window's switch and knobs, read once per process (draft.h). Off unless set. */
+    DraftController::from_env(&dp);
     RAD_TRY(draft_.configure(dp));
 
     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
@@ -178,6 +180,9 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.card = -1;
     s.running = false;
     s.drafter_reset();
+    /* A NEW REQUEST'S TEXT, so a new estimate: the slot's last tenant was writing something else. */
+    s.adapt.depth = 0;
+    s.adapt.held  = 0;
     s.sched_tokens = 0;
     s.entry = -1;
     s.entry_next = -1;
@@ -221,8 +226,15 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
 
     /* THE NEXT STEP ALREADY VERIFIES THESE. It was planned with the count the drafter issued, and
      * the card already put the tokens in its batch; the host copy is what that step's commit
-     * emits the accepted ones from, so it takes exactly those, unclamped. */
+     * emits the accepted ones from, so it takes exactly those, unclamped.
+     *
+     * UNDER THE ADAPTIVE WINDOW THE DRAFTER RAN AS MANY ROUNDS AS THE DEEPEST SEQUENCE WANTED,
+     * and expect_draft() already cut this one's count to its own window -- the card verifies the
+     * FIRST draft_next of the proposals, which are these. So a longer proposal is cut to that
+     * count here, against the number the step was planned with: the window itself may have moved
+     * at the commit in between, and the planned step is what these tokens are for. */
     if (next_open_ && s.entry_next >= 0) {
+        if (draft_.adaptive() && n > s.draft_next) n = s.draft_next;
         if (n != s.draft_next) {
             RAD_ERR("request %llu: %d draft(s) published for a step planned to verify %d",
                     (unsigned long long)id, n, s.draft_next);
@@ -244,7 +256,7 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
         return RAD_OK;
     }
 
-    int cap = draft_.next_depth();
+    int cap = draft_cap(s);
     if (n > cap) n = cap;
     if (n > RAD_SCHED_MAX_SPEC) n = RAD_SCHED_MAX_SPEC;
     for (int i = 0; i < n; ++i) s.draft[i] = tokens[i];
@@ -979,10 +991,15 @@ const RadBatch* Scheduler::step() {
             /* THE LAST GATE, and it has to be here rather than only at set_draft, because the
              * n-gram fallback below fills any proposal a drafter left empty -- so refusing a
              * draft upstream and stopping there hands the request a different draft instead of
-             * none. Request::may_speculate says why a request can be ineligible. */
+             * none. Request::may_speculate says why a request can be ineligible.
+             *
+             * AND THE CAP IS THE SEQUENCE'S OWN WINDOW, which is `depth` unless the adaptive
+             * policy is on -- then it is what this sequence's acceptance pays for, and the n-gram
+             * fallback is held to it like any other proposal. */
+            const int cap = draft_.adaptive() ? draft_.depth_for(s.adapt) : depth;
             if (!r.may_speculate) s.n_draft = 0;
-            else if (s.n_draft == 0) s.n_draft = (int32_t)draft_ngram(s, depth);
-            if (s.n_draft > depth) s.n_draft = depth;
+            else if (s.n_draft == 0) s.n_draft = (int32_t)draft_ngram(s, cap);
+            if (s.n_draft > cap) s.n_draft = cap;
             /* NO VERIFIED POSITION AT OR PAST THE CONTEXT. The step computes positions n_computed
              * .. n_computed + n_draft, and nothing past ctx_limit_ - 1 has a rotary row or a
              * block-table column. commit() finishes a sequence before its length reaches the
@@ -1325,7 +1342,15 @@ void Scheduler::expect_draft(uint64_t id, int n) {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = by_id_.find(id);
     if (it == by_id_.end()) return;
-    reqs_[(size_t)it->second]->draft_next = n > 0 ? n : 0;
+    SchedReq& s = *reqs_[(size_t)it->second];
+    /* UNDER THE ADAPTIVE WINDOW THE ROUNDS RAN FOR THE DEEPEST SEQUENCE, and this one verifies the
+     * first of them up to its own window -- the cap serial_begin sized the rounds from, unchanged
+     * since, because nothing commits between the two. */
+    if (draft_.adaptive() && n > 0) {
+        const int cap = draft_.depth_for(s.adapt);
+        if (n > cap) n = cap;
+    }
+    s.draft_next = n > 0 ? n : 0;
 }
 
 const RadBatch* Scheduler::step_next() {
@@ -1566,6 +1591,24 @@ int Scheduler::commit(const StepResult& res) {
 
             if (e.n_spec > 0) {
                 draft_.observe(e.n_spec, a);
+                /* AND THIS SEQUENCE'S OWN ESTIMATE, from the same outcome, under the adaptive
+                 * window. A move takes effect at the next draft: this step's drafter has already
+                 * run, sized from the estimate as it stood before this commit. */
+                if (draft_.adaptive()) {
+                    const int was = s.adapt.depth;
+                    const int now = draft_.adapt_observe(s.adapt, e.n_spec, a);
+                    if (now != was && was > 0 && (int)log_level() >= (int)Log::Debug) {
+                        char est[8 * RAD_SCHED_MAX_SPEC];
+                        int o = 0;
+                        for (int j = 0; j < draft_.next_depth() && o < (int)sizeof est - 8; ++j)
+                            o += std::snprintf(est + o, sizeof est - (size_t)o, "%s%.2f",
+                                               j ? " " : "", (double)s.adapt.a[j]);
+                        est[o] = 0;
+                        RAD_DEBUG("draft window: request %llu %d -> %d (E/T %.4f -> %.4f; "
+                                  "acceptance by position %s)", (unsigned long long)r.id, was,
+                                  now, draft_.gain(s.adapt, was), draft_.gain(s.adapt, now), est);
+                    }
+                }
                 m_.draft_tokens += e.n_spec;
                 m_.draft_accepted += a;
                 server::sink_drafts(r.sink, e.n_spec, a);
@@ -1724,6 +1767,27 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
     bool may_draft = depth > 0;
     if (depth > 0 && *rounds > depth) *rounds = depth;
     if (*rounds > RAD_SCHED_MAX_SPEC) *rounds = RAD_SCHED_MAX_SPEC;
+
+    /* UNDER THE ADAPTIVE WINDOW, NO MORE ROUNDS THAN THE DEEPEST SEQUENCE WANTS. A round is one
+     * pass of the head over every drafting row, so the step runs as many as its deepest window,
+     * and a sequence that wants fewer verifies the first of them (expect_draft, set_draft); a
+     * round past the deepest window is a pass whose proposal nobody verifies. Only a row that will
+     * draft and be given its drafts counts. When no row does, the rounds stay as they are: round 0
+     * is the history pass, and that still has to run. The reservation below is then made for the
+     * rounds that will actually run, which is what it is for. */
+    if (may_draft && draft_.adaptive()) {
+        int want = 0;
+        for (const StepEntry& e : plan_.e) {
+            if (!e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
+            SchedReq& s = *reqs_[(size_t)e.slot];
+            if (!s.req || s.req->state != ReqState::Running || !s.running ||
+                !s.req->may_speculate)
+                continue;
+            const int c = draft_.depth_for(s.adapt);
+            if (c > want) want = c;
+        }
+        if (want > 0 && *rounds > want) *rounds = want;
+    }
 
     int n_draft_rows = 0;
     int64_t cu = 0;                     /* this entry's first token in the step just run */
@@ -2277,6 +2341,19 @@ SchedMetrics Scheduler::metrics_locked() const {
     for (int j = 0; j < m.draft_depth_seen && j < kPos; ++j) {
         m.draft_pos_reached [j] = draft_.reached(j);
         m.draft_pos_accepted[j] = draft_.hits(j);
+    }
+    if (draft_.adaptive()) {
+        m.draft_adaptive = true;
+        /* Over the running sequences whose estimate has started; one that has not drafted yet
+         * has no window to report. */
+        int64_t sum = 0, n = 0;
+        for (int32_t slot : running_) {
+            const SchedReq& s = *reqs_[(size_t)slot];
+            if (s.adapt.depth > 0) { sum += s.adapt.depth; ++n; }
+        }
+        m.draft_depth_adaptive = n ? (float)((double)sum / (double)n) : 0.0f;
+        const int kDepth = (int)(sizeof m.draft_verify_depth / sizeof m.draft_verify_depth[0]);
+        for (int d = 0; d < kDepth; ++d) m.draft_verify_depth[d] = draft_.verified_at(d);
     }
     return m;
 }

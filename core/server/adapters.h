@@ -280,6 +280,13 @@ public:
             o.draft_pos_reached [j] = m.draft_pos_reached [j];
             o.draft_pos_accepted[j] = m.draft_pos_accepted[j];
         }
+        o.draft_adaptive = m.draft_adaptive;
+        o.draft_depth_adaptive = m.draft_depth_adaptive;
+        {
+            const int ka = (int)(sizeof m.draft_verify_depth / sizeof m.draft_verify_depth[0]);
+            const int kb = (int)(sizeof o.draft_verify_depth / sizeof o.draft_verify_depth[0]);
+            for (int d = 0; d < ka && d < kb; ++d) o.draft_verify_depth[d] = m.draft_verify_depth[d];
+        }
         o.preemptions = m.preemptions;
         o.total_requests = m.admitted;
         o.steps = m.steps;

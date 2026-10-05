@@ -1570,6 +1570,303 @@ TEST(the_draft_depth_is_the_configured_one_whatever_the_acceptance_trace) {
     CHECK_EQ(d3.next_depth(), 0);
 }
 
+/* ------------------------------------------------------------------ the adaptive window
+ * RADIANCE_DRAFT_ADAPT (draft.h). The switch is read from the environment once per process, so
+ * these cases turn the policy on through Params instead -- the controller cannot tell the two
+ * apart, and the tests do not depend on what the suite was started with. */
+
+/* A small deterministic coin, the one the static case above uses. */
+namespace {
+struct Coin {
+    uint64_t s = 12345;
+    bool operator()(double pr) {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        return ((double)((s >> 33) & 0xFFFFFF) / (double)0x1000000) < pr;
+    }
+};
+}  /* namespace */
+
+TEST(the_adaptive_window_follows_each_sequences_own_acceptance) {
+    DraftController c;
+    DraftController::Params p;
+    p.max_depth = 6;
+    p.adapt = true;
+    CHECK_OK(c.configure(p));
+    CHECK(c.adaptive());
+    CHECK_EQ(c.next_depth(), 6);                 /* the ceiling is still the flag */
+
+    /* Nothing measured yet: both start from the prior, which on the default cost wants it all. */
+    DraftAdapt code, summary;
+    CHECK_EQ(c.depth_for(code), 6);
+    CHECK_EQ(c.depth_for(summary), 6);
+
+    /* Two texts through one controller. The drafter almost always agrees on one; on the other it
+     * agrees at the first position and rarely after it. Each window follows its own text. */
+    Coin coin;
+    for (int t = 0; t < 600; ++t) {
+        int d = c.depth_for(code), a = 0;
+        while (a < d && coin(0.95)) ++a;
+        c.observe(d, a);
+        c.adapt_observe(code, d, a);
+
+        d = c.depth_for(summary);
+        a = 0;
+        while (a < d && coin(a == 0 ? 0.6 : 0.2)) ++a;
+        c.observe(d, a);
+        c.adapt_observe(summary, d, a);
+    }
+    CHECK_EQ(c.depth_for(code), 6);
+    CHECK(c.depth_for(summary) >= 1);
+    CHECK(c.depth_for(summary) <= 2);
+    CHECK(code.a[0] > 0.85f);
+    CHECK_NEAR(summary.a[0], 0.6, 0.2);
+    /* The estimate is the conditional rate, and the global hazard is still counted. */
+    CHECK(c.reached(0) == 1200);
+    /* The windows the verifies carried are counted while the policy is on: 6 throughout for one,
+     * and 6 until the other moved off it. */
+    CHECK(c.verified_at(6) >= 600);
+    CHECK(c.verified_at(1) + c.verified_at(2) > 0);
+    CHECK_EQ(c.verified_at(1) + c.verified_at(2) + c.verified_at(3) + c.verified_at(4) +
+             c.verified_at(5) + c.verified_at(6), (int64_t)1200);
+
+    /* And a window that went shallow comes back when the text changes: the positions it stopped
+     * drafting drift toward the deepest it still drafts, so a text the drafter predicts again is
+     * found without anyone drafting deep first. */
+    for (int t = 0; t < 600; ++t) {
+        const int d = c.depth_for(summary);
+        int a = 0;
+        while (a < d && coin(0.95)) ++a;
+        c.adapt_observe(summary, d, a);
+    }
+    CHECK_EQ(c.depth_for(summary), 6);
+}
+
+/* A MOVE IS RATE-LIMITED: not within `hold` verifies of the last one, and only for a window worth
+ * `hyst` more than the one it leaves. A window that followed every flicker of its estimate would
+ * re-record its passes for nothing (runtime/ctx.h). */
+TEST(the_adaptive_window_moves_only_past_its_hold_and_its_hysteresis) {
+    DraftController c;
+    DraftController::Params p;
+    p.max_depth = 6;
+    p.adapt = true;
+    p.hold = 50;
+    CHECK_OK(c.configure(p));
+    DraftAdapt s;
+    CHECK_EQ(c.depth_for(s), 6);
+    for (int t = 0; t < 49; ++t) CHECK_EQ(c.adapt_observe(s, 6, 0), 6);   /* held */
+    CHECK(c.adapt_observe(s, 6, 0) < 6);                                    /* the 50th moves */
+
+    /* The same trace with a hysteresis no estimate can clear never moves at all. */
+    DraftController h;
+    p.hold = 0;
+    p.hyst = 1000.0f;
+    CHECK_OK(h.configure(p));
+    DraftAdapt u;
+    CHECK_EQ(h.depth_for(u), 6);
+    for (int t = 0; t < 200; ++t) h.adapt_observe(u, 6, 0);
+    CHECK_EQ(u.depth, 6);
+
+    /* The floor holds whatever the estimate says. */
+    DraftController m;
+    p.hyst = 0.0f;
+    p.min_depth = 2;
+    CHECK_OK(m.configure(p));
+    DraftAdapt v;
+    for (int t = 0; t < 200; ++t) m.adapt_observe(v, m.depth_for(v), 0);
+    CHECK_EQ(m.depth_for(v), 2);
+
+    /* Off, the window is the flag and an observation is not taken. */
+    DraftController off;
+    DraftController::Params q;
+    q.max_depth = 5;
+    CHECK_OK(off.configure(q));
+    CHECK(!off.adaptive());
+    DraftAdapt w;
+    CHECK_EQ(off.depth_for(w), 5);
+    CHECK_EQ(off.adapt_observe(w, 5, 0), 5);
+    CHECK_EQ(w.depth, 0);
+    off.observe(5, 2);
+    CHECK_EQ(off.verified_at(5), (int64_t)0);
+
+    /* Nonsense knobs are refused rather than run. */
+    DraftController bad;
+    DraftController::Params r;
+    r.max_depth = 4;
+    r.adapt = true;
+    r.half_life = 0.0f;
+    CHECK(bad.configure(r) < 0);
+}
+
+/* THE COST TABLE: measured points as they are, lines between them, the nearest two past the ends;
+ * and with fewer than two points, the default 1 + 0.06 d. A dear depth is a shallower window at
+ * the same estimate. */
+TEST(the_adaptive_window_prices_a_step_from_the_cost_table) {
+    DraftController c;
+    DraftController::Params p;
+    p.max_depth = 6;
+    p.adapt = true;
+    p.cost[2] = 11.3f;
+    p.cost[3] = 12.0f;
+    CHECK_OK(c.configure(p));
+    CHECK_NEAR(c.cost(2), 11.3, 1e-4);
+    CHECK_NEAR(c.cost(3), 12.0, 1e-4);
+    CHECK_NEAR(c.cost(1), 10.6, 1e-4);                 /* extrapolated below */
+    CHECK_NEAR(c.cost(6), 14.1, 1e-4);                 /* and above */
+
+    DraftController d;
+    DraftController::Params q;
+    q.max_depth = 6;
+    q.adapt = true;
+    q.cost[1] = 1.0f;
+    q.cost[2] = 10.0f;                                 /* a second draft costs nine times the first */
+    CHECK_OK(d.configure(q));
+    DraftAdapt s;
+    CHECK_EQ(d.depth_for(s), 1);
+
+    DraftController e;
+    DraftController::Params r;
+    r.max_depth = 4;
+    r.adapt = true;
+    r.cost[3] = 5.0f;                                  /* one point is no table */
+    CHECK_OK(e.configure(r));
+    CHECK_NEAR(e.cost(1), 1.06, 1e-9);
+    CHECK_NEAR(e.cost(4), 1.24, 1e-9);
+
+    /* A table whose line runs below zero is the wrong sign, and the default is used. */
+    DraftController g;
+    DraftController::Params t;
+    t.max_depth = 6;
+    t.adapt = true;
+    t.cost[1] = 10.0f;
+    t.cost[2] = 4.0f;
+    CHECK_OK(g.configure(t));
+    CHECK_NEAR(g.cost(6), 1.36, 1e-9);
+}
+
+/* THE SCHEDULER'S HALF: the cap on a proposal, and the rounds the head runs. One sequence whose
+ * prior pays for two drafts of a ceiling of four verifies two, and the head runs two rounds. */
+TEST(the_adaptive_window_caps_the_proposal_and_the_rounds) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    DraftController::Params p;
+    p.max_depth = 4;
+    p.adapt = true;
+    p.prior = 0.3f;                                    /* on the default cost: two */
+    CHECK_OK(f.sch.draft().configure(p));
+
+    const uint64_t a = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    CHECK_EQ(f.sch.find(a)->n_draft, 2);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_spec, 2);
+    CHECK_EQ(b->n_tok, 3);
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 2);
+
+    int rounds = 4;
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 1);
+    CHECK_EQ(rounds, 2);
+    const RadBatch* hb = f.sch.serial_batch(0, 1);
+    REQUIRE(hb != nullptr);
+    CHECK_EQ(hb->n_tok, 3);                            /* every verified position, as ever */
+    CHECK(f.sch.serial_batch(2, 1) != nullptr);
+    f.sch.serial_end(2);
+
+    const SchedMetrics m = f.sch.metrics();
+    CHECK(m.draft_adaptive);
+    CHECK_NEAR(m.draft_depth_adaptive, 2.0, 1e-6);
+    CHECK_EQ(m.draft_depth, 4);                        /* the ceiling, as before */
+}
+
+/* EACH SEQUENCE ITS OWN WINDOW, AND THE ROUNDS FOLLOW THE DEEPEST. The step issued ahead of a
+ * commit verifies, for each sequence, the first of those rounds up to its own window -- and the
+ * drafter's longer proposal is taken cut to that count rather than refused as a mismatch. */
+TEST(the_adaptive_window_is_per_sequence_and_the_rounds_follow_the_deepest) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    DraftController::Params p;
+    p.max_depth = 4;
+    p.adapt = true;
+    p.hold = 0;
+    p.hyst = 0.0f;
+    CHECK_OK(f.sch.draft().configure(p));
+
+    const uint64_t a = f.submit(160, 2000);
+    const uint64_t b = f.submit(160, 2000);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    /* `a`'s drafts are never taken and `b`'s always are. */
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    auto commit_ab = [&]() {
+        const StepPlan& pl = f.sch.plan();
+        std::vector<int32_t> acc(pl.e.size(), 0), tok(pl.e.size(), 9);
+        std::vector<uint8_t> eos(pl.e.size(), 0);
+        for (size_t i = 0; i < pl.e.size(); ++i) acc[i] = pl.e[i].seq == b ? pl.e[i].n_spec : 0;
+        Scheduler::StepResult r;
+        r.n_seq = (int)pl.e.size();
+        r.n_accepted = acc.data();
+        r.token = tok.data();
+        r.eos = eos.data();
+        CHECK_OK(f.sch.commit(r));
+    };
+    for (int t = 0; t < 64; ++t) {
+        CHECK_OK(f.sch.set_draft(a, draft, 4));
+        CHECK_OK(f.sch.set_draft(b, draft, 4));
+        REQUIRE(f.sch.step() != nullptr);
+        commit_ab();
+    }
+
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    CHECK_OK(f.sch.set_draft(b, draft, 4));
+    const RadBatch* s = f.sch.step();
+    REQUIRE(s != nullptr);
+    CHECK_EQ(s->n_spec, 4);
+    CHECK_EQ(s->n_tok, 2 + 5);
+    for (const StepEntry& e : f.sch.plan().e) CHECK_EQ(e.n_spec, e.seq == a ? 1 : 4);
+    CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 2.5, 1e-6);
+
+    /* The head runs for the deepest. */
+    int rounds = 4;
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 2);
+    CHECK_EQ(rounds, 4);
+    REQUIRE(f.sch.serial_batch(0, 1) != nullptr);
+    for (int rd = 2; rd <= rounds; ++rd) REQUIRE(f.sch.serial_batch(rd, 1) != nullptr);
+
+    /* The step issued ahead: `a` verifies one of the four rounds, `b` all four. */
+    f.sch.find(a)->speculation_fixed = true;
+    f.sch.find(b)->speculation_fixed = true;
+    f.sch.expect_draft(a, rounds);
+    f.sch.expect_draft(b, rounds);
+    const RadBatch* nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 4);
+    CHECK_EQ(nb->n_tok, 2 + 5);
+
+    /* Its commit, the watermark, and the proposals published for the step already on the card:
+     * four rounds' worth to both, and each keeps what its step was planned to verify. */
+    commit_ab();
+    f.sch.serial_end(rounds);
+    CHECK_OK(f.sch.set_draft(a, draft, rounds));
+    CHECK_OK(f.sch.set_draft(b, draft, rounds));
+    CHECK_EQ(f.sch.find(a)->n_draft, 1);
+    CHECK_EQ(f.sch.find(b)->n_draft, 4);
+    f.sch.promote_next();
+    for (const StepEntry& e : f.sch.plan().e) CHECK_EQ(e.n_spec, e.seq == a ? 1 : 4);
+    CHECK(f.sch.metrics().draft_verify_depth[1] > 0);
+    CHECK(f.sch.metrics().draft_verify_depth[4] > 0);
+}
+
 /* ================================================================== the step path */
 TEST(the_step_path_does_not_allocate) {
     Fixture f;
