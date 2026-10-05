@@ -72,6 +72,14 @@ struct GdnFP8 {
          * `gdn_recurrent_update` composes the same parameter, so this is a string to pass and
          * not a kernel to write. "silu" or "sigmoid"; anything else is refused below. */
         const char* act    = "silu";
+        /* AN UNEVEN SPLIT OF THE HEADS (rad_weight_shard_span_parts). n_head_k / n_head_v are
+         * this rank's; k_first / v_first its first head of the container's n_head_k_all /
+         * n_head_v_all. k_first < 0 is the even split the plain row shard gives, as before.
+         * Three ranks over 16 K heads take 6, 5 and 5 (and 18, 15, 15 of the 48 V heads) --
+         * every rank real heads, nothing padded, every kernel at its own head count. */
+        int64_t k_first = -1, v_first = -1;
+        int64_t n_head_k_all = 0, n_head_v_all = 0;
+        bool    uneven() const { return k_first >= 0; }
 
         int64_t k_dim()    const { return n_head_k * head_k; }
         int64_t v_dim()    const { return n_head_v * head_v; }
@@ -268,6 +276,25 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
     RAD_ARCH_TRY(in.declare(b, nm, g, nm.f("blk.%d.ssm_inz", l), conv_dim + v_dim, g.n_embd,
                             RAD_SHARD_ROW, grp_layer(l), { s.in_qkv, s.in_z }, w.h, w.in.x, 0,
                             { cfg.k_dim(), cfg.k_dim(), cfg.v_dim(), cfg.v_dim() }));
+    if (cfg.uneven()) {
+        /* THIS RANK'S HEADS OF EACH PART, in the container's rows: q and k by K head, v and z by
+         * V head. The scale plane of a row shard has the same rows (its blocks run along K). */
+        const int64_t kl = cfg.k_first * cfg.head_k, vl = cfg.v_first * cfg.head_v;
+        const int64_t ka = cfg.n_head_k_all * cfg.head_k, va = cfg.n_head_v_all * cfg.head_v;
+        const int64_t lo[4] = { kl, kl, vl, vl };
+        const int64_t hi[4] = { kl + cfg.k_dim(), kl + cfg.k_dim(), vl + cfg.v_dim(), vl + cfg.v_dim() };
+        const int64_t tot[4] = { ka, ka, va, va };
+        RAD_ARCH_TRY(in.span_parts(b, lo, hi, tot, 4));
+        const int64_t clo[3] = { kl, kl, vl }, chi[3] = { kl + cfg.k_dim(), kl + cfg.k_dim(), vl + cfg.v_dim() };
+        const int64_t ctot[3] = { ka, ka, va };
+        RAD_ARCH_TRY(rad_weight_shard_span_parts(b, w_conv, clo, chi, ctot, 3));
+        const int64_t alo[2] = { cfg.v_first, cfg.v_first };
+        const int64_t ahi[2] = { cfg.v_first + cfg.n_head_v, cfg.v_first + cfg.n_head_v };
+        const int64_t atot[2] = { cfg.n_head_v_all, cfg.n_head_v_all };
+        RAD_ARCH_TRY(rad_weight_shard_span_parts(b, w_ab, alo, ahi, atot, 2));
+        RAD_ARCH_TRY(rad_weight_shard_span(b, w_a_log,   cfg.v_first, cfg.v_first + cfg.n_head_v));
+        RAD_ARCH_TRY(rad_weight_shard_span(b, w_dt_bias, cfg.v_first, cfg.v_first + cfg.n_head_v));
+    }
     /* NOT SLICED, and why it could need to be is worth keeping. This is a 96-column bf16 GEMM --
      * half a percent of the layer's projection bytes -- and a bf16 kernel for this shape that
      * stopped at M = 64 would leave a hole in its bucket table above 64. Since every op in a step
@@ -374,7 +401,9 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
 
     RAD_ARCH_TRY(q_o.declare(b, g, w.o, v_dim));
     RAD_ARCH_TRY(out.declare(b, nm, g, nm.f("blk.%d.ssm_out", l), g.n_embd, v_dim,
-                             RAD_SHARD_COL, grp_layer(l), { s.out }, w.o, w.h.x));
+                             RAD_SHARD_COL, grp_layer(l), { s.out }, w.o, w.h.x, 0, {},
+                             cfg.uneven() ? cfg.v_first * cfg.head_v : 0,
+                             cfg.uneven() ? cfg.v_first * cfg.head_v + v_dim : 0));
 
     if (g.world > 1)
         op_ar = rw(b, RAD_OP(b, "all_reduce",

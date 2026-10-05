@@ -406,9 +406,35 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     (long long)gc.conv_width);
             return RAD_E_INVAL;
         }
-        int s;
-        if ((s = divide_or_fail(nk, g.world, "linear_num_key_heads",   &gc.n_head_k)) < 0) return s;
-        if ((s = divide_or_fail(nv, g.world, "linear_num_value_heads", &gc.n_head_v)) < 0) return s;
+        /* THE HEADS SPLIT EVENLY WHEN THEY CAN, as before, and UNEVENLY WHEN THEY CANNOT: 16 K
+         * heads over three ranks are 6, 5 and 5, each rank's V heads the same multiple of its K
+         * heads (48 / 16 = 3 -> 18, 15, 15), declared as spans of the container's rows
+         * (rad_block_gdn_fp8.h Config::k_first). Nothing is padded and every rank holds real
+         * heads; the kernels take any head count. A V count that is not a multiple of the K count
+         * cannot be grouped that way and is refused. */
+        gc.n_head_k_all = nk;
+        gc.n_head_v_all = nv;
+        if (g.world > 1 && (nk % g.world != 0 || nv % g.world != 0)) {
+            if (nv % nk != 0) {
+                fprintf(stderr, "radiance: qwen4exp: %lld value heads over %lld key heads do not "
+                                "group, so an uneven split over %d ranks is not defined\n",
+                        (long long)nv, (long long)nk, g.world);
+                return RAD_E_INVAL;
+            }
+            const int64_t ratio = nv / nk, base = nk / g.world, rem = nk % g.world;
+            gc.n_head_k = base + (g.rank < rem ? 1 : 0);
+            gc.k_first  = g.rank * base + (g.rank < rem ? g.rank : rem);
+            gc.n_head_v = ratio * gc.n_head_k;
+            gc.v_first  = ratio * gc.k_first;
+            fprintf(stderr, "radiance: qwen4exp: rank %d takes delta-net K heads [%lld, %lld) of "
+                            "%lld and V heads [%lld, %lld) of %lld\n", g.rank,
+                    (long long)gc.k_first, (long long)(gc.k_first + gc.n_head_k), (long long)nk,
+                    (long long)gc.v_first, (long long)(gc.v_first + gc.n_head_v), (long long)nv);
+        } else {
+            int s;
+            if ((s = divide_or_fail(nk, g.world, "linear_num_key_heads",   &gc.n_head_k)) < 0) return s;
+            if ((s = divide_or_fail(nv, g.world, "linear_num_value_heads", &gc.n_head_v)) < 0) return s;
+        }
     }
 
     /* ---- the routed feed-forward.

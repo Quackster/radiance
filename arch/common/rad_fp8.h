@@ -664,6 +664,11 @@ struct LinearFP8 {
     rad_weight w = 0, ws = 0;
     rad_op     op = 0;
     int64_t    N = 0, K = 0;
+    /* ROWS OF THE SCALE PLANE PER ROW OF THE WEIGHT: 1 for an int8 or bf16 linear, whose scale
+     * plane (if any) has the weight's rows, RAD_FP8_BLOCK for a block-fp8 one, whose scale plane
+     * is 1/128 of them. A row span on `ws` is in the plane's own rows (declare's span code
+     * divides); span_parts below divides the same way. */
+    int64_t    ws_row_div = 1;
     /* A PLAIN bf16 WEIGHT read by `gemm_nt` over the activation's bf16 plane, in a model whose
      * linears are bf16 (Geom::w_bf16): one weight and no scale plane, and no quantiser in front. */
     bool       bf16 = false;
@@ -722,6 +727,35 @@ struct LinearFP8 {
                  int64_t span_lo = 0, int64_t span_hi = 0);
     void step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0 = 0,
               int64_t rows = 0) const;
+    /* THIS RANK READS NOTHING FOR IT: the weight and its scale plane are zeros
+     * (rad_weight_shard_zero). After declare(); for an attention-zero rank (rad_arch.h). */
+    int  zero_share(RadBuilder* b) const {
+        RAD_ARCH_TRY(rad_weight_shard_zero(b, w));
+        if (ws) RAD_ARCH_TRY(rad_weight_shard_zero(b, ws));
+        return RAD_OK;
+    }
+    /* A SPAN PER STACKED ROW PART (rad_weight_shard_span_parts), in the weight's rows; the scale
+     * plane takes the same spans in its own rows. After declare(); every span and total has to be
+     * whole scale blocks when the plane is 1/128, which head widths of 128 are. */
+    int  span_parts(RadBuilder* b, const int64_t* lo, const int64_t* hi, const int64_t* total,
+                    int n) const {
+        RAD_ARCH_TRY(rad_weight_shard_span_parts(b, w, lo, hi, total, n));
+        if (!ws) return RAD_OK;
+        if (ws_row_div == 1) return rad_weight_shard_span_parts(b, ws, lo, hi, total, n);
+        int64_t slo[RAD_MAX_ROW_PARTS], shi[RAD_MAX_ROW_PARTS], stot[RAD_MAX_ROW_PARTS];
+        for (int g = 0; g < n && g < RAD_MAX_ROW_PARTS; ++g) {
+            if (lo[g] % ws_row_div || hi[g] % ws_row_div || total[g] % ws_row_div) {
+                fprintf(stderr, "radiance: a part span [%lld, %lld) of %lld rows is not whole "
+                                "%lld-row scale blocks\n", (long long)lo[g], (long long)hi[g],
+                        (long long)total[g], (long long)ws_row_div);
+                return RAD_E_INVAL;
+            }
+            slo[g] = lo[g] / ws_row_div;
+            shi[g] = hi[g] / ws_row_div;
+            stot[g] = total[g] / ws_row_div;
+        }
+        return rad_weight_shard_span_parts(b, ws, slo, shi, stot, n);
+    }
 };
 
 /* THE NAME MAP OF A LINEAR, DECLARED BEFORE ITS WEIGHT: it is how the checkpoint -- or the recipe
@@ -928,6 +962,7 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      * bf16 release) declares the same two views; what makes the planes exist is rad-convert. */
     w  = decl_view(b, wn, nullptr, "codes", RAD_F8E4M3, { N, K },
                    RAD_ACCESS_PER_TOKEN, shard, grp, wparts, np);
+    ws_row_div = RAD_FP8_BLOCK;
     ws = decl_view(b, sn, wn, "scale", RAD_BF16, { fp8_blocks(N), fp8_blocks(K) },
                    RAD_ACCESS_PER_TOKEN, shard, grp, sparts, np);
     if (!w || !ws) return RAD_E_INVAL;

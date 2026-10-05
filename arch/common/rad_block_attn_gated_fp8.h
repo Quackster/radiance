@@ -192,9 +192,19 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
      * never cuts one, and share.cpp's `shard_hi <= cpart` holds with cpart = 512 / 1 part.
      * AT WORLD <= n_head_kv_all the ordinary even shard already selects exactly these rows, so the
      * span stays 0/0 and the default path runs as before -- TP2 declares identically. */
-    const bool    kv_spanned = g.world > g.n_head_kv_all;
+    /* AND UNDER A SMALLER ATTENTION WORLD (rad_arch.h Geom::attn_world: three ranks over two KV
+     * heads) the even shard over `world` is the wrong cut for every projection: q|gate and the
+     * output take this rank's heads [attn_rank * n_head, +n_head) as a span too, and k/v the
+     * kv_off span. An attention-zero rank declares the same spans -- the same shapes as its peers
+     * -- and then reads nothing for them (zero_share below). */
+    const bool    a_spanned  = g.attn_world != g.world;
+    const bool    kv_spanned = g.world > g.n_head_kv_all || a_spanned;
     const int64_t kv_span_lo = kv_spanned ? g.kv_off : 0;
     const int64_t kv_span_hi = kv_spanned ? g.kv_off + kv_dim : 0;
+    const int64_t qg_span_lo = a_spanned ? g.attn_rank * qg_dim : 0;
+    const int64_t qg_span_hi = a_spanned ? (g.attn_rank + 1) * qg_dim : 0;
+    const int64_t o_span_lo  = a_spanned ? g.attn_rank * q_dim : 0;
+    const int64_t o_span_hi  = a_spanned ? (g.attn_rank + 1) * q_dim : 0;
 
     if (n_rot <= 0 || n_rot > g.head_dim || (n_rot & 1)) {
         fprintf(stderr, "radiance: rotary_dim %lld is not an even width inside head_dim %lld\n",
@@ -235,13 +245,19 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
         RAD_ARCH_TRY(nq_h.declare(b, g, w_norm, fold ? w.h.x : w.x, w.h, g.n_embd,
                                   fold ? w.x : 0, 0, ar_in));
     RAD_ARCH_TRY(qg.declare(b, nm, g, nm.f("blk.%d.attn_qg", l), qg_dim, g.n_embd,
-                            RAD_SHARD_ROW, grp_layer(l), { src.qg }, w.h, w.qg));
+                            RAD_SHARD_ROW, grp_layer(l), { src.qg }, w.h, w.qg,
+                            0, {}, qg_span_lo, qg_span_hi));
     RAD_ARCH_TRY(kp.declare(b, nm, g, nm.f("blk.%d.attn_k", l), kv_dim, g.n_embd,
                             RAD_SHARD_ROW, grp_layer(l), { src.k }, w.h, w.k,
                             0, {}, kv_span_lo, kv_span_hi));
     RAD_ARCH_TRY(vp.declare(b, nm, g, nm.f("blk.%d.attn_v", l), kv_dim, g.n_embd,
                             RAD_SHARD_ROW, grp_layer(l), { src.v }, w.h, w.v,
                             0, {}, kv_span_lo, kv_span_hi));
+    if (g.attn_zero) {
+        RAD_ARCH_TRY(qg.zero_share(b));
+        RAD_ARCH_TRY(kp.zero_share(b));
+        RAD_ARCH_TRY(vp.zero_share(b));
+    }
 
     /* THE FUSED PROLOGUE, AND IT IS A PROBE: the four ops below are declared either way and are
      * what runs when nothing serves this one. rad_block_attn_gated.h does not make the probe,
@@ -417,7 +433,9 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
     }
 
     RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
-                           RAD_SHARD_COL, grp_layer(l), { src.o }, w.attn, w.h.x));
+                           RAD_SHARD_COL, grp_layer(l), { src.o }, w.attn, w.h.x,
+                           0, {}, o_span_lo, o_span_hi));
+    if (g.attn_zero) RAD_ARCH_TRY(o.zero_share(b));
 
     if (g.world > 1)
         op_ar = rw(b, RAD_OP(b, "all_reduce",

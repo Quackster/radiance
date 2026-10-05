@@ -576,6 +576,17 @@ struct Geom {
      * declares a row-sharded k/v passes it straight through as `span_lo`. Zero on every split
      * deployment, which is what keeps TP2 reading the projection exactly as it always did. */
     int64_t kv_off   = 0;
+    /* THE ATTENTION WORLD. A world size the KV head count neither divides nor is a multiple of
+     * -- three ranks over Flash-Next's two KV heads -- serves attention on the largest multiple
+     * of the head count below it (`attn_world`, here 2: split, or replicated when that is still
+     * above the count) and the remaining ranks are ATTENTION-ZERO: they declare the same heads and
+     * the same program as their peers, read nothing for the attention projections
+     * (rad_weight_shard_zero) and add exactly zero to the reduce. `attn_rank` is this rank's
+     * index inside the attention world (an attention-zero rank clamps to the last). When
+     * attn_world == world nothing here is used and every block declares as it always did. */
+    int     attn_world = 1;
+    int     attn_rank  = 0;
+    bool    attn_zero  = false;
     int64_t n_ff       = 0;    /* per rank */
     int64_t n_ff_all   = 0;
     int64_t max_tok    = 0;
@@ -786,7 +797,23 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     }
 
     int s;
-    if ((s = divide_or_fail(g.n_head_all,    g.world, "n_head",    &g.n_head))    < 0) return s;
+    /* THE ATTENTION WORLD (see the field). Below the KV head count, or a multiple of it, it is the
+     * world and the two rules that follow run on the world as before. Otherwise it is the largest
+     * multiple of the head count under the world, and the ranks past it carry zero attention. */
+    g.attn_world = g.world;
+    g.attn_rank  = g.rank;
+    g.attn_zero  = false;
+    if (g.world > g.n_head_kv_all && g.world % g.n_head_kv_all != 0) {
+        g.attn_world = (int)(g.n_head_kv_all * (g.world / g.n_head_kv_all));
+        g.attn_zero  = g.rank >= g.attn_world;
+        g.attn_rank  = g.attn_zero ? g.attn_world - 1 : g.rank;
+        fprintf(stderr, "radiance: world_size = %d over n_head_kv = %lld: attention on %d rank(s), "
+                        "rank(s) %d..%d carry zero attention weights and the delta net and "
+                        "experts of a full rank\n", g.world, (long long)g.n_head_kv_all,
+                g.attn_world, g.attn_world, g.world - 1);
+    }
+    const int aw = g.attn_world, ar = g.attn_rank;
+    if ((s = divide_or_fail(g.n_head_all, aw, "n_head", &g.n_head)) < 0) return s;
     /* THE KV HEADS ARE REPLICATED WHEN THERE ARE NOT ENOUGH TO SPLIT. There is one row-span per KV
      * head and no way to hand four ranks half a head, so `divide_or_fail` on n_head_kv is the
      * wrong verb once world exceeds the head count -- the question is not rounding, it is whether
@@ -805,19 +832,24 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
      *
      * When world <= n_head_kv_all the split below is untouched, so a world that divides the KV
      * heads -- TP2 on this family -- declares exactly as it did before replication existed. */
-    if (g.world > g.n_head_kv_all) {
-        if (g.world % g.n_head_kv_all != 0) {
+    if (aw > g.n_head_kv_all) {
+        /* aw is a multiple of the head count by construction (the world itself, checked here, or
+         * the attention world, which is one). */
+        if (aw % g.n_head_kv_all != 0) {
             fprintf(stderr, "radiance: world_size = %d cannot replicate n_head_kv = %lld; "
                             "replication needs world to be a multiple of the KV head count\n",
-                    g.world, (long long)g.n_head_kv_all);
+                    aw, (long long)g.n_head_kv_all);
             return RAD_E_INVAL;
         }
-        g.n_head_kv = 1;   /* world / n_head_kv_all ranks share each KV head */
-        g.kv_off    = (g.rank / (g.world / g.n_head_kv_all)) * g.head_dim;
-    } else if ((s = divide_or_fail(g.n_head_kv_all, g.world, "n_head_kv", &g.n_head_kv)) < 0) {
+        g.n_head_kv = 1;   /* aw / n_head_kv_all ranks share each KV head */
+        g.kv_off    = (ar / (aw / g.n_head_kv_all)) * g.head_dim;
+    } else if ((s = divide_or_fail(g.n_head_kv_all, aw, "n_head_kv", &g.n_head_kv)) < 0) {
         return s;
     } else {
-        g.kv_off = 0;   /* a split rank reads the rows the plain row-shard already gives it */
+        /* A split rank reads the rows the plain row-shard gives it -- when the attention world
+         * is the world. Under a smaller attention world the even shard over `world` is the wrong
+         * cut, and the block spans [kv_off, kv_off + kv_dim) instead. */
+        g.kv_off = aw == g.world ? 0 : ar * g.n_head_kv * g.head_dim;
     }
     if (arch_splits_ff && g.world > 1 && g.n_ff_all % g.world != 0) {
         g.n_ff = g.n_ff_all;   /* the plugin slices it (see the parameter's comment) */
