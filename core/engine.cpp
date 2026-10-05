@@ -1619,6 +1619,7 @@ std::string Engine::engine_info() const {
     e["tp_wire_min_kb"]         = cfg_.tp_wire_exact ? 0 : cfg_.tp_wire_min_kb;
     e["max_num_batched_tokens"] = cfg_.max_tok;
     e["placement"]              = cfg_.placement;
+    e["host_weights"]           = cfg_.host_weights;
     e["prefix_cache"]           = cfg_.prefix_cache;
     e["checkpoint_slots"]       = cfg_.checkpoint_slots;
     e["deterministic"]          = cfg_.deterministic;

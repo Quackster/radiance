@@ -55,6 +55,9 @@ static const Flag g_flags[] = {
     { "--vram-kv-mib",        "N",      "the paged KV pool; 0 derives it from the card" },
     { "--kv-cache-dtype",     "T",      "bf16 | fp8 -- fp8 halves what a token of context costs" },
     { "--host-pool-mib",      "N",      "pinned host tier" },
+    { "--host-weights",       "NAMES",  "embedding tables to keep in the pinned host pool, read in place\n"
+    "                                    over the link: comma-separated weight names, a trailing *\n"
+    "                                    matching a prefix (token_embd.weight)" },
     { "--weights-disk-tier",  nullptr,  "read weights that fit neither VRAM nor the host pool from the\n"
     "                                    container on disk (O_DIRECT); a routed expert is read a layer\n"
     "                                    at a time, so a step is paced by the drive" },
@@ -375,6 +378,23 @@ int config_parse(int argc, char** argv, Config* c) {
             }
         }
         else if (S("--host-pool-mib"))         { if (!(v = need(i))) return RAD_E_INVAL; c->host_pool_mib = atoll(v); }
+        else if (S("--host-weights")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            c->host_weights.clear();
+            for (std::string p : split_commas(v)) {
+                p.erase(0, p.find_first_not_of(" \t"));
+                p.erase(p.find_last_not_of(" \t") + 1);
+                if (p.empty() || p == "*") {
+                    RAD_ERR("--host-weights: '%s' is not a weight name", p.c_str());
+                    return RAD_E_INVAL;
+                }
+                c->host_weights.push_back(p);
+            }
+            if (c->host_weights.empty()) {
+                RAD_ERR("--host-weights: no weight names in '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
         else if (S("--prefix-cache-host-mib"))     { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_host_mib = atoll(v); }
         else if (S("--prefix-cache-dir"))          { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_dir = v; }

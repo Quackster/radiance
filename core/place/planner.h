@@ -95,6 +95,11 @@ struct MoveUnit {
     Site    site = Site::Device;
     int32_t slab_slot = -1;
     bool    movable = false;     /* may the heat engine relocate it after load */
+    bool    host_forced = false; /* --host-weights put it in the pinned pool; no strategy moves it */
+
+    /* PLACED BEFORE ANY STRATEGY RAN, so every assignment pass skips it and no VRAM total counts
+     * it: the mapped tier (no device kernel can read it) and --host-weights. */
+    bool preplaced() const { return tier == Tier::Mapped || host_forced; }
     const char* reason = "fits in vram";   /* a fixed string, so the report never guesses */
 
     /* The group's INTERNAL LAYOUT, computed once here so the mover never has to. `offset[i]` is
@@ -239,6 +244,9 @@ public:
     int64_t vram_budget = 0, host_budget = 0;
     int64_t file_stage_reserve = 0;
     int64_t file_windows = 0;          /* the read windows' part of it */
+    /* --host-weights: taken out of --host-pool-mib before any strategy ran, like the file staging
+     * above, and reported beside it rather than among the pooled units. */
+    int64_t host_weights_bytes = 0;
     /* ROUTED EXPERTS ON THE FILE TIER have no address of their own: a routed layer's are read into
      * one of two VRAM buffers before the layer's first expert op and published there until the next
      * routed layer starts (place/stager.h, FileStager). `file_layer_max` is the most one layer's
@@ -317,6 +325,7 @@ private:
     void resolve_sites(const Program& prog);
     void build_units(const Program& prog, Plan* p);
     void pin_mapped(const Program& prog, Plan* p);
+    int  pin_host_weights(const Program& prog, const Config& cfg, Plan* p) const;
     void build_classes(Plan* p);
     void rank_units(Plan* p, std::vector<int32_t>* order) const;
     int  assign(Plan* p);
@@ -361,9 +370,20 @@ struct WeightFootprint {
     int64_t experts = 0;   /* the elastic plane: what streams from host when it does not fit */
     int64_t expert_layer_max = 0;   /* the most expert bytes any one routed layer holds */
     int64_t mapped  = 0;   /* no device kernel can read them; they never enter a pool at all */
+    int64_t hosted  = 0;   /* --host-weights: in the pinned host pool, never on the card */
     int64_t n_units = 0;
 };
-void weight_footprint(const Program& prog, WeightFootprint* out);
+void weight_footprint(const Program& prog, WeightFootprint* out,
+                      const std::vector<std::string>& host_weights = {});
+
+/* Does `name` match the --host-weights list: comma-separated, a trailing '*' matching a prefix.
+ * One definition, because Planner::pin_host_weights and weight_footprint must agree on it or the
+ * budget is resolved for weights the planner then puts somewhere else. */
+bool host_weight_match(const std::vector<std::string>& list, const std::string& name);
+
+/* Is every op that reads weight `w` an embedding lookup? Only those read a few rows a step; any
+ * other reader (a GEMM) would stream the whole weight over the link on every step. */
+bool read_only_by_lookups(const Program& prog, rad_weight w);
 
 /* "blk.12.ffn_gate_exps.3.weight" -> "blk.*.ffn_gate_exps.*.weight". The report's grouping key:
  * one line per weight class rather than per weight (spec §16). */

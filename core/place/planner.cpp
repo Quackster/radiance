@@ -91,7 +91,8 @@ int64_t weight_bytes(const WeightInfo& w) {
 /* See planner.h. Planner::resolve_sites, Planner::build_units and Planner::pin_mapped, run over
  * the same program without allocating a Plan -- the budget resolver calls this before a Planner
  * exists. Kept adjacent to the three so a change to any of them has this in the same diff. */
-void weight_footprint(const Program& prog, WeightFootprint* out) {
+void weight_footprint(const Program& prog, WeightFootprint* out,
+                      const std::vector<std::string>& host_weights) {
     if (!out) return;
     *out = WeightFootprint{};
 
@@ -108,7 +109,8 @@ void weight_footprint(const Program& prog, WeightFootprint* out) {
 
     /* build_units: a model-level weight is its own unit, everything else groups by the declared
      * (layer, expert). Ordered, for the same reason build_units is. */
-    struct U { int32_t layer = -1, expert = -1; int64_t bytes = 0; bool mapped = false; };
+    struct U { int32_t layer = -1, expert = -1; int64_t bytes = 0; bool mapped = false;
+               bool hosted = true; };
     std::map<std::pair<int32_t, int32_t>, size_t> by_group;
     std::vector<U> units;
 
@@ -137,6 +139,10 @@ void weight_footprint(const Program& prog, WeightFootprint* out) {
         mu.bytes = align_up(mu.bytes, a) + weight_bytes(wi);
         /* pin_mapped: THE WHOLE UNIT GOES, not the one weight. */
         if (w < device_ok.size() && !device_ok[w]) mu.mapped = true;
+        /* pin_host_weights: a named model-level weight only lookups read. */
+        if (layer >= 0 || !host_weight_match(host_weights, wi.name) ||
+            !read_only_by_lookups(prog, w))
+            mu.hosted = false;
     }
 
     /* And one align_up a unit, because that is how Mover::init spends the slab: `us.static_off =
@@ -146,6 +152,7 @@ void weight_footprint(const Program& prog, WeightFootprint* out) {
     for (const U& mu : units) {
         const int64_t b = align_up(mu.bytes, RAD_ALIGN_UNIT);
         if (mu.mapped)          out->mapped  += b;
+        else if (mu.hosted && mu.layer < 0) out->hosted += b;
         else if (mu.expert >= 0) { out->experts += b; layer_experts[mu.layer] += b; }
         else                     out->statics += b;
     }
@@ -516,7 +523,7 @@ int Planner::assign_all_vram(Plan* p) {
     for (MoveUnit& mu : p->units) {
         /* A MAPPED UNIT IS ALREADY PLACED and no strategy may move it: there is no device kernel
          * that could read it anywhere else. Every assignment pass below begins with this line. */
-        if (mu.tier == Tier::Mapped) continue;
+        if (mu.preplaced()) continue;
         mu.tier = Tier::VRAM;
         mu.site = Site::Device;
         mu.movable = false;      /* the degenerate case: the mover never runs */
@@ -546,12 +553,12 @@ int Planner::assign_all_vram(Plan* p) {
  */
 int Planner::assign_layer_offload(Plan* p) {
     for (MoveUnit& mu : p->units) {
-        if (mu.tier == Tier::Mapped) continue;
+        if (mu.preplaced()) continue;
         mu.tier = Tier::VRAM; mu.site = Site::Device;
     }
 
     int64_t total = 0;
-    for (const MoveUnit& mu : p->units) total += mu.slot_bytes;
+    for (const MoveUnit& mu : p->units) if (!mu.preplaced()) total += mu.slot_bytes;
     if (p->vram_budget <= 0 || total <= p->vram_budget) return RAD_OK;
 
     /* Layers in EXECUTION order. The layer index is normally that order already, but the order
@@ -617,7 +624,7 @@ int Planner::assign_layer_offload(Plan* p) {
     int rc = RAD_OK;
     for (size_t i = cut; i < layers.size(); ++i) {
         for (MoveUnit& mu : p->units) {
-            if (mu.layer != layers[i] || mu.tier == Tier::Mapped) continue;
+            if (mu.layer != layers[i] || mu.preplaced()) continue;
             bool host_kernel = true;
             for (rad_weight w : mu.weights) if (!host_ok_[w]) { host_kernel = false; break; }
             if (!fall.place(mu, host_kernel, &mu.reason)) {
@@ -640,7 +647,7 @@ int Planner::assign_layer_offload(Plan* p) {
 int Planner::assign_expert_tiered(Plan* p) {
     int64_t fixed = 0;
     for (MoveUnit& mu : p->units) {
-        if (mu.tier == Tier::Mapped) continue;
+        if (mu.preplaced()) continue;
         mu.tier = Tier::VRAM;
         mu.site = Site::Device;
         if (mu.access != RAD_ACCESS_CONDITIONAL) fixed += mu.slot_bytes;
@@ -964,6 +971,90 @@ void Planner::finish(const Program& prog, Plan* p) {
     }
 }
 
+/* ------------------------------------------------------------------ --host-weights */
+/* AN EMBEDDING TABLE THE OPERATOR NAMED goes to the pinned host pool before any strategy runs, and
+ * stays there. The site is DeviceZeroCopy: the host pool is mapped (Pools::configure), so the
+ * lookup kernel is handed the pool's device-side address and reads its M rows of n_embd over the
+ * link in place -- a few KiB a decode step, against a table that is the largest model-level weight
+ * a dense model has. Measured on Qwen3.8-27B at tp 2, 1.18 GiB a card: decode and prefill within
+ * noise of the table in VRAM.
+ *
+ * ONLY A LOOKUP'S WEIGHT. A GEMM operand placed this way would stream its whole shard every step,
+ * so a named weight any other op reads is refused rather than served slowly. And a layer unit is
+ * never eligible: layers belong to the offload strategies. */
+bool host_weight_match(const std::vector<std::string>& list, const std::string& name) {
+    for (const std::string& pat : list) {
+        if (pat.empty()) continue;
+        if (pat.back() == '*') {
+            if (name.compare(0, pat.size() - 1, pat, 0, pat.size() - 1) == 0) return true;
+        } else if (pat == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool read_only_by_lookups(const Program& prog, rad_weight w) {
+    bool read = false;
+    for (const OpInfo& o : prog.ops)
+        for (rad_weight ow : o.weights)
+            if (ow == w) {
+                if (o.op.compare(0, 12, "embed_lookup") != 0) return false;
+                read = true;
+            }
+    return read;
+}
+
+int Planner::pin_host_weights(const Program& prog, const Config& cfg, Plan* p) const {
+    if (cfg.host_weights.empty()) return RAD_OK;
+    std::vector<int> hits(cfg.host_weights.size(), 0);
+    int rc = RAD_OK;
+    for (MoveUnit& mu : p->units) {
+        /* build_units gives a model-level weight a unit of its own: it is the unit's one weight. */
+        if (mu.layer >= 0 || mu.weights.empty()) continue;
+        const rad_weight w = mu.weights.front();
+        const std::string& name = prog.weights[w].name;
+        bool named = false;
+        for (size_t i = 0; i < cfg.host_weights.size(); ++i)
+            if (host_weight_match({ cfg.host_weights[i] }, name)) { ++hits[i]; named = true; }
+        if (!named || mu.tier == Tier::Mapped) continue;   /* mapped is further off the card */
+        if (!read_only_by_lookups(prog, w)) {
+            RAD_ERR("placement: --host-weights names '%s', which an op other than an embedding "
+                    "lookup reads; it would stream over the link every step", name.c_str());
+            p->notes.push_back(fmt("--host-weights: '%s' is not only an embedding lookup's",
+                                   name.c_str()));
+            rc = RAD_E_INVAL;
+            continue;
+        }
+        if (mu.slot_bytes > p->host_budget) {
+            RAD_ERR("placement: --host-weights '%s' needs %s of pinned host pool and %s of "
+                    "--host-pool-mib is left%s", name.c_str(), humanb(mu.slot_bytes).c_str(),
+                    humanb(p->host_budget).c_str(),
+                    p->file_stage_reserve ? " after the file tier's staging" : "");
+            p->notes.push_back(fmt("--host-weights: '%s' (%s) does not fit the host pool",
+                                   name.c_str(), humanb(mu.slot_bytes).c_str()));
+            rc = RAD_E_NOMEM;
+            continue;
+        }
+        p->host_budget -= mu.slot_bytes;
+        p->host_weights_bytes += mu.slot_bytes;
+        mu.tier = Tier::HostPinned;
+        mu.site = Site::DeviceZeroCopy;
+        mu.movable = false;
+        mu.host_forced = true;
+        mu.reason = "--host-weights; read over the link in place";
+        RAD_INFO("placement: '%s' (%s) kept in the pinned host pool by --host-weights",
+                 name.c_str(), humanb(mu.bytes).c_str());
+    }
+    /* A NAME THAT MATCHED NOTHING is the operator's intent lost: with a derived budget the weight
+     * silently stays on the card. Each one is named. */
+    for (size_t i = 0; i < hits.size(); ++i)
+        if (!hits[i])
+            RAD_WARN("placement: --host-weights '%s' matched no model-level weight",
+                     cfg.host_weights[i].c_str());
+    return rc;
+}
+
 /* ------------------------------------------------------------------ plan */
 int Planner::plan(Plan* out) {
     if (!out || !in_.program || !in_.config) return RAD_E_INVAL;
@@ -1037,18 +1128,21 @@ int Planner::plan(Plan* out) {
         }
     }
 
+    /* NOT a RAD_TRY: a refusal still leaves `out` filled in far enough to print. */
+    const int hrc = pin_host_weights(prog, cfg, out);
+
     int rc = assign(out);
     enforce_op_site_agreement(prog, out);
     schedule_prefetch(out);
     finish(prog, out);
-    return rc;
+    return hrc < 0 ? hrc : rc;
 }
 
 int Planner::assign(Plan* p) {
     int64_t total = 0;
     bool has_conditional = false;
     for (const MoveUnit& mu : p->units) {
-        total += mu.slot_bytes;
+        if (!mu.preplaced()) total += mu.slot_bytes;
         if (mu.access == RAD_ACCESS_CONDITIONAL) has_conditional = true;
     }
 
@@ -1136,7 +1230,7 @@ std::string Plan::report(const Program& prog) const {
              humanb(totals.bytes[(int)Tier::VRAM]).c_str());
     s += fmt("  host pinned   %12s  %12s\n",
              host_budget > 0 ? humanb(host_budget).c_str() : "none",
-             humanb(totals.bytes[(int)Tier::HostPinned]).c_str());
+             humanb(totals.bytes[(int)Tier::HostPinned] - host_weights_bytes).c_str());
     if (totals.bytes[(int)Tier::HostPageable])
         s += fmt("  host pageable %12s  %12s\n", "-",
                  humanb(totals.bytes[(int)Tier::HostPageable]).c_str());
@@ -1156,6 +1250,10 @@ std::string Plan::report(const Program& prog) const {
         s += fmt("  file staging  %12s  %12s   (%d slots%s, pinned)\n", "-",
                  humanb(file_stage_reserve).c_str(), RAD_PLACE_FILE_STAGE_SLOTS,
                  file_windows ? fmt(" and %d read windows", RAD_PLACE_FILE_WINDOWS).c_str() : "");
+    /* The same, for --host-weights: out of --host-pool-mib before any strategy, read in place. */
+    if (host_weights_bytes)
+        s += fmt("  host weights  %12s  %12s   (--host-weights, pinned, read in place)\n", "-",
+                 humanb(host_weights_bytes).c_str());
     /* Out of the VRAM weight budget, beside the residents and not among them: the two buffers a
      * routed layer's file-tier experts are read into, each sized to the layer that puts the most
      * there. */

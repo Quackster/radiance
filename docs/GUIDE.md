@@ -468,7 +468,21 @@ Related flags:
 --gpu-headroom-mib 96      # VRAM left unclaimed on every card
 --kv-cache-dtype fp8       # halve what a token of context costs (a real quantisation)
 --host-pool-mib 8192       # pinned host tier for weights
+--host-weights token_embd.weight   # the embedding table off the card (below)
 --weights-disk-tier       # stream what fits neither from the container; needs O_DIRECT
+```
+
+**`--host-weights` takes the embedding table off the card.** It is the largest model-level weight a
+dense model has -- 248320 x 5120 in bf16 is 1.18 GiB a card at `--tp 2` -- and a step reads only its
+rows: M of them, a few KiB at decode. Named here, it is placed in the pinned host pool before any
+strategy runs and the lookup kernel reads it over the link in place, so it costs no VRAM and the
+KV pool gets its share. On Qwen3.8-27B at two 16 GiB cards decode and prefill measured within noise
+of the table on the card, against ~73K more tokens of context. The pool must hold it
+(`--host-pool-mib`, every rank its own shard), a derived split leaves it out of the weight budget,
+and a name any other op reads -- a head, a GEMM operand -- is refused: it would stream every step.
+
+```sh
+radiance --model m.rad --tp 2 --host-pool-mib 1280 --host-weights token_embd.weight
 ```
 
 **A model larger than the card and the host pool together still serves with
@@ -843,6 +857,7 @@ one line naming each one the command line moved.
 | `--vram-kv-mib N` | derive | the paged KV pool |
 | `--kv-cache-dtype T` | bf16 | `bf16` or `fp8` |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
+| `--host-weights NAMES` | none | embedding tables kept in the pinned host pool and read in place over the link (comma-separated, a trailing `*` matches a prefix); charged to `--host-pool-mib`, and only a weight embedding lookups alone read is accepted. See §4.3 |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
 
 **Idle session tiers**

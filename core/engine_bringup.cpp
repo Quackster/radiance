@@ -742,7 +742,7 @@ int Engine::plan() {
              * already this card's even share of the static weights: declare ran once per rank
              * with every dimension divided. */
             WeightFootprint wf;
-            weight_footprint(r->program, &wf);
+            weight_footprint(r->program, &wf, cfg_.host_weights);
             f.statics = wf.statics;
             f.experts = wf.experts;
             /* THE STAGING REGION IS SIZED ONLY WHERE THE ARENA LENDS ITS TOP: with no smaller level

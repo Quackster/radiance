@@ -616,6 +616,11 @@ struct Config {
     bool    weights_disk_tier = false;
 
     std::string placement = "auto";    /* all_vram | layer_offload | expert_tiered | auto */
+    /* MODEL-LEVEL WEIGHTS KEPT IN THE PINNED HOST POOL by name, comma-separated (a trailing '*'
+     * matches a prefix). The device kernel reads them over the link in place (DeviceZeroCopy), so
+     * this is for a gather -- the embedding table, of which a step reads a few rows -- and not for
+     * a GEMM operand. Charged to --host-pool-mib; every strategy leaves them where they are. */
+    std::vector<std::string> host_weights;
     bool    deterministic = false;
     int64_t checkpoint_interval = 2048;   /* linear-state checkpoints (spec §7.3) */
     /* HOW MANY LINEAR-STATE SNAPSHOTS THE SERVER MAY HOLD AT ONCE -- a CAP and not a charge.

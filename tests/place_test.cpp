@@ -2250,7 +2250,7 @@ TEST(the_weight_footprint_splits_statics_from_the_elastic_expert_plane) {
     int64_t declared = 0;
     for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w)
         declared += weight_bytes(f.prog.weights[w]);
-    CHECK_EQ(fp.statics + fp.experts + fp.mapped, declared);
+    CHECK_EQ(fp.statics + fp.experts + fp.mapped + fp.hosted, declared);
 }
 
 TEST(weights_in_one_layer_are_one_unit_and_are_aligned_once_each) {
@@ -2304,6 +2304,93 @@ TEST(a_weight_with_no_device_band_takes_its_whole_unit_to_the_mapped_tier) {
     CHECK_EQ(fp.n_units, 1ll);
     CHECK_EQ(fp.statics, 0ll);
     CHECK_EQ(fp.mapped, 6 * MiB);          /* both weights: the unit is what moves */
+}
+
+/* --host-weights. The fixture's embedding is read by an `embed_lookup`, as every arch declares it:
+ * that is the only reader the flag accepts. */
+void build_dense_lookup(Fixture& f, int layers, int64_t per_layer) {
+    const rad_weight m = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed_lookup", {m}, false);
+    for (int l = 0; l < layers; ++l) {
+        const rad_weight w = f.weight("blk." + std::to_string(l) + ".ffn_down.weight", per_layer,
+                                      RAD_ACCESS_PER_TOKEN, l, -1);
+        f.op("gemm", {w}, false);
+    }
+    const rad_weight o = f.weight("output.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("logits_gemm", {o}, false);
+}
+
+/* A HOSTED WEIGHT IS IN THE HOST POOL, NOT ON THE CARD, and the footprint has to say so: the
+ * resolver sizes a derived weight budget from `statics`, so a hosted weight counted there would
+ * reserve VRAM the planner never spends. */
+TEST(host_weights_leave_the_statics_for_the_hosted_bucket) {
+    Fixture f;
+    build_dense_lookup(f, /*layers=*/2, /*per_layer=*/4 * MiB);
+
+    WeightFootprint fp;
+    weight_footprint(f.prog, &fp, {"token_embd.weight"});
+    CHECK_EQ(fp.hosted, 1 * MiB);
+    CHECK_EQ(fp.statics, 2 * 4 * MiB + 1 * MiB);
+
+    weight_footprint(f.prog, &fp, {"token_*"});         /* a trailing '*' is a prefix */
+    CHECK_EQ(fp.hosted, 1 * MiB);
+
+    /* NEITHER A LAYER WEIGHT NOR A GEMM'S: layers belong to the offload strategies, and a GEMM
+       operand would stream every step. */
+    weight_footprint(f.prog, &fp, {"blk.*", "output.weight"});
+    CHECK_EQ(fp.hosted, 0ll);
+
+    weight_footprint(f.prog, &fp);                      /* and none named is none hosted */
+    CHECK_EQ(fp.hosted, 0ll);
+    CHECK_EQ(fp.statics, 2 * 4 * MiB + 2 * MiB);
+}
+
+TEST(host_weights_go_to_the_pinned_pool_read_in_place_and_cost_no_vram) {
+    Fixture f;
+    build_dense_lookup(f, /*layers=*/2, /*per_layer=*/4 * MiB);
+    Config cfg = base_config();
+    cfg.placement = "all_vram";
+    cfg.vram_weights_mib = 9;           /* layers and the head exactly: not the embedding */
+    cfg.host_pool_mib = 2;
+    cfg.host_weights = {"token_embd.weight"};
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+
+    const rad_weight emb = 1;           /* declared first */
+    CHECK(plan.weight[emb].tier == Tier::HostPinned);
+    CHECK(plan.weight[emb].site == Site::DeviceZeroCopy);
+    CHECK(!plan.units[(size_t)plan.weight[emb].unit].movable);
+    CHECK_EQ(plan.host_weights_bytes, 1 * MiB);
+    for (rad_weight w = 2; (size_t)w < f.prog.weights.size(); ++w)
+        CHECK(plan.weight[w].tier == Tier::VRAM);
+}
+
+TEST(host_weights_that_a_gemm_reads_are_refused) {
+    Fixture f;
+    build_dense_lookup(f, /*layers=*/1, /*per_layer=*/4 * MiB);
+    Config cfg = base_config();
+    cfg.placement = "all_vram";
+    cfg.host_pool_mib = 4;
+    cfg.host_weights = {"output.weight"};
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_EQ(Planner(in).plan(&plan), RAD_E_INVAL);
+    CHECK(!plan.notes.empty());
+}
+
+TEST(host_weights_that_do_not_fit_the_host_pool_are_refused_with_the_plan_filled_in) {
+    Fixture f;
+    build_dense_lookup(f, /*layers=*/1, /*per_layer=*/4 * MiB);
+    Config cfg = base_config();
+    cfg.placement = "all_vram";
+    cfg.host_pool_mib = 0;              /* nowhere to put it */
+    cfg.host_weights = {"token_embd.weight"};
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_EQ(Planner(in).plan(&plan), RAD_E_NOMEM);
+    CHECK_EQ(plan.weight.size(), f.prog.weights.size());   /* finish() ran: the report prints */
+    CHECK(!plan.notes.empty());
 }
 
 TEST(an_empty_program_has_an_empty_footprint) {
