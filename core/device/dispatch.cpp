@@ -20,6 +20,8 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <cstdint>
 
 namespace rad {
 
@@ -113,7 +115,16 @@ const char* device_backend_name() { return dev()->name; }
  * exactly that reason -- the ledger says what the core spent, the card says what was spent.
  *
  * RADIANCE_TRACE_ALLOC=N logs every allocation of at least N bytes as it happens. That is the
- * instrument; the counters are the summary. */
+ * instrument; the counters are the summary.
+ *
+ * RADIANCE_POISON_ALLOC=B fills every fresh DEVICE allocation with byte B (0..255) before it is
+ * handed out, so a buffer that is read before anything wrote it shows up as garbage rather than
+ * as the zeros a wiped card hands back by luck. A card that has just been through a driver reset
+ * ("VRAM is lost") is that garbage for real, which is where such a read is otherwise first seen.
+ * RADIANCE_POISON_RANGE=lo:hi narrows the fill to device allocations with ordinal in [lo, hi) --
+ * ordinals count from 1 in allocation order ON THE ALLOCATING THREAD, the `#n on this thread` the
+ * trace prints -- to bisect to the one allocation that matters. Both are debug knobs: the fill is synchronous and costs a stream a
+ * call. */
 namespace rad {
 namespace {
 
@@ -136,6 +147,28 @@ int64_t trace_floor() {
         return x >= 0 ? (int64_t)x : (int64_t)0;
     }();
     return v;
+}
+
+/* -1 when off; otherwise the byte. */
+int poison_byte() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_POISON_ALLOC");
+        if (!e || !*e) return -1;
+        const long x = std::atol(e);
+        return (x >= 0 && x <= 255) ? (int)x : 255;
+    }();
+    return v;
+}
+
+/* [lo, hi) over device-allocation ordinals; the whole run when unset. */
+bool poison_in_range(int64_t ordinal) {
+    static const std::pair<int64_t, int64_t> r = [] {
+        const char* e = std::getenv("RADIANCE_POISON_RANGE");
+        long long lo = 0, hi = INT64_MAX;
+        if (e && *e && std::sscanf(e, "%lld:%lld", &lo, &hi) < 1) { lo = 0; hi = INT64_MAX; }
+        return std::make_pair((int64_t)lo, (int64_t)hi);
+    }();
+    return ordinal >= r.first && ordinal < r.second;
 }
 
 const char* kind_name(int kind) {
@@ -372,16 +405,36 @@ int  rad_dev_props(int device, RadDeviceProps* o)  { return dev()->props(device,
 int  rad_dev_enable_peer(int self, int peer)      { return dev()->enable_peer(self, peer); }
 
 void* rad_dev_alloc(int64_t bytes, int kind) {
+    /* The poison range is over THIS THREAD's device allocations, because a rank brings itself up on
+     * its own thread in a fixed order while the threads interleave freely: a process-wide ordinal
+     * would name a different allocation on every run, and a bisect over it would not converge. */
+    thread_local int64_t t_device_ordinal = 0;
     void* p = dev()->alloc(bytes, kind);
     if (p && kind >= 0 && kind < 4) {
         rad::g_ledger[kind].bytes.fetch_add(bytes, std::memory_order_relaxed);
-        rad::g_ledger[kind].count.fetch_add(1, std::memory_order_relaxed);
+        const int64_t total = rad::g_ledger[kind].count.fetch_add(1, std::memory_order_relaxed) + 1;
+        const int64_t ordinal = kind == RAD_MEM_DEVICE ? ++t_device_ordinal : total;
         const int64_t floor_ = rad::trace_floor();
         if (floor_ >= 0 && bytes >= floor_)
-            RAD_INFO("alloc %s %s (%lld live in %lld allocations)", rad::kind_name(kind),
-                     rad::humanb(bytes).c_str(),
+            RAD_INFO("alloc %s %s (#%lld on this thread; %lld live in %lld allocations)",
+                     rad::kind_name(kind), rad::humanb(bytes).c_str(), (long long)ordinal,
                      (long long)rad::g_ledger[kind].bytes.load(std::memory_order_relaxed),
-                     (long long)rad::g_ledger[kind].count.load(std::memory_order_relaxed));
+                     (long long)total);
+        /* The poison fill (see the top of this file). Through the backend's own stream so it
+         * holds on both backends; synchronous, so the bytes are there before the caller sees p. */
+        const int poison = rad::poison_byte();
+        if (poison >= 0 && kind == RAD_MEM_DEVICE && rad::poison_in_range(ordinal)) {
+            RadStream s = nullptr;
+            if (dev()->stream_create(&s, 0) == RAD_OK) {
+                if (dev()->memset_async(p, poison, bytes, s) != RAD_OK || dev()->stream_sync(s) != RAD_OK)
+                    RAD_WARN("poison: device allocation #%lld (%s) was not filled",
+                             (long long)ordinal, rad::humanb(bytes).c_str());
+                else if (floor_ >= 0 && bytes >= floor_)
+                    RAD_INFO("poison: device allocation #%lld filled with 0x%02x", (long long)ordinal,
+                             poison);
+                dev()->stream_destroy(s);
+            }
+        }
     }
     return p;
 }
