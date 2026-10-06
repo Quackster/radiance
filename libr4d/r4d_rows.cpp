@@ -1100,6 +1100,10 @@ static const RadParamSpec pQsaBlockKey[] = {
      * its `sections`, read against a [3, M] component-major `pos` list. Absent is NeoX. */
     { "mode",       RAD_P_STR, RAD_OPTIONAL },
     { "sections",   RAD_P_STR, RAD_OPTIONAL },
+    { "yarn_factor", RAD_P_F64, RAD_OPTIONAL },
+    { "yarn_low", RAD_P_F64, RAD_OPTIONAL },
+    { "yarn_high", RAD_P_F64, RAD_OPTIONAL },
+    { "yarn_magnitude", RAD_P_F64, RAD_OPTIONAL },
 };
 static const RadOperandSpec oQsaBlockKey[] = {
     { "k",    RAD_OPD_IN,     0 },

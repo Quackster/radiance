@@ -1,15 +1,30 @@
-# Static YaRN for Qwen dense FP8 and DFlash2
+# Static YaRN for Qwen architectures
 
 Increasing `--max-model-len` reserves a larger serving window; it does not change
 the model's rotary embeddings. A Qwen checkpoint trained at 262144 positions can
 explicitly request static YaRN for a 524288-token deployment. Whether that extension
 preserves useful accuracy must be measured on the model and workload.
 
-The Qwen dense FP8 architecture reads the target's `text_config.rope_parameters`,
+The Qwen architectures read the target's `text_config.rope_parameters`,
 then `rope_parameters`, then their legacy `rope_scaling` spellings, in that order.
 The first object with `rope_type` (or legacy `type`) is authoritative. The DFlash2
 drafter reads its own `draft.rope_parameters` / `draft.rope_scaling`; it does not
 inherit the target's scaling. The vision tower keeps its original axial rotations.
+
+## Coverage
+
+| Architecture | Rotary paths | Validation so far |
+| --- | --- | --- |
+| `qwen35_fp8` | Target direct/table; independent DFlash2 | Qwen3.8-27B FP8: text/tool/image checks, 499997-token retrieval and two concurrent 255981-token retrievals, TP4/BF16 KV |
+| `qwen35_bf16` | Target direct rotary | Architecture declaration and shared numerical tests; no end-to-end BF16 model run yet |
+| `qwen35moe_fp8` | Shared Qwen35 target and MTP geometry | Shares implementation; model qualification pending |
+| `qwen4exp_fp8` | Attention, indexer, compressed block keys and shared MTP geometry | Architecture declarations and compressed-key GPU numerical checks; model qualification pending |
+
+Radiance 1.2.0 also serves the published Qwen3.8-27B MXFP4 container through the
+Qwen35 FP8 architecture's encoding dispatch. Its model qualification is pending.
+Synthetic retrieval is evidence for those requests, not a general accuracy benchmark
+or a capacity guarantee for other model sizes. Original-context quality should be
+checked alongside extended-context quality when deploying static YaRN.
 
 ## Metadata
 

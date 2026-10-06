@@ -31,6 +31,7 @@
 
 #include "r4d.h"
 #include "r4d_args.h"
+#include "rad_yarn.h"
 #include "r4d_emit.h"
 #include "r4d_common.h"   // r4d_wave_sum
 
@@ -61,7 +62,7 @@ __global__ __launch_bounds__(kMaxN) void qsa_block_key_kernel(
     const int32_t* __restrict__ page, const int32_t* __restrict__ bpos,
     uint16_t* __restrict__ out,
     int n, int ratio, int rot, float eps, float wadd, float theta, float rscale,
-    long long pos0, int k_ld, int o_ld, int mode, int s0, int s1, int s2, int bstep, int mc) {
+    long long pos0, int k_ld, int o_ld, int mode, int s0, int s1, int s2, int bstep, int mc, RadYarn yarn) {
 
     __shared__ float sh[kMaxN];
     __shared__ float red[kMaxN / 32];
@@ -114,9 +115,10 @@ __global__ __launch_bounds__(kMaxN) void qsa_block_key_kernel(
         const long long bp = bpos ? (long long)bpos[(size_t)b * bstep + comp]
                                   : (pos0 + (long long)b * ratio);
         const float p = (float)bp / (rscale != 0.0f ? rscale : 1.0f);
-        const float iv = 1.0f / powf(theta, (float)(2 * ci) / (float)rot);
+        const float iv = yarn.frequency(1.0f / powf(theta, (float)(2 * ci) / (float)rot), ci);
         float s, c;
         sincosf(p * iv, &s, &c);
+        if (yarn.factor != 0.0f) { c *= yarn.magnitude; s *= yarn.magnitude; }
         const float xp = sh[pt];
         res = first ? (res * c - xp * s) : (xp * s + res * c);
     }
@@ -148,7 +150,7 @@ static int r4d_qsa_block_key_bf16_emit(long k, long w, long page, long bpos, lon
                                       int n, int ratio, int rot, float eps, float wadd,
                                       float theta, float rscale, long long pos0, int k_ld,
                                       int o_ld, int mode, int s0, int s1, int s2, int bstep, int mc,
-                                      const R4dSink& sk) {
+                                      const R4dSink& sk, RadYarn yarn = {}) {
     int emit_rc = RAD_OK;
     if (!k || !w || !out) return -1;
     if (M <= 0 || n <= 0 || n > kMaxN || ratio <= 0) return -2;
@@ -162,7 +164,7 @@ static int r4d_qsa_block_key_bf16_emit(long k, long w, long page, long bpos, lon
     emit_rc = R4D_EMIT(sk, qsa_block_key_kernel, dim3((unsigned)M), dim3((unsigned)thr), 0, (const uint16_t*)k, (const float*)w,
                        (const int32_t*)page, (const int32_t*)bpos, (uint16_t*)out,
                        n, ratio, rot, eps, wadd, theta, rscale, pos0, k_ld, o_ld, mode, s0, s1,
-                       s2, bstep, mc);
+                        s2, bstep, mc, yarn);
     return emit_rc == RAD_OK && (sk.desc || hipGetLastError() == hipSuccess) ? 0 : -4;
 }
 
@@ -244,12 +246,16 @@ static int r4d_rad_qsa_block_key_body(const RadArgs* a, const R4dSink& sk) {
     if (r4d_numel(w) < n) return R4D_NO(RAD_E_SHAPE);
     const long long kp = r4d_row_pitch(k), op = r4d_row_pitch(o);
     if (kp < 0 || op < 0) return R4D_NO(RAD_E_STRIDE);
+    const RadYarn yarn = rad_yarn_args(a);
+    if (!rad_yarn_valid(yarn) ||
+        (yarn.factor != 0.0f && (rot <= 0 || r4d_getf(a, "scale", 1.0) != 1.0)))
+        return R4D_NO(RAD_E_INVAL);
     const int e = r4d_qsa_block_key_bf16_emit(
         r4d_addr(k), r4d_addr(w), r4d_addr(pg), r4d_addr(bp), r4d_addr(o),
         (int)M, (int)n, (int)ratio, (int)rot,
         (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 1.0),
         (float)r4d_getf(a, "theta", 10000.0), (float)r4d_getf(a, "scale", 1.0),
-        pos0, (int)kp, (int)op, mode, sec[0], sec[1], sec[2], bstep, mc, sk);
+        pos0, (int)kp, (int)op, mode, sec[0], sec[1], sec[2], bstep, mc, sk, yarn);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 

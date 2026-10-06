@@ -269,7 +269,7 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
     /* UNDER M-RoPE a block key rotates at its first token's three components, which qsa_work
      * writes into a [work, 3] `bpos` when it is handed the step's rotary planes. */
     op_bkey = g.rope_mc
-        ? RAD_OP(b, "qsa_block_key",
+        ? decl_rotary(b, g, "qsa_block_key",
                  RAD_PARAMS(RAD_RANGE("M", 1, c.max_work), RAD_INT("n", c.head_dim),
                             RAD_INT("ratio", c.ratio), RAD_INT("rotary_dim", c.rot),
                             RAD_INT("block_size", c.ratio),
@@ -278,7 +278,7 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                             RAD_STR("dtype", g.dtype), RAD_STR("mode", g.rope_mode),
                             RAD_STR("sections", g.rope_sections)),
                  RAD_WEIGHTS(w_kn))
-        : RAD_OP(b, "qsa_block_key",
+        : decl_rotary(b, g, "qsa_block_key",
                  RAD_PARAMS(RAD_RANGE("M", 1, c.max_work), RAD_INT("n", c.head_dim),
                             RAD_INT("ratio", c.ratio), RAD_INT("rotary_dim", c.rot),
                             RAD_INT("block_size", c.ratio),

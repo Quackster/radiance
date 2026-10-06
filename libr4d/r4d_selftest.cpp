@@ -8658,6 +8658,51 @@ static void qsa_score_rows_case(const Plugin& pl) {
  * block's worth of angle, which is the mistake a reader makes when they take the position of the
  * block's LAST token instead of its first, and it is invisible in magnitude: the vectors stay the
  * same length and point somewhere else. rel_l2 is what sees it. */
+static void qsa_block_key_yarn_case(const Plugin& pl) {
+    const char* what = "qsa_block_key YaRN vs independent ROCm vectors through 524287";
+    const RadKernelInfo* r = find(pl, "qsa_block_key_bf16");
+    if (!r) { ok(what, false, "row absent"); return; }
+    const std::string here = __FILE__;
+    std::ifstream input(here.substr(0, here.find_last_of('/')) + "/../tests/data/yarn_reference_rocm.json");
+    if (!input) { ok(what, false, "fixture absent"); return; }
+    const auto fixture = nlohmann::json::parse(input);
+    const auto positions = fixture["positions"].get<std::vector<int32_t>>();
+    const auto& c = fixture["cases"][0];
+    const int64_t M = positions.size(), n = 128, ratio = 4;
+    /* Identical unit keys make the block mean exactly one. Unit gain and eps=0
+     * make the norm exactly one too, isolating the compressed-key rotation. */
+    std::vector<uint16_t> keys(M * ratio * n, h_to_bf16(1.0f));
+    std::vector<float> gains(n, 1.0f);
+    void* dk = dalloc(keys.size()*2), *dw = dalloc(gains.size()*4);
+    void* dp = dalloc(M*4), *dout = dalloc(M*n*2);
+    st_memcpy(dk, keys.data(), keys.size()*2, hipMemcpyHostToDevice);
+    st_memcpy(dw, gains.data(), gains.size()*4, hipMemcpyHostToDevice);
+    st_memcpy(dp, positions.data(), M*4, hipMemcpyHostToDevice);
+    std::vector<RadTensor> ts = {T(dk, RAD_BF16, {M*ratio,n}), T(dw, RAD_F32, {n}),
+        T(nullptr, RAD_I32, {M}), T(dp, RAD_I32, {M}), T(dout, RAD_BF16, {M,n})};
+    std::vector<RadParam> ps = {PI("M",M), PI("n",n), PI("ratio",ratio), PI("rotary_dim",64),
+        PF("eps",0), PF("theta",1e7), PF("scale",1), PF("wadd",0), PS("dtype","bf16"),
+        PF("yarn_factor",2), PF("yarn_low",14), PF("yarn_high",22), PF("yarn_magnitude",1.069314718)};
+    RadArgs a{}; a.t=ts.data(); a.n_t=ts.size(); a.p=ps.data(); a.n_p=ps.size();
+    bool passed = r->launch(&a,nullptr) == RAD_OK;
+    st_stream_sync(nullptr);
+    std::vector<uint16_t> got(M*n);
+    st_memcpy(got.data(),dout,got.size()*2,hipMemcpyDeviceToHost);
+    double worst=0;
+    for (int64_t m=0;m<M;++m) for (int i=0;i<n;++i) {
+        double expected=1;
+        if (i<64) {
+            const int j=i%32;
+            const double cosine=c["cos"][m][j], sine=c["sin"][m][j];
+            expected=i<32 ? cosine-sine : cosine+sine;
+        }
+        const double actual=h_bf16(got[m*n+i]);
+        passed = passed && std::isfinite(actual);
+        worst=std::max(worst,std::abs(actual-expected));
+    }
+    ok(what,passed && worst<=0.008,"worst absolute BF16 error "+std::to_string(worst));
+}
+
 static void qsa_block_key_case(const Plugin& pl) {
     const char* what = "qsa_block_key vs an f64 evaluation of the same formula";
     const RadKernelInfo* r = find(pl, "qsa_block_key_bf16");
@@ -11057,6 +11102,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("qsa_block_key_bf16")) {
         if (!g_case) std::printf("\nthe QSA compressed key, against the formula it implements\n");
         qsa_block_key_case(pl);
+        qsa_block_key_yarn_case(pl);
     }
 
     if (sel("moe_gemm_w4a8")) {

@@ -1572,6 +1572,35 @@ RadModelMeta qwen4exp_meta() {
  * convert and at load. Asked about a model whose recipe made them int4-rotated, E4M3 rows and u2,
  * it declares the rotated expert kernels, the E4M3 mix and the 2-bit head; asked about one with
  * nothing behind it, the fp8 experts and the bf16 mix. */
+TEST(qwen4exp_yarn_reaches_attention_indexer_and_compressed_keys) {
+    RadModelMeta meta = qwen4exp_meta();
+    std::vector<const char*> keys(meta.kv_key, meta.kv_key + meta.n_kv);
+    std::vector<const char*> vals(meta.kv_val, meta.kv_val + meta.n_kv);
+    keys.insert(keys.end(), {"text_config.rope_parameters.rope_type", "text_config.rope_parameters.factor",
+                            "text_config.rope_parameters.original_max_position_embeddings"});
+    vals.insert(vals.end(), {"yarn", "2", "262144"});
+    meta.n_kv = (int)keys.size(); meta.kv_key = keys.data(); meta.kv_val = vals.data();
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 2048; c.max_seqs = 8; c.max_spec = 3; c.max_ctx = 524288;
+    RadBuilder b;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    int direct = 0, table = 0, compressed = 0;
+    for (const auto& op : b.ops) {
+        if (op.op == "rope") ++direct;
+        else if (op.op == "rope_table") ++table;
+        else if (op.op == "qsa_block_key") ++compressed;
+        else continue;
+        int found = 0;
+        for (const auto& p : op.p) {
+            if (p.key == "yarn_factor") { CHECK_EQ(p.dval, 2.0); ++found; }
+            if (p.key == "yarn_magnitude") { CHECK_NEAR(p.dval, 1.069314718, 1e-7); ++found; }
+            if (p.key == "scale") CHECK_EQ(p.dval, 1.0);
+        }
+        CHECK_EQ(found, 2);
+    }
+    CHECK(direct > 0); CHECK(table > 0); CHECK(compressed > 0);
+}
+
 TEST(the_encodings_the_model_holds_choose_the_flash_next_kernels) {
     RadModelMeta meta = qwen4exp_meta();
     RadEncoding w4 = rad_enc_affine(RAD_I4, RAD_BF16, 1, 128);

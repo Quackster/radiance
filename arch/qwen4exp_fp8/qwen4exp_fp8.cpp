@@ -364,6 +364,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             return RAD_E_INVAL;
         }
     }
+    RAD_ARCH_TRY(yarn_from(g, meta, "", m.n_rot));
     /* THERE IS NO BRING-UP SLICE, and the rule is worth stating: if a model ever arrives too large
      * for the target device, the answer is a converter flag that writes a NAMED partial container
      * -- not an environment variable that makes a full one silently mean something else. A slice
@@ -1000,7 +1001,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * one step; the symptom is fluent output with one arm of the model reading the other's
      * leftovers, which nothing downstream flags.
      */
-    m.op_rope_cs = rw(b, RAD_OP(b, "rope_table",
+    m.op_rope_cs = rw(b, decl_rotary(b, g, "rope_table",
                          RAD_PARAMS(RAD_RANGE("M", 1, qk_fuse_rows(g)),
                                     RAD_INT("rot", m.n_rot), RAD_F64("theta", g.theta),
                                     RAD_F64("scale", g.rope_scale), RAD_STR("dtype", "f32")),
