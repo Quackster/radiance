@@ -54,6 +54,9 @@ struct AttnGatedFP8 {
          * (Geom::w_bf16) only: there the gate is `sigmoid` then `mul`, rad_block_attn_gated.h's
          * pair, and the fp8 path's fused gate-and-quantiser has no form that skips its codes. */
         rad_buf gate = 0;
+        /* [max_tok, qg_dim + 2*kv_dim] -- the ONE projection when the block fuses q|gate, k and v
+         * (`fuse_qkv`); 0 otherwise. */
+        rad_buf qkv  = 0;
     };
 
     struct Src {
@@ -137,6 +140,18 @@ struct AttnGatedFP8 {
     /* The input was normed and quantised by the caller; this block declares no norm. */
     bool       ext_in = false;
     LinearFP8  qg{}, kp{}, vp{}, o{};
+    /* Q|GATE, K AND V AS ONE GEMM, set by the architecture before declare(). An OCP-MXFP4 weight
+     * has its scale group along K, so the three projections concatenate along rows into one
+     * [qg_dim + 2*kv_dim, n_embd] weight over the same normed activation -- one launch where k and
+     * v were two of their own at ~2.6 MB each, which at decode are almost all fixed cost. The gate
+     * consumers read [q|gate] as rows a HEAD at a pitch of 2*head_dim, which a column view of the
+     * fused row cannot give, so on the UNFUSED paths [q|gate] is copied out (`op_cqg`, one bf16
+     * row copy). On the fused prologue's path nothing is copied: the prologue reads q|gate, k and v
+     * as column views of the fused row and writes the gate to `w.qg` itself (`gate_out`, a
+     * contiguous [T, q_dim] -- see step()); the unfused path copies k and v out too. */
+    bool       fuse_qkv = false;
+    LinearFP8  qkv{};
+    rad_op     op_cqg = 0, op_ck = 0, op_cv = 0;
     NormQuantFP8 nq_h{};
 
     rad_op     op_fused = 0;                                 /* qk_norm_rope_gate, if it resolves */
@@ -262,15 +277,35 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                          RAD_NOWEIGHTS),
                      {}, {w.h.x});
     } else {
-    RAD_ARCH_TRY(qg.declare(b, nm, g, nm.f("blk.%d.attn_qg", l), qg_dim, g.n_embd,
-                            RAD_SHARD_ROW, grp_layer(l), { src.qg }, w.h, w.qg,
-                            0, {}, qg_span_lo, qg_span_hi));
-    RAD_ARCH_TRY(kp.declare(b, nm, g, nm.f("blk.%d.attn_k", l), kv_dim, g.n_embd,
-                            RAD_SHARD_ROW, grp_layer(l), { src.k }, w.h, w.k,
-                            0, {}, kv_span_lo, kv_span_hi));
-    RAD_ARCH_TRY(vp.declare(b, nm, g, nm.f("blk.%d.attn_v", l), kv_dim, g.n_embd,
-                            RAD_SHARD_ROW, grp_layer(l), { src.v }, w.h, w.v,
-                            0, {}, kv_span_lo, kv_span_hi));
+    if (fuse_qkv) {
+        /* the fused weight has no KV row span: it needs world <= n_head_kv_all (arch gates it) */
+        if (kv_spanned) return RAD_E_INVAL;
+        if (!w.qkv) return RAD_E_INVAL;
+        RAD_ARCH_TRY(qkv.declare(b, nm, g, nm.f("blk.%d.attn_qkv", l), qg_dim + 2 * kv_dim, g.n_embd,
+                                 RAD_SHARD_ROW, grp_layer(l), { src.qg, src.k, src.v }, w.h, w.qkv,
+                                 0, { qg_dim, kv_dim, kv_dim }));
+        auto cp = [&](int64_t n, rad_buf dst) {
+            return rw(b, RAD_OP(b, "cast",
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n),
+                                     RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
+                          RAD_NOWEIGHTS),
+                      {w.qkv}, {dst});
+        };
+        op_cqg = cp(qg_dim, w.qg);
+        op_ck  = cp(kv_dim, w.k);
+        op_cv  = cp(kv_dim, w.v);
+        if (!op_cqg || !op_ck || !op_cv) return RAD_E_INVAL;
+    } else {
+        RAD_ARCH_TRY(qg.declare(b, nm, g, nm.f("blk.%d.attn_qg", l), qg_dim, g.n_embd,
+                                RAD_SHARD_ROW, grp_layer(l), { src.qg }, w.h, w.qg,
+                                0, {}, qg_span_lo, qg_span_hi));
+        RAD_ARCH_TRY(kp.declare(b, nm, g, nm.f("blk.%d.attn_k", l), kv_dim, g.n_embd,
+                                RAD_SHARD_ROW, grp_layer(l), { src.k }, w.h, w.k,
+                                0, {}, kv_span_lo, kv_span_hi));
+        RAD_ARCH_TRY(vp.declare(b, nm, g, nm.f("blk.%d.attn_v", l), kv_dim, g.n_embd,
+                                RAD_SHARD_ROW, grp_layer(l), { src.v }, w.h, w.v,
+                                0, {}, kv_span_lo, kv_span_hi));
+    }
 
     /* THE FUSED PROLOGUE, AND IT IS A PROBE: the four ops below are declared either way and are
      * what runs when nothing serves this one. rad_block_attn_gated.h does not make the probe,
@@ -283,9 +318,13 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
      * where mrope reduces to neox -- one position component a token, which is every text batch and
      * is argued in rad_block_attn_gated.h. A vision span would need the sections first.
      *
-     * NO `gate_out`. `gate_quant_fp8` below already reads the gate at its column offset inside the
+     * `gate_out` IS PASSED ONLY WITH THE FUSED PROJECTION (`fuse_qkv`). When q|gate has its own
+     * GEMM output, `gate_quant_fp8` below reads the gate at its column offset inside the
      * interleaved projection, so a contiguous copy would be q_dim of bf16 a layer written for
-     * nothing. The operand is optional and this passes none.
+     * nothing and the operand is passed absent. With `fuse_qkv` the interleaved row is a column
+     * view of a wider one, which gate_quant_fp8 cannot read as (token, head) rows (tq_pitch), so
+     * the block used to copy q|gate out first (`op_cqg`); the prologue already walks every gate
+     * element to split the pair, and storing it contiguously into `w.qg` replaces that copy.
      *
      * IT IS BIT-IDENTICAL TO THE FOUR, checked in r4d_selftest (`qk_norm_rope_gate ... matches the
      * unfused pair`) rather than argued: the kernel rounds its norm output to bf16 before rotating
@@ -382,6 +421,14 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                                        RAD_STR("kv_dtype", g.kv_dtype)),
                             RAD_WEIGHTS(w_q_norm, w_k_norm)),
                          {w.qg, w.k, w.cos_sin, w.v}, {w.q, w.k});
+    if (fuse_qkv) {
+        if (op_fused) RAD_ARCH_TRY(rad_op_reads(b, op_fused, &w.qkv, 1));
+        if (op_fused_kv) RAD_ARCH_TRY(rad_op_reads(b, op_fused_kv, &w.qkv, 1));
+        /* `gate_out` lands in w.qg (step(): gate_direct), so both ops write it as well as read it
+         * -- the declared lifetime has to cover the touch or the issue check refuses it. */
+        if (op_fused) RAD_ARCH_TRY(rad_op_writes(b, op_fused, &w.qg, 1));
+        if (op_fused_kv) RAD_ARCH_TRY(rad_op_writes(b, op_fused_kv, &w.qg, 1));
+    }
 
     /* THE OUTPUT GATE, THE MULTIPLY AND THE QUANTISER ARE ONE PASS. Unfused they are three --
      * sigmoid into a de-interleaved buffer, a multiply in place, then quant_act_fp8 -- and at
@@ -487,9 +534,14 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch) const {
         if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
         return;
     }
-    qg.step(c, w.h, w.qg, T);
-    kp.step(c, w.h, w.k,  T);
-    vp.step(c, w.h, w.v,  T);
+    const int64_t qgd = (int64_t)g.n_head * 2 * g.head_dim, kvd = (int64_t)g.n_head_kv * g.head_dim;
+    if (fuse_qkv) {
+        qkv.step(c, w.h, w.qkv, T);
+    } else {
+        qg.step(c, w.h, w.qg, T);
+        kp.step(c, w.h, w.k,  T);
+        vp.step(c, w.h, w.v,  T);
+    }
 
     /* Four launches or one. The fused kernel takes the [q|gate] projection WHOLE and splits it
      * itself -- so `w.qg` goes in as it stands and not as the column slice the unfused norm needs
@@ -498,17 +550,41 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch) const {
      * components differ -- takes the unfused pair with the whole [3, T] instead. */
     const bool fuse_ok = T <= fused_rows && !rope_mixed(batch);
     const bool fused_kv = op_fused_kv && fuse_ok;
+    /* With the fused projection, k and v are column views of its row wherever the fused prologue
+     * reads them (it takes a row pitch on both and writes k to its own plane), and copies
+     * everywhere else. */
+    const bool kview = fuse_qkv && (fused_kv || (op_fused && fuse_ok));
+    /* THE SPARSE ATTENTION PATH, decided here because the gate's source depends on it. */
+    const int64_t reach  = (int64_t)batch->max_ctx_len + batch->max_q_len;
+    const bool    sparse = qsa_sel && qsa_sequ &&
+                           (T == batch->n_seq || qsa_exact_to <= 0 || reach > qsa_exact_to);
+    const bool gated = sparse && op_attn_gq;
+    /* THE GATE COMES OUT OF THE PROLOGUE, NOT OUT OF A COPY, wherever the fused prologue runs on the
+     * fused projection: it reads q|gate as a column view of w.qkv and stores the gate contiguously
+     * into w.qg ([T, q_dim]; the interleaved copy has no other reader on this path), and
+     * gate_quant_fp8 reads it from there. Not with the merge-fused attention (`gated`), which reads
+     * the gate as the interleaved column slice of w.qg, and not in a bf16 model (sigmoid reads that
+     * slice too). Those, and every unfused step, copy q|gate out exactly as before. */
+    const bool gate_direct = kview && !g.w_bf16 && !gated;
+    if (fuse_qkv && !gate_direct)
+        RAD_ISSUE_N(c, op_cqg, T, bcol(w.qkv, 0, qgd, T), brows(w.qg, T));
+    if (fuse_qkv && !kview) RAD_ISSUE_N(c, op_ck, T, bcol(w.qkv, qgd, kvd, T), brows(w.k, T));
+    if (fuse_qkv && !fused_kv) RAD_ISSUE_N(c, op_cv, T, bcol(w.qkv, qgd + kvd, kvd, T), brows(w.v, T));
+    const RadOperand k_in = kview ? bcol(w.qkv, qgd, kvd, T) : brows(w.k, T);
+    const RadOperand v_in = (fuse_qkv && fused_kv) ? bcol(w.qkv, qgd + kvd, kvd, T) : brows(w.v, T);
+    const RadOperand qg_in = gate_direct ? bcol(w.qkv, 0, qgd, T) : brows(w.qg, T);
+    const RadOperand g_out = gate_direct ? brows(w.qg, T) : RAD_NONE;
     if (fused_kv) {
         RAD_ISSUE_N(c, op_fused_kv, T,
-                    brows(w.qg, T), brows(w.k, T), RAD_B(w.cos_sin), rope_pos1(batch, T),
+                    qg_in, k_in, RAD_B(w.cos_sin), rope_pos1(batch, T),
                     RAD_W(w_q_norm), RAD_W(w_k_norm),
-                    brows(w.q, T), brows(w.k, T), RAD_NONE,
-                    brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer));
+                    brows(w.q, T), brows(w.k, T), g_out,
+                    v_in, praw(slot, RAD_I32, T), kv_cache(kv, layer));
     } else if (op_fused && fuse_ok) {
         RAD_ISSUE_N(c, op_fused, T,
-                    brows(w.qg, T), brows(w.k, T), RAD_B(w.cos_sin), rope_pos1(batch, T),
+                    qg_in, k_in, RAD_B(w.cos_sin), rope_pos1(batch, T),
                     RAD_W(w_q_norm), RAD_W(w_k_norm),
-                    brows(w.q, T), brows(w.k, T), RAD_NONE);
+                    brows(w.q, T), brows(w.k, T), g_out);
     } else {
         RAD_ISSUE_N(c, op_q_norm, T * g.n_head,
                     bcol(w.qg, 0, g.head_dim, T), RAD_W(w_q_norm), brows(w.q, T));
@@ -538,10 +614,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch) const {
      * rows -- and handing it T rows past that is refused as RAD_E_SCRATCH at issue. max_seqs rows
      * of q_len 1 is strictly inside what q_len_max >= 1 already bought, so the bound holds
      * whatever the kernel's band turns out to be. */
-    const int64_t reach  = (int64_t)batch->max_ctx_len + batch->max_q_len;
-    const bool    sparse = qsa_sel && qsa_sequ &&
-                           (T == batch->n_seq || qsa_exact_to <= 0 || reach > qsa_exact_to);
-    const bool gated = sparse && op_attn_gq;
+    /* (`reach`, `sparse` and `gated` are decided above, where the gate's source needs them.) */
     if (gated) {
         const int64_t chunk = qsa_gq_rows();
         const int64_t qw = g.q_dim(), hd = g.head_dim;
@@ -592,7 +665,8 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE(c, op_mul, brows(w.attn.x, T), brows(w.gate, T), brows(w.attn.x, T));
     } else if (!gated)
         RAD_ISSUE_N(c, op_gq, T * g.n_head,
-                    bcol(w.qg, g.head_dim, g.head_dim, T), brows(w.attn.x, T),
+                    gate_direct ? brows(w.qg, T) : bcol(w.qg, g.head_dim, g.head_dim, T),
+                    brows(w.attn.x, T),
                     brows(w.attn.cq(), T), brows(w.attn.cs(), T), brows(w.attn.x, T));
 
     o.step(c, w.attn, w.h.x, T);

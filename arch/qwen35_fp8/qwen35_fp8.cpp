@@ -130,6 +130,8 @@ struct Model {
     ActFP8  a_h{};
     /* full attention */
     rad_buf b_qg = 0, b_k = 0, b_v = 0, b_q = 0;
+    rad_buf b_qkv = 0;
+    bool    fuse_qkv = false;
     /* [rope_table_rows, n_rot] f32, the rope cos/sin every attention layer reads. One buffer and
      * one fill a step, against a rope launch a layer -- see rad_block_attn_gated_fp8.h at
      * op_fused. */
@@ -806,6 +808,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_k       = decl_b(b, nm.f("attn_k"),   g.act_dtype, {g.max_tok, kv_dim});
     m.b_v       = decl_b(b, nm.f("attn_v"),   g.act_dtype, {g.max_tok, kv_dim});
     m.b_q       = decl_b(b, nm.f("attn_q"),   g.act_dtype, {g.max_tok, q_dim});
+    /* Q|GATE, K AND V AS ONE PROJECTION (AttnGatedFP8::fuse_qkv) when the trunk is MXFP4 and the
+     * container does not hold a separate k -- one converted before the fusion is served as it was;
+     * a conversion, which finds no such weight, fuses. */
+#if QWEN35_MXFP4
+    {
+        int64_t lf = 0;
+        while (lf < g.n_layer && !is_full_attention(lf, interval)) ++lf;
+        RadEncoding e{};
+        m.fuse_qkv = lf < g.n_layer && !weight_enc(b, nm.f("blk.%lld.attn_k.weight", (long long)lf), &e);
+    }
+#endif
+    if (m.fuse_qkv)
+        m.b_qkv = decl_b(b, nm.f("attn_qkv"), g.act_dtype,
+                         {g.max_tok, 2 * g.n_head * g.head_dim + 2 * kv_dim});
     m.a_attn.x  = decl_b(b, nm.f("attn_out"), g.act_dtype, {g.max_tok, q_dim});
     /* THE ROPE TABLE, and it is the model's rather than a layer's because sixteen layers rotate at
      * the same positions with the same theta. Only the rows a step names are written, so the fill
@@ -1039,7 +1055,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     AttnGatedFP8::Wire aw{};
     aw.x = m.b_x; aw.h = m.a_h; aw.qg = m.b_qg; aw.k = m.b_k; aw.v = m.b_v;
-    aw.q = m.b_q; aw.attn = m.a_attn;
+    aw.q = m.b_q; aw.attn = m.a_attn; aw.qkv = m.b_qkv;
     aw.cos_sin = m.op_rope_cs ? m.b_rope_cs : 0;
 
     GdnFP8::Wire gw{};
@@ -1124,6 +1140,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             as.k_norm = nm.ckpt("%s.%lld.self_attn.k_norm.weight",    pre, (long long)l);
             as.o      = nm.ckpt("%s.%lld.self_attn.o_proj.weight",    pre, (long long)l);
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_full));
+            lay.attn.fuse_qkv = m.fuse_qkv;
             RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv_full, m.n_rot, aw, as,
                                           mix_fold, mix_add, mix_ar_in, mix_ar_out));
         } else {
