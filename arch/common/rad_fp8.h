@@ -1149,6 +1149,18 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
 }
 
 
+/* RADIANCE_MXFP4_GATED_FOLD=1 (default off): fold an MXFP4 gate_up projection's SwiGLU and E4M3
+ * quantiser into the GEMM's epilogue (libr4d `gemm_nt_q_gated_mx`, gemm_mxfp4a8_gated_decode), over
+ * the same weights and into the same activation the pair writes, for M <= 64. It changes the declared
+ * ops, so it is read at declare time and a running server keeps what it was built with.
+ * `N >= 14080` is the decode row's unsplit regime (see libr4d's cGemmNtQGatedMx): below it the
+ * unfused GEMM splits K and the fold would not be bit-identical to the pair, so those shapes keep it. */
+inline bool mxfp4_gated_fold_on(int64_t N) {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_MXFP4_GATED_FOLD");
+                                return e && e[0] && e[0] != '0'; }();
+    return on && N >= 14080 && N % 256 == 0;
+}
+
 /* ================================================== an fp8 weight with no op of its own
  *
  * LinearFP8's two views without the GEMM: a weight a block declares here and reads through an op

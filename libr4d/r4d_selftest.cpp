@@ -3753,6 +3753,170 @@ static void mxd_overlap_case(const Plugin& pl) {
     ok("gemm_mxfp4a8_decode: serial after the overlap storm is still identical (counters left at zero)", again);
 }
 
+/* THE MXFP4 GATED FOLD (gemm_mxfp4a8_gated_decode, op gemm_nt_q_gated_mx) AGAINST THE PAIR IT REPLACES,
+ * on one set of operands: gemm_mxfp4a8_decode over the stacked [2*nff, K] weight FORCED UNSPLIT (ks = 1,
+ * which is the regime the fold's `N GE 14080` constraint names and the tune file holds at the real
+ * shape), then gated_quant_fp8 over the bf16 plane it wrote. The claim is BYTE identity -- codes, scales
+ * and the optional bf16 product -- so the comparison is a memcmp, not a tolerance, and every buffer is
+ * poisoned first so a byte the fold never writes shows as a difference. The planes are built once per
+ * (nff, K) and reused over the M list, which crosses every M-fragment count (DTM 1..4); both activation
+ * scale grids run, the block-scaled one with a zero-scale block and an all-zero row (the quantiser's
+ * scale-1 branch). The same launch is repeated without the optional bf16 output.
+ * The real shape (K = 5120, nff = 17408 -> N = 34816) is the trunk's gate_up AND the drafter's:
+ * Qwen3.8-27B and its DFlash2 drafter share hidden 5120 and intermediate 17408. */
+static void mxfp4_gated_fold_case(const Plugin& pl, int64_t nff, int64_t K, const std::vector<int64_t>& Ms) {
+    if (!sel("gemm_mxfp4a8_gated_decode") && !sel("gemm_mxfp4a8_decode")) return;
+    const int64_t N = 2 * nff, nblk = K / 32, nkb = (K + 127) / 128;
+    char nm[160];
+    std::snprintf(nm, sizeof nm, "gemm_mxfp4a8_gated_decode vs decode(ks=1) + gated_quant_fp8, nff=%lld K=%lld",
+                  (long long)nff, (long long)K);
+    const RadKernelInfo* rg = find(pl, "gemm_mxfp4a8_gated_decode");
+    const RadKernelInfo* rd = find(pl, "gemm_mxfp4a8_decode");
+    const RadKernelInfo* gq = find(pl, "gated_quant_fp8");
+    if (!rg || !rd || !gq || !rg->layout || !rg->relayout) { ok(nm, false, "row or hooks absent"); return; }
+    Planes p;
+    p.enc = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    p.size(N, K);
+    const int ic = p.find("codes"), is = p.find("scale");
+    if (ic < 0 || is < 0) { ok(nm, false, "encoding has no codes/scale plane"); return; }
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t k = 0; k < K; k += 2) {
+            const uint8_t lo = (uint8_t)((n * 7 + k * 3 + 1) % 16);
+            const uint8_t hi = (uint8_t)((n * 5 + (k + 1) * 11 + 3) % 16);
+            p.data[(size_t)ic][(size_t)((n * K + k) / 2)] = (uint8_t)(lo | (hi << 4));
+        }
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t b = 0; b < nblk; ++b) {
+            int e = 127 + (int)((n * 3 + b * 5) % 7) - 3;
+            if ((n + b) % 11 == 0) e -= 6 + (int)((n + 2 * b) % 7);
+            p.data[(size_t)is][(size_t)(n * nblk + b)] = (uint8_t)e;
+        }
+    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 32) };
+    std::vector<uint8_t> wq, ws, wr, wq2;
+    /* The fold's OWN hooks at its own operand indices (b 2, b_scale 3, b_ref 6), and the decode row's
+     * codes besides: the two rows must lay the weight out identically or they could not share it. */
+    const int rw = stored(rg, lp, 2, p, { "codes" }, &wq);
+    const int rs = stored(rg, lp, 3, p, { "scale" }, &ws);
+    const int rr = stored(rg, lp, 6, p, { "scale" }, &wr);
+    const int r2 = stored(rd, lp, 2, p, { "codes" }, &wq2);
+    if (rw != RAD_OK || rs != RAD_OK || rr != RAD_OK || r2 != RAD_OK) {
+        ok(nm, false, "relayout rc " + std::to_string(rw) + "/" + std::to_string(rs) + "/" +
+                      std::to_string(rr) + "/" + std::to_string(r2));
+        return;
+    }
+    ok((std::string(nm) + ": both rows lay the weight out identically").c_str(), wq == wq2);
+    void* d_w = dalloc(wq.size());
+    void* d_e = dalloc(ws.size());
+    void* d_r = dalloc(wr.size());
+    if (!d_w || !d_e || !d_r) { ok(nm, false, "hipMalloc failed"); return; }
+    st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_e, ws.data(), ws.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_r, wr.data(), wr.size(), hipMemcpyHostToDevice);
+
+    for (const int64_t M : Ms)
+        for (int grid = 0; grid < 2; ++grid) {
+            const bool ablk = grid == 1;
+            const int64_t asc = ablk ? nkb : 1;
+            char cn[200];
+            std::snprintf(cn, sizeof cn, "%s M=%lld ascale=%s", nm, (long long)M, ablk ? "row x 128" : "row");
+            std::vector<uint8_t> ha((size_t)(M * K));
+            std::vector<float> as((size_t)(M * asc));
+            for (int64_t i = 0; i < M; ++i) {
+                const bool dead = ablk && M > 3 && i == 3;          /* an all-zero row: scale 1, codes 0 */
+                for (int64_t c = 0; c < asc; ++c)
+                    as[(size_t)(i * asc + c)] =
+                        dead ? 0.0f
+                             : ablk ? ((i + c) % 11 == 5 ? 0.0f : 0.002f * (float)(1 + (i * 3 + c * 7) % 97))
+                                    : 0.0125f * (float)(1 + i % 5);
+                for (int64_t k = 0; k < K; ++k) {
+                    const bool zero = dead || (ablk && as[(size_t)(i * asc + k / 128)] == 0.0f);
+                    const float v = zero ? 0.0f
+                                         : (float)(((i * 7 + k * 13) % 401) - 200) * 0.02f * ((k % 3) ? 1.f : -1.f);
+                    rad_store_f32(ha.data(), RAD_F8E4M3, i * K + k, v);
+                }
+            }
+            void* d_a = dalloc(ha.size());
+            void* d_s = dalloc(as.size() * 4);
+            void* d_gu = dalloc((size_t)(M * N) * 2);
+            const int64_t gkb = nff / 128;
+            void* d_q[2] = { dalloc((size_t)(M * nff)), dalloc((size_t)(M * nff)) };
+            void* d_ss[2] = { dalloc((size_t)(M * gkb) * 4), dalloc((size_t)(M * gkb) * 4) };
+            void* d_y[3] = { dalloc((size_t)(M * nff) * 2), dalloc((size_t)(M * nff) * 2), nullptr };
+            if (!d_a || !d_s || !d_gu || !d_q[0] || !d_q[1] || !d_ss[0] || !d_ss[1] || !d_y[0] || !d_y[1]) {
+                ok(cn, false, "hipMalloc failed"); return;
+            }
+            st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+            st_memcpy(d_s, as.data(), as.size() * 4, hipMemcpyHostToDevice);
+            for (int v = 0; v < 2; ++v) {
+                st_memset(d_q[v], 0xCD, (size_t)(M * nff));
+                st_memset(d_ss[v], 0xCD, (size_t)(M * gkb) * 4);
+                st_memset(d_y[v], 0xCD, (size_t)(M * nff) * 2);
+            }
+            /* ---- the pair */
+            std::vector<RadTensor> t1 = {
+                T(d_a, RAD_F8E4M3, { M, K }),
+                ablk ? T(d_s, RAD_F32, { M, asc }) : T(d_s, RAD_F32, { M }),
+                T(d_w, RAD_U8, { (int64_t)wq.size() }), T(d_e, RAD_U8, { (int64_t)ws.size() }),
+                T(d_gu, RAD_BF16, { M, N }), T(nullptr, RAD_F32, { 1 }), T(d_r, RAD_U8, { (int64_t)wr.size() }),
+            };
+            absent(t1[5]);
+            std::vector<RadParam> p1 = { PI("M", M), PI("N", N), PI("K", K), PI("group", 32),
+                                         PS("dtype", "mxfp4a8"), PI("ks", 1), PI("bk", 0), PI("nt", 0) };
+            int rc = launch_row(rd, t1, p1);
+            if (rc != RAD_OK) { ok(cn, false, "decode rc=" + std::to_string(rc)); return; }
+            std::vector<RadTensor> t2 = { T(d_gu, RAD_BF16, { M, N }), T(d_q[0], RAD_F8E4M3, { M, nff }),
+                                          T(d_ss[0], RAD_F32, { M, gkb }), T(d_y[0], RAD_BF16, { M, nff }) };
+            std::vector<RadParam> p2 = { PI("M", M), PI("n", nff), PI("group", 128), PS("dtype", "bf16"),
+                                         PS("act", "silu") };
+            rc = launch_row(gq, t2, p2);
+            if (rc != RAD_OK) { ok(cn, false, "gated_quant_fp8 rc=" + std::to_string(rc)); return; }
+            /* ---- the fold, with and without the bf16 product */
+            std::vector<RadTensor> t3 = {
+                T(d_a, RAD_F8E4M3, { M, K }),
+                ablk ? T(d_s, RAD_F32, { M, asc }) : T(d_s, RAD_F32, { M }),
+                T(d_w, RAD_U8, { (int64_t)wq.size() }), T(d_e, RAD_U8, { (int64_t)ws.size() }),
+                T(d_q[1], RAD_F8E4M3, { M, nff }), T(d_ss[1], RAD_F32, { M, gkb }),
+                T(d_r, RAD_U8, { (int64_t)wr.size() }), T(d_y[1], RAD_BF16, { M, nff }),
+            };
+            std::vector<RadParam> p3 = { PI("M", M), PI("N", N), PI("K", K), PI("group", 32),
+                                         PS("dtype", "mxfp4a8"), PS("act", "silu") };
+            rc = launch_row(rg, t3, p3);
+            if (rc != RAD_OK) { ok(cn, false, "fold rc=" + std::to_string(rc)); return; }
+            std::vector<uint8_t> q0((size_t)(M * nff)), q1(q0.size());
+            std::vector<float> s0((size_t)(M * gkb)), s1(s0.size());
+            std::vector<uint16_t> y0((size_t)(M * nff)), y1(y0.size());
+            st_memcpy(q0.data(), d_q[0], q0.size(), hipMemcpyDeviceToHost);
+            st_memcpy(q1.data(), d_q[1], q1.size(), hipMemcpyDeviceToHost);
+            st_memcpy(s0.data(), d_ss[0], s0.size() * 4, hipMemcpyDeviceToHost);
+            st_memcpy(s1.data(), d_ss[1], s1.size() * 4, hipMemcpyDeviceToHost);
+            st_memcpy(y0.data(), d_y[0], y0.size() * 2, hipMemcpyDeviceToHost);
+            st_memcpy(y1.data(), d_y[1], y1.size() * 2, hipMemcpyDeviceToHost);
+            size_t dq = 0, ds = 0, dy = 0;
+            for (size_t i = 0; i < q0.size(); ++i) dq += q0[i] != q1[i];
+            for (size_t i = 0; i < s0.size(); ++i) ds += std::memcmp(&s0[i], &s1[i], 4) != 0;
+            for (size_t i = 0; i < y0.size(); ++i) dy += y0[i] != y1[i];
+            /* the same fold with the optional output absent: the codes and scales must not move */
+            st_memset(d_q[1], 0xCD, (size_t)(M * nff));
+            st_memset(d_ss[1], 0xCD, (size_t)(M * gkb) * 4);
+            absent(t3[7]);
+            rc = launch_row(rg, t3, p3);
+            size_t dn = (size_t)-1;
+            if (rc == RAD_OK) {
+                std::vector<uint8_t> q2(q0.size());
+                std::vector<float> s2(s0.size());
+                st_memcpy(q2.data(), d_q[1], q2.size(), hipMemcpyDeviceToHost);
+                st_memcpy(s2.data(), d_ss[1], s2.size() * 4, hipMemcpyDeviceToHost);
+                dn = 0;
+                for (size_t i = 0; i < q0.size(); ++i) dn += q0[i] != q2[i];
+                for (size_t i = 0; i < s0.size(); ++i) dn += std::memcmp(&s0[i], &s2[i], 4) != 0;
+            }
+            char d[200];
+            std::snprintf(d, sizeof d, "codes %zu/%zu, scales %zu/%zu, bf16 %zu/%zu differ; without bf16 out: %zd",
+                          dq, q0.size(), ds, s0.size(), dy, y0.size(), dn == (size_t)-1 ? (ssize_t)-1 : (ssize_t)dn);
+            ok(cn, dq == 0 && ds == 0 && dy == 0 && dn == 0, d);
+        }
+}
+
 /* THE INT8 TRUNK CHAIN: quant_act_i8g on a bf16 activation, then one of the i8a8 GEMMs on what it
  * wrote, against the planes' meaning. The weight is i8 with a bf16 scale per row per 128 K (what
  * libquant writes for `codes=i8 group=128 scale=bf16 clamp=sym`), stored through the row's own
@@ -11208,6 +11372,13 @@ static void device_phase(const Plugin& pl) {
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 64, 512, 2560, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 5, 1040, 576, 0, true);
         mxd_overlap_case(pl);
+        /* THE MXFP4 GATED FOLD against decode(ks=1) + gated_quant_fp8, byte for byte: edge shapes over the
+         * whole M band (both K slab widths: K = 576 is not a multiple of 128), then the real gate_up
+         * (and the drafter's, the same shape) at M inside every fragment count. */
+        mxfp4_gated_fold_case(pl, 128, 640, { 1, 5, 8, 16, 17, 33, 64 });
+        mxfp4_gated_fold_case(pl, 384, 576, { 3, 13, 24, 40, 64 });
+        mxfp4_gated_fold_case(pl, 640, 2560, { 8, 24, 48, 64 });
+        mxfp4_gated_fold_case(pl, 17408, 5120, { 8, 16, 24, 40, 64 });
         for (int ks : { 1, 2, 4 })
             for (int bk : { 64, 128 })
                 mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 24, 400, 2560, 0, true,

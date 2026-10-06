@@ -291,6 +291,7 @@ int r4d_rad_gemm_fp8a16_m1  (const RadArgs*, RadStream);
 int r4d_rad_gemm_fp8a8_m16  (const RadArgs*, RadStream);
 int r4d_rad_gemm_fp8a8_m16_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_gemm_fp8a8_gated_m16(const RadArgs*, RadStream);
+int r4d_rad_gemm_mxfp4a8_gated(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_fp8a8_m16_scratch(const RadArgs*);
 int r4d_rad_gemm_fp8a8_tiled(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_m16  (const RadArgs*, RadStream);

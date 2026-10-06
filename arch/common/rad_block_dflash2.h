@@ -227,6 +227,7 @@ struct Dflash2 {
     int     first_layer = 0;   /* absolute, so the KV group's layer_slot lookup finds these five */
     int64_t qrows = 0, crows = 0, srows = 0;
     int64_t gated_rows = 0;    /* the band op_gug was declared over; 0 when there is no fold */
+    bool    gug_mx = false;    /* op_gug is `gemm_nt_q_gated_mx` (RADIANCE_MXFP4_GATED_FOLD), not the fp8 fold */
     rad_kvgroup kv = 0;
 
     /* model-scope weights.
@@ -718,6 +719,17 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                    RAD_WEIGHTS(w_gu[i].w, w_gu[i].s)),
                                {w.h2q, w.h2s}, {w.ffq, w.ffs});
                 if (op_gug[i]) gated_rows = hi;
+            } else if (hi > 0 && w_gu[i].mx && mxfp4_gated_fold_on(2 * g.n_ff)) {
+                /* The MXFP4 fold, opt-in: the same epilogue behind libr4d's decode GEMM, its operand list
+                 * the fp8 fold's with the reference exponent plane after `scale`. */
+                op_gug[i] = rw(b, RAD_OP(b, "gemm_nt_q_gated_mx",
+                                   RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", 2 * g.n_ff),
+                                              RAD_INT("K", g.n_embd),
+                                              RAD_INT("group", RAD_MX_GROUP),
+                                              RAD_STR("dtype", "mxfp4a8"), RAD_STR("act", "silu")),
+                                   RAD_WEIGHTS(w_gu[i].w, w_gu[i].s, w_gu[i].ref)),
+                               {w.h2q, w.h2s}, {w.ffq, w.ffs});
+                if (op_gug[i]) { gated_rows = hi; gug_mx = true; }
             }
         }
         op_dn[i] = w_dn[i].gemm(b, qrows, g.n_embd, g.n_ff, {w.ffq, w.ffs}, {w.h});
@@ -999,7 +1011,11 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE_N(c, op_fconv[i], T, brows(w.h, T), bcol(w.coef, 0, half, T),
                     wrow_slice(w_fcb[i], 0, 1, cfg.taps * g.n_embd), brows(w.h2, T));
         RAD_ISSUE_N(c, op_qh2, T, brows(w.h2, T), brows(w.h2q, T), brows(w.h2s, T));
-        if (op_gug[i] && T <= gated_rows) {
+        if (op_gug[i] && gug_mx && T <= gated_rows) {
+            RAD_ISSUE_N(c, op_gug[i], T, brows(w.h2q, T), brows(w.h2s, T),
+                        RAD_W(w_gu[i].w), RAD_W(w_gu[i].s), brows(w.ffq, T), brows(w.ffs, T),
+                        RAD_W(w_gu[i].ref), RAD_NONE);
+        } else if (op_gug[i] && T <= gated_rows) {
             RAD_ISSUE_N(c, op_gug[i], T, brows(w.h2q, T), brows(w.h2s, T),
                         RAD_W(w_gu[i].w), RAD_W(w_gu[i].s), brows(w.ffq, T), brows(w.ffs, T),
                         RAD_NONE);

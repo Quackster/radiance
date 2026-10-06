@@ -73,6 +73,9 @@ struct MlpFP8 {
      * the same claim -- so this is two spellings of one arithmetic and not two answers. */
     rad_op     op_gated = 0;
     int64_t    gated_rows = 0;
+    /* op_gated is `gemm_nt_q_gated_mx` (an MXFP4 gate_up, RADIANCE_MXFP4_GATED_FOLD) rather than the fp8
+     * `gemm_nt_q_gated`: its operand list carries the weight's reference exponent plane. */
+    bool       gated_mx = false;
     /* ...AND WHETHER THE COLLECTIVE AT THE END OF THIS BLOCK IS THE NEXT BLOCK'S FIRST PASS.
      * `ar_in` says this block's own norm absorbs its PREDECESSOR's all-reduce; `ar_out` says the
      * block after it absorbs THIS one's, so this one must not issue it. They are the residual
@@ -137,6 +140,19 @@ inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, co
                          gq_ffn.want_x ? std::initializer_list<rad_buf>{ w.ffn.q, w.ffn.s, w.ffn.x }
                                        : std::initializer_list<rad_buf>{ w.ffn.q, w.ffn.s });
             if (op_gated) gated_rows = hi;
+        } else if (hi > 0 && !gate_up.bf16 && gate_up.mx && mxfp4_gated_fold_on(gate_up.N)) {
+            /* THE MXFP4 FOLD: the same epilogue behind libr4d's decode GEMM; opt-in. Its operand list is
+             * the fp8 fold's with the weight's reference exponent plane (`b_ref`) after `scale`. */
+            op_gated = rw(b, RAD_OP(b, "gemm_nt_q_gated_mx",
+                             RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", gate_up.N),
+                                        RAD_INT("K", gate_up.K),
+                                        RAD_INT("group", RAD_MX_GROUP),
+                                        RAD_STR("dtype", "mxfp4a8"), RAD_STR("act", "silu")),
+                             RAD_WEIGHTS(gate_up.w, gate_up.ws, gate_up.wref)),
+                         { w.h.q, w.h.s },
+                         gq_ffn.want_x ? std::initializer_list<rad_buf>{ w.ffn.q, w.ffn.s, w.ffn.x }
+                                       : std::initializer_list<rad_buf>{ w.ffn.q, w.ffn.s });
+            if (op_gated) { gated_rows = hi; gated_mx = true; }
         }
     }
     RAD_ARCH_TRY(down.declare(b, nm, g, down_base,
@@ -174,7 +190,13 @@ inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, co
 inline void MlpFP8::slice(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const {
     if (rows <= 0) rows = T - r0;
     nq_h.step(c, T, r0, rows);
-    if (op_gated && rows <= gated_rows) {
+    if (op_gated && gated_mx && rows <= gated_rows) {
+        RAD_ISSUE_N(c, op_gated, rows, brow_slice(w.h.q, r0, rows, g.n_embd),
+                    brow_slice(w.h.s, r0, rows, g.n_embd / RAD_FP8_BLOCK), RAD_W(gate_up.w),
+                    RAD_W(gate_up.ws), brow_slice(w.ffn.q, r0, rows, g.n_ff),
+                    brow_slice(w.ffn.s, r0, rows, g.n_ff / RAD_FP8_BLOCK), RAD_W(gate_up.wref),
+                    gq_ffn.want_x ? brow_slice(w.ffn.x, r0, rows, g.n_ff) : RAD_NONE);
+    } else if (op_gated && rows <= gated_rows) {
         RAD_ISSUE_N(c, op_gated, rows, brow_slice(w.h.q, r0, rows, g.n_embd),
                     brow_slice(w.h.s, r0, rows, g.n_embd / RAD_FP8_BLOCK), RAD_W(gate_up.w),
                     RAD_W(gate_up.ws), brow_slice(w.ffn.q, r0, rows, g.n_ff),

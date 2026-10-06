@@ -1367,6 +1367,34 @@ static const RadOperandSpec oGemmNtQGated[] = {
     { "out_bf16", RAD_OPD_OUT,    1 },
 };
 
+/* THE MXFP4 TWIN OF gemm_nt_q_gated, a schema of its own and not a trailing operand on that one: an
+ * MXFP4 weight is three streams (codes, E8M0 exponents, the per-row reference exponent) where the fp8
+ * block grid is two, and the fp8 op's seven-operand issue sites -- three architectures, the fuse chain,
+ * libref and libavx -- would all change their operand counts for a row only libr4d has. Private to this
+ * plugin, like dequant_w4: libref has no MXFP4 grid to check it against, so its reference is libr4d's own
+ * pair (gemm_nt_q at mxfp4a8, then gated_quant_fp8), run by r4d_selftest.
+ *
+ * Operands sit at gemm_nt_q's indices where they have one: b 2, b_scale 3, b_ref 6 -- the layout hooks
+ * key on those. `N` is the WEIGHT's rows, twice the fused width, gate then up, as for the fp8 op. */
+static const RadParamSpec pGemmNtQGatedMx[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "N",     RAD_P_INT, RAD_REQUIRED },
+    { "K",     RAD_P_INT, RAD_REQUIRED },
+    { "group", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    { "act",   RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oGemmNtQGatedMx[] = {
+    { "a",        RAD_OPD_IN,     0 },
+    { "a_scale",  RAD_OPD_IN,     0 },
+    { "b",        RAD_OPD_WEIGHT, 0 },
+    { "b_scale",  RAD_OPD_WEIGHT, 0 },
+    { "q",        RAD_OPD_OUT,    0 },
+    { "scale",    RAD_OPD_OUT,    0 },
+    { "b_ref",    RAD_OPD_WEIGHT, 0 },
+    { "out_bf16", RAD_OPD_OUT,    1 },
+};
+
 static const RadParamSpec pGateQuantFp8[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -2147,6 +2175,11 @@ static const RadOpSchema kSchemas[] = {
            "columns) and optionally the bf16 product, and no [M, 2n] tensor is ever written. "
            "Byte-identical to the two ops it replaces, which is what makes it substitutable "
            "rather than a second numerical path."),
+    SCHEMA("gemm_nt_q_gated_mx", pGemmNtQGatedMx, oGemmNtQGatedMx,
+           "gemm_nt_q at dtype mxfp4a8 over a stacked [2n, K] gate_up plane with gated_quant_fp8's pass "
+           "folded into the epilogue: E4M3 codes, an f32 scale per (row, `group` columns) and "
+           "optionally the bf16 product; no [M, 2n] tensor is written. Bit-identical to the unsplit "
+           "gemm_nt_q followed by gated_quant_fp8."),
     SCHEMA("gate_quant_fp8", pGateQuantFp8, oGateQuantFp8,
            "the same, with the gate in its own operand rather than packed beside x."),
     SCHEMA("quant_act_fp8", pQuantActFp8, oQuantActFp8,
@@ -2868,6 +2901,16 @@ static const RadConstraint cGatedHadQuantFp8[] = {
 static const RadConstraint cGemmNtQGatedFp8[] = {
     C_LE("M", 64), C_DIV("K", 256), C_DIV("N", 256), C_GE("N", 2048),
     C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "fp8a8"), C_IN("act", "silu"),
+};
+/* THE MXFP4 FOLD'S ROW. `N GE 14080` IS THE DECODE ROW'S SPLIT RULE, NOT A TUNING: the fold has no
+ * partial plane, so it equals the unfused pair bit for bit only where gemm_mxfp4a8_decode itself runs
+ * UNSPLIT, and its rule (mxd_split_k) gives ks = 1 once N / 128 column blocks reach 110. Below that
+ * the unfused GEMM splits K and sums in a different order; the op then resolves to nothing and the
+ * architecture's pair runs, which is the same answer to float rounding but not to the bit. `N DIV 256`
+ * is nout DIV 128: a block emits one whole 128-column scale group. K DIV 64 is the decode kernel's. */
+static const RadConstraint cGemmNtQGatedMx[] = {
+    C_LE("M", 64), C_DIV("K", 64), C_DIV("N", 256), C_GE("N", 14080),
+    C_IN("dtype", "mxfp4a8"), C_IN("act", "silu"),
 };
 static const RadConstraint cGateQuantFp8[] = {
     C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
@@ -4390,6 +4433,23 @@ static const RadKernelInfo kKernels[] = {
    * steps are rows of this plugin, so the claim is checkable libr4d-against-libr4d rather than
    * against a tolerance. r4d_fuse.cpp names the two parameters that are not copies. */
   r4d_fuse_gemm_nt_q_gated },
+
+{ "gemm_mxfp4a8_gated_decode", "gemm_nt_q_gated_mx", "gemm",
+  "the OCP-MXFP4 decode GEMM over a stacked gate_up weight with the SwiGLU and the fp8 quantiser folded "
+  "into its epilogue: a block owns one 128-column scale group, its waves stream the gate fragment and the "
+  "matching up fragment, and the quantiser's amax closes inside the block",
+  "M <= 64; K a multiple of 64; N (both halves) a multiple of 256 and at least 14080 (the decode row's "
+  "unsplit regime); the decode row's weight, exponent plane and per-row reference; act silu only; no "
+  "split-K, no scratch",
+  "e4m3 A with an f32 scale per row or per (row, 128), e2m1 W with an E8M0 scale per 32 K folded into the "
+  "element against a per-row reference, and the QUANTISER's outputs: E4M3 codes, an f32 scale per (row, "
+  "128 columns) and an optional bf16 product. Bit-identical to gemm_mxfp4a8_decode at ks = 1 followed by "
+  "gated_quant_fp8: each accumulator is the unfused GEMM's float, rounded to bf16 before the gate and the "
+  "multiply, and the amax is an fmaxf reduction, exact however it is regrouped",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGemmNtQGatedMx), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_mxfp4a8_gated, nullptr, r4d_rad_layout_mxfp4,
+  r4d_rad_relayout_mxfp4 },
 
 { "gemm_fp8a8_tiled", "gemm_nt_q", "gemm",
   "the same GEMM for prefill row counts: 128x128 tile, eight waves, one K tile prefetched in "

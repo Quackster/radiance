@@ -343,6 +343,27 @@ another.
 taken over *that*, so a layer with a bf16 consumer of the post-norm value must ask for it or the
 fusion is a different function. `residual` present is the `fused_add_rms_norm` form.
 
+### `gemm_nt_q_gated_mx` — device-only
+
+`gemm_nt_q_gated`'s MXFP4 twin. `libref` has no MXFP4 grid and nothing else declares it, so, like
+`dequant_w4`, it is libr4d's own and not negotiated between plugins; its reference is libr4d's own
+pair (`gemm_nt_q` at `mxfp4a8` unsplit, then `gated_quant_fp8`), which `r4d_selftest` holds it to byte
+for byte. It is a schema of its own rather than a trailing operand on `gemm_nt_q_gated` because an
+MXFP4 weight is three streams where the block-fp8 grid is two, and that would change the operand count
+of every fp8 issue site.
+
+| op | params | operands |
+|---|---|---|
+| `gemm_nt_q_gated_mx` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `b_ref`w, `out_bf16`? |
+
+`N` is the weight's rows, twice the fused width, gate half first; `group` is 32 (the E8M0 block) and
+`dtype` is `mxfp4a8`; `a_scale` is `gemm_nt_q`'s (one f32 per row, or one per row and 128 of K). `q` is the
+quantiser's E4M3 plane with `scale` per (row, 128 columns). `b`, `b_scale` and `b_ref` sit at
+`gemm_nt_q`'s operand indices 2, 3 and 6, which the weight's layout hooks key on. The row applies for
+`M <= 64`, `N` a multiple of 256 and at least 14080: the fold has no split-K, so it equals the pair
+only where the decode GEMM itself runs unsplit. An architecture opts in with
+`RADIANCE_MXFP4_GATED_FOLD=1` (default off).
+
 ### `dequant_w4` — device-only
 
 `libref` declares `dequant` and nothing else declares `dequant_w4`, so this op is not negotiated
