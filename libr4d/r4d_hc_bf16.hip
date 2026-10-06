@@ -1298,9 +1298,23 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
  * The LDS cap is the real bound: RG rows of `d` are RG*lr floats beside the 4 KiB of staging
  * slots, so a model with a wide low rank gets a smaller group rather than a launch failure. */
 
+/* R4D_HC_RG_EXACT=1: a row count up to eight is ONE group of exactly that many rows (3, 5, 6 and 7
+ * are instantiated too), so a depth-4 or depth-5 verify -- five or six rows -- still reads W_up once
+ * instead of twice (4 + 1, 4 + 2). Bit-identical for the reason the RG note gives: only the loop
+ * nest changes. Unset: the power-of-two rule. Read once, so recorded and live passes agree. */
+static bool hc_rg_exact() {
+    static const bool v = [] {
+        const char* e = std::getenv("R4D_HC_RG_EXACT");
+        return e && *e && *e != '0';
+    }();
+    return v;
+}
 static inline long hc_up_rg(long long rows, long long lr) {
     constexpr long kLdsCap = 60 * 1024;          /* leave the 4 KiB of staging slots room */
     long rg = (rows >= 8) ? 8 : (rows >= 4) ? 4 : (rows >= 2) ? 2 : 1;
+    if (hc_rg_exact() && rows > 1 && rows < 8 &&
+        (long long)rows * lr * (long long)sizeof(float) <= kLdsCap)
+        return (long)rows;
     while (rg > 1 && (long long)rg * lr * (long long)sizeof(float) > kLdsCap) rg >>= 1;
     return rg;
 }
@@ -1319,7 +1333,11 @@ static inline int hc_up_launch(const RadTensor* up, long uld, bool f8, const uns
                        ubuf, (long)rows, (long)HN, (long)lr)
     switch (rg) {
         case 8:  if (f8) HC_UP1_CASE(8, true); else HC_UP1_CASE(8, false); break;
+        case 7:  if (f8) HC_UP1_CASE(7, true); else HC_UP1_CASE(7, false); break;
+        case 6:  if (f8) HC_UP1_CASE(6, true); else HC_UP1_CASE(6, false); break;
+        case 5:  if (f8) HC_UP1_CASE(5, true); else HC_UP1_CASE(5, false); break;
         case 4:  if (f8) HC_UP1_CASE(4, true); else HC_UP1_CASE(4, false); break;
+        case 3:  if (f8) HC_UP1_CASE(3, true); else HC_UP1_CASE(3, false); break;
         case 2:  if (f8) HC_UP1_CASE(2, true); else HC_UP1_CASE(2, false); break;
         default: if (f8) HC_UP1_CASE(1, true); else HC_UP1_CASE(1, false); break;
     }
@@ -1352,7 +1370,11 @@ static inline int hc_up_mix_launch(const RadTensor* up, long uld, bool f8, bool 
     do { if (i8) HC_UPMIX_CASE3(RG_, F8_, true); else HC_UPMIX_CASE3(RG_, F8_, false); } while (0)
     switch (rg) {
         case 8:  if (f8) HC_UPMIX_CASE(8, true); else HC_UPMIX_CASE(8, false); break;
+        case 7:  if (f8) HC_UPMIX_CASE(7, true); else HC_UPMIX_CASE(7, false); break;
+        case 6:  if (f8) HC_UPMIX_CASE(6, true); else HC_UPMIX_CASE(6, false); break;
+        case 5:  if (f8) HC_UPMIX_CASE(5, true); else HC_UPMIX_CASE(5, false); break;
         case 4:  if (f8) HC_UPMIX_CASE(4, true); else HC_UPMIX_CASE(4, false); break;
+        case 3:  if (f8) HC_UPMIX_CASE(3, true); else HC_UPMIX_CASE(3, false); break;
         case 2:  if (f8) HC_UPMIX_CASE(2, true); else HC_UPMIX_CASE(2, false); break;
         default: if (f8) HC_UPMIX_CASE(1, true); else HC_UPMIX_CASE(1, false); break;
     }
