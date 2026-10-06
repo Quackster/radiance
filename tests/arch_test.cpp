@@ -2584,11 +2584,14 @@ TEST(flashnext_tp3_zeroes_the_third_ranks_attention_and_splits_gdn_heads_unevenl
             CHECK_EQ(o->span_lo, (int64_t)ar * (n_head / attn_world) * head_dim);
             CHECK_EQ(o->zero, zero);
         }
-        /* (3) THE DELTA NET: 6, 5, 5 K heads and 18, 15, 15 V heads, real on every rank, as
+        /* (3) THE DELTA NET: 5, 5, 6 K heads and 15, 15, 18 V heads, real on every rank, as
          * per-part spans of [q|k|v|z] and of the conv channels, a one-span of A_log. */
         const int64_t base = nk / world, rem = nk % world;
-        const int64_t my_k = base + (r < rem ? 1 : 0);
-        const int64_t k0   = r * base + (r < rem ? r : rem);
+        /* The extra head goes to the rank without attention first (rad_arch.h remainder_place):
+         * rank 2 takes 6, ranks 0 and 1 take 5 each. */
+        const int64_t pl   = r >= attn_world ? r - attn_world : (world - attn_world) + r % attn_world;
+        const int64_t my_k = base + (pl < rem ? 1 : 0);
+        const int64_t k0   = pl * base + (pl < rem ? pl : rem);
         const int64_t my_v = (nv / nk) * my_k, v0 = (nv / nk) * k0;
         const RecWeight* in = find_w(b[r], "blk.0.ssm_inz.weight");
         REQUIRE(in != nullptr);
@@ -2629,7 +2632,7 @@ TEST(flashnext_tp3_zeroes_the_third_ranks_attention_and_splits_gdn_heads_unevenl
     /* The three ranks' K heads are the container's 16, once each. */
     {
         int64_t sum = 0;
-        for (int r = 0; r < world; ++r) sum += nk / world + (r < nk % world ? 1 : 0);
+        for (int r = 0; r < world; ++r) sum += nk / world + (r < nk % world ? 1 : 0);   /* a permutation of the same counts */
         CHECK_EQ(sum, nk);
     }
 }

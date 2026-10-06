@@ -733,6 +733,21 @@ inline long long meta_int2(const RadModelMeta* m, const char* gguf_key, const ch
  * count). With it set, a width the world does not divide is left whole in g.n_ff and the plugin
  * takes its slice from there; without it the refusal stands, because for every other plugin g.n_ff
  * IS the per-rank width. A width that does divide is unaffected either way. */
+/* THE REMAINDER-FIRST ORDER OF THE RANKS. Whatever does not divide evenly over the world -- the
+ * extra block of an expert's width, the extra delta-net head -- goes to the ranks with NO
+ * attention first: they pay nothing for attention (rad_block_attn_gated_fp8.h: one fill) and keep
+ * no attention cache (rad_kv_group_zero), so they have the time and the memory for it, and every
+ * rank with heads is lighter for it. This is a rank's PLACE in that order: the attention-zero ranks
+ * take places 0..n-1 whatever `parity` is, and the attention ranks follow in today's rotation by
+ * `parity` -- so where no rank is attention-zero (every world the heads divide) the place is
+ * exactly (rank - parity) mod world and every cut is what it always was, byte for byte. */
+inline int64_t remainder_place(const Geom& g, int rank, int parity) {
+    const int nz = g.world - g.attn_world;
+    if (rank >= g.attn_world) return rank - g.attn_world;
+    const int aw = g.attn_world;
+    return nz + ((rank - parity) % aw + aw) % aw;
+}
+
 inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
                      const char* dtype, uint32_t act_dtype, bool arch_splits_ff = false) {
     if (!m || !c) return RAD_E_INVAL;
@@ -808,8 +823,8 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
         g.attn_zero  = g.rank >= g.attn_world;
         g.attn_rank  = g.attn_zero ? g.attn_world - 1 : g.rank;
         fprintf(stderr, "radiance: world_size = %d over n_head_kv = %lld: attention on %d rank(s), "
-                        "rank(s) %d..%d carry zero attention weights and the delta net and "
-                        "experts of a full rank\n", g.world, (long long)g.n_head_kv_all,
+                        "rank(s) %d..%d carry no attention and take the delta net's and the "
+                        "experts' remainders first\n", g.world, (long long)g.n_head_kv_all,
                 g.attn_world, g.attn_world, g.world - 1);
     }
     const int aw = g.attn_world, ar = g.attn_rank;
