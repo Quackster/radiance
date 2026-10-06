@@ -415,6 +415,10 @@ int Engine::step_loop() {
     if (drafter_.kind == RAD_DRAFT_BLOCK && cfg_.n_spec > 0) {
         const AdaptiveK::Params akp = AdaptiveK::Params::from_env();
         if (akp.enabled) (void)sched_.set_adaptive_k(akp);
+        /* RADIANCE_LOOKUP_DRAFT=1: whole-context prompt lookup over the block drafter's proposal
+         * (sched/lookup_draft.h). */
+        const LookupParams lkp = LookupParams::from_env();
+        if (lkp.enabled) (void)sched_.set_lookup_draft(lkp, (int)drafter_.window);
     }
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* Read once. See the block in the idle branch below for what it is for. */

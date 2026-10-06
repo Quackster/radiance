@@ -268,6 +268,8 @@ public:
         o.draft_acceptance = m.draft_acceptance;
         o.prefill_tokens = m.prefill_tokens;   o.decode_tokens = m.decode_tokens;
         o.draft_tokens = m.draft_tokens;       o.draft_accepted = m.draft_accepted;
+        o.lookup_taken = m.lookup_taken;       o.lookup_steps = m.lookup_steps;
+        o.lookup_drafted = m.lookup_drafted;   o.lookup_accepted = m.lookup_accepted;
         o.linear_hit_rate = m.linear_hit_rate;
         o.attn_cached_tokens = m.attn_cached_tokens;
         o.linear_cached_tokens = m.linear_cached_tokens;

@@ -462,7 +462,7 @@ struct Fixture {
 
     ~Fixture() { sch.fini(); for (void* p : owned) std::free(p); }
 
-    void build(int64_t blocks = 4096, int64_t states = 64, int64_t max_tok = 512) {
+    void build(int64_t blocks = 4096, int64_t states = 64, int64_t max_tok = 512, int64_t max_ctx = 4096) {
         g_gdn_ki = RadKernelInfo{};
         g_gdn_ki.name = "gdn_fake";
         g_gdn_ki.op = "gdn_chunked";
@@ -470,7 +470,7 @@ struct Fixture {
         g_gdn_ki.n_constraints = 1;
         g_gdn_row = KernelRow{ &g_gdn_ki, "fake", 0, 0 };
 
-        prog.meta.n_ctx_train = 4096;
+        prog.meta.n_ctx_train = max_ctx;
 
         /* index 0 is the sentinel every handle table in Program carries */
         prog.ops.emplace_back();
@@ -498,7 +498,7 @@ struct Fixture {
         op.op = "gdn_chunk_scan";
         op.schema = &g_gdn_schema;
         Band b;
-        b.hi = 4096;
+        b.hi = max_ctx;
         b.dom[RAD_DOMAIN_DEVICE].row = &g_gdn_row;
         /* The architecture plugin's own declared geometry, in arch/common/rad_block_gdn.h's
          * spelling, which is the key its schema marks RAD_PROLE_SEQ_CHUNK. Both this and the
@@ -513,7 +513,7 @@ struct Fixture {
 
         cfg.max_tok = max_tok;
         cfg.max_seqs = 32;
-        cfg.max_ctx = 4096;
+        cfg.max_ctx = max_ctx;
         cfg.checkpoint_interval = 256;
         cfg.prefix_cache = true;
         /* `Config::n_spec` defaults to -1, which is `auto`: a REQUEST that engine_bringup resolves
@@ -2421,7 +2421,7 @@ struct AkRun {
 
 AkRun ak_run(bool adaptive, int n_seq, const int* g, int n_steps) {
     Fixture f;
-    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/1024);
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/1024, /*max_ctx=*/4096);
     f.cfg.n_spec = 7;
     f.cfg.max_seqs = 16;
     CHECK_OK(f.start());
@@ -2500,4 +2500,231 @@ TEST(adaptive_k_is_lossless_and_cuts_the_rows_of_a_batch_that_accepts_poorly) {
     CHECK_EQ(one.rows, one.steps * 8);
 }
 
+/* ================================================================== whole-context lookup draft
+ * sched/lookup_draft.h through the scheduler: the proposal the drafter published is replaced by the
+ * continuation of a far match, the verify is unchanged, so the stream is the target's own. */
+namespace {
+/* The prompt is a 400-token text T (no 8-gram repeats). The target copies it: output index i is T[i], except
+ * that every `edit_every`-th token (0 = none) is replaced by a token the text does not contain. The drafter
+ * proposes junk, always wrong. */
+static std::string lk_data_dir() { std::string f = __FILE__; return f.substr(0, f.rfind('/')) + "/data"; }
+static std::vector<int32_t> lk_readids(const std::string& path) {
+    std::vector<int32_t> v;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return v;
+    int32_t x;
+    while (std::fread(&x, 4, 1, f) == 1) v.push_back(x);
+    std::fclose(f);
+    return v;
+}
+int32_t lk_text(int64_t i) { return 3000 + (int32_t)((i * 2654435761ull >> 7) % 4001); }
+std::vector<int32_t> lk_rp, lk_ra;   /* a recorded prompt and answer (real token ids), when set */
+int lk_prompt_len = 400, lk_pre = 0, lk_off = 0, lk_mind = 64, lk_blocks = 4096, lk_ctx = 4096;   /* knobs of lk_run, reset by LkKnobs */
+bool lk_silent = false;                 /* the drafter declines every sequence: set_draft is never called */
+struct LkKnobs { ~LkKnobs() { lk_prompt_len = 400; lk_pre = 0; lk_off = 0; lk_mind = 64; lk_blocks = 4096; lk_ctx = 4096; lk_silent = false; lk_rp.clear(); lk_ra.clear(); } };
+int32_t lk_tgt(uint64_t id, int64_t idx, int edit_every) {
+    if (!lk_ra.empty()) return idx < (int64_t)lk_ra.size() ? lk_ra[(size_t)idx] : 20000 + (int32_t)(idx % 977);
+    if (idx < lk_pre) return 15000 + (int32_t)((idx * 31 + (int64_t)id) % 97);        /* the answer starts with text the prompt does not hold */
+    idx = idx - lk_pre + lk_off;
+    if (edit_every > 0 && idx % edit_every == edit_every - 1) return 9000 + (int32_t)(idx % 50) + (int32_t)id;
+    return lk_text(idx);
+}
+
+struct LkRun {
+    std::vector<std::vector<int32_t>> out;
+    int64_t steps = 0, tokens = 0, rows = 0;
+    SchedMetrics m;
+};
+
+/* n_seq sequences; sequence i copies the text when copy[i], else it is a stream the prompt does not contain */
+LkRun lk_run(bool lookup, bool adaptive, int n_seq, const bool* copy, int edit_every, int n_steps,
+             int hot = 3, int enter = 8, int stay = 3) {
+    Fixture f;
+    f.build(/*blocks=*/lk_blocks, /*states=*/64, /*max_tok=*/1024, /*max_ctx=*/lk_ctx);
+    f.cfg.n_spec = 7;
+    f.cfg.max_seqs = 16;
+    CHECK_OK(f.start());
+    if (adaptive) CHECK_OK(f.sch.set_adaptive_k(ak_params()));
+    if (lookup) {
+        LookupParams lp;
+        lp.enabled = true; lp.enter = enter; lp.stay = stay; lp.hot = hot; lp.min_dist = lk_mind;
+        CHECK_OK(f.sch.set_lookup_draft(lp, 0));
+    }
+    std::vector<uint64_t> ids;
+    for (int i = 0; i < n_seq; ++i) {
+        auto r = std::make_unique<Request>();
+        r->id = f.next_id++;
+        r->max_tokens = 300;
+        r->prompt.resize((size_t)lk_prompt_len);
+        if (!lk_rp.empty()) r->prompt = lk_rp; else
+        for (int j = 0; j < lk_prompt_len; ++j) r->prompt[(size_t)j] = j < 400 ? lk_text(j) : 40000 + (int32_t)((j * 2246822519ull >> 5) % 100003);
+        ids.push_back(r->id);
+        CHECK_OK(f.sch.add(std::move(r)));
+    }
+    auto tgt = [&](int seq_idx, uint64_t id, int64_t idx) {
+        return copy[seq_idx] ? lk_tgt(id, idx, edit_every) : 20000 + (int32_t)((id * 977 + (uint64_t)idx * 131) % 997);
+    };
+    LkRun r;
+    for (int st = 0; st < n_steps; ++st) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        const StepPlan& p = f.sch.plan();
+        std::vector<int32_t> acc(p.e.size(), 0), tok(p.e.size(), 0);
+        std::vector<uint8_t> eos(p.e.size(), 0);
+        for (size_t i = 0; i < p.e.size(); ++i) {
+            const StepEntry& e = p.e[i];
+            const Request* q = f.sch.find(e.seq);
+            const int64_t L = (int64_t)q->output.size();
+            int si = 0;
+            for (int j = 0; j < n_seq; ++j) if (ids[(size_t)j] == e.seq) si = j;
+            int a = 0;
+            if (!e.is_prefill) {
+                /* greedy verify: a draft token is taken iff it is the target's own pick */
+                while (a < e.n_spec && q->draft[a] == tgt(si, e.seq, L + a)) ++a;
+                r.rows += 1 + e.n_spec;
+                ++r.steps;
+            }
+            acc[i] = a;
+            tok[i] = tgt(si, e.seq, L + a);
+        }
+        Scheduler::StepResult res;
+        res.n_seq = (int)p.e.size();
+        res.n_accepted = acc.data(); res.token = tok.data(); res.eos = eos.data();
+        CHECK_OK(f.sch.commit(res));
+        for (int i = 0; i < n_seq; ++i) {
+            const Request* q = f.sch.find(ids[(size_t)i]);
+            if (!q || q->output.empty() || q->state != ReqState::Running) continue;
+            int32_t d[7];
+            for (int j = 0; j < 7; ++j) d[j] = 1 + j;            /* junk: the drafter is always wrong */
+            if (!lk_silent) CHECK_OK(f.sch.set_draft(ids[(size_t)i], d, 7));
+        }
+    }
+    for (int i = 0; i < n_seq; ++i) {
+        const Request* q = f.sch.find(ids[(size_t)i]);
+        r.out.push_back(q->output);
+        r.tokens += (int64_t)q->output.size();
+    }
+    r.m = f.sch.metrics();
+    return r;
+}
+}  /* namespace */
+
+TEST(lookup_draft_is_lossless_and_lifts_a_far_copy_to_full_acceptance) {
+    const bool copy[1] = { true };
+    LkRun off = lk_run(false, false, 1, copy, 0, 200);
+    LkRun on  = lk_run(true,  false, 1, copy, 0, 200);
+    /* both streams are the target's own, token for token */
+    for (const LkRun* r : { &off, &on })
+        for (size_t t = 0; t < r->out[0].size(); ++t) CHECK_EQ(r->out[0][t], lk_tgt(1, (int64_t)t, 0));
+    CHECK_EQ(on.out[0].size(), (size_t)300);              /* the lookup run finished within the steps given */
+    CHECK(off.out[0].size() < on.out[0].size());          /* the junk-draft run did not */
+    /* junk drafts: one token a step; lookup copies 7 + 1 a step after the 8-token entry */
+    CHECK(off.tokens * 100 <= off.steps * 105);
+    CHECK(on.steps * 4 < off.steps);
+    CHECK(on.m.lookup_steps > 20);
+    CHECK(on.m.lookup_accepted * 100 >= on.m.lookup_drafted * 95);
+    CHECK(on.m.lookup_taken >= on.m.lookup_steps);
+    CHECK_EQ(off.m.lookup_taken, (int64_t)0);
+}
+
+TEST(lookup_draft_with_edits_stays_lossless_and_only_gains) {
+    const bool copy[1] = { true };
+    for (int edit_every : { 5, 11, 40 }) {
+        LkRun off = lk_run(false, false, 1, copy, edit_every, 400);
+        LkRun on  = lk_run(true,  false, 1, copy, edit_every, 400);
+        for (const LkRun* r : { &off, &on })
+            for (size_t t = 0; t < r->out[0].size(); ++t) CHECK_EQ(r->out[0][t], lk_tgt(1, (int64_t)t, edit_every));
+        CHECK_EQ(off.out[0].size(), on.out[0].size());
+        CHECK(on.steps <= off.steps);
+        /* edits every 40 leave long copies between them; every 5 breaks the entry threshold (8) most of the time */
+        if (edit_every == 40) CHECK(on.steps * 2 < off.steps);
+    }
+}
+
+TEST(lookup_draft_stay_threshold_keeps_a_short_match_going_only_while_hot) {
+    /* An edit every 11 tokens: after an edit the suffix matches for < 8 tokens until 8 more tokens are
+     * written, so only STAY (3) after a hot step keeps lookup going through. With HOT = 8 (never reached:
+     * at most 7 drafts are accepted) the mode can never stay, so it needs a fresh 8-match after every edit. */
+    const bool copy[1] = { true };
+    LkRun hot3 = lk_run(true, false, 1, copy, 11, 400, /*hot=*/3);
+    LkRun hot8 = lk_run(true, false, 1, copy, 11, 400, /*hot=*/8);
+    LkRun off  = lk_run(false, false, 1, copy, 11, 400);
+    for (const LkRun* r : { &hot3, &hot8 })
+        for (size_t t = 0; t < r->out[0].size(); ++t) CHECK_EQ(r->out[0][t], lk_tgt(1, (int64_t)t, 11));
+    CHECK(hot3.steps <= hot8.steps);
+    CHECK(hot8.steps <= off.steps);
+    CHECK(hot3.m.lookup_taken >= hot8.m.lookup_taken);
+}
+
+TEST(lookup_draft_runs_per_sequence_in_a_batch_and_beside_adaptive_k) {
+    /* eight sequences: four copy the text, four write something the prompt does not contain */
+    const bool copy[8] = { true, true, true, true, false, false, false, false };
+    LkRun off = lk_run(false, true, 8, copy, 0, 120);
+    LkRun on  = lk_run(true,  true, 8, copy, 0, 120);
+    for (const LkRun* r : { &off, &on })
+        for (int i = 0; i < 8; ++i)
+            for (size_t t = 0; t < r->out[(size_t)i].size(); ++t)
+                CHECK_EQ(r->out[(size_t)i][t], copy[i] ? lk_tgt((uint64_t)i + 1, (int64_t)t, 0)
+                                                       : 20000 + (int32_t)(((uint64_t)i + 1) * 977 + (uint64_t)t * 131) % 997);
+    /* the copies finish in far fewer steps, and what they accepted never fed the adaptive estimate: the
+     * four poor sequences are still shortened (rows saved) exactly as without lookup */
+    CHECK(on.m.lookup_steps > 40);
+    CHECK(on.m.lookup_accepted * 100 >= on.m.lookup_drafted * 95);
+    CHECK(on.tokens > off.tokens);
+    CHECK(on.m.adaptive_k_rows_saved > 0);
+    /* lookup rows are full length: 8 rows a lookup step, so the batch never verified fewer than 8 rows of a copy */
+    CHECK(on.rows > 0);
+}
+
 RAD_TEST_MAIN()
+
+
+/* THE BUG THESE TWO PIN (found by the first GPU A/B: 0 lookup steps in every workload). A block drafter declines a
+ * sequence whose draft cache has a hole -- every prefix-cache hit leaves one, and a long context is cached -- and
+ * then set_draft() is never called for it, so the override living there never ran; the n-gram fallback filled the
+ * proposal instead. The lookup is decided in step() for those sequences too. */
+TEST(lookup_draft_serves_a_sequence_the_drafter_declined_far_copy_after_a_long_prompt) {
+    LkKnobs reset;
+    lk_prompt_len = 9000; lk_pre = 6; lk_off = 100; lk_mind = -1; lk_blocks = 16384; lk_ctx = 16384;   /* window: 2048 */
+    lk_silent = true;
+    const bool copy[1] = { true };
+    LkRun on = lk_run(true, true, 1, copy, 0, 200);
+    for (size_t t = 0; t < on.out[0].size(); ++t) CHECK_EQ(on.out[0][t], lk_tgt(1, (int64_t)t, 0));   /* lossless */
+    CHECK_EQ(on.out[0].size(), (size_t)300);
+    CHECK(on.m.lookup_taken >= 30);
+    CHECK(on.m.lookup_steps >= 30);
+    CHECK(on.m.lookup_accepted * 100 >= on.m.lookup_drafted * 95);
+    CHECK(on.steps < 70);                                  /* one token a step would be 300 */
+    LkRun off = lk_run(false, true, 1, copy, 0, 400);      /* the same drafter-less sequence without it */
+    CHECK_EQ(off.m.lookup_taken, (int64_t)0);
+}
+
+/* The same with REAL token ids: tests/data/lookup/ holds the Qwen3.5 tokenisation of a chat prompt (11042 tokens:
+ * a Python file's 30-line class head, then 30 KB of other standard-library source, then "copy the first 30 lines")
+ * and of the answer a model gives (266 tokens: the head in a code block). The source starts within the first
+ * 400 tokens; the answer starts with text the prompt does not hold. Code repeats its own 4-grams, so the hash
+ * chains are long here -- the synthetic text above has none. */
+TEST(lookup_draft_finds_a_far_copy_in_a_real_token_stream) {
+    LkKnobs reset;
+    lk_rp = lk_readids(lk_data_dir() + "/lookup/copy-prompt.ids");
+    lk_ra = lk_readids(lk_data_dir() + "/lookup/copy-answer.ids");
+    CHECK(lk_rp.size() >= 8192);
+    CHECK(lk_ra.size() > 200);
+    lk_prompt_len = (int)lk_rp.size(); lk_mind = -1; lk_blocks = 16384; lk_ctx = 16384;
+    const bool copy[1] = { true };
+    for (int silent = 0; silent < 2; ++silent) {
+        lk_silent = silent != 0;
+        LkRun off = lk_run(false, true, 1, copy, 0, 400);
+        LkRun on  = lk_run(true,  true, 1, copy, 0, 400);
+        for (const LkRun* r : { &off, &on }) {
+            CHECK_EQ(r->out[0].size(), (size_t)300);
+            for (size_t t = 0; t < r->out[0].size(); ++t) CHECK_EQ(r->out[0][t], lk_tgt(1, (int64_t)t, 0));
+        }
+        CHECK_EQ(off.m.lookup_taken, (int64_t)0);
+        CHECK(on.m.lookup_taken >= 20);
+        CHECK(on.m.lookup_steps >= 20);
+        CHECK(on.m.lookup_accepted * 100 >= on.m.lookup_drafted * 90);
+        CHECK(on.steps * 2 < off.steps || silent);          /* junk drafter: 1 token a step -> lookup's long drafts */
+        CHECK(on.steps < 100);
+    }
+}

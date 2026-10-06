@@ -62,6 +62,11 @@ add_executable(rad-tokcheck rad_tokcheck.cpp)
 target_link_libraries(rad-tokcheck PRIVATE rad_tokref rad_core)
 set_target_properties(rad-tokcheck PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+add_executable(rad-tokenize rad_tokenize.cpp)
+target_link_libraries(rad-tokenize PRIVATE rad_core)
+target_include_directories(rad-tokenize PRIVATE ${CMAKE_SOURCE_DIR}/core)
+set_target_properties(rad-tokenize PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # Not a rad_add_tool: it links no core at all, deliberately. It dlopens plugins and reads their
 # static schema tables, so it works on a plugin the engine cannot even load -- which is exactly
 # when you need it.

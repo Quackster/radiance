@@ -222,6 +222,38 @@ int Scheduler::set_adaptive_k(const AdaptiveK::Params& p) {
     return RAD_OK;
 }
 
+int Scheduler::set_lookup_draft(const LookupParams& p, int window) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!p.enabled) return RAD_OK;
+    if (!p.valid()) return RAD_E_INVAL;
+    lk_p_ = p;
+    lk_min_dist_ = p.min_dist >= 0 ? p.min_dist : (window > 0 ? window : 2048);
+    RAD_INFO("lookup draft ON: enter %d stay %d hot %d, match <= %d, sources > %lld tokens back, chain <= %d",
+             p.enter, p.stay, p.hot, p.max_match, (long long)lk_min_dist_, p.chain);
+    return RAD_OK;
+}
+
+/* A block drafter's proposal, replaced by the longest match of the sequence's suffix further back than the
+ * drafter can see (lookup_draft.h). The tokens are the target's to verify like any other: lossless. */
+int Scheduler::lookup_override(SchedReq& s, int n) {
+    if (n <= 0 || !s.req) { s.lk.decide(lk_p_, 0); return n; }
+    ++lk_considered_;
+    const Request& r = *s.req;
+    TokView t;
+    t.a = r.prompt.data(); t.na = (int64_t)r.prompt.size();
+    t.b = r.output.data(); t.nb = (int64_t)r.output.size();
+    if (t.size() <= lk_min_dist_ + 1 && !s.lk_idx) { s.lk.decide(lk_p_, 0); return n; }   /* nothing is further back than the window */
+    if (!s.lk_idx) s.lk_idx.reset(new LookupIndex());
+    int64_t p = 0;
+    const int m = s.lk_idx->search(t, lk_p_, lk_min_dist_, &p);
+    int64_t clen = t.size() - p;
+    if (clen > n) clen = n;
+    if (!s.lk.decide(lk_p_, clen > 0 ? m : 0)) return n;
+    for (int i = 0; i < (int)clen; ++i) s.draft[i] = t[p + i];
+    ++lk_taken_;
+    return (int)clen;
+}
+
 int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = by_id_.find(id);
@@ -258,6 +290,8 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     if (n > cap) n = cap;
     if (n > RAD_SCHED_MAX_SPEC) n = RAD_SCHED_MAX_SPEC;
     for (int i = 0; i < n; ++i) s.draft[i] = tokens[i];
+    s.lk.used = false;
+    if (lk_p_.enabled) n = lookup_override(s, n);
     s.n_draft = n;
     s.req->n_draft = n;
     s.req->draft = s.draft;
@@ -956,6 +990,26 @@ const RadBatch* Scheduler::step() {
      * alone rather than as anything failing. */
     const int depth = draft_.next_depth();
 
+    /* ---------------------------------------------------------- lookup draft for the undrafted
+     * A block drafter DECLINES a sequence whose draft cache has a hole (a prefix-cache hit leaves one: block_begin,
+     * `reach`) and one that has no anchor yet, and then nothing calls set_draft() for it -- the lookup override
+     * there never runs, and the n-gram fallback below is all that is left. Those are exactly the long, cached
+     * contexts the lookup is for, so it gets the same decision here, before adaptive-k reads the rows, with the
+     * same state (s.lk) and the same counters. A sequence set_draft() already handled has n_draft > 0. */
+    if (lk_p_.enabled && depth > 0) {
+        for (size_t i = 0; i < running_.size(); ++i) {
+            SchedReq& s = *reqs_[(size_t)running_[i]];
+            const Request& r = *s.req;
+            if (s.n_draft > 0 || !r.may_speculate || r.output.empty()) continue;
+            if ((r.n_computed < (int64_t)r.prompt.size()) || (r.n_computed + 1 < s.seq_len())) continue;
+            s.lk.used = false;
+            const int n = lookup_override(s, depth) * (s.lk.used ? 1 : 0);   /* a declined lookup leaves it undrafted */
+            s.n_draft = n;
+            s.req->n_draft = n;
+            if (n > 0) s.req->draft = s.draft;
+        }
+    }
+
     /* ---------------------------------------------------------- adaptive verify length
      * One decision for the whole batch, before any entry is built: which of the drafts the block
      * drafter just published are verified in full and which are cut to a shorter prefix. The cap
@@ -969,6 +1023,10 @@ const RadBatch* Scheduler::step() {
             const bool pf = (r.n_computed < (int64_t)r.prompt.size()) || (r.n_computed + 1 < s.seq_len());
             if (pf) continue;
             if (!r.may_speculate || s.n_draft <= 0) { base_rows += 1; continue; }
+            /* A LOOKUP PROPOSAL KEEPS ITS FULL LENGTH: it is a long match that is right ~95 % of the
+             * time, nothing the drafter's acceptance estimate says about it applies. Its rows are
+             * fixed, like a sequence that takes no draft. */
+            if (s.lk.used) { base_rows += 1 + (s.n_draft < depth ? s.n_draft : depth); continue; }
             const int n = s.n_draft < depth ? s.n_draft : depth;
             ak_cand_[(size_t)nc] = AdaptiveK::Cand{ ak_.q_of(s.ak), n };
             ak_slot_[(size_t)nc] = running_[i];
@@ -1610,12 +1668,16 @@ int Scheduler::commit(const StepResult& res) {
 
             if (e.n_spec > 0) {
                 draft_.observe(e.n_spec, a);
-                ak_.observe(s.ak, e.n_spec, a);
+                /* A lookup step says nothing about how well the DRAFTER does, so it stays out of the
+                 * adaptive-k estimate; it has its own counters. */
+                if (s.lk.used) { ++lk_steps_; lk_drafted_ += e.n_spec; lk_accepted_ += a; }
+                else ak_.observe(s.ak, e.n_spec, a);
                 m_.draft_tokens += e.n_spec;
                 m_.draft_accepted += a;
                 server::sink_drafts(r.sink, e.n_spec, a);
             }
         }
+        s.lk.verified(lk_p_, r.n_accepted);
         s.n_draft = 0;
         r.n_draft = 0;
         s.entry = -1;
@@ -2308,6 +2370,11 @@ SchedMetrics Scheduler::metrics_locked() const {
         ? (float)((double)m.attn_cached_tokens / (double)m.prompt_tokens) : 0.0f;
     m.linear_hit_rate = m.prompt_tokens
         ? (float)((double)m.linear_cached_tokens / (double)m.prompt_tokens) : 0.0f;
+    m.lookup_considered = lk_considered_;
+    m.lookup_taken = lk_taken_;
+    m.lookup_steps = lk_steps_;
+    m.lookup_drafted = lk_drafted_;
+    m.lookup_accepted = lk_accepted_;
     m.adaptive_k_steps = ak_steps_;
     m.adaptive_k_rows_saved = ak_rows_saved_;
     m.draft_acceptance = draft_.acceptance();
