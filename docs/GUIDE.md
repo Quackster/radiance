@@ -1532,6 +1532,7 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct at al
 | | |
 |---|---|
 | `RADIANCE_TAPES` | the number of recorded decode/prefill passes ("tapes") the step keeps for replay. Default 24, range 1..4096. A pass is keyed by token count, longest query and speculative width, so many concurrent sequences with varying draft lengths can push the cache over its capacity and every miss costs a live issue. `/stats` `passes` shows `played`, `recorded`, `audited`, `dispatched`, `unordered`, `evicted` and `tape_cap`: `recorded` and `evicted` climbing means thrash, `played` climbing steady replay. **Recommended:** keep the default at one or two sequences; raise it (64 is a good start) at 8 sequences. Read once at start |
+| `RADIANCE_GDN_STATE` | `f32` (default) / `f16`: the width of the delta net's recurrent state on the Qwen3.5 family. `f16` halves the largest item of the KV plan (144 -> 72 MiB a slot, two slots a sequence, and each checkpoint with it), which goes to the KV pool (about +37k to +55k tokens at 8 sequences), and changes the generated text slightly (round-trip error ~5e-4 relative). **Recommended: `f32` unless context capacity is the limit**; judge `f16` on KL and acceptance for your model before using it. Read at declare time |
 
 There is also a family of instruments for engine development — `RADIANCE_DEBUG_*` (residual probes,
 idle scrubs, routing and issue dumps), `RADIANCE_OP_ORACLE*` (named ops checked against `libref` on

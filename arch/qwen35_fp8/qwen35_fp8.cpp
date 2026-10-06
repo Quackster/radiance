@@ -192,6 +192,26 @@ struct Model {
  * every list-valued key arrives in. Out-of-range entries are dropped rather than clamped: a
  * drafter that names a layer this model does not have is paired with the wrong target, and
  * silently reading layer 63 instead of 71 would make that a quality mystery. */
+/* THE SSM STATE'S WIDTH, `RADIANCE_GDN_STATE=f16`. f32 (the default, and what this model's HF config
+ * asks for) or f16, which halves the largest item of the KV plan: 144 -> 72 MiB a slot, two slots
+ * a sequence, and the checkpoint a slot with it -- about 1.1 GiB at eight sequences, ~37k KV
+ * tokens, plus the same again if the checkpoint slots are kept. libr4d reads the width off the
+ * state operand (both GDN decode rows and the chunk scan), so this is the whole switch. It changes
+ * the generated text (round-trip error ~5e-4 relative a step), so it is opt-in and is to be judged
+ * on KL / GSM8K / acceptance before it is anybody's default. Anything but f32/f16 is refused
+ * loudly, not read as the default. */
+static uint32_t gdn_state_dtype() {
+    const char* e = std::getenv("RADIANCE_GDN_STATE");
+    if (!e || !*e || !std::strcmp(e, "f32") || !std::strcmp(e, "fp32")) return RAD_F32;
+    if (!std::strcmp(e, "f16") || !std::strcmp(e, "fp16")) {
+        fprintf(stderr, "radiance: RADIANCE_GDN_STATE=f16 -- the delta-net state is held in f16 "
+                        "(half the KV plan's largest item; the text differs from the f32 state's)\n");
+        return RAD_F16;
+    }
+    fprintf(stderr, "radiance: RADIANCE_GDN_STATE=%s is neither f32 nor f16; using f32\n", e);
+    return RAD_F32;
+}
+
 static int parse_tap_layers(const char* s, int64_t n_layer, int* out, int max) {
     if (!s) return 0;
     int n = 0;
@@ -725,7 +745,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * does that without being asked to. */
     RadKVGroupDecl sd{};
     sd.kind         = RAD_KV_LINEAR;
-    sd.dtype        = RAD_F32;
+    sd.dtype        = gdn_state_dtype();   /* f32 unless RADIANCE_GDN_STATE=f16, see above */
     sd.n_head_kv    = gc.n_head_v;
     sd.state_dim[0] = gc.head_v;
     sd.state_dim[1] = gc.head_k;
