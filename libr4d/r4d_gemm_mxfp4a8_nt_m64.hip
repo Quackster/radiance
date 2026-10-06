@@ -68,6 +68,14 @@
 // The E8M0 scales are left in [K/32][N] order -- a half-wave reads sixteen consecutive bytes of
 // those already.
 //
+// TWO ACTIVATION SCALE GRIDS, as in r4d_gemm_mxfp4a8_tiled.hip: one f32 per row (ABLK=false), or
+// one per (row, 128 of K) (ABLK=true, the block-scaled fp8 family's grid). With ABLK each wave
+// carries its partial sums in units of the current 128-block's scale and rescales them by
+// s_prev / s_next at each block boundary inside its split-K segment. The segments end in
+// DIFFERENT blocks, so each partial is brought back to absolute units -- multiplied by its own
+// last scale -- before the LDS reduction adds them, and the epilogue applies only the weight's
+// reference factor.
+//
 // TRAP FOR ANYONE MEASURING THIS KERNEL: a weight of tens of megabytes streamed in a loop is
 // Infinity-Cache resident on this part, so a bandwidth figure taken that way can read above the
 // DRAM roofline.  It ranks kernels reading the same bytes; it is not achieved DRAM bandwidth.
@@ -122,12 +130,12 @@ __device__ __forceinline__ v2i r4d_mxfp4_unpack8(unsigned int wv, int dsh) {
   return out;
 }
 
-template <int MT, int NPW>
+template <int MT, int NPW, bool ABLK>
 __global__ void r4d_gemm_mxfp4a8_nt_m64_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
     const unsigned char* __restrict__ W, const unsigned char* __restrict__ Ws,
     const unsigned char* __restrict__ Wref, __hip_bfloat16* __restrict__ C,
-    int M, int K, int N, int WV, int SK) {
+    int M, int K, int N, int WV, int SK, int as_rs) {
   extern __shared__ float red[];
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
   const int col_local = wave / SK, ksplit = wave % SK;
@@ -161,8 +169,39 @@ __global__ void r4d_gemm_mxfp4a8_nt_m64_kernel(
   const unsigned int* __restrict__ Wp = (const unsigned int*)W;
   const int ksteps = K / 16;
 
+  // ABLK: the scale each accumulator row of this lane is carried in -- row (mt0+i)*16 + mhalf + e.
+  float scur[ABLK ? MT : 1][8];
+  if constexpr (ABLK) {
+#pragma unroll
+    for (int i = 0; i < MT; i++)
+#pragma unroll
+      for (int e = 0; e < 8; e++) {
+        int r = (mt0 + i) * 16 + mhalf + e;
+        r = r < M - 1 ? r : M - 1;
+        const float s = As[(size_t)r * as_rs + (kbase >> 7)];
+        scur[i][e] = s > 0.f ? s : 1.f;
+      }
+  }
+
   for (int k = 0; k < Ks; k += 16) {
     const int kg = kbase + k;                       // fragment base, both lane halves
+    if constexpr (ABLK) {
+      if (k && (kg & 127) == 0) {                   // a new 128-wide activation block
+#pragma unroll
+        for (int i = 0; i < MT; i++)
+#pragma unroll
+          for (int e = 0; e < 8; e++) {
+            int r = (mt0 + i) * 16 + mhalf + e;
+            r = r < M - 1 ? r : M - 1;
+            float s = As[(size_t)r * as_rs + (kg >> 7)];
+            s = s > 0.f ? s : scur[i][e];
+            const float q = scur[i][e] / s;
+            scur[i][e] = s;
+#pragma unroll
+            for (int j = 0; j < NPW; j++) acc[j][i][e] *= q;
+          }
+      }
+    }
     const int kstep = kg / 16;
     const int blk = kg / R4D_GEMM_MXFP4_GROUP;      // one E8M0 block covers this whole step
     v2i af[MT];
@@ -199,7 +238,8 @@ __global__ void r4d_gemm_mxfp4a8_nt_m64_kernel(
     for (int j = 0; j < NPW; j++) {
       const int slot = ((col_local * NPW + j) * SK + ksplit) * 256;
 #pragma unroll
-      for (int e = 0; e < 8; e++) red[slot + lane * 8 + e] = acc[j][i][e];
+      for (int e = 0; e < 8; e++)
+        red[slot + lane * 8 + e] = ABLK ? acc[j][i][e] * scur[i][e] : acc[j][i][e];
     }
     __syncthreads();
     // One pass over the block's 256-element tiles; every thread takes a stride.
@@ -215,7 +255,7 @@ __global__ void r4d_gemm_mxfp4a8_nt_m64_kernel(
       float v = 0.f;
       for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
       C[(size_t)m * N + n] =
-          (__hip_bfloat16)(v * __int_as_float((int)Wref[n] << 23) * As[m]);
+          (__hip_bfloat16)(v * __int_as_float((int)Wref[n] << 23) * (ABLK ? 1.f : As[m]));
     }
   }
 }
@@ -225,7 +265,7 @@ extern "C" int r4d_gemm_mxfp4a8_nt_m64_group(void) { return R4D_GEMM_MXFP4_GROUP
 
 extern "C" void r4d_gemm_mxfp4a8_nt_m64(long a, long ascale, long wq, long ws, long wref, long c,
                                         int M, int K, int N, int WV, int SK, int MB, int NPW,
-                                        long stream) {
+                                        int as_group, int as_rs, long stream) {
   if (M < 1 || M > R4D_GEMM_MXFP4_MAX_M)
     throw std::runtime_error("r4d gemm_mxfp4a8_nt_m64: M must be 1..64");
   if (N % 16) throw std::runtime_error("r4d gemm_mxfp4a8_nt_m64: N must be a multiple of 16");
@@ -236,6 +276,9 @@ extern "C" void r4d_gemm_mxfp4a8_nt_m64(long a, long ascale, long wq, long ws, l
   if (MB < 1 || MB > 4) throw std::runtime_error("r4d gemm_mxfp4a8_nt_m64: MB must be 1..4");
   if (NPW != 1 && NPW != 2 && NPW != 4 && NPW != 8)
     throw std::runtime_error("r4d gemm_mxfp4a8_nt_m64: NPW must be 1, 2, 4 or 8");
+  if (as_group != 0 && as_group != 128)
+    throw std::runtime_error("r4d gemm_mxfp4a8_nt_m64: the activation scale is per row or per 128 of K");
+  const bool ablk = as_group == 128;
   const int ntiles = N / 16, mtiles = (M + 15) / 16;
   const int ncols = WV * NPW;
   dim3 grid((ntiles + ncols - 1) / ncols, (mtiles + MB - 1) / MB), block(WV * SK * WAVE32);
@@ -249,8 +292,13 @@ extern "C" void r4d_gemm_mxfp4a8_nt_m64(long a, long ascale, long wq, long ws, l
   auto Rp = (const unsigned char*)wref;
   auto Cp = (__hip_bfloat16*)c;
   hipStream_t st = (hipStream_t)stream;
-#define LAUNCH(MTv, NPv) hipLaunchKernelGGL((r4d_gemm_mxfp4a8_nt_m64_kernel<MTv, NPv>), grid, \
-                                            block, smem, st, Ap, Sp, Wp, Zp, Rp, Cp, M, K, N, WV, SK)
+#define LAUNCH(MTv, NPv)                                                                          \
+  do {                                                                                            \
+    if (ablk) hipLaunchKernelGGL((r4d_gemm_mxfp4a8_nt_m64_kernel<MTv, NPv, true>), grid, block,   \
+                                 smem, st, Ap, Sp, Wp, Zp, Rp, Cp, M, K, N, WV, SK, as_rs);       \
+    else      hipLaunchKernelGGL((r4d_gemm_mxfp4a8_nt_m64_kernel<MTv, NPv, false>), grid, block,  \
+                                 smem, st, Ap, Sp, Wp, Zp, Rp, Cp, M, K, N, WV, SK, as_rs);       \
+  } while (0)
 #define LAUNCH_MB(NPv) switch (MB) { \
     case 1: LAUNCH(1, NPv); break; \
     case 2: LAUNCH(2, NPv); break; \
@@ -284,6 +332,9 @@ extern "C" int r4d_rad_gemm_mxfp4a8_m64(const RadArgs* a, RadStream s) {
      * reference and every element would be scaled against zero. */
     if (!g.bref) return R4D_NO(RAD_E_INVAL);
     const int group = r4d_gemm_mxfp4a8_nt_m64_group();
+    int as_group = 0, as_rs = 1;
+    rc = mx_ascale_grid(g, &as_group, &as_rs);
+    if (rc != RAD_OK) return rc;
     Cfg c;
     rc = cfg_for(a, g.K, g.M, group, BR_FLAT, &c);
     if (rc != RAD_OK) return rc;
@@ -291,7 +342,7 @@ extern "C" int r4d_rad_gemm_mxfp4a8_m64(const RadArgs* a, RadStream s) {
         r4d_gemm_mxfp4a8_nt_m64(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b),
                                 r4d_addr(g.bscale), r4d_addr(g.bref), r4d_addr(g.y),
                                 (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb, c.npw,
-                                (long)(uintptr_t)s));
+                                as_group, as_rs, (long)(uintptr_t)s));
     return RAD_OK;
 }
 

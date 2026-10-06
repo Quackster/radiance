@@ -261,6 +261,16 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
     if (const char* qm = gs("quantization_config.quant_method")) {
         out->quant = qm;
         if (const char* fm = gs("quantization_config.fmt")) { out->quant += "_"; out->quant += fm; }
+        /* COMPRESSED-TENSORS NAMES ITS FORMAT, NOT ITS METHOD. `quant_method` is the container
+         * library (llm-compressor's) and says nothing about the numbers; `format` does. An
+         * OCP-MXFP4 release -- e2m1 codes, one E8M0 exponent a 32 -- is `mxfp4`, the descriptor
+         * qwen35_mxfp4 claims; any other format keeps its name so it is refused as itself. */
+        if (out->quant == "compressed-tensors") {
+            const char* cf = gs("quantization_config.format");
+            out->quant = cf && !std::strcmp(cf, "mxfp4-pack-quantized")
+                             ? std::string("mxfp4")
+                             : "compressed-tensors_" + std::string(cf ? cf : "?");
+        }
     }
 
     out->finish();
@@ -432,7 +442,56 @@ int Checkpoint::open_safetensors(const std::string& path) {
             fp8_bc_ = c;
         }
     }
+    if (meta_.quant == "mxfp4") RAD_TRY(alias_mxfp4());
     meta_.finish();
+    return RAD_OK;
+}
+
+/* A COMPRESSED-TENSORS MXFP4 LINEAR IS TWO U8 TENSORS, and they are already the two planes of
+ * `fp4_e2m1*e8m0[1x32]` byte for byte:
+ *
+ *   X.weight_packed   U8 [N][K/2]    two e2m1 codes a byte, element 2j in the LOW nibble
+ *   X.weight_scale    U8 [N][K/32]   an E8M0 exponent a 32 of K
+ *
+ * llm-compressor packs `x[..., 0::2] | x[..., 1::2] << 4`, and a 4-bit plane here is low nibble
+ * first (rad_load_bits), so the codes need no repacking at all. Each pair is ALIASED as the names
+ * the rest of this file already reads -- `X.weight` at fp4_e2m1 [N][K] and its companion
+ * `X.weight_scale_inv` at e8m0 -- over the same mapped bytes, which makes the weight trivial
+ * exactly as a block-fp8 one is and lets rad-convert copy it. Nothing is aliased for a pair whose
+ * shapes disagree; it is refused by name, since a scale grid read at the wrong width is a model
+ * that loads and is wrong. */
+int Checkpoint::alias_mxfp4() {
+    static const char kP[] = ".weight_packed";
+    const size_t lp = sizeof(kP) - 1;
+    std::vector<SrcTensor> add;
+    for (const SrcTensor& t : tensors_) {
+        if (t.name.size() <= lp || t.name.compare(t.name.size() - lp, lp, kP) != 0) continue;
+        const std::string base = t.name.substr(0, t.name.size() - lp);
+        const SrcTensor* sc = find(base + ".weight_scale");
+        if (t.rad_dtype != RAD_U8 || t.shape.size() != 2 || !sc || sc->rad_dtype != RAD_U8 ||
+            sc->shape.size() != 2 || sc->shape[0] != t.shape[0] ||
+            sc->shape[1] * 32 != t.shape[1] * 2) {
+            RAD_ERR("'%s' is not an MXFP4 pair: want U8 [N][K/2] codes beside a U8 [N][K/32] "
+                    "'%s.weight_scale'", t.name.c_str(), base.c_str());
+            return RAD_E_FORMAT;
+        }
+        if (find(base + ".weight")) continue;
+        SrcTensor w = t;
+        w.name      = base + ".weight";
+        w.rad_dtype = RAD_FP4E2M1;
+        w.shape     = { t.shape[0], t.shape[1] * 2 };
+        SrcTensor s = *sc;
+        s.name      = base + ".weight_scale_inv";
+        s.rad_dtype = RAD_E8M0;
+        add.push_back(std::move(w));
+        add.push_back(std::move(s));
+    }
+    for (SrcTensor& s : add) {
+        index_.emplace(s.name, tensors_.size());
+        tensors_.push_back(std::move(s));
+    }
+    RAD_INFO("checkpoint: %zu compressed-tensors MXFP4 linear(s) read as fp4_e2m1*e8m0[1x32]",
+             add.size() / 2);
     return RAD_OK;
 }
 
@@ -673,6 +732,22 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             rad_enc_add_plane(&out->enc, "codes", dt, 1, 1);
             rad_enc_add_plane(&out->enc, "scale", sdt, br, bc);
         }
+    } else if (dt == RAD_FP4E2M1 && scaled) {
+        /* OCP-MXFP4, the pair alias_mxfp4() made: e2m1 codes and one E8M0 exponent per 32 of K
+         * in each row. The block is one row tall, so pieces join along rows with no alignment
+         * condition; a join along columns would interleave two exponent grids and is not one. */
+        out->trivial = d == 0 || out->pieces.size() == 1;
+        if (!out->trivial) out->why = "its MXFP4 pieces are joined along a column";
+        for (size_t k = 0; k < out->pieces.size() && out->trivial; ++k) {
+            const SrcTensor& pk = *out->pieces[k];
+            const SrcTensor& sk = *out->scales[k];
+            if (sk.rad_dtype != RAD_E8M0 || pk.shape.size() != 2 || sk.shape.size() != 2 ||
+                sk.shape[0] != pk.shape[0] || pk.shape[1] % 32 || sk.shape[1] != pk.shape[1] / 32) {
+                out->trivial = false;
+                out->why = "'" + sk.name + "' is not the [rows][K/32] E8M0 plane of '" + pk.name + "'";
+            }
+        }
+        if (out->trivial) out->enc = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
     } else if (!unscaled) {
         out->why = "some of its pieces carry a scale plane and some do not";
     } else if (dt == RAD_F8E4M3 || dt == RAD_F8E5M2) {
@@ -808,6 +883,7 @@ int piece_f32(const SrcTensor& t, int64_t e, int64_t n, float* out) {
             return RAD_OK;
         }
         case RAD_F16: case RAD_F8E4M3: case RAD_F8E5M2:
+        case RAD_FP4E2M1: case RAD_E8M0:
         case RAD_I8: case RAD_U8: case RAD_I16: case RAD_I32: case RAD_U32: case RAD_U16:
             for (int64_t i = 0; i < n; ++i) out[i] = rad_load_f32(p, t.rad_dtype, e + i);
             return RAD_OK;
@@ -876,16 +952,21 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
     rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr, &pc);
     if (r0 < 0 || nr < 0 || r0 + nr > pr) return refuse(RAD_E_SHAPE, "plane rows out of range");
     const uint32_t dt = w.enc.plane[k].dtype;
-    const int64_t eb = rad_dtype_bits(dt) / 8;
+    const int64_t bits = rad_dtype_bits(dt);
+    const int64_t eb = bits / 8;
     uint8_t* o = (uint8_t*)dst;
     if (k == 0) {
-        /* the codes: the pieces joined, bytes as they are */
+        /* the codes: the pieces joined, bytes as they are. A sub-byte code (MXFP4's e2m1) is
+         * copied in whole bytes, which every run here is: a run starts and ends on a row, and a
+         * row of an even-K 4-bit plane is whole bytes. */
         Joined j;
         j.init(src, w.concat_dim);
         return j.walk(r0 * pc, (r0 + nr) * pc, [&](int p, int64_t e, int64_t n) {
-            std::memcpy(o, (const uint8_t*)src[(size_t)p]->data + e * eb, (size_t)(n * eb));
-            o += n * eb;
-            return RAD_OK;
+            if ((e * bits) % 8 || (n * bits) % 8) return (int)RAD_E_SHAPE;
+            std::memcpy(o, (const uint8_t*)src[(size_t)p]->data + e * bits / 8,
+                        (size_t)(n * bits / 8));
+            o += n * bits / 8;
+            return (int)RAD_OK;
         });
     }
     /* an FP8 scale plane: the pieces' scale rows one after another */

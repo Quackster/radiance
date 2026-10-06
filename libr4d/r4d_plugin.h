@@ -42,6 +42,7 @@ enum {
      * asks with M=64 to exclude m16. */
     R4D_PRIO_GEMM_M16     = 60,
     R4D_PRIO_GEMM_SKINNY  = 50,
+    R4D_PRIO_GEMM_MXDEC   = 55,   /* above the MXFP4 skinny row: the decode band is its */
     /* The skinny m64 row has no upper bound on M, so the tiled bf16 row -- M > 64 only -- has to
      * outrank it to be reached, and stays below m16 whose band it never enters. */
     R4D_PRIO_GEMM_BF16_TILED = 55,
@@ -208,6 +209,9 @@ int r4d_rad_gemm_w8a8_m64   (const RadArgs*, RadStream);
 int r4d_rad_gemm_w8a8_tiled (const RadArgs*, RadStream);
 int r4d_rad_gemm_w2a8       (const RadArgs*, RadStream);
 int r4d_rad_gemm_mxfp4a8_m64(const RadArgs*, RadStream);
+int r4d_rad_gemm_mxfp4a8_tiled(const RadArgs*, RadStream);
+int r4d_rad_gemm_mxfp4a8_decode(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_mxfp4a8_decode_scratch(const RadArgs*);
 int r4d_rad_dequant_w4      (const RadArgs*, RadStream);
 int r4d_rad_rowtopk         (const RadArgs*, RadStream);
 int r4d_rad_rowtopk_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);

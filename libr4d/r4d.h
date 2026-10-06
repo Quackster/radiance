@@ -558,10 +558,26 @@ void r4d_gemm_w8a8_tiled(long a, long ascale, long wq, long ws, long c, int M, i
 
 // OCP-MXFP4 weight, fp8 activation. e2m1 elements with one E8M0 exponent per 32 K, folded
 // against a per-row reference exponent so the inner loop has no rescale; fp8 WMMA.
+// as_group 0 = one f32 activation scale per row, 128 = one per (row, 128 of K) at row stride as_rs.
 void r4d_gemm_mxfp4a8_nt_m64(long a, long ascale, long wq, long ws, long wref, long c,
-                             int M, int K, int N, int WV, int SK, int MB, int NPW, long stream);
+                             int M, int K, int N, int WV, int SK, int MB, int NPW,
+                             int as_group, int as_rs, long stream);
 int  r4d_gemm_mxfp4a8_nt_m64_max_m(void);
 int  r4d_gemm_mxfp4a8_nt_m64_group(void);
+// The same operands and weight layout tiled for PREFILL: a 256-row block stages A through LDS once
+// per K slab and unpacks the weight once per slab, where the skinny kernel re-reads the weight
+// ceil(M/64) times. TN (2 or 4, 0 = by M) is the per-wave column width in 16-column fragments.
+// as_group 0 = one f32 activation scale per row, 128 = one per (row, 128 of K) at row stride as_rs.
+void r4d_gemm_mxfp4a8_tiled(long a, long ascale, long wq, long ws, long wref, long c,
+                            int M, int K, int N, int TN, int as_group, int as_rs, long stream);
+int  r4d_gemm_mxfp4a8_tiled_group(void);
+// The same operands for the DECODE band (M <= 64): split-K across workgroups with a fused
+// last-arriver reduction and a persistent partial a (device, stream). KS/BK 0 = the measured rule.
+void r4d_gemm_mxfp4a8_decode(long a, long ascale, long wq, long ws, long wref, long c,
+                             int M, int K, int N, int KS, int BK, int NT,
+                             int as_group, int as_rs, long stream);
+int  r4d_gemm_mxfp4a8_decode_max_m(void);
+int  r4d_gemm_mxfp4a8_tiled_k_unit(void);
 
 // ---- BLOCK-SCALED FP8: the format a checkpoint ships in ----------------------------------------
 //

@@ -122,10 +122,11 @@ inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, co
 
     /* The fold, over the same weights and into the same activation the pair writes. Not
      * RAD_ARCH_TRY: a plugin without the row is the ordinary case and the pair still runs. It
-     * multiplies fp8 codes by a block-fp8 gate_up, so a plain gate_up has no fold. */
+     * multiplies fp8 codes by a block-fp8 gate_up, so a plain gate_up has no fold -- and neither
+     * has an MXFP4 one: libr4d's gated fold is an fp8a8 tile, and the pair serves it. */
     {
         const int64_t hi = g.max_tok < 64 ? g.max_tok : 64;
-        if (hi > 0 && !gate_up.bf16) {
+        if (hi > 0 && !gate_up.bf16 && !gate_up.mx) {
             op_gated = rw(b, RAD_OP(b, "gemm_nt_q_gated",
                              RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", gate_up.N),
                                         RAD_INT("K", gate_up.K),

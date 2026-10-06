@@ -113,6 +113,7 @@ private:
     int add_shard(const std::string& p, const std::string& prefix = "");
     int open_safetensors(const std::string& path);
     int open_gguf(const std::string& path);
+    int alias_mxfp4();
 
     enum Kind { None, Gguf, SafeT } kind_ = None;
     std::string path_, dir_;

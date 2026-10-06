@@ -3308,6 +3308,313 @@ static void w8a16_numeric(const Plugin& pl, const char* row, int64_t M, int64_t 
 }
 
 
+/* THE MXFP4 GEMMS AGAINST WHAT THE PLANES MEAN. The weight is an OCP-MXFP4 plane pair -- e2m1
+ * codes and an E8M0 exponent per 32 K -- stored through the row's own hooks, so the fragment
+ * order, the [K/32][N] exponents and the per-row reference all come from r4d_layout.cpp and the
+ * kernel is checked on what the loader would hand it. The reference decodes the planes on the host
+ * with no fold at all, so a misread arrangement shows as a column that disagrees.
+ *
+ * The exponents are spread so a row's blocks sit up to 12 binades under its reference: d <= 8 is
+ * exact in the folded e4m3 table and d = 9..12 rounds, which is the subnormal tail both MXFP4 rows
+ * share. M and N are chosen ragged against the tiled row's 256-row block and 64/128-column tile,
+ * so the clamped staging and the guarded epilogue both run. `tn` pins the tiled row's column
+ * width; 0 leaves it to the row's own M rule (and is ignored by the skinny row).
+ *
+ * `ablk` hands the activation scale as the block-scaled fp8 family's grid, one f32 per (row, 128
+ * of K), instead of one per row -- what an architecture's fused quantisers write. The scales are
+ * spread over two decades and every eleventh block's is ZERO with zero codes behind it (an
+ * all-zero activation block), which is the case the kernels carry their previous scale through. */
+static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N, int64_t K,
+                            int tn, bool ablk = false, std::vector<RadParam> extra = {}) {
+    if (!sel(row)) return;
+    char nm[160];
+    std::string ex;
+    for (const RadParam& p : extra) ex += std::string(" ") + p.key + "=" + std::to_string(p.ival);
+    std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld tn=%d%s%s", row, (long long)M,
+                  (long long)N, (long long)K, tn, ablk ? " ascale=row x 128" : "", ex.c_str());
+    const RadKernelInfo* r = find(pl, row);
+    if (!r || !r->layout || !r->relayout) { ok(nm, false, "row or hooks absent"); return; }
+    const int64_t nblk = K / 32;
+
+    Planes p;
+    p.enc = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    p.size(N, K);
+    const int ic = p.find("codes"), is = p.find("scale");
+    if (ic < 0 || is < 0) { ok(nm, false, "encoding has no codes/scale plane"); return; }
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t k = 0; k < K; k += 2) {
+            const uint8_t lo = (uint8_t)((n * 7 + k * 3 + 1) % 16);
+            const uint8_t hi = (uint8_t)((n * 5 + (k + 1) * 11 + 3) % 16);
+            p.data[(size_t)ic][(size_t)((n * K + k) / 2)] = (uint8_t)(lo | (hi << 4));
+        }
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t b = 0; b < nblk; ++b) {
+            int e = 127 + (int)((n * 3 + b * 5) % 7) - 3;
+            if ((n + b) % 11 == 0) e -= 6 + (int)((n + 2 * b) % 7);     /* d up to ~12 */
+            p.data[(size_t)is][(size_t)(n * nblk + b)] = (uint8_t)e;
+        }
+    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 32) };
+    std::vector<uint8_t> wq, ws, wr;
+    const int rw = stored(r, lp, 2, p, { "codes" }, &wq);
+    const int rs = stored(r, lp, 3, p, { "scale" }, &ws);
+    const int rr = stored(r, lp, 6, p, { "scale" }, &wr);
+    if (rw != RAD_OK || rs != RAD_OK || rr != RAD_OK) {
+        ok(nm, false, "relayout rc " + std::to_string(rw) + "/" + std::to_string(rs) + "/" +
+                      std::to_string(rr));
+        return;
+    }
+
+    const int64_t nkb = (K + 127) / 128, asc = ablk ? nkb : 1;
+    std::vector<uint8_t> ha((size_t)(M * K));
+    std::vector<float> av((size_t)(M * K)), as((size_t)(M * asc));
+    for (int64_t i = 0; i < M; ++i) {
+        for (int64_t c = 0; c < asc; ++c)
+            as[(size_t)(i * asc + c)] =
+                ablk ? ((i + c) % 11 == 5 ? 0.0f : 0.002f * (float)(1 + (i * 3 + c * 7) % 97))
+                     : 0.0125f * (float)(1 + i % 5);
+        for (int64_t k = 0; k < K; ++k) {
+            const bool zero = ablk && as[(size_t)(i * asc + k / 128)] == 0.0f;
+            const float v = zero ? 0.0f
+                                 : (float)(((i * 7 + k * 13) % 401) - 200) * 0.02f * ((k % 3) ? 1.f : -1.f);
+            rad_store_f32(ha.data(), RAD_F8E4M3, i * K + k, v);
+            av[(size_t)(i * K + k)] = rad_load_f32(ha.data(), RAD_F8E4M3, i * K + k);
+        }
+    }
+    std::vector<uint16_t> hy((size_t)(M * N), 0);
+    void* d_a = dalloc(ha.size());
+    void* d_s = dalloc(as.size() * 4);
+    void* d_w = dalloc(wq.size());
+    void* d_e = dalloc(ws.size());
+    void* d_r = dalloc(wr.size());
+    void* d_y = dalloc(hy.size() * 2);
+    if (!d_a || !d_s || !d_w || !d_e || !d_r || !d_y) { ok(nm, false, "hipMalloc failed"); return; }
+    st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_s, as.data(), as.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_e, ws.data(), ws.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_r, wr.data(), wr.size(), hipMemcpyHostToDevice);
+    std::vector<RadTensor> ts = {
+        T(d_a, RAD_F8E4M3, { M, K }),
+        ablk ? T(d_s, RAD_F32, { M, asc }) : T(d_s, RAD_F32, { M }),
+        T(d_w, RAD_U8, { (int64_t)wq.size() }), T(d_e, RAD_U8, { (int64_t)ws.size() }),
+        T(d_y, RAD_BF16, { M, N }), T(nullptr, RAD_F32, { 1 }), T(d_r, RAD_U8, { (int64_t)wr.size() }),
+    };
+    absent(ts[5]);
+    std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PI("group", 32),
+                                 PS("dtype", "mxfp4a8") };
+    if (tn) ps.push_back(PI("tn", tn));
+    for (const RadParam& p : extra) ps.push_back(p);
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    a.world_size = 1;
+    /* A row with a scratch hook (the decode row's split partial) gets what it asks for: with no
+     * scratch the engine path silently runs UNSPLIT, so every ks=2/4 case here would be ks=1. */
+    if (r->scratch) {
+        const int64_t sb = r->scratch(&a);
+        if (sb > 0) {
+            a.scratch = dalloc((size_t)sb);
+            a.scratch_bytes = sb;
+            if (!a.scratch) { ok(nm, false, "hipMalloc failed"); return; }
+        }
+    }
+    const int rc = r->launch(&a, (RadStream) nullptr);
+    if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+        ok(nm, false, "rc=" + std::to_string(rc));
+        return;
+    }
+    st_memcpy(hy.data(), d_y, hy.size() * 2, hipMemcpyDeviceToHost);
+
+    /* Every column for small N, a stride otherwise -- always including the last column, which is
+     * the clamped tail of the tiled row's weight staging. */
+    const int64_t nstep = N > 96 ? N / 96 : 1;
+    double num = 0, den = 0, worst = 0;
+    for (int64_t i = 0; i < M; ++i)
+        for (int64_t n = 0; n < N; n = (n + 1 == N) ? N : std::min(n + nstep, N - 1)) {
+            double acc = 0;
+            for (int64_t k = 0; k < K; ++k) {
+                const double w = (double)rad_load_f32(p.data[(size_t)ic].data(), RAD_FP4E2M1, n * K + k) *
+                                 (double)rad_load_f32(p.data[(size_t)is].data(), RAD_E8M0, n * nblk + k / 32);
+                acc += (double)av[(size_t)(i * K + k)] * w *
+                       (ablk ? (double)as[(size_t)(i * asc + k / 128)] : 1.0);
+            }
+            if (!ablk) acc *= (double)as[(size_t)i];
+            const double d = (double)h_bf16(hy[(size_t)(i * N + n)]) - acc;
+            num += d * d;
+            den += acc * acc;
+            worst = std::max(worst, std::fabs(d) / (std::fabs(acc) + 1e-3));
+        }
+    const double rel = den > 0 ? std::sqrt(num / den) : std::sqrt(num);
+    char d[96];
+    std::snprintf(d, sizeof d, "rel_l2 %.3e, worst %.3e", rel, worst);
+    ok(nm, rel < 1e-2, d);
+}
+
+
+/* TWO DECODE GEMMS THE ENGINE MAY OVERLAP (gemm_mxfp4a8_decode is a concurrent row: its split partial
+ * is the op's scratch and its arrival counters are keyed on the output). Each GEMM has its own
+ * weights, activations and output and a DISJOINT slice of one scratch allocation, with a split
+ * (ks > 1) so the partial and the counters are live. The reference is each launched alone, then the
+ * pair is launched on two non-blocking streams with nothing ordering them -- repeated, so the
+ * launches overlap in different phases -- and every output must be BYTE-identical to the serial one
+ * (the reducer sums the splits in a fixed order, so a lost or shared counter / partial shows as a
+ * different byte or a hang). A last serial launch after the loop checks that the counters were
+ * left at zero. */
+struct MxdOverlapGemm {
+    int64_t M, N, K;
+    int ks;
+    std::vector<RadTensor> ts;
+    std::vector<RadParam> ps;
+    void* y = nullptr;
+    int64_t scratch = 0;
+    bool ready = false;
+};
+
+static bool mxd_overlap_build(const RadKernelInfo* r, MxdOverlapGemm& g, int seed) {
+    const int64_t M = g.M, N = g.N, K = g.K, nblk = K / 32, nkb = K / 128;
+    Planes p;
+    p.enc = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    p.size(N, K);
+    const int ic = p.find("codes"), is = p.find("scale");
+    if (ic < 0 || is < 0) return false;
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t k = 0; k < K; k += 2) {
+            const uint8_t lo = (uint8_t)((n * 7 + k * 3 + seed) % 16);
+            const uint8_t hi = (uint8_t)((n * 5 + (k + 1) * 11 + 3 + seed) % 16);
+            p.data[(size_t)ic][(size_t)((n * K + k) / 2)] = (uint8_t)(lo | (hi << 4));
+        }
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t b = 0; b < nblk; ++b)
+            p.data[(size_t)is][(size_t)(n * nblk + b)] = (uint8_t)(127 + (int)((n * 3 + b * 5 + seed) % 7) - 3);
+    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 32) };
+    std::vector<uint8_t> wq, ws, wr;
+    if (stored(r, lp, 2, p, { "codes" }, &wq) != RAD_OK || stored(r, lp, 3, p, { "scale" }, &ws) != RAD_OK ||
+        stored(r, lp, 6, p, { "scale" }, &wr) != RAD_OK)
+        return false;
+    std::vector<uint8_t> ha((size_t)(M * K));
+    std::vector<float> as((size_t)(M * nkb));
+    for (int64_t i = 0; i < M; ++i) {
+        for (int64_t c = 0; c < nkb; ++c) as[(size_t)(i * nkb + c)] = 0.002f * (float)(1 + (i * 3 + c * 7 + seed) % 97);
+        for (int64_t k = 0; k < K; ++k)
+            rad_store_f32(ha.data(), RAD_F8E4M3, i * K + k,
+                          (float)(((i * 7 + k * 13 + seed) % 401) - 200) * 0.02f * ((k % 3) ? 1.f : -1.f));
+    }
+    void* d_a = dalloc(ha.size());
+    void* d_s = dalloc(as.size() * 4);
+    void* d_w = dalloc(wq.size());
+    void* d_e = dalloc(ws.size());
+    void* d_r = dalloc(wr.size());
+    g.y = dalloc((size_t)(M * N) * 2);
+    if (!d_a || !d_s || !d_w || !d_e || !d_r || !g.y) return false;
+    st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_s, as.data(), as.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_e, ws.data(), ws.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_r, wr.data(), wr.size(), hipMemcpyHostToDevice);
+    g.ts = { T(d_a, RAD_F8E4M3, { M, K }), T(d_s, RAD_F32, { M, nkb }),
+             T(d_w, RAD_U8, { (int64_t)wq.size() }), T(d_e, RAD_U8, { (int64_t)ws.size() }),
+             T(g.y, RAD_BF16, { M, N }), T(nullptr, RAD_F32, { 1 }), T(d_r, RAD_U8, { (int64_t)wr.size() }) };
+    absent(g.ts[5]);
+    g.ps = { PI("M", M), PI("N", N), PI("K", K), PI("group", 32), PS("dtype", "mxfp4a8"),
+             PI("ks", g.ks), PI("bk", 128), PI("nt", 1) };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = g.ts.data(); a.n_t = (int)g.ts.size();
+    a.p = g.ps.data(); a.n_p = (int)g.ps.size();
+    a.world_size = 1;
+    g.scratch = r->scratch ? r->scratch(&a) : 0;
+    g.ready = g.scratch >= (int64_t)g.ks * M * N * 4;
+    return g.ready;
+}
+
+static int mxd_overlap_launch(const RadKernelInfo* r, MxdOverlapGemm& g, void* scratch, hipStream_t st) {
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = g.ts.data(); a.n_t = (int)g.ts.size();
+    a.p = g.ps.data(); a.n_p = (int)g.ps.size();
+    a.world_size = 1;
+    a.scratch = scratch;
+    a.scratch_bytes = g.scratch;
+    return r->launch(&a, (RadStream)st);
+}
+
+static void mxd_overlap_case(const Plugin& pl) {
+    if (!sel("gemm_mxfp4a8_decode_overlap") && !sel("gemm_mxfp4a8_decode")) return;
+    const char* nm = "gemm_mxfp4a8_decode: two split GEMMs on two streams, disjoint scratch, byte-identical to serial";
+    const RadKernelInfo* r = find(pl, "gemm_mxfp4a8_decode");
+    if (!r || !r->layout || !r->relayout || !r->scratch) { ok(nm, false, "row or hooks absent"); return; }
+    MxdOverlapGemm g[3];
+    g[0] = MxdOverlapGemm{}; g[0].M = 8;  g[0].N = 400;  g[0].K = 2560; g[0].ks = 4;
+    g[1] = MxdOverlapGemm{}; g[1].M = 8;  g[1].N = 272;  g[1].K = 2560; g[1].ks = 2;
+    g[2] = MxdOverlapGemm{}; g[2].M = 24; g[2].N = 1040; g[2].K = 1152; g[2].ks = 4;
+    for (int i = 0; i < 3; ++i)
+        if (!mxd_overlap_build(r, g[i], 1 + 2 * i)) { ok(nm, false, "operands or scratch hook (ks > 1 needs a split partial)"); return; }
+    /* One allocation, a slice each, 256-byte aligned: the core's disjoint scratch slices. */
+    int64_t off[3], tot = 0;
+    for (int i = 0; i < 3; ++i) { off[i] = tot; tot += (g[i].scratch + 255) & ~int64_t(255); }
+    char* base = (char*)dalloc((size_t)tot);
+    if (!base) { ok(nm, false, "hipMalloc failed"); return; }
+    /* The serial reference gets its own scratch, so the two runs share nothing but the kernel. */
+    std::vector<std::vector<uint16_t>> want(3);
+    for (int i = 0; i < 3; ++i) {
+        void* sc = dalloc((size_t)g[i].scratch);
+        if (!sc) { ok(nm, false, "hipMalloc failed"); return; }
+        const int rc = mxd_overlap_launch(r, g[i], sc, nullptr);
+        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { ok(nm, false, "serial rc=" + std::to_string(rc)); return; }
+        want[(size_t)i].assign((size_t)(g[i].M * g[i].N), 0);
+        st_memcpy(want[(size_t)i].data(), g[i].y, want[(size_t)i].size() * 2, hipMemcpyDeviceToHost);
+    }
+    hipStream_t s1 = nullptr, s2 = nullptr;
+    if (hipStreamCreateWithFlags(&s1, hipStreamNonBlocking) != hipSuccess ||
+        hipStreamCreateWithFlags(&s2, hipStreamNonBlocking) != hipSuccess) { ok(nm, false, "hipStreamCreate failed"); return; }
+    int bad = 0, iters = 0;
+    std::string why;
+    for (int it = 0; it < 200 && !bad; ++it) {
+        const int a = it % 3, b = (it + 1 + (it / 3) % 2) % 3;   /* every ordered pair of distinct GEMMs */
+        for (int i : { a, b }) st_memset(g[i].y, 0, (size_t)(g[i].M * g[i].N) * 2);
+        /* The streams are non-blocking, so nothing orders them after the legacy-stream memset. */
+        (void)hipDeviceSynchronize();
+        const int ra = mxd_overlap_launch(r, g[a], base + off[a], s1);
+        const int rb = mxd_overlap_launch(r, g[b], base + off[b], s2);
+        const bool sa = st_stream_sync(s1) == hipSuccess, sb = st_stream_sync(s2) == hipSuccess;
+        if (ra != RAD_OK || rb != RAD_OK || !sa || !sb) { bad = 1; why = "launch rc " + std::to_string(ra) + "/" + std::to_string(rb); break; }
+        for (int i : { a, b }) {
+            std::vector<uint16_t> got((size_t)(g[i].M * g[i].N));
+            st_memcpy(got.data(), g[i].y, got.size() * 2, hipMemcpyDeviceToHost);
+            if (std::memcmp(got.data(), want[(size_t)i].data(), got.size() * 2) != 0) {
+                bad = 1;
+                size_t nd = 0, first = got.size(), nz = 0;
+                for (size_t j = 0; j < got.size(); ++j) {
+                    if (got[j] != want[(size_t)i][j]) { ++nd; if (first == got.size()) first = j; }
+                    if (got[j] == 0) ++nz;
+                }
+                why = "iter " + std::to_string(it) + ": GEMM " + std::to_string(i) + " (ks=" + std::to_string(g[i].ks) + ") differs from serial: " +
+                      std::to_string(nd) + "/" + std::to_string(got.size()) + " elements, first at " + std::to_string(first) +
+                      " (m=" + std::to_string(first / (size_t)g[i].N) + " n=" + std::to_string(first % (size_t)g[i].N) + "), " +
+                      std::to_string(nz) + " zero, partner GEMM " + std::to_string(i == a ? b : a);
+            }
+        }
+        ++iters;
+    }
+    (void)hipStreamDestroy(s1);
+    (void)hipStreamDestroy(s2);
+    ok(nm, !bad, bad ? why : std::to_string(iters) + " overlapped pairs identical");
+    /* The counters must be zero again: a serial launch after the storm is still byte-identical. */
+    bool again = true;
+    for (int i = 0; i < 3 && again; ++i) {
+        st_memset(g[i].y, 0, (size_t)(g[i].M * g[i].N) * 2);
+        const int rc = mxd_overlap_launch(r, g[i], base + off[i], nullptr);
+        std::vector<uint16_t> got((size_t)(g[i].M * g[i].N));
+        again = rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+        if (again) {
+            st_memcpy(got.data(), g[i].y, got.size() * 2, hipMemcpyDeviceToHost);
+            again = std::memcmp(got.data(), want[(size_t)i].data(), got.size() * 2) == 0;
+        }
+    }
+    ok("gemm_mxfp4a8_decode: serial after the overlap storm is still identical (counters left at zero)", again);
+}
+
 /* THE INT8 TRUNK CHAIN: quant_act_i8g on a bf16 activation, then one of the i8a8 GEMMs on what it
  * wrote, against the planes' meaning. The weight is i8 with a bf16 scale per row per 128 K (what
  * libquant writes for `codes=i8 group=128 scale=bf16 clamp=sym`), stored through the row's own
@@ -10725,6 +11032,45 @@ static void device_phase(const Plugin& pl) {
         gemm_case(pl, "gemm_w8a8_nt_m64",    "w8a8",    M, N, K, RAD_I8,  1, 0, 0, N*K,   N*(K/128)*2);
         gemm_case(pl, "gemm_w2a8_nt",        "w2a8",    M, N, K, RAD_I8,  1, 1, 0, N*K/4, N*(K/128)*4);
         gemm_case(pl, "gemm_mxfp4a8_nt_m64", "mxfp4a8", M, N, K, RAD_F8E4M3, 1, 0, 1, N*K/2, (K/32)*N);
+        gemm_case(pl, "gemm_mxfp4a8_tiled",  "mxfp4a8", 256, 256, K, RAD_F8E4M3, 1, 0, 1, 256*K/2, (K/32)*256);
+        /* The skinny row is known-good, so it checks the check; the tiled row at both widths, ragged
+         * in M and N, then at the size where tn=0 crosses over to TN=4. */
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_nt_m64", 40, 272, 640, 0);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 40, 272, 640, 2);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 640, 2);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 400, 640, 4);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 2100, 512, 2560, 0);
+        /* ...and against the fp8 family's (row, 128) activation grid, which is what an architecture
+         * feeds them. K = 640 is five blocks and 2560 twenty, so every split-K segment of the
+         * skinny row and every slab pair of the tiled one crosses block boundaries. */
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_nt_m64", 40, 272, 640, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_nt_m64", 7, 512, 2560, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 640, 2, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 400, 640, 4, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 2100, 512, 2560, 0, true);
+        /* The decode row over its whole band: the split rule's own choice, then every split and
+         * slab forced, at both activation grids; N past a 128-column block, K a multiple of 64
+         * but not 128 (the slab falls back to 64), and DTM 1..4. */
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 8, 272, 640, 0, false);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 8, 272, 640, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 40, 400, 2560, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 64, 512, 2560, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 5, 1040, 576, 0, true);
+        mxd_overlap_case(pl);
+        for (int ks : { 1, 2, 4 })
+            for (int bk : { 64, 128 })
+                mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 24, 400, 2560, 0, true,
+                                { PI("ks", ks), PI("bk", bk), PI("nt", ks == 2 ? 0 : 1) });
+        /* ...and the one-fragment form (DTM = 1: the register prefetch and 16 B loads) at every
+         * split, slab and load hint, on both activation grids, N past a column block. */
+        for (int ks : { 1, 2, 4 })
+            for (int bk : { 64, 128 })
+                for (int nt : { 0, 1 }) {
+                    mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 8, 400, 2560, 0, true,
+                                    { PI("ks", ks), PI("bk", bk), PI("nt", nt) });
+                    mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 13, 272, 1152, 0, false,
+                                    { PI("ks", ks), PI("bk", bk), PI("nt", nt) });
+                }
         gemm_case(pl, "gemm_w4a8_tiled",     "w4a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K/2, 256*(K/128)*4);
         gemm_case(pl, "gemm_w8a8_tiled",     "w8a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K,   256*(K/128)*2);
         gemm_case(pl, "gemm_w4a8_prefill",   "w4a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K/2, 256*(K/128)*4);

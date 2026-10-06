@@ -68,6 +68,16 @@
 #ifndef QWEN35_ARCH_ID
 #define QWEN35_ARCH_ID "qwen35"
 #endif
+/* THE QUANTISATION DESCRIPTOR THIS TRANSLATION UNIT CLAIMS. The graph does not depend on it:
+ * LinearFP8 reads each weight's encoding and declares the GEMM that reads it, so the same blocks
+ * serve a block-fp8 trunk and an OCP-MXFP4 one (arch/qwen35_mxfp4/). What differs is only which
+ * checkpoints select the plugin. */
+#ifndef QWEN35_QUANT
+#define QWEN35_QUANT "fp8_e4m3"
+#endif
+#ifndef QWEN35_MXFP4
+#define QWEN35_MXFP4 0
+#endif
 
 #include <cstdlib>
 #include <arch/rad_arch.h>
@@ -308,6 +318,24 @@ static int check_layer_schedule(const RadModelMeta* meta, int64_t n_layer, int64
  * converted from a GGUF carries no HuggingFace quantization_config -- because the weight shapes and
  * the scale planes are then the only evidence and they are checked where they are read. */
 static int check_format(const RadModelMeta* meta) {
+#if QWEN35_MXFP4
+    /* THE MXFP4 SIBLING'S STATEMENT: llm-compressor's container with the OCP-MXFP4 format. The
+     * group is the format's (32, fixed by OCP MX) and the codes are e2m1 by definition, so there is
+     * no width to get wrong beyond the format name itself -- and the exponent planes' shapes are
+     * checked where core/format/checkpoint.cpp pairs them with their codes. */
+    {
+        const char* method = rad_meta_gets(meta, "quantization_config.quant_method", nullptr);
+        const char* format = rad_meta_gets(meta, "quantization_config.format", nullptr);
+        if (method && (std::strcmp(method, "compressed-tensors") != 0 || !format ||
+                       std::strcmp(format, "mxfp4-pack-quantized") != 0)) {
+            fprintf(stderr, "radiance: qwen35_mxfp4 refuses a container quantised by '%s' (format "
+                            "'%s'). This plugin serves compressed-tensors mxfp4-pack-quantized; "
+                            "qwen35_fp8 serves block-scaled fp8.\n", method, format ? format : "-");
+            return RAD_E_UNSUPPORTED;
+        }
+        return RAD_OK;
+    }
+#endif
     const char* method = rad_meta_gets(meta, "quantization_config.quant_method", nullptr);
     const char* fmt    = rad_meta_gets(meta, "quantization_config.fmt", nullptr);
     const char* block  = rad_meta_gets(meta, "quantization_config.weight_block_size", nullptr);
@@ -1498,8 +1526,13 @@ QWEN35_PLUGIN_X(QWEN35_NS, QWEN35_ARCH_ID, "fp8_e4m3", "0.1.0",
                 "dense graph with a routed feed-forward -- 256 experts, 8 a token, a shared expert "
                 "beside them -- gated attention over paged KV every fourth layer and gated delta "
                 "net between")
+#elif QWEN35_MXFP4
+QWEN35_PLUGIN_X(QWEN35_NS, QWEN35_ARCH_ID, QWEN35_QUANT, "0.1.0",
+                "Qwen3.5 / 3.6 / 3.8 dense (0.8B..27B), OCP-MXFP4 weights (e2m1, an E8M0 exponent "
+                "a 32) and block-scaled fp8 activations, gated attention over paged KV every "
+                "fourth layer and gated delta net between")
 #else
-QWEN35_PLUGIN_X(QWEN35_NS, QWEN35_ARCH_ID, "fp8_e4m3", "0.1.0",
+QWEN35_PLUGIN_X(QWEN35_NS, QWEN35_ARCH_ID, QWEN35_QUANT, "0.1.0",
                 "Qwen3.5 / 3.6 / 3.8 dense (0.8B..27B), block-scaled fp8 weights and fp8 "
                 "activations, gated attention over paged KV every fourth layer and gated delta "
                 "net between")

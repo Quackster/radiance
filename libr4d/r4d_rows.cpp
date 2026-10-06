@@ -2940,6 +2940,17 @@ static const RadConstraint cGemmNtW8A8[] = {
 static const RadConstraint cGemmW4A8Tiled[] = {
     C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 256), C_IN("dtype", "w4a8 w4a8_asym"),
 };
+/* r4d_gemm_mxfp4a8_tiled. Entry point: N % 16 (the fragment-order weight), K % 64 (its K slab),
+ * M >= 1. The skinny sibling outranks it up to M = 64 by priority, so the band starts at 1 rather
+ * than at a hand-picked crossover. */
+/* r4d_gemm_mxfp4a8_decode. Entry point: M <= 64, N % 16, K % 64. Above the skinny row by
+ * priority, so it takes the whole decode band; the tiled row keeps the rest. */
+static const RadConstraint cGemmMxfp4A8Decode[] = {
+    C_LE("M", 64), C_LE("N", 36864), C_DIV("K", 64), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
+};
+static const RadConstraint cGemmMxfp4A8Tiled[] = {
+    C_GE("M", 1), C_DIV("K", 64), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
+};
 /* r4d_gemm_w8a8_tiled. The same kernel at radix 8; the asym arm exists in the .hip but is NOT
  * declared in r4d.h, so this plugin cannot reach it and `w8a8_asym` is deliberately absent from
  * the dtype set. */
@@ -3057,6 +3068,25 @@ static const int64_t kPrefillArms[] = { 0, 2, 3, 5, 6, 8, 9, 10, 13, 14, 27, 28,
 static const RadTunable tGemmPrefill[] = {
   { "tile", kPrefillArms, NELEM(kPrefillArms), 0,
     "compiled tile arm; 0 is BM 128 x BN 256, libr4d's own default" },
+};
+
+/* The MXFP4 tiled GEMM's one axis. Both values are compiled arms of one template; 0 is the
+ * measured M crossover (TN=4 from M >= 2048), which needs M and so cannot be a constant. */
+static const int64_t kMxTn[] = { 0, 2, 4 };
+static const RadTunable tGemmMxfp4Tiled[] = {
+  { "tn", kMxTn, NELEM(kMxTn), 0,
+    "16-column fragments per wave: 2 = 256x64 block, 4 = 256x128. 0 = TN 4 from M >= 2048" },
+};
+
+/* The MXFP4 decode GEMM's axes. 0 on `ks` and `bk` is the kernel's measured rule; `nt` streams
+ * the weight (measured -5..-8% at M <= 48 on the fragment-order layout, ~0 at 64). */
+static const int64_t kMxDecKs[] = { 0, 1, 2, 4 };
+static const int64_t kMxDecBk[] = { 0, 64, 128 };
+static const int64_t kMxDecNt[] = { 0, 1 };
+static const RadTunable tGemmMxfp4Decode[] = {
+  { "ks", kMxDecKs, NELEM(kMxDecKs), 0, "split-K workgroups a column block. 0 = the fill rule" },
+  { "bk", kMxDecBk, NELEM(kMxDecBk), 0, "K slab in bytes. 0 = 128, or 64 at DTM 4 unsplit" },
+  { "nt", kMxDecNt, NELEM(kMxDecNt), 1, "non-temporal weight loads" },
 };
 
 /* ------------------------------------------------------------------------ split-KV attention
@@ -4369,6 +4399,30 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_gemm_mxfp4a8_m64, nullptr, r4d_rad_layout_mxfp4,
   r4d_rad_relayout_mxfp4 },
 
+{ "gemm_mxfp4a8_decode", "gemm_nt_q", "gemm",
+  "the OCP-MXFP4 GEMM for the DECODE band: split-K across workgroups with a fused last-arriver "
+  "reduction, the weight unpacked through LDS, streaming weight loads",
+  "M <= 64; N a multiple of 16; K a multiple of 64; the skinny kernel's fragment-order weight, "
+  "[K/32][N] E8M0 exponents and per-row reference exponent; the split partial in the op's scratch",
+  "e4m3 A with an f32 scale per row or per (row, 128), e2m1 W with an E8M0 scale per 32 K folded "
+  "into the element against a per-row reference, bf16 C, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_MXDEC,
+  ROW(cGemmMxfp4A8Decode), ROW(tGemmMxfp4Decode), nullptr,
+  nullptr, nullptr, r4d_rad_gemm_mxfp4a8_decode, r4d_rad_gemm_mxfp4a8_decode_scratch, r4d_rad_layout_mxfp4,
+  r4d_rad_relayout_mxfp4 },
+
+{ "gemm_mxfp4a8_tiled", "gemm_nt_q", "gemm",
+  "the OCP-MXFP4 GEMM tiled for PREFILL row counts: a 256-row block stages A through LDS once per "
+  "K slab and unpacks the weight once per slab, where the skinny kernel re-reads it every 64 rows",
+  "any M; N a multiple of 16; K a multiple of 64; the skinny kernel's fragment-order weight, "
+  "[K/32][N] E8M0 exponents and per-row reference exponent",
+  "e4m3 A with an f32 per-row scale, e2m1 W with an E8M0 scale per 32 K folded into the element "
+  "against a per-row reference, bf16 C, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_TILED,
+  ROW(cGemmMxfp4A8Tiled), ROW(tGemmMxfp4Tiled), nullptr,
+  nullptr, nullptr, r4d_rad_gemm_mxfp4a8_tiled, nullptr, r4d_rad_layout_mxfp4,
+  r4d_rad_relayout_mxfp4 },
+
 /* BAND READ OFF THE ENTRY POINT'S OWN REJECTION TESTS. */
 { "gemm_w4a8_prefill", "gemm_nt_q", "gemm",
   "the 4-bit GEMM for PREFILL row counts, where the matrix pipe rather than the weight stream is "
@@ -5161,11 +5215,13 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
  *   gemm_w8a8_tiled
  *   every collective    the peer flags and exchange buffers the all-reduces own
  *
- * gemm_fp8a8_nt_m16's finisher counters are keyed on the stream AND the output, and
- * router_gemm_topk_scatter_bf16's arrival counter is its op instance's (taken at init, one a
- * declared op and band), so two launches that could run at once never share them, and both rows
- * are concurrent. A row added with state of its own that the stream's order protects belongs in
- * this list. */
+ * gemm_fp8a8_nt_m16 (finisher counters keyed on stream AND output), gemm_mxfp4a8_decode (engine path:
+ * split partial in the op scratch, counters keyed on the output alone, so a kernel argument never
+ * depends on the stream a pass is recorded or replayed on) and router_gemm_topk_scatter_bf16 (arrival
+ * counter is its op instance's, taken at init, one a declared op and band) are NOT in the list: two
+ * launches that could run at once never share any of them, and the rows are concurrent. (The standalone
+ * entry r4d_gemm_mxfp4a8_decode, for tools and benches, keeps its per-stream workspace; the engine never
+ * calls it.) A row added with state of its own that the stream's order protects belongs in this list. */
 extern "C" int rad_kernel_concurrent(int i) {
     const RadKernelInfo* k = rad_kernel_at(i);
     if (!k) return 0;
@@ -5239,6 +5295,14 @@ extern "C" void r4d_cfg_tiled(const RadArgs* a, R4dTileCfg* out) {
 }
 extern "C" void r4d_cfg_prefill(const RadArgs* a, R4dTileCfg* out) {
     tile_bmbn(TUNE(a, tGemmPrefill, "tile"), 1, out);
+}
+extern "C" void r4d_cfg_mxfp4_decode(const RadArgs* a, R4dMxDecCfg* out) {
+    out->ks = TUNE(a, tGemmMxfp4Decode, "ks");
+    out->bk = TUNE(a, tGemmMxfp4Decode, "bk");
+    out->nt = TUNE(a, tGemmMxfp4Decode, "nt");
+}
+extern "C" void r4d_cfg_mxfp4_tiled(const RadArgs* a, R4dMxTileCfg* out) {
+    out->tn = TUNE(a, tGemmMxfp4Tiled, "tn");
 }
 extern "C" void r4d_cfg_split(const RadArgs* a, R4dSplitCfg* out) {
     out->splits = TUNE(a, tAttnSplit, "splits");
