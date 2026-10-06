@@ -237,6 +237,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_INVAL;
     }
 
+    RAD_ARCH_TRY(yarn_from(g, meta, "", m.n_rot));
+
     /* The linear-attention geometry. llama.cpp maps the GGUF ssm keys onto these:
      *   ssm.state_size -> the key AND value head width, ssm.group_count -> key heads,
      *   ssm.time_step_rank -> value heads, ssm.inner_size -> value heads * value width. */

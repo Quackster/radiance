@@ -22,6 +22,8 @@
 #include "rad_abi.h"
 #include "../libref/ref_common.h"
 #include "rad_sample.h"
+#include "../vendor/nlohmann/json.hpp"
+#include <fstream>
 
 #include <deque>
 #include <string>
@@ -1777,6 +1779,83 @@ TEST(op_rope) {
     CHECK_NEAR(qkv.at(3), std::sin(1.0f), 1e-6);
     CHECK_EQ(qkv.at(4), 9.0f);          /* the value heads are left alone */
     CHECK_EQ(qkv.at(5), 9.0f);
+}
+
+TEST(yarn_rotary_matches_independent_vllm_vectors) {
+    const std::string here = __FILE__;
+    std::ifstream input(here.substr(0, here.find_last_of('/')) + "/data/yarn_reference.json");
+    REQUIRE(input.good());
+    const auto fixture = nlohmann::json::parse(input);
+    const auto positions = fixture["positions"].get<std::vector<int64_t>>();
+    for (const auto& c : fixture["cases"]) {
+        const int rot = c["rot"], half = rot / 2, hd = rot + 16;
+        const double low = rot == 64 ? 14 : (rot == 128 ? 28 : 56);
+        const double high = rot == 64 ? 22 : (rot == 128 ? 43 : 85);
+        T pos(RAD_I32, {(int64_t)positions.size()}); pos.n(positions);
+        T qkv(RAD_F32, {(int64_t)positions.size(), hd * 3});
+        std::vector<float> values(positions.size() * hd * 3, 9.0f);
+        for (size_t m = 0; m < positions.size(); ++m)
+            for (int h = 0; h < 2; ++h)
+                for (int i = 0; i < rot; ++i) values[m * hd * 3 + h * hd + i] = i < half ? 1.0f : 0.0f;
+        qkv.f(values);
+        A direct; direct.t(qkv).t(pos).i("M", positions.size()).i("head_dim", hd).i("n_head", 1).i("n_head_kv", 1)
+            .i("rotary_dim", rot).d("theta", 1e7).d("scale", 1).s("mode", "neox")
+            .d("yarn_factor", 2).d("yarn_low", low).d("yarn_high", high).d("yarn_magnitude", c["magnitude"]);
+        CHECK_OK(run("rope", direct));
+        /* The table is position-addressed. Allocate its real extent, not a compact stand-in. */
+        T table(RAD_F32, {524288, rot});
+        A ta; ta.t(pos).t(table).i("M", positions.size()).i("rot", rot).d("theta", 1e7).d("scale", 1).s("dtype", "f32")
+            .d("yarn_factor", 2).d("yarn_low", low).d("yarn_high", high).d("yarn_magnitude", c["magnitude"]);
+        CHECK_OK(run("rope_table", ta));
+        for (size_t m = 0; m < positions.size(); ++m) {
+            for (int i = 0; i < half; ++i) {
+                const float cosine = c["cos"][m][i], sine = c["sin"][m][i];
+                /* FP32 libm/pow versus torch; at long positions an inverse-frequency ULP
+                 * is amplified into the phase. Bound the actual absolute cosine error. */
+                CHECK_NEAR(qkv.at(m * hd * 3 + i), cosine, 0.004);
+                CHECK_NEAR(qkv.at(m * hd * 3 + half + i), sine, 0.004);
+                CHECK_EQ(table.at(positions[m] * rot + i), qkv.at(m * hd * 3 + i));
+                CHECK_EQ(table.at(positions[m] * rot + half + i), qkv.at(m * hd * 3 + half + i));
+                CHECK_EQ(qkv.at(m * hd * 3 + hd + i), qkv.at(m * hd * 3 + i));
+            }
+            for (int i = rot; i < hd; ++i) CHECK_EQ(qkv.at(m * hd * 3 + i), 9.0f);
+            for (int i = 0; i < hd; ++i) CHECK_EQ(qkv.at(m * hd * 3 + 2 * hd + i), 9.0f);
+        }
+    }
+}
+
+TEST(yarn_multimodal_positions_and_invalid_parameters) {
+    const int rot = 64, hd = 80;
+    T positions(RAD_I32, {3, 1}); positions.n({262144, 500000, 524287});
+    T mixed(RAD_F32, {1, hd});
+    std::vector<float> seed(hd, 9.0f);
+    for (int i = 0; i < rot; ++i) seed[i] = i < rot/2 ? 1.0f : 0.0f;
+    mixed.f(seed);
+    auto params = [&](A& a, const char* mode) -> A& {
+        return a.i("M", 1).i("head_dim", hd).i("n_head", 1).i("n_head_kv", 0)
+            .i("rotary_dim", rot).d("theta", 1e7).d("scale", 1).s("mode", mode)
+            .s("sections", "11 11 10").d("yarn_factor", 2).d("yarn_low", 14)
+            .d("yarn_high", 22).d("yarn_magnitude", 1.069314718);
+    };
+    A ma; ma.t(mixed).t(positions); params(ma, "imrope");
+    CHECK_OK(run("rope", ma));
+    for (int component = 0; component < 3; ++component) {
+        T plain(RAD_F32, {1, hd}); plain.f(seed);
+        T pos(RAD_I32, {1}); pos.n({positions.iat(component)});
+        A a; a.t(plain).t(pos); params(a, "neox");
+        CHECK_OK(run("rope", a));
+        for (int i = 0; i < 32; ++i) {
+            const int selected = i % 3 == 1 && i < 33 ? 1 : (i % 3 == 2 && i < 30 ? 2 : 0);
+            if (selected != component) continue;
+            CHECK_EQ(mixed.at(i), plain.at(i)); CHECK_EQ(mixed.at(i+32), plain.at(i+32));
+        }
+    }
+    for (int i = rot; i < hd; ++i) CHECK_EQ(mixed.at(i), 9.0f);
+    T single(RAD_I32, {1}); single.n({1});
+    A invalid; invalid.t(mixed).t(single); params(invalid, "axial");
+    CHECK_EQ(run("rope", invalid), RAD_E_UNSUPPORTED);
+    for (auto& p : invalid.ps) if (!std::strcmp(p.key, "yarn_factor")) p = RAD_F64("yarn_factor", NAN);
+    CHECK_EQ(run("rope", invalid), RAD_E_INVAL);
 }
 
 /* THE EPILOGUE IS THE UNFUSED CHAIN: the biased product, then the activation of it, then the

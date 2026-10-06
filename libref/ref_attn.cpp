@@ -27,6 +27,7 @@
  *                the two-sided reading libr4d's h128 kernel documents.
  */
 #include "ref_common.h"
+#include "rad_yarn.h"
 /* `row_stride`: which axis carries a row of `cols` elements, at whatever rank the operand arrived
  * in. Every q/k/v/out below goes through it rather than through `rank >= 3 ? stride[rank-3] : cols`
  * -- the comment above kv_store shows where that shortcut is wrong. */
@@ -412,11 +413,11 @@ static int rope_freqs(int mode, int64_t rot, float theta, const int64_t* sec, in
 }
 
 static void rope_head(const RadTensor* t, int64_t base, int64_t ds, int64_t rot, int mode,
-                      const RopeFreq& f, const float* pos) {
+                      const RopeFreq& f, const float* pos, float magnitude = 1.0f) {
     const int64_t half = rot / 2;
     for (int64_t i = 0; i < half; ++i) {
         const float ang = pos[f.comp[i]] * f.inv[i];
-        const float c = std::cos(ang), s = std::sin(ang);
+        const float c = std::cos(ang) * magnitude, s = std::sin(ang) * magnitude;
         const int64_t i0 = (mode == ROPE_GPTJ) ? 2 * i : i;
         const int64_t i1 = (mode == ROPE_GPTJ) ? 2 * i + 1 : i + half;
         const float x0 = ldt(t, base + i0 * ds), x1 = ldt(t, base + i1 * ds);
@@ -471,6 +472,12 @@ int ref_rope(const RadArgs* a, RadStream) {
     }
     RopeFreq f;
     RAD_REF_TRY(rope_freqs(mode, rot, theta, sec, multi ? n_sec : 0, &f));
+    const RadYarn yarn = rad_yarn_args(a);
+    if (!rad_yarn_valid(yarn)) return RAD_E_INVAL;
+    if (yarn.factor != 0.0f) {
+        if (mode == ROPE_AXIAL || rscale != 1.0f) return RAD_E_UNSUPPORTED;
+        for (int64_t i = 0; i < rot / 2; ++i) f.inv[i] = yarn.frequency(f.inv[i], (int)i);
+    }
 
     const int64_t stride_row = (n_head + 2 * n_head_kv) * head_dim;
     if (M <= 0 || numel(qkv) < M * stride_row) return RAD_E_SHAPE;
@@ -493,7 +500,7 @@ int ref_rope(const RadArgs* a, RadStream) {
         /* Q heads then K heads. The V heads that follow are left alone, which is the whole reason
          * this op takes the fused qkv rather than two tensors. */
         for (int64_t h = 0; h < n_head + n_head_kv; ++h)
-            rope_head(qkv, row + h * head_dim * ds, ds, rot, mode, f, p);
+            rope_head(qkv, row + h * head_dim * ds, ds, rot, mode, f, p, yarn.magnitude);
     }
     return RAD_OK;
 }
@@ -577,16 +584,18 @@ int ref_rope_table(const RadArgs* a, RadStream) {
     const int64_t rows = numel(cs) / rot;
     const int64_t half = rot / 2;
 
+    const RadYarn yarn = rad_yarn_args(a);
+    if (!rad_yarn_valid(yarn) || (yarn.factor != 0.0f && rscale != 1.0f)) return RAD_E_INVAL;
     #pragma omp parallel for schedule(static)
     for (int64_t m = 0; m < M; ++m) {
         const int64_t pp = ld_int(pos->dtype, pos->data, offlin(pos, m));
         if (pp < 0 || pp >= rows) continue;
         const float p = (float)pp / (rscale != 0.0f ? rscale : 1.0f);
         for (int64_t i = 0; i < half; ++i) {
-            const float inv = 1.0f / std::pow(theta, (float)(2 * i) / (float)rot);
+            const float inv = yarn.frequency(1.0f / std::pow(theta, (float)(2 * i) / (float)rot), (int)i);
             const float ang = p * inv;
-            stt(cs, offlin(cs, pp * rot + i),        std::cos(ang));
-            stt(cs, offlin(cs, pp * rot + half + i), std::sin(ang));
+            stt(cs, offlin(cs, pp * rot + i),        std::cos(ang) * yarn.magnitude);
+            stt(cs, offlin(cs, pp * rot + half + i), std::sin(ang) * yarn.magnitude);
         }
     }
     return RAD_OK;

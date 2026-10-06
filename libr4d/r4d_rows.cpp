@@ -274,6 +274,10 @@ static const RadParamSpec pRopeTable[] = {
     P_F64("theta"),
     P_F64("scale"),
     { "dtype", RAD_P_STR, RAD_REQUIRED },
+    { "yarn_factor", RAD_P_F64, RAD_OPTIONAL },
+    { "yarn_low", RAD_P_F64, RAD_OPTIONAL },
+    { "yarn_high", RAD_P_F64, RAD_OPTIONAL },
+    { "yarn_magnitude", RAD_P_F64, RAD_OPTIONAL },
 };
 static const RadOperandSpec oRopeTable[] = {
     { "positions", RAD_OPD_IN,  0 },
@@ -1572,6 +1576,10 @@ static const RadParamSpec pRope[] = {
     { "mode",       RAD_P_STR, RAD_REQUIRED },
     { "rotary_dim", RAD_P_INT, RAD_OPTIONAL },
     { "sections",   RAD_P_STR, RAD_OPTIONAL },
+    { "yarn_factor", RAD_P_F64, RAD_OPTIONAL },
+    { "yarn_low", RAD_P_F64, RAD_OPTIONAL },
+    { "yarn_high", RAD_P_F64, RAD_OPTIONAL },
+    { "yarn_magnitude", RAD_P_F64, RAD_OPTIONAL },
 };
 
 /* ---------------------------------------------------------------------- the vision tower */

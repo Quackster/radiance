@@ -45,6 +45,7 @@
 #include "r4d_args.h"
 #include "r4d_emit.h"
 #include "r4d_common.h"
+#include "rad_yarn.h"
 #include "r4d_fp8_wmma.h"
 
 #include <cstdlib>
@@ -356,7 +357,7 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
     uint16_t* __restrict__ qkv, const int32_t* __restrict__ pos,
     uint32_t head_dim, uint32_t n_rope_heads, uint32_t rot, int gptj,
     float theta, float rscale, uint32_t row_pitch,
-    int mode, int s0, int s1, int s2, int n_sec, uint32_t plane) {
+    int mode, int s0, int s1, int s2, int n_sec, uint32_t plane, RadYarn yarn) {
     const uint32_t m = blockIdx.x;
     const uint32_t half = rot / 2;
     const float div = rscale != 0.0f ? rscale : 1.0f;
@@ -376,9 +377,11 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
             if (mode == 4)
                 inv = 1.0f / powf(theta, (float)(2 * j) / (float)(2 * sec[c]));
         }
+        inv = yarn.frequency(inv, (int)i);
         const float ang = p * inv;
         float c, s;
         sincosf(ang, &s, &c);
+        if (yarn.factor != 0.0f) { c *= yarn.magnitude; s *= yarn.magnitude; }
         const uint32_t i0 = gptj ? 2 * i : i;
         const uint32_t i1 = gptj ? 2 * i + 1 : i + half;
         const float x0 = bf2f(hd[i0]), x1 = bf2f(hd[i1]);
@@ -787,7 +790,7 @@ extern "C" int r4d_rope_mc_bf16(long qkv, long pos, int M, int head_dim, int n_r
     hipLaunchKernelGGL(rope_kernel, dim3((uint32_t)M, gy), dim3(kThreads), 0, (hipStream_t)stream,
                        (uint16_t*)qkv, (const int32_t*)pos, (uint32_t)head_dim,
                        (uint32_t)n_rope_heads, (uint32_t)rot, gptj, theta, rscale,
-                       (uint32_t)row_pitch, mode, s0, s1, s2, n_sec, (uint32_t)plane);
+                       (uint32_t)row_pitch, mode, s0, s1, s2, n_sec, (uint32_t)plane, RadYarn{});
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -1384,6 +1387,18 @@ extern "C" int r4d_rad_rope(const RadArgs* a, RadStream s) {
 
     const float theta  = (float)r4d_getf(a, "theta", 10000.0);
     const float rscale = (float)r4d_getf(a, "scale", 1.0);
+    const RadYarn yarn = rad_yarn_args(a);
+    if (!rad_yarn_valid(yarn)) return R4D_NO(RAD_E_INVAL);
+    if (yarn.factor != 0.0f) {
+        if (mc == 4 || rscale != 1.0f) return R4D_NO(RAD_E_UNSUPPORTED);
+        const uint32_t heads = (uint32_t)(n_head + n_head_kv);
+        const uint32_t gy = (heads * (uint32_t)(rot / 2) + kThreads - 1) / kThreads;
+        hipLaunchKernelGGL(rope_kernel, dim3((uint32_t)Mp, gy), dim3(kThreads), 0, (hipStream_t)s,
+                           (uint16_t*)r4d_addr(qkv), (const int32_t*)r4d_addr(pos),
+                           (uint32_t)head_dim, heads, (uint32_t)rot, gptj, theta, rscale,
+                           (uint32_t)pitch, mc, sec[0], sec[1], sec[2], n_sec, (uint32_t)plane, yarn);
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    }
     /* The Q heads and the K heads rotate; the V heads that follow them do not, which is the whole
      * reason this op takes the fused projection rather than two tensors. */
     return r4d_rope_mc_bf16(r4d_addr(qkv), r4d_addr(pos), (int)Mp, (int)head_dim,

@@ -340,6 +340,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     dg.theta         = (float)rad_meta_getf(meta, "draft.rope_parameters.rope_theta",
                                             rad_meta_getf(meta, "draft.rope_theta", 0.0));
     dg.rope_scale    = 1.0f;
+    RAD_ARCH_TRY(yarn_from(dg, meta, "draft.", dg.head_dim));
     /* PLAIN RMS NORM. The drafter uses the ordinary norm where the trunk uses GemmaRMSNorm, and
      * the checkpoint agrees rather than only vLLM -- rad_block_dflash2.h has the numbers. Two
      * conventions in one process, which is exactly why this is a second Geom and not a flag. */
@@ -635,6 +636,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_INVAL;
     }
 
+    RAD_ARCH_TRY(yarn_from(g, meta, "", m.n_rot));
     GdnFP8::Config& gc = m.gcfg;
     const int64_t n_head_k_all = meta_int2(meta, "qwen35.ssm.group_count",
                                            "linear_num_key_heads", 0);
@@ -952,7 +954,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * which is why `aw.cos_sin` is cleared rather than left pointing at a plane nothing fills. Its
      * band is the fused prologue's (qk_fuse_rows), so a step the prologue does not serve -- a
      * prefill chunk, where the fill's grid is one block a TOKEN -- issues no fill either. */
-    m.op_rope_cs = rw(b, RAD_OP(b, "rope_table",
+    m.op_rope_cs = rw(b, decl_rotary(b, g, "rope_table",
                          RAD_PARAMS(RAD_RANGE("M", 1, qk_fuse_rows(g)), RAD_INT("rot", m.n_rot),
                                     RAD_F64("theta", g.theta), RAD_F64("scale", g.rope_scale),
                                     RAD_STR("dtype", "f32")),

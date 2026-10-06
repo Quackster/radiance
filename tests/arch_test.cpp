@@ -550,6 +550,34 @@ TEST(declare_is_a_qwen35_trunk) {
     CHECK_EQ(count_op(b, "silu_mul"), 8);
 }
 
+TEST(qwen35_bf16_yarn_reaches_every_text_rotary_op) {
+    RadModelMeta meta = qwen35_meta();
+    std::vector<const char*> keys(meta.kv_key, meta.kv_key + meta.n_kv);
+    std::vector<const char*> vals(meta.kv_val, meta.kv_val + meta.n_kv);
+    keys.insert(keys.end(), {"rope_parameters.rope_type", "rope_parameters.factor",
+                            "rope_parameters.original_max_position_embeddings"});
+    vals.insert(vals.end(), {"yarn", "2", "262144"});
+    meta.n_kv = (int)keys.size(); meta.kv_key = keys.data(); meta.kv_val = vals.data();
+    RadBuildCtx ctx = build_ctx();
+    RadBuilder b;
+    CHECK_OK(qwen35_bf16::declare(&b, &meta, &ctx));
+    int rotary = 0;
+    for (const auto& op : b.ops) if (op.op == "rope") {
+        ++rotary;
+        int found = 0;
+        for (const auto& p : op.p) {
+            if (p.key == "yarn_factor") { CHECK_EQ(p.dval, 2.0); ++found; }
+            if (p.key == "yarn_magnitude") { CHECK_NEAR(p.dval, 1.069314718, 1e-7); ++found; }
+            if (p.key == "scale") CHECK_EQ(p.dval, 1.0);
+        }
+        CHECK_EQ(found, 2);
+    }
+    CHECK_EQ(rotary, 4);
+    vals[vals.size()-2] = "nan";
+    RadBuilder invalid;
+    CHECK_EQ(qwen35_bf16::declare(&invalid, &meta, &ctx), RAD_E_INVAL);
+}
+
 TEST(the_alternation_puts_full_attention_at_3_and_7) {
     RadBuilder b;
     RadModelMeta meta = qwen35_meta();

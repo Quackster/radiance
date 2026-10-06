@@ -371,8 +371,8 @@ that folds dequantisation into its epilogue still receives them.
 | `attn_paged` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out` |
 | `attn_dense` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt `max_seqlen`/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
 | `kv_store` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout |
-| `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt | `qkv`:inout, `positions` |
-| `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` | `positions` → `cos_sin` |
+| `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt | `qkv`:inout, `positions` |
+| `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt | `positions` → `cos_sin` |
 | `qk_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `wadd`:f64/opt | `qkv`:inout, `positions`, `q_w`w, `k_w`w |
 
 `attn_paged` is the ranged op whose band is `q_len`, not `M`: one query row at decode, up to 64 at

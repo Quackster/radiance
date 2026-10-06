@@ -45,6 +45,8 @@
 
 #include "rad_abi.h"
 #include "rad_plugin.h"
+#include "../vendor/nlohmann/json.hpp"
+#include <fstream>
 #include "r4d_args.h"
 #include "r4d_hc_fp8.h"
 #include "r4d_fp8_frag.h"
@@ -1191,7 +1193,7 @@ static bool restores(const RadKernelInfo* r, const std::vector<RadParam>& lp, in
  * The q side reads a STRIDED view in the engine (the [q|gate] projection is interleaved per head)
  * and the unfused norm cannot, so the reference is fed a contiguous copy of the same numbers. The
  * arithmetic does not depend on the stride; the values are what is being compared. */
-static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt) {
+static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt, bool yarn = false, int64_t rot = 64) {
     if (!sel("qk_norm_rope_gate") && !sel("rope_table_f32")) return;
     /* THE GAIN'S WIDTH IS RUN BOTH WAYS, because the two callers differ: every architecture plugin
      * here declares an f32 norm gain and vLLM's declares bf16, and one flag inside the kernel picks
@@ -1209,7 +1211,12 @@ static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt) {
      * one k buffer does, and 4 query heads is not 12: the wave count the launcher picks is a
      * function of nq + nkv, so a head count the model does not have exercises a launch it does not
      * make. */
-    const int64_t M = 512, nq = 12, nkv = 2, hd = 256, rot = 64, ctx = 4096;
+    const int64_t M = 512, nq = 12, nkv = 2, hd = 256, ctx = yarn ? 524288 : 4096;
+    auto add_yarn = [&](std::vector<RadParam>& ps) {
+        if (!yarn) return;
+        ps.push_back(PF("yarn_factor", 2)); ps.push_back(PF("yarn_low", rot == 64 ? 14 : 28));
+        ps.push_back(PF("yarn_high", rot == 64 ? 22 : 43)); ps.push_back(PF("yarn_magnitude", 1.069314718));
+    };
     const double  theta = 1e7, eps = 1e-6, wadd = 1.0;
     /* MANY ROWS, because the difference this case is hunting is one bf16 in tens of thousands: two
      * summation orders for the same mean-square agree to a ULP in f32 and that ULP almost never
@@ -1218,6 +1225,10 @@ static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt) {
      * near the top. */
     std::vector<int32_t> pos((size_t)M);
     for (int64_t i = 0; i < M; ++i) pos[(size_t)i] = (int32_t)((i * 7 + i * i) % ctx);
+    if (yarn) {
+        const int32_t edges[] = {0, 1, 4096, 262143, 262144, 500000, 524287};
+        std::copy(std::begin(edges), std::end(edges), pos.begin());
+    }
 
     auto rnd = [](int64_t i) {                       /* deterministic, and spans the exponent */
         const uint32_t x = (uint32_t)(i * 2654435761u + 12345u);
@@ -1307,6 +1318,7 @@ static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt) {
         std::vector<RadParam> ps = { PI("M", M), PI("head_dim", hd), PI("n_head", nh),
                                      PI("n_head_kv", 0), PF("theta", theta), PF("scale", 1.0),
                                      PS("mode", "neox"), PI("rotary_dim", rot) };
+        add_yarn(ps);
         run_case(rr, ts, ps);
     }
 
@@ -1315,7 +1327,26 @@ static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt) {
         std::vector<RadTensor> ts = { T(d_p, RAD_I32, { M }), T(d_cs, RAD_F32, { ctx, rot }) };
         std::vector<RadParam> ps = { PI("M", M), PI("rot", rot), PF("theta", theta),
                                      PF("scale", 1.0), PS("dtype", "f32") };
+        add_yarn(ps);
         run_case(rt, ts, ps);
+        if (yarn) {
+            const std::string here = __FILE__;
+            std::ifstream input(here.substr(0, here.find_last_of('/')) + "/../tests/data/yarn_reference_rocm.json");
+            if (!input) { ok("YaRN independent vectors", false, "fixture missing"); return; }
+            const auto fixture = nlohmann::json::parse(input);
+            const auto& c = fixture["cases"][rot == 64 ? 0 : 1];
+            std::vector<float> row(rot);
+            double worst = 0.0;
+            for (size_t m = 0; m < fixture["positions"].size(); ++m) {
+                st_memcpy(row.data(), (float*)d_cs + (size_t)pos[m] * rot, rot * sizeof(float), hipMemcpyDeviceToHost);
+                for (int i = 0; i < rot / 2; ++i) {
+                    worst = std::max(worst, std::abs((double)row[i] - c["cos"][m][i].get<double>()));
+                    worst = std::max(worst, std::abs((double)row[rot/2+i] - c["sin"][m][i].get<double>()));
+                }
+            }
+            ok("YaRN GPU table vs independent vLLM through 524287", worst <= 0.004,
+               ("worst absolute error " + std::to_string(worst)).c_str());
+        }
     }
     {
         std::vector<RadTensor> ts = {
@@ -1377,7 +1408,7 @@ static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt) {
                         " vs " + std::to_string(h_bf16(want[i]));
             }
         }
-        const std::string tag = std::string(gf32 ? "f32 gain, " : "bf16 gain, ") + what;
+        const std::string tag = std::string(yarn ? "YaRN, " : "") + (gf32 ? "f32 gain, " : "bf16 gain, ") + what;
         char rate[128];
         std::snprintf(rate, sizeof rate, "%lld of %zu differ, worst %.2e of full scale",
                       (long long)n_off, got.size(), worst);
@@ -10531,6 +10562,8 @@ static void device_phase(const Plugin& pl) {
         }
         qk_prologue_case(pl, RAD_BF16);
         qk_prologue_case(pl, RAD_F32);
+        qk_prologue_case(pl, RAD_F32, true);
+        qk_prologue_case(pl, RAD_F32, true, 128);
         qk_kv_fold_case(pl, false);
         qk_kv_fold_case(pl, true);
         qsa_qprep_case(pl);

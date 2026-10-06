@@ -278,14 +278,18 @@ static const RadOperandSpec oKvStore[] = { OPD("k"), OPD("v"), OPD("slot_mapping
 
 static const RadParamSpec pRope[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
                                       P_INT("n_head_kv"), P_F64("theta"), P_F64("scale"),
-                                      P_STR("mode"), P_INTO("rotary_dim"), P_STRO("sections") };
+                                      P_STR("mode"), P_INTO("rotary_dim"), P_STRO("sections"),
+                                      P_F64O("yarn_factor"), P_F64O("yarn_low"),
+                                      P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
 static const RadOperandSpec oRope[] = { INOUT("qkv"), OPD("positions") };
 
 /* The cos/sin plane a fused prologue reads instead of theta: written at each position's OWN row
  * of a [max_ctx, rot] table. `rot`, `theta` and `scale` are `rope`'s, spelled the same way,
  * because the two have to compute the same angles. */
 static const RadParamSpec pRopeTable[] = { P_INT("M"), P_INT("rot"), P_F64("theta"),
-                                           P_F64("scale"), P_STR("dtype") };
+                                           P_F64("scale"), P_STR("dtype"),
+                                           P_F64O("yarn_factor"), P_F64O("yarn_low"),
+                                           P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
 static const RadOperandSpec oRopeTable[] = { OPD("positions"), OUT("cos_sin") };
 
 static const RadParamSpec pQkNormRope[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),

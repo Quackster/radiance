@@ -16,6 +16,7 @@
 #include "rad_builder.h"
 #include "rad_device.h"
 #include "rad_runtime.h"
+#include "rad_yarn.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -626,6 +627,7 @@ struct Geom {
     float   wadd_qk    = 0.0f;
     float   theta      = 1e6f;
     float   rope_scale = 1.0f;
+    RadYarn yarn;
     /* M-RoPE: the checkpoint's `mrope_section`, when it has one. A model whose rotary has several
      * position components declares `rope` with `rope_mode` and these sections and hands it
      * RadBatch::rope_pos; empty, the rotary is one-component NeoX over `positions`. Stored here
@@ -1025,17 +1027,97 @@ inline bool rope_mixed(const RadBatch* b) { return b->rope_pos && b->rope_mixed;
 
 /* `rope` declared for the geometry's rotary: M-RoPE's mode and sections when the model has them,
  * `mode` otherwise. */
+/* Append only for explicit YaRN, preserving stock op identities and tune keys. */
+inline rad_op decl_rotary(RadBuilder* b, const Geom& g, const char* name,
+                          const RadParam* params, int n, const rad_weight* weights, int nw) {
+    if (g.yarn.factor == 0.0f) return rad_decl_op(b, name, params, n, weights, nw);
+    std::vector<RadParam> p(params, params + n);
+    p.push_back(RAD_F64("yarn_factor", g.yarn.factor));
+    p.push_back(RAD_F64("yarn_low", g.yarn.low));
+    p.push_back(RAD_F64("yarn_high", g.yarn.high));
+    p.push_back(RAD_F64("yarn_magnitude", g.yarn.magnitude));
+    return rad_decl_op(b, name, p.data(), (int)p.size(), weights, nw);
+}
+
+/* Both modern HF rope_parameters and legacy rope_scaling. Nested text_config is
+ * authoritative for a multimodal target; the draft has its own independent config. */
+inline int yarn_from(Geom& g, const RadModelMeta* meta, const char* prefix, int64_t rot) {
+    g.yarn = {};
+    const std::string root(prefix);
+    const std::vector<std::string> homes = root.empty()
+        ? std::vector<std::string>{"text_config.rope_parameters.", "rope_parameters.",
+                                    "text_config.rope_scaling.", "rope_scaling."}
+        : std::vector<std::string>{root + "rope_parameters.", root + "rope_scaling."};
+    std::string home;
+    const char* type = nullptr;
+    for (const auto& h : homes) {
+        type = rad_meta_gets(meta, (h + "rope_type").c_str(),
+                              rad_meta_gets(meta, (h + "type").c_str(), nullptr));
+        if (type) { home = h; break; }
+    }
+    if (!type || !std::strcmp(type, "default")) return RAD_OK;
+    auto get = [&](const char* key, double fallback) {
+        const char* text = rad_meta_gets(meta, (home + key).c_str(), nullptr);
+        if (!text) return fallback;
+        char* end = nullptr;
+        const double value = std::strtod(text, &end);
+        if (end == text) return (double)NAN;
+        while (*end == ' ' || *end == '\t' || *end == '\n') ++end;
+        return *end ? (double)NAN : value;
+    };
+    if (!std::strcmp(type, "linear")) {
+        const double factor = get("factor", 0.0);
+        if (!std::isfinite(factor) || factor <= 0.0) return RAD_E_INVAL;
+        g.rope_scale = (float)factor;
+        return RAD_OK;
+    }
+    if (std::strcmp(type, "yarn")) {
+        fprintf(stderr, "radiance: %s rotary type '%s' is unsupported\n", prefix, type);
+        return RAD_E_UNSUPPORTED;
+    }
+    const double factor = get("factor", 0.0), original = get("original_max_position_embeddings", 0.0);
+    const double fast = get("beta_fast", 32.0), slow = get("beta_slow", 1.0);
+    const double magnitude = get("attention_factor", factor > 1.0 ? 1.0 + 0.1 * std::log(factor) : 1.0);
+    const double truncate = get("truncate", 1.0);
+    if (!std::isfinite(factor) || factor < 1.0 || !std::isfinite(original) || original < 1.0 ||
+        original != std::floor(original) || (truncate != 0.0 && truncate != 1.0) ||
+        !std::isfinite(fast) || !std::isfinite(slow) || slow <= 0.0 || fast < slow ||
+        !std::isfinite(magnitude) || magnitude <= 0.0 || !std::isfinite(g.theta) || g.theta <= 1.0f ||
+        rot < 2 || (rot & 1)) {
+        fprintf(stderr, "radiance: %s YaRN needs finite factor >= 1, original context > 0, "
+                        "beta_fast >= beta_slow > 0 and attention_factor > 0\n", prefix);
+        return RAD_E_INVAL;
+    }
+    /* mscale variants are a different contract; never silently ignore them. */
+    for (const char* k : {"mscale", "mscale_all_dim"})
+        if (rad_meta_gets(meta, (home + k).c_str(), nullptr)) {
+            fprintf(stderr, "radiance: %s YaRN %s is unsupported; use attention_factor\n", prefix, k);
+            return RAD_E_UNSUPPORTED;
+        }
+    auto correction = [&](double beta) {
+        return rot * std::log(original / (beta * 2.0 * 3.14159265358979323846)) /
+               (2.0 * std::log((double)g.theta));
+    };
+    double low = correction(fast), high = correction(slow);
+    if (truncate != 0.0) { low = std::floor(low); high = std::ceil(high); }
+    g.yarn = {(float)factor, (float)std::max(0.0, low),
+              (float)std::min((double)rot - 1, high), (float)magnitude};
+    if (!rad_yarn_valid(g.yarn)) return RAD_E_INVAL;
+    g.rope_scale = 1.0f; /* YaRN blends frequencies; it does not divide positions. */
+    return RAD_OK;
+}
+
 inline rad_op decl_rope(RadBuilder* b, const Geom& g, int64_t rows, int64_t head_dim,
                         int64_t n_head, int64_t n_head_kv, int64_t rot, const char* mode) {
     if (g.rope_mc)
-        return RAD_OP(b, "rope",
+        return decl_rotary(b, g, "rope",
                       RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("head_dim", head_dim),
                                  RAD_INT("n_head", n_head), RAD_INT("n_head_kv", n_head_kv),
                                  RAD_F64("theta", g.theta), RAD_F64("scale", g.rope_scale),
                                  RAD_STR("mode", g.rope_mode), RAD_INT("rotary_dim", rot),
                                  RAD_STR("sections", g.rope_sections)),
                       RAD_NOWEIGHTS);
-    return RAD_OP(b, "rope",
+    return decl_rotary(b, g, "rope",
                   RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("head_dim", head_dim),
                              RAD_INT("n_head", n_head), RAD_INT("n_head_kv", n_head_kv),
                              RAD_F64("theta", g.theta), RAD_F64("scale", g.rope_scale),

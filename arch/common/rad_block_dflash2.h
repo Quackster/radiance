@@ -538,7 +538,7 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
      * V heads that follow alone, so a K-only tensor is described by n_head = n_head_kv and
      * n_head_kv = 0: all the heads there are rotate, none follow them. Weightless, so one op
      * serves every layer. */
-    op_crope = rw(b, RAD_OP(b, "rope",
+    op_crope = rw(b, decl_rotary(b, g, "rope",
                      RAD_PARAMS(RAD_RANGE("M", 1, crows), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("n_head", g.n_head_kv), RAD_INT("n_head_kv", 0),
                                 RAD_F64("theta", g.theta), RAD_F64("scale", g.rope_scale),
@@ -712,14 +712,14 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                             RAD_WEIGHTS(w_fcb[i])),
                         {w.h, w.coef}, {w.h2});
     }
-    op_qrope = rw(b, RAD_OP(b, "rope",
+    op_qrope = rw(b, decl_rotary(b, g, "rope",
                      RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("n_head", g.n_head), RAD_INT("n_head_kv", 0),
                                 RAD_F64("theta", g.theta), RAD_F64("scale", g.rope_scale),
                                 RAD_STR("mode", "neox")),
                      RAD_NOWEIGHTS),
                  {w.q}, {w.q});
-    op_krope = rw(b, RAD_OP(b, "rope",
+    op_krope = rw(b, decl_rotary(b, g, "rope",
                      RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("n_head", g.n_head_kv), RAD_INT("n_head_kv", 0),
                                 RAD_F64("theta", g.theta), RAD_F64("scale", g.rope_scale),

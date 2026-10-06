@@ -54,6 +54,7 @@
  */
 #include "avx_vec.h"
 #include "avx_common.h"
+#include "rad_yarn.h"
 
 using namespace avx;
 
@@ -836,6 +837,12 @@ AVX_KERNEL(rope) {
         }
     }
     const int pair_mode = mode == ROPE_GPTJ ? ROPE_GPTJ : ROPE_NEOX;
+    const RadYarn yarn = rad_yarn_args(a);
+    if (!rad_yarn_valid(yarn)) return RAD_E_INVAL;
+    if (yarn.factor != 0.0f) {
+        if (mode == ROPE_AXIAL || rscale != 1.0f) return RAD_E_UNSUPPORTED;
+        for (int64_t i = 0; i < half; ++i) invf[i] = yarn.frequency(invf[i], (int)i);
+    }
     const int64_t pcs = multi ? pos->stride[0] : 0, pms = multi ? pos->stride[1] : 0;
 
     AVX_PARALLEL_FOR_IF(M * (n_head + n_head_kv) * rot >= AVX_PAR_MIN)
@@ -851,6 +858,8 @@ AVX_KERNEL(rope) {
         } else {
             angles(cs, invf, half, (float)ldi(pos, offlin(pos, m)) / div);
         }
+        if (yarn.factor != 0.0f)
+            for (int64_t i = 0; i < rot; ++i) cs[i] *= yarn.magnitude;
         /* Q heads then K heads. The V heads that follow are left alone, which is the whole reason
          * this op takes the fused qkv rather than two tensors. */
         for (int64_t h = 0; h < n_head + n_head_kv; ++h)
@@ -953,7 +962,11 @@ AVX_KERNEL(rope_table) {
     if (M <= 0 || numel(cs) % rot) return RAD_E_SHAPE;
     const int64_t rows = numel(cs) / rot;
     const int64_t half = rot / 2;
-    const float* invf = inv_freqs(half, rot, theta);
+    float* invf = inv_freqs(half, rot, theta);
+    const RadYarn yarn = rad_yarn_args(a);
+    if (!rad_yarn_valid(yarn) || (yarn.factor != 0.0f && rscale != 1.0f)) return RAD_E_INVAL;
+    if (yarn.factor != 0.0f)
+        for (int64_t i = 0; i < half; ++i) invf[i] = yarn.frequency(invf[i], (int)i);
 
     AVX_PARALLEL_FOR_IF(M * rot >= AVX_PAR_MIN)
     for (int64_t m = 0; m < M; ++m) {
@@ -962,6 +975,8 @@ AVX_KERNEL(rope_table) {
         const float p = (float)pp / (rscale != 0.0f ? rscale : 1.0f);
         float* buf = scratch_f32((size_t)rot);
         angles(buf, invf, half, p);
+        if (yarn.factor != 0.0f)
+            for (int64_t i = 0; i < rot; ++i) buf[i] *= yarn.magnitude;
         /* `cs` may be strided, and offlin has to be evaluated per element there -- which is what
          * libref does unconditionally. The dense case is one row store. */
         if (rad_tensor_is_contiguous(cs)) {

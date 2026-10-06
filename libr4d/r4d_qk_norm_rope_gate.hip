@@ -23,6 +23,7 @@
 #include "r4d_args.h"
 #include "r4d_emit.h"
 #include "r4d_common.h"
+#include "rad_yarn.h"
 #include <hip/hip_bf16.h>
 #include <cstdint>
 #include <cmath>
@@ -205,7 +206,7 @@ __global__ __launch_bounds__(256) void r4d_qk_norm_rope_gate_kernel(
 // those here silently changes the model's output -- a different rope is a different model.
 __global__ __launch_bounds__(64) void r4d_qk_rope_table_kernel(
     const void* __restrict__ POS, void* __restrict__ CS, long rows, int rot, float theta,
-    float rscale, int cs_f32, int pos_i64) {
+    float rscale, int cs_f32, int pos_i64, RadYarn yarn) {
   const int m = blockIdx.x;
   const long pp = pos_i64 ? ((const long*)POS)[m] : (long)((const int*)POS)[m];
   // A padded row addresses no table row, and a position at or past the table's height writes
@@ -216,9 +217,10 @@ __global__ __launch_bounds__(64) void r4d_qk_rope_table_kernel(
   const float p = (float)pp / (rscale != 0.0f ? rscale : 1.0f);
   const size_t o = (size_t)pp * rot;
   for (int i = threadIdx.x; i < half; i += (int)blockDim.x) {
-    const float inv = 1.0f / powf(theta, (float)(2 * i) / (float)rot);
+    const float inv = yarn.frequency(1.0f / powf(theta, (float)(2 * i) / (float)rot), i);
     float c, s;
     sincosf(p * inv, &s, &c);
+    if (yarn.factor != 0.0f) { c *= yarn.magnitude; s *= yarn.magnitude; }
     if (cs_f32) {
       ((float*)CS)[o + i] = c;
       ((float*)CS)[o + half + i] = s;
@@ -386,8 +388,10 @@ static int rad_rope_table_body(const RadArgs* args, const R4dSink& sk) {
 
   const float theta  = (float)r4d_getf(args, "theta", 10000.0);
   const float rscale = (float)r4d_getf(args, "scale", 1.0);
+  const RadYarn yarn = rad_yarn_args(args);
+  if (!rad_yarn_valid(yarn) || (yarn.factor != 0.0f && rscale != 1.0f)) return R4D_NO(RAD_E_INVAL);
   return R4D_EMIT(sk, r4d_qk_rope_table_kernel, dim3((int)M), dim3(64), 0,
                   r4d_p(po), r4d_wp(cs), (long)(r4d_numel(cs) / rot), (int)rot, theta, rscale,
-                  cs->dtype == RAD_F32 ? 1 : 0, po->dtype == RAD_I64 ? 1 : 0);
+                  cs->dtype == RAD_F32 ? 1 : 0, po->dtype == RAD_I64 ? 1 : 0, yarn);
 }
 R4D_ENTRY(r4d_rad_rope_table, rad_rope_table_body)
