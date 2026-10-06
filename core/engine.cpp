@@ -410,6 +410,12 @@ int Engine::step_loop() {
      * collected, and a pass issued ahead would have overwritten them by then. */
     pipelining_ = !cfg_.kld() && drafter_.kind != RAD_DRAFT_BLOCK &&
                   (serial_drafting() || cfg_.n_spec <= 0);
+    /* RADIANCE_ADAPTIVE_K=1: per-sequence verify length for a block drafter (sched/adaptive_k.h).
+     * Not for a serial drafter, whose depth is decided on the card before the host sees it. */
+    if (drafter_.kind == RAD_DRAFT_BLOCK && cfg_.n_spec > 0) {
+        const AdaptiveK::Params akp = AdaptiveK::Params::from_env();
+        if (akp.enabled) (void)sched_.set_adaptive_k(akp);
+    }
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* Read once. See the block in the idle branch below for what it is for. */
     /* "kv" | "arena" | "all" | "kv:<name>,<name>" -- the last narrows the KV scrub to named groups,

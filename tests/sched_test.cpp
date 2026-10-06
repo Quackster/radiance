@@ -2232,4 +2232,272 @@ TEST(a_sink_carries_its_requests_admission_and_draft_counts) {
     CHECK_EQ(sink.n_draft_accepted(), accepted);
 }
 
+/* ================================================================== adaptive verify length
+ * sched/adaptive_k.h: which prefix of a block drafter's proposal each sequence verifies. */
+namespace {
+AdaptiveK::Params ak_params() {
+    AdaptiveK::Params p;
+    p.enabled = true;                 /* defaults otherwise: lengths 1,3,5,7; a=30.57 b=0.4286 */
+    return p;
+}
+bool ak_in_set(int k, int n) { return k == 1 || k == 3 || k == 5 || k == 7 || k == n; }
+}  /* namespace */
+
+TEST(adaptive_k_is_deterministic_bounded_and_on_the_length_set) {
+    AdaptiveK a, b;
+    CHECK_OK(a.configure(ak_params(), 7, 16));
+    CHECK_OK(b.configure(ak_params(), 7, 16));
+    uint64_t rng = 99;
+    auto u = [&]() { rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+                     return (double)((rng >> 33) & 0xFFFFFF) / (double)0x1000000; };
+    for (int t = 0; t < 2000; ++t) {
+        const int n = 1 + (int)(u() * 15);
+        AdaptiveK::Cand c[16];
+        for (int i = 0; i < n; ++i) { c[i].q = u(); c[i].n = u() < 0.2 ? 1 + (int)(u() * 7) : 7; }
+        const int base = (int)(u() * 3);
+        int k1[16], k2[16];
+        const int r1 = a.choose(c, n, base, k1);
+        const int r2 = b.choose(c, n, base, k2);
+        CHECK_EQ(r1, r2);
+        int rows = base;
+        for (int i = 0; i < n; ++i) {
+            CHECK_EQ(k1[i], k2[i]);
+            CHECK(k1[i] >= 1 && k1[i] <= c[i].n);
+            CHECK(ak_in_set(k1[i], c[i].n));
+            rows += 1 + k1[i];
+        }
+        CHECK_EQ(rows, r1);
+    }
+}
+
+TEST(adaptive_k_leaves_a_single_stream_and_small_batches_alone) {
+    AdaptiveK a;
+    CHECK_OK(a.configure(ak_params(), 7, 8));
+    for (double q : { 0.0, 0.1, 0.3, 0.6, 0.95 }) {
+        for (int n = 1; n <= 3; ++n) {           /* 8, 16, 24 rows: under min_rows 32 */
+            AdaptiveK::Cand c[3];
+            int k[3];
+            for (int i = 0; i < n; ++i) { c[i].q = q; c[i].n = 7; }
+            CHECK_EQ(a.choose(c, n, 0, k), 8 * n);
+            for (int i = 0; i < n; ++i) CHECK_EQ(k[i], 7);
+        }
+    }
+    /* Off means off, at any size. */
+    AdaptiveK off;
+    AdaptiveK::Params p = ak_params();
+    p.enabled = false;
+    CHECK_OK(off.configure(p, 7, 8));
+    AdaptiveK::Cand c[8];
+    int k[8];
+    for (int i = 0; i < 8; ++i) { c[i].q = 0.05; c[i].n = 7; }
+    CHECK_EQ(off.choose(c, 8, 0, k), 64);
+    for (int i = 0; i < 8; ++i) CHECK_EQ(k[i], 7);
+}
+
+TEST(adaptive_k_shortens_the_poor_sequences_and_keeps_the_good_ones) {
+    AdaptiveK a;
+    CHECK_OK(a.configure(ak_params(), 7, 8));
+    AdaptiveK::Cand c[8];
+    int k[8];
+    for (int i = 0; i < 4; ++i) { c[i].q = 0.92; c[i].n = 7; }     /* code-like */
+    for (int i = 4; i < 8; ++i) { c[i].q = 0.45; c[i].n = 7; }     /* prose-like */
+    const int rows = a.choose(c, 8, 0, k);
+    for (int i = 0; i < 4; ++i) CHECK_EQ(k[i], 7);
+    for (int i = 4; i < 8; ++i) CHECK(k[i] <= 3);
+    CHECK(rows < 64);
+    CHECK_EQ(rows % 8, 0);                                         /* the quantum */
+
+    /* Everyone good: nothing to cut. */
+    for (int i = 0; i < 8; ++i) c[i].q = 0.95;
+    CHECK_EQ(a.choose(c, 8, 0, k), 64);
+
+    /* Everyone poor: all cut, and never below one draft. */
+    for (int i = 0; i < 8; ++i) c[i].q = 0.2;
+    const int r2 = a.choose(c, 8, 0, k);
+    for (int i = 0; i < 8; ++i) CHECK(k[i] >= 1 && k[i] <= 3);
+    CHECK(r2 <= 32);
+
+    /* Monotone in q: a better sequence never gets a shorter verify than a worse one. */
+    for (int i = 0; i < 8; ++i) c[i].q = 0.3 + 0.08 * i;
+    a.choose(c, 8, 0, k);
+    for (int i = 1; i < 8; ++i) CHECK(k[i] >= k[i - 1]);
+}
+
+TEST(adaptive_k_total_rows_stay_on_the_quantum_or_unshrunk) {
+    AdaptiveK a;
+    CHECK_OK(a.configure(ak_params(), 7, 12));
+    uint64_t rng = 7;
+    auto u = [&]() { rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+                     return (double)((rng >> 33) & 0xFFFFFF) / (double)0x1000000; };
+    for (int t = 0; t < 3000; ++t) {
+        const int n = 4 + (int)(u() * 8);
+        AdaptiveK::Cand c[12];
+        int k[12], full = 0;
+        for (int i = 0; i < n; ++i) { c[i].q = u(); c[i].n = 7; full += 8; }
+        const int rows = a.choose(c, n, 0, k);
+        CHECK(rows == full || rows % 8 == 0);
+    }
+}
+
+TEST(adaptive_k_cost_model_and_table) {
+    AdaptiveK a;
+    CHECK_OK(a.configure(ak_params(), 7, 4));
+    CHECK_NEAR(a.cost_ms(8), 34.0, 0.05);
+    CHECK_NEAR(a.cost_ms(64), 58.0, 0.05);
+    AdaptiveK::Params p = ak_params();
+    p.n_pts = 3;
+    p.pt_m[0] = 8;  p.pt_ms[0] = 34;
+    p.pt_m[1] = 32; p.pt_ms[1] = 40;
+    p.pt_m[2] = 64; p.pt_ms[2] = 58;
+    AdaptiveK t;
+    CHECK_OK(t.configure(p, 7, 4));
+    CHECK_NEAR(t.cost_ms(8), 34.0, 1e-9);
+    CHECK_NEAR(t.cost_ms(20), 37.0, 1e-9);
+    CHECK_NEAR(t.cost_ms(64), 58.0, 1e-9);
+    CHECK_NEAR(t.cost_ms(80), 67.0, 1e-9);        /* extrapolates the last segment */
+
+    /* A flat cost makes every row free, so nothing is cut; a steep one cuts hard. */
+    AdaptiveK::Params flat = ak_params();
+    flat.cost_b = 0.0;
+    AdaptiveK f;
+    CHECK_OK(f.configure(flat, 7, 8));
+    AdaptiveK::Cand c[8];
+    int k[8];
+    for (int i = 0; i < 8; ++i) { c[i].q = 0.5; c[i].n = 7; }
+    CHECK_EQ(f.choose(c, 8, 0, k), 64);
+    AdaptiveK::Params steep = ak_params();
+    steep.cost_a = 1.0; steep.cost_b = 5.0;
+    AdaptiveK s;
+    CHECK_OK(s.configure(steep, 7, 8));
+    CHECK(s.choose(c, 8, 0, k) <= 24);
+}
+
+TEST(adaptive_k_estimates_acceptance_with_the_censoring_a_short_verify_implies) {
+    AdaptiveK a;
+    CHECK_OK(a.configure(ak_params(), 7, 4));
+    /* A fresh sequence is the pool's, which starts at 0.75. */
+    AdaptiveK::Stat s;
+    CHECK_NEAR(a.q_of(s), 0.75, 1e-9);
+    /* A verify of 1 draft that hit: one position evaluated, one taken. A miss: evaluated, not taken. */
+    uint64_t rng = 5;
+    auto coin = [&](double pr) { rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+                                 return (double)((rng >> 33) & 0xFFFFFF) / (double)0x1000000 < pr; };
+    AdaptiveK::Stat g;
+    double qsum = 0.0;
+    int qn = 0;
+    for (int t = 0; t < 2000; ++t) {
+        const int k = (t % 3 == 0) ? 7 : 3;                    /* lengths vary, q is 0.7 */
+        int acc = 0;
+        while (acc < k && coin(0.7)) ++acc;
+        a.observe(g, k, acc);
+        if (t >= 200) { qsum += a.q_of(g); ++qn; }
+    }
+    /* the mean estimate is unbiased (a short window is noisy, so the mean, not the last value) */
+    CHECK_NEAR(qsum / qn, 0.7, 0.04);
+    /* A full accept evaluates `drafted` positions; a rejection at 0 evaluates one. */
+    AdaptiveK b;
+    AdaptiveK::Params p = ak_params();
+    p.prior = 0.0;
+    p.alpha = 1.0;
+    CHECK_OK(b.configure(p, 7, 4));
+    AdaptiveK::Stat h;
+    b.observe(h, 7, 7);
+    CHECK_NEAR(b.q_of(h), 1.0, 1e-9);
+    b.observe(h, 7, 0);
+    CHECK_NEAR(b.q_of(h), 0.0, 1e-9);
+}
+
+/* THE SCHEDULER END: the step verifies the capped prefix, the stream is still the target's, and a
+ * lone sequence is untouched. The fake target emits tgt(id, index); a drafter is right for its
+ * first g tokens of each proposal. */
+namespace {
+int32_t ak_tgt(uint64_t id, int64_t idx) { return (int32_t)(5000 + (id * 131 + (uint64_t)idx * 7) % 997); }
+
+struct AkRun {
+    std::vector<std::vector<int32_t>> out;
+    int64_t rows = 0, steps = 0, tokens = 0;
+    int last_cap_good = 0, last_cap_poor = 0, lone_rows = 0;
+};
+
+AkRun ak_run(bool adaptive, int n_seq, const int* g, int n_steps) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/1024);
+    f.cfg.n_spec = 7;
+    f.cfg.max_seqs = 16;
+    CHECK_OK(f.start());
+    if (adaptive) CHECK_OK(f.sch.set_adaptive_k(ak_params()));
+    std::vector<uint64_t> ids;
+    for (int i = 0; i < n_seq; ++i) ids.push_back(f.submit(16, 4000));
+    AkRun r;
+    for (int st = 0; st < n_steps; ++st) {
+        const RadBatch* b = f.sch.step();
+        if (!b) { CHECK(b != nullptr); break; }
+        const StepPlan& p = f.sch.plan();
+        std::vector<int32_t> acc(p.e.size(), 0), tok(p.e.size(), 0);
+        std::vector<uint8_t> eos(p.e.size(), 0);
+        for (size_t i = 0; i < p.e.size(); ++i) {
+            const StepEntry& e = p.e[i];
+            const Request* q = f.sch.find(e.seq);
+            const int64_t L = (int64_t)q->output.size();
+            int gi = 0;
+            for (int j = 0; j < n_seq; ++j) if (ids[(size_t)j] == e.seq) gi = g[j];
+            int a = e.n_spec < gi ? e.n_spec : gi;
+            if (e.is_prefill) a = 0;
+            /* the proposal the drafter published for THIS step must have been verified against
+             * the target: tokens past `a` are wrong */
+            if (!e.is_prefill) {
+                for (int j = 0; j < e.n_spec; ++j)
+                    CHECK_EQ(q->draft[j], j < gi ? ak_tgt(e.seq, L + j) : ak_tgt(e.seq, L + j) + 1);
+                r.rows += 1 + e.n_spec;
+                ++r.steps;
+            }
+            acc[i] = a;
+            tok[i] = ak_tgt(e.seq, L + a);
+        }
+        Scheduler::StepResult res;
+        res.n_seq = (int)p.e.size();
+        res.n_accepted = acc.data(); res.token = tok.data(); res.eos = eos.data();
+        CHECK_OK(f.sch.commit(res));
+        for (int i = 0; i < n_seq; ++i) {
+            const Request* q = f.sch.find(ids[(size_t)i]);
+            if (q->output.empty()) continue;
+            const int64_t L = (int64_t)q->output.size();
+            int32_t d[7];
+            for (int j = 0; j < 7; ++j) d[j] = j < g[i] ? ak_tgt(ids[(size_t)i], L + j)
+                                                         : ak_tgt(ids[(size_t)i], L + j) + 1;
+            CHECK_OK(f.sch.set_draft(ids[(size_t)i], d, 7));
+        }
+    }
+    for (int i = 0; i < n_seq; ++i) {
+        const Request* q = f.sch.find(ids[(size_t)i]);
+        r.out.push_back(q->output);
+        r.tokens += (int64_t)q->output.size();
+    }
+    return r;
+}
+}  /* namespace */
+
+TEST(adaptive_k_is_lossless_and_cuts_the_rows_of_a_batch_that_accepts_poorly) {
+    /* eight sequences: four whose drafter is right to the end, four that stop after one token */
+    const int g[8] = { 7, 7, 7, 7, 1, 1, 1, 1 };
+    AkRun off = ak_run(false, 8, g, 60);
+    AkRun on  = ak_run(true,  8, g, 60);
+    /* every emitted token is the target's own, in both runs */
+    for (const AkRun* r : { &off, &on })
+        for (size_t i = 0; i < r->out.size(); ++i)
+            for (size_t t = 0; t < r->out[i].size(); ++t)
+                CHECK_EQ(r->out[i][t], t == 0 ? r->out[i][0] : ak_tgt((uint64_t)i + 1, (int64_t)t));
+    /* the unshrunk run verifies 8 rows a sequence; the adaptive run learned to spend fewer */
+    CHECK_EQ(off.rows, off.steps * 8);
+    CHECK(on.rows < off.rows * 85 / 100);
+    /* and what the poor sequences lose is the rows they were wasting, not tokens: the good ones
+     * commit the same per step, the poor ones commit 2 either way */
+    CHECK(on.tokens * 100 >= off.tokens * 97);
+
+    /* a lone sequence is never shortened, whatever its acceptance */
+    const int g1[1] = { 0 };
+    AkRun one = ak_run(true, 1, g1, 30);
+    CHECK_EQ(one.rows, one.steps * 8);
+}
+
 RAD_TEST_MAIN()

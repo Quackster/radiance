@@ -18,6 +18,7 @@
  *   - DRAFT DEPTH, controlled against measured acceptance (draft.h, §10).
  */
 #pragma once
+#include "adaptive_k.h"
 #include "batch.h"
 #include "draft.h"
 #include "metrics.h"
@@ -107,7 +108,14 @@ struct SchedReq {
         draft_filled = 0;
         draft_lo     = 0;
         draft_hi     = 0;
+        ak           = AdaptiveK::Stat{};
+        ak_cap       = RAD_SCHED_MAX_SPEC;
     }
+
+    /* ADAPTIVE VERIFY LENGTH (adaptive_k.h): this sequence's acceptance history, and the cap the
+     * policy put on its draft for the step being planned. A cap at RAD_SCHED_MAX_SPEC is "none". */
+    AdaptiveK::Stat ak;
+    int32_t  ak_cap = RAD_SCHED_MAX_SPEC;
 
     int32_t  sched_tokens = 0;   /* tokens given to this request in the current step */
     int32_t  entry = -1;         /* its index in the current StepPlan, or -1 */
@@ -428,6 +436,11 @@ public:
     const StepPlan&      plan() const { return plan_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
+    /* Turns the adaptive verify length on (adaptive_k.h) with these parameters. Engine thread,
+     * before the first step; a no-op for p.enabled == false. The engine calls it for a block
+     * drafter only: a serial drafter's depth is fixed on the card before the host sees it. */
+    int                  set_adaptive_k(const AdaptiveK::Params& p);
+    const AdaptiveK&     adaptive_k() const { return ak_; }
     SchedMetrics         metrics() const;
 
     /* THE OBSERVERS' COPY. A dashboard, a scraper or an admin call reads what the engine thread
@@ -474,6 +487,11 @@ private:
     bool          hit_holes_draft_ = true;
     BatchBuilder  builder_;
     DraftController draft_;
+    AdaptiveK       ak_;
+    std::vector<AdaptiveK::Cand> ak_cand_;
+    std::vector<int32_t>         ak_slot_;
+    std::vector<int>             ak_k_;
+    int64_t ak_calls_ = 0, ak_steps_ = 0, ak_rows_saved_ = 0, ak_hist_[RAD_SCHED_MAX_SPEC + 1] = {};
 
     /* Where this sequence's block-drafter cache begins, as the guard in block_begin reads it
      * and block_end records it. One rule, one place. */

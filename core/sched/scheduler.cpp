@@ -205,6 +205,23 @@ Request* Scheduler::find(uint64_t id) {
     return it == by_id_.end() ? nullptr : reqs_[(size_t)it->second]->req.get();
 }
 
+int Scheduler::set_adaptive_k(const AdaptiveK::Params& p) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!p.enabled) return RAD_OK;
+    const int max_c = (int)cfg_.max_seqs;
+    RAD_TRY(ak_.configure(p, draft_.next_depth(), max_c));
+    ak_cand_.assign((size_t)max_c, AdaptiveK::Cand{});
+    ak_slot_.assign((size_t)max_c, -1);
+    ak_k_.assign((size_t)max_c, 0);
+    std::string ls;
+    for (int i = 0; i < p.n_lens; ++i) ls += (i ? "," : "") + std::to_string(p.lens[i]);
+    RAD_INFO("adaptive verify length ON: lengths {%s}+depth %d, alpha %.2f, prior %.1f, cost %s, "
+             "min rows %d, row quantum %d", ls.c_str(), draft_.next_depth(), p.alpha, p.prior,
+             p.n_pts >= 2 ? "table" : (std::to_string(p.cost_a) + " + " + std::to_string(p.cost_b) + "*M ms").c_str(),
+             p.min_rows, p.quant);
+    return RAD_OK;
+}
+
 int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = by_id_.find(id);
@@ -939,6 +956,48 @@ const RadBatch* Scheduler::step() {
      * alone rather than as anything failing. */
     const int depth = draft_.next_depth();
 
+    /* ---------------------------------------------------------- adaptive verify length
+     * One decision for the whole batch, before any entry is built: which of the drafts the block
+     * drafter just published are verified in full and which are cut to a shorter prefix. The cap
+     * only ever LOWERS s.n_draft below; the drafter's tokens are untouched (adaptive_k.h). */
+    if (ak_.enabled()) {
+        int nc = 0, base_rows = 0;
+        for (size_t i = 0; i < running_.size() && nc < (int)ak_cand_.size(); ++i) {
+            SchedReq& s = *reqs_[(size_t)running_[i]];
+            s.ak_cap = RAD_SCHED_MAX_SPEC;
+            const Request& r = *s.req;
+            const bool pf = (r.n_computed < (int64_t)r.prompt.size()) || (r.n_computed + 1 < s.seq_len());
+            if (pf) continue;
+            if (!r.may_speculate || s.n_draft <= 0) { base_rows += 1; continue; }
+            const int n = s.n_draft < depth ? s.n_draft : depth;
+            ak_cand_[(size_t)nc] = AdaptiveK::Cand{ ak_.q_of(s.ak), n };
+            ak_slot_[(size_t)nc] = running_[i];
+            ++nc;
+        }
+        if (nc > 0) {
+            int full = base_rows;
+            for (int i = 0; i < nc; ++i) full += 1 + ak_cand_[(size_t)i].n;
+            const int rows = ak_.choose(ak_cand_.data(), nc, base_rows, ak_k_.data());
+            for (int i = 0; i < nc; ++i) {
+                SchedReq& s = *reqs_[(size_t)ak_slot_[(size_t)i]];
+                s.ak_cap = ak_k_[(size_t)i];
+                ++ak_hist_[ak_k_[(size_t)i]];
+            }
+            if (rows < full) {
+                ++ak_steps_;
+                ak_rows_saved_ += full - rows;
+            }
+            if ((++ak_calls_ % 1024) == 0) {
+                std::string h;
+                for (int k = 1; k <= RAD_SCHED_MAX_SPEC; ++k)
+                    if (ak_hist_[k]) h += " k" + std::to_string(k) + "=" + std::to_string(ak_hist_[k]);
+                RAD_INFO("adaptive k: %lld/%lld steps shortened, %lld rows saved (%.1f/step); "
+                         "per-sequence lengths:%s", (long long)ak_steps_, (long long)ak_calls_,
+                         (long long)ak_rows_saved_, (double)ak_rows_saved_ / (double)ak_calls_, h.c_str());
+            }
+        }
+    }
+
     /* ---------------------------------------------------------- running requests first */
     /* Continuous batching: a request already holding blocks is served before a new one is let in,
      * because the alternative is admitting work that then preempts work already half done. */
@@ -967,6 +1026,7 @@ const RadBatch* Scheduler::step() {
             if (!r.may_speculate) s.n_draft = 0;
             else if (s.n_draft == 0) s.n_draft = (int32_t)draft_ngram(s, depth);
             if (s.n_draft > depth) s.n_draft = depth;
+            if (s.n_draft > s.ak_cap) s.n_draft = s.ak_cap;   /* adaptive verify length */
             /* NO VERIFIED POSITION AT OR PAST THE CONTEXT. The step computes positions n_computed
              * .. n_computed + n_draft, and nothing past ctx_limit_ - 1 has a rotary row or a
              * block-table column. commit() finishes a sequence before its length reaches the
@@ -1550,6 +1610,7 @@ int Scheduler::commit(const StepResult& res) {
 
             if (e.n_spec > 0) {
                 draft_.observe(e.n_spec, a);
+                ak_.observe(s.ak, e.n_spec, a);
                 m_.draft_tokens += e.n_spec;
                 m_.draft_accepted += a;
                 server::sink_drafts(r.sink, e.n_spec, a);
@@ -2247,6 +2308,8 @@ SchedMetrics Scheduler::metrics_locked() const {
         ? (float)((double)m.attn_cached_tokens / (double)m.prompt_tokens) : 0.0f;
     m.linear_hit_rate = m.prompt_tokens
         ? (float)((double)m.linear_cached_tokens / (double)m.prompt_tokens) : 0.0f;
+    m.adaptive_k_steps = ak_steps_;
+    m.adaptive_k_rows_saved = ak_rows_saved_;
     m.draft_acceptance = draft_.acceptance();
     m.draft_depth = draft_.next_depth();
     /* THE LOOP BOUND IS THE ARRAY'S OWN EXTENT, not a constant that happens to equal it. Clamping
