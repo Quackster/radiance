@@ -290,6 +290,13 @@ public:
      * (draft_cap): the controller's depth, or what the adaptive policy gives the sequence. */
     int      set_draft(uint64_t id, const int32_t* tokens, int n);
 
+    /* RADIANCE_DRAFT_ADAPT is the SERIAL drafter's policy: every draft there is one more round of
+     * the head, which is what its cost table prices. A block drafter proposes its whole block in
+     * one pass, so a shorter window only saves verify rows -- a different trade with a policy of its
+     * own. The engine calls this once, before the first step, when the drafter is a block drafter;
+     * the switch then changes nothing about that run. Says so when it was on. */
+    void     draft_adapt_off(const char* why);
+
     /* ---------------------------------------------------------- media the encoder owes
      * A REQUEST CARRYING MEDIA IS ADMITTED ONLY ONCE EVERY ITEM IS ENCODED. Until then it keeps
      * its place in the queue, the requests behind it are admitted around it, and its items wait

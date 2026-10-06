@@ -1341,6 +1341,17 @@ void Scheduler::take_encodes(std::vector<std::shared_ptr<mm::Item>>* out) {
 }
 
 /* ------------------------------------------------------------------ the load cap */
+void Scheduler::draft_adapt_off(const char* why) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!draft_.adaptive()) return;
+    DraftController::Params p = draft_.params();
+    p.adapt = false;
+    if (draft_.configure(p) == RAD_OK)
+        RAD_WARN("RADIANCE_DRAFT_ADAPT is set and the drafter is %s: the adaptive window is the serial "
+                 "drafter's policy, so this run keeps the configured depth %d", why, p.max_depth);
+    draft_busy_cap_ = 0;
+}
+
 void Scheduler::draft_cycle() {
     const int32_t cap = (int32_t)draft_.busy_cap((int)running_.size());
     if (cap != draft_busy_cap_)

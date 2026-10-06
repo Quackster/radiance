@@ -1785,6 +1785,34 @@ TEST(the_adaptive_window_caps_the_proposal_and_the_rounds) {
     CHECK_EQ(m.draft_depth, 4);                        /* the ceiling, as before */
 }
 
+/* A BLOCK DRAFTER KEEPS ITS DEPTH. The engine turns the policy off before the first step when the
+ * drafter proposes its block in one pass; the proposal then reaches the step uncut, as without the
+ * switch. */
+TEST(the_adaptive_window_turns_off_for_a_block_drafter) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    DraftController::Params p;
+    p.max_depth = 4;
+    p.adapt = true;
+    p.prior = 0.3f;                                    /* on the default cost: two */
+    CHECK_OK(f.sch.draft().configure(p));
+    f.sch.draft_adapt_off("a block drafter");
+    CHECK(!f.sch.draft().adaptive());
+
+    const uint64_t a = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    CHECK_EQ(f.sch.find(a)->n_draft, 4);
+    const SchedMetrics m = f.sch.metrics();
+    CHECK(!m.draft_adaptive);
+    f.sch.draft_adapt_off("again");                    /* a second call is a no-op */
+    CHECK(!f.sch.draft().adaptive());
+}
+
 /* EACH SEQUENCE ITS OWN WINDOW, AND THE ROUNDS FOLLOW THE DEEPEST. The step issued ahead of a
  * commit verifies, for each sequence, the first of those rounds up to its own window -- and the
  * drafter's longer proposal is taken cut to that count rather than refused as a mismatch. */

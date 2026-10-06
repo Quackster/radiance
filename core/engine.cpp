@@ -410,6 +410,8 @@ int Engine::step_loop() {
      * collected, and a pass issued ahead would have overwritten them by then. */
     pipelining_ = !cfg_.kld() && drafter_.kind != RAD_DRAFT_BLOCK &&
                   (serial_drafting() || cfg_.n_spec <= 0);
+    /* The adaptive draft window prices serial rounds; a block drafter keeps its depth (scheduler.h). */
+    if (drafter_.kind == RAD_DRAFT_BLOCK) sched_.draft_adapt_off("a block drafter");
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* Read once. See the block in the idle branch below for what it is for. */
     /* "kv" | "arena" | "all" | "kv:<name>,<name>" -- the last narrows the KV scrub to named groups,
