@@ -5125,7 +5125,9 @@ static void hc_read_i8(const Plugin& pl, int64_t M, bool real_stream, int form) 
     void* d_rq = dalloc(qb);
     void* d_rs = dalloc(sb);
     static const char* const kForm[] = { "the launcher's rule", "the decode tiles' kernels",
-                                         "the wide kernels" };
+                                         "the wide kernels", "the PF2 kernels",
+                                         "the PF2 down product", "the PF2 up product",
+                                         "the PF2 kernels at 128 rows" };
     const std::string nm = fmt("hc_read_e4m3 int8 codes at M=%lld (%s, %s)", (long long)M,
                                real_stream ? "a real stream" : "the null stream", kForm[form]);
     if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q || !d_qs || !d_rq || !d_rs) {
@@ -5203,9 +5205,10 @@ static void hc_read_i8(const Plugin& pl, int64_t M, bool real_stream, int form) 
  * it is several launches, so this is also the harness to run under libr4d/isa/trace.sh for their
  * split. Random codes and small positive scales: what is timed is the traffic and the arithmetic.
  *
- * BOTH FORMS OF THE PREFILL TILE are run -- the decode tiles' kernels at 128 rows and the wide
- * kernels, through the r4d_hc_read_pin_prefill hook -- and their outputs compared BYTE FOR BYTE,
- * which is what the wide kernels claim. `timed` times each form as well. */
+ * EVERY FORM OF THE PREFILL TILE is run -- the decode tiles' kernels at 128 rows, the wide kernels
+ * and, where the band can hold their weight planes, the PF2 kernels, through the
+ * r4d_hc_read_pin_prefill hook -- and their outputs compared BYTE FOR BYTE, which is what the wide
+ * and the PF2 kernels claim. `timed` times each form as well. */
 static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed) {
     if (iters <= 0) iters = 20;
     const RadKernelInfo* r = find(pl, "hc_read_e4m3");
@@ -5288,9 +5291,14 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed) {
     const RadStream rst = (RadStream)hs;
 
     struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs; };
-    const int f_lo = pl.pin_hc ? 1 : 0, f_hi = pl.pin_hc ? 2 : 0;
+    /* PF2 keeps its two weight planes in the band's `u` buffer, M * hc * n bf16: they need
+     * ceil((lr + hc) / 16) * 16 + lr rows of it, so a smaller M is the wide form's alone. */
+    const int64_t pf2_min_m = ((lr + hc + 15) / 16) * 16 + lr;
+    const int f_lo = pl.pin_hc ? 1 : 0, f_hi = pl.pin_hc ? (M >= pf2_min_m ? 6 : 2) : 0;
     static const char* const kForm[] = { "the launcher's rule", "the decode tiles' kernels",
-                                         "the wide kernels" };
+                                         "the wide kernels", "the PF2 kernels",
+                                         "the PF2 down product", "the PF2 up product",
+                                         "the PF2 kernels at 128 rows" };
     std::vector<Out> outs;
     for (int form = f_lo; form <= f_hi; ++form) {
         if (pl.pin_hc) pl.pin_hc(form);
@@ -5312,22 +5320,24 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed) {
         get(o.qs, d_qs, sb); get(o.rq, d_rq, qb); get(o.rs, d_rs, sb);
         outs.push_back(std::move(o));
     }
-    if (outs.size() == 2) {
+    /* Form f against the decode tiles' kernels, outs[0]. */
+    auto same = [&](size_t f, const char* what) {
         std::string bad;
-        if (outs[0].x != outs[1].x)     bad += " x";
-        if (outs[0].inj != outs[1].inj) bad += " inj";
-        if (outs[0].q != outs[1].q)     bad += " q";
-        if (outs[0].qs != outs[1].qs)   bad += " qs";
-        if (outs[0].rq != outs[1].rq)   bad += " rq";
-        if (outs[0].rs != outs[1].rs)   bad += " rs";
+        if (outs[0].x != outs[f].x)     bad += " x";
+        if (outs[0].inj != outs[f].inj) bad += " inj";
+        if (outs[0].q != outs[f].q)     bad += " q";
+        if (outs[0].qs != outs[f].qs)   bad += " qs";
+        if (outs[0].rq != outs[f].rq)   bad += " rq";
+        if (outs[0].rs != outs[f].rs)   bad += " rs";
         /* A zero output would pass a byte comparison between two forms that both wrote nothing. */
         size_t nz = 0;
-        for (uint8_t v : outs[1].q) nz += v != 0;
-        ok(fmt("hc_read_e4m3 prefill tile at M=%lld: the wide kernels are byte-identical to the "
-               "decode tiles' kernels", (long long)M).c_str(),
+        for (uint8_t v : outs[f].q) nz += v != 0;
+        ok(fmt("hc_read_e4m3 prefill tile at M=%lld, %s: byte-identical to the decode tiles' "
+               "kernels", (long long)M, what).c_str(),
            bad.empty() && nz > qb / 2, bad.empty() ? fmt("%zu of %zu codes non-zero", nz, qb)
                                                    : "differs in" + bad);
-    }
+    };
+    for (size_t f = 1; f < outs.size(); ++f) same(f, kForm[f_lo + (int)f]);
 
     if (timed) {
         for (int form = f_lo; form <= f_hi; ++form) {
@@ -10288,14 +10298,19 @@ static void device_phase(const Plugin& pl) {
     if (sel("hc_read_e4m3")) {
         if (!g_case) std::printf("\nthe gated residual's read at the prefill tile, the wide "
                                  "kernels against the decode tiles'\n");
-        for (int64_t m : { 65, 300, 2048 }) hc_prefill(pl, m, 0, false);
+        /* 700 and 1000 put PF2's K chunks across a stream boundary and its row tiles past the
+         * last row; 4096 is the one-chunk epilogue. */
+        for (int64_t m : { 65, 300, 700, 1000, 2048, 4096 }) hc_prefill(pl, m, 0, false);
         for (int64_t m : { 1, 4, 33, 65, 300, 2048 }) {
             hc_read_i8(pl, m, false, 0);
             hc_read_i8(pl, m, true, 0);
         }
-        if (pl.pin_hc)
+        if (pl.pin_hc) {
             for (int64_t m : { 65, 2048 })
                 for (int form : { 1, 2 }) hc_read_i8(pl, m, true, form);
+            for (int64_t m : { 700, 2048 })
+                for (int form : { 3, 4, 5, 6 }) hc_read_i8(pl, m, true, form);
+        }
     }
 
     if (sel("moe_gemm_w4a8")) {
@@ -10579,8 +10594,9 @@ static void usage(void) {
                 "  --perfw8 N K M [iters]:  the 8-bit trunk GEMMs -- block E4M3 W8A8 and the int8\n"
                 "             rows -- at one shape, each with its TFLOP/s.\n"
                 "  --perfw2 N K M [iters]:  the int2 DFlash2 draft head at every variant it has.\n"
-                "  --perfhc M [iters]:  hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows, both\n"
-                "             prefill-tile forms compared byte for byte and timed as one op each;\n"
+                "  --perfhc M [iters]:  hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows, every\n"
+                "             prefill-tile form (PF2 from M=656) compared byte for byte and timed\n"
+                "             as one op each;\n"
                 "             run it under libr4d/isa/trace.sh for its launches.\n"
                 "  --perfmoe M [iters] [experts] [top_k] [pooled%%]:  the routed-expert w4 GEMM,\n"
                 "             both projections at rank 0's tp2 width split, over a skewed routing of\n"

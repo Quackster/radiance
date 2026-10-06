@@ -1704,7 +1704,9 @@ constexpr int kWideRT = 128, kWideNT = 112, kWideCH = 16;
 
 /* THE PREFILL TILE'S FORM, pinned for a test: 0 is the launcher's rule, 1 the decode tiles'
  * kernels at RT 128 (hc_down_tiled, then hc_up_tiled into `ubuf` and hc_mix), 2 the wide kernels
- * (which then refuse a shape they are not built for). */
+ * (which then refuse a shape they are not built for), 3..6 the PF2 forms R4D_HC_READ_PF2=1..4
+ * selects (hc_pf2_launch; refused likewise, and also where the band's `u` cannot hold their
+ * weight planes). */
 static int g_hc_prefill_form = 0;
 
 /* ==================================================== d = silu(W_down @ N / hc) at the PREFILL tile
@@ -2425,6 +2427,24 @@ static inline void hc_up_mix_tiled_launch(int rt, bool f8, bool i8, const void* 
 #undef HC_UM_CASE3
 }
 
+/* The codes of `x` and the rotated twin, after a mix that writes `x` alone: hc_quant_rows_kernel
+ * over every (row, scale group). Nothing to do without codes. */
+static inline void hc_quant_rows_launch(bool i8, const unsigned short* x, unsigned char* q,
+                                        float* qs, unsigned char* rq, float* rqs, long rows,
+                                        long n, long xrow, long qrow, long srow, long rqrow,
+                                        long rsrow, RadStream s) {
+    if (!q) return;
+    const long items = rows * (n / kUpTB);
+    if (i8)
+        hipLaunchKernelGGL(hc_quant_rows_kernel<true>, dim3((unsigned)((items + kWaves - 1) / kWaves)),
+                           dim3(kThreads), 0, (hipStream_t)s, x, q, qs, rq, rqs, rows, n / kUpTB,
+                           xrow, qrow, srow, rqrow, rsrow);
+    else
+        hipLaunchKernelGGL(hc_quant_rows_kernel<false>, dim3((unsigned)((items + kWaves - 1) / kWaves)),
+                           dim3(kThreads), 0, (hipStream_t)s, x, q, qs, rq, rqs, rows, n / kUpTB,
+                           xrow, qrow, srow, rqrow, rsrow);
+}
+
 static inline void hc_up_mix_wide_launch(bool f8, bool i8, const void* up, long uld,
                                          const unsigned short* dbuf, const unsigned short* h,
                                          const float* w, const float* scale, unsigned short* x,
@@ -2439,16 +2459,591 @@ static inline void hc_up_mix_wide_launch(bool f8, bool i8, const void* up, long 
                        up, uld, dbuf, h, w, scale, x, rows, n, lr, hrow, xrow, wadd)
     if (f8) HC_UMW_CASE(true); else HC_UMW_CASE(false);
 #undef HC_UMW_CASE
-    if (!q) return;
-    const long items = rows * (n / kUpTB);
-    if (i8)
-        hipLaunchKernelGGL(hc_quant_rows_kernel<true>, dim3((unsigned)((items + kWaves - 1) / kWaves)),
-                           dim3(kThreads), 0, (hipStream_t)s, x, q, qs, rq, rqs, rows, n / kUpTB,
-                           xrow, qrow, srow, rqrow, rsrow);
-    else
-        hipLaunchKernelGGL(hc_quant_rows_kernel<false>, dim3((unsigned)((items + kWaves - 1) / kWaves)),
-                           dim3(kThreads), 0, (hipStream_t)s, x, q, qs, rq, rqs, rows, n / kUpTB,
-                           xrow, qrow, srow, rqrow, rsrow);
+    hc_quant_rows_launch(i8, x, q, qs, rq, rqs, rows, n, xrow, qrow, srow, rqrow, rsrow, s);
+}
+
+/* ==================================================== hc_read, the SECOND PREFILL FORM (PF2)
+ *
+ * R4D_HC_READ_PF2=1 takes it at a prefill chunk, pinned form 3 takes it for a test. The same five
+ * steps as the wide form and the same bytes out of every one of them -- what moves is which
+ * workgroup does which part of the work, and how often:
+ *
+ *   THE A OPERAND OF THE DOWN PRODUCT IS BUILT ONCE. hc_down_wide_kernel owns 112 columns, so the
+ *   three column tiles of a row tile each rebuild N from `h` -- the norm weight, the scale and the
+ *   rounding to bf16, three times for every element of a 42 MB stream. A PF2 workgroup owns 64
+ *   rows and EVERY column, so `h` is read and N is built exactly once a call.
+ *   THE WEIGHT IS DECODED ONCE. Every row tile of the wide form decodes the E4M3 rows of both
+ *   mixing matrices it stages -- sixteen decodes of each matrix a call at a 2048-row chunk. A PF2
+ *   call decodes each matrix once, in its prologue, into scratch the wide form leaves unused.
+ *   THE DOWN PRODUCT'S B OPERAND SKIPS LDS. With every column in one workgroup, each 16-column
+ *   n-tile belongs to exactly one wave, so nothing is shared and nothing needs staging: the
+ *   prologue writes the decoded matrix in WMMA FRAGMENT ORDER and a wave's fragment is one
+ *   512-byte load. Only N goes through LDS, double-buffered, one barrier a slice.
+ *   THE UP PRODUCT'S TILE IS 256 ROWS, two m-tiles a wave. Each B fragment read out of LDS feeds
+ *   two WMMAs instead of one, and the weight is staged and read half as often.
+ *
+ * WHAT KEEPS IT THE SAME BYTES. Every output element is the same chain of 16x16x16 WMMAs over
+ * the same fragments in the same order: N is the same expression, the decoded weight is the bf16
+ * the wide form stages into LDS, the fragment layout is r4d_gdn_wmma.h's, rows and columns keep
+ * their place inside a 16x16 tile, and the down product keeps the K-split of hc_down_kchunk at
+ * the 128-row tile, partial for partial, summed by the same reduce. The norm scales are
+ * hc_norm_scale_kernel's sums in hc_norm_scale_kernel's order (see the prologue). r4d_selftest
+ * compares all three forms byte for byte. */
+constexpr int  kPf2RT      = 64;                 // down product: rows a workgroup, four m-tiles
+constexpr int  kPf2NW      = 3;                  // down product: n-tiles a wave, at most
+constexpr int  kPf2MaxNT   = kWaves * kPf2NW;    // ...so ceil((lr + hc) / 16) <= 24
+constexpr int  kPf2WRT     = 128;                // the 128-row down product (PF2 form 4)...
+constexpr int  kPf2WThreads = 2 * kThreads;      // ...is sixteen waves, two m-halves of eight
+constexpr int  kPf2WMaxNT  = 21;                 // ...and holds a B slice of 21 n-tiles in LDS
+constexpr int  kPf2UpRT    = 256;                // up product: rows a workgroup, two m-tiles a wave
+constexpr long kPf2MinRows = 512;                // the rule's floor; the pin takes any prefill tile
+
+/* WHAT A PF2 CALL RUNS, as bits: the 64-row down product, the up product and mix at 256 rows, the
+ * 128-row down product. A side without its bit is the wide form's kernel, so each half can be
+ * timed and checked alone; the prologue (norm scales, and the planes the chosen kernels read)
+ * runs in every PF2 call. */
+enum : int { kPf2Down = 1, kPf2Up = 2, kPf2DownW = 4 };
+
+/* R4D_HC_READ_PF2 (unset or 0: the wide form, as upstream): 1 both halves, 2 the down product
+ * alone, 3 the up product alone, 4 both with the 128-row down product. Pinned forms 3..6 are the
+ * same four. Read once, so a recorded pass and a live one take the same branch. */
+static int hc_pf2_bits(int sel) {
+    switch (sel) {
+        case 1:  return kPf2Down | kPf2Up;
+        case 2:  return kPf2Down;
+        case 3:  return kPf2Up;
+        case 4:  return kPf2DownW | kPf2Up;
+        default: return 0;
+    }
+}
+static int hc_pf2_env() {
+    static const int v = [] {
+        const char* e = std::getenv("R4D_HC_READ_PF2");
+        return hc_pf2_bits(e != nullptr ? std::atoi(e) : 0);
+    }();
+    return v;
+}
+
+/* THE PROLOGUE: the per-stream norm scales and the two weight planes, in ONE launch, because
+ * the down product needs all three and none of them needs another.
+ *
+ * Blocks [0, nnb) are the scales, one WAVE a (row, stream). hc_norm_scale_kernel gives a
+ * (row, stream) a workgroup: thread t sums the squares of elements t, t + 256, ... in ascending
+ * order, each wave folds its 32 sums with r4d_wave_sum, and thread 0 adds the eight wave totals
+ * in ascending order. Here lane L loads elements 8L .. 8L + 7 of each 256-element chunk -- so it
+ * holds threads 8L .. 8L + 7's running sums, each over the same elements in the same order --
+ * and a wave-private slot of LDS turns them back into thread order, so that lane L of the k-th
+ * r4d_wave_sum holds thread 32k + L's sum, as wave k's lane L did. Same squares, same sums, same
+ * butterfly, same eight adds: the same scale. A wave's LDS operations complete in order and no
+ * other wave touches its slot, so the round trip needs no barrier (wave_dot_lds relies on the
+ * same rule).
+ *
+ * Blocks [nnb, ...) write the planes, a 16-byte vector an item:
+ *
+ *   `plane`, the down product's B in FRAGMENT ORDER: [ntt][HN/16][32 lanes][8 bf16]. Lane l of
+ *   the fragment for n-tile nt and k-step g holds column nt*16 + (l & 15) at k = 16g + 4(l >> 4)
+ *   + {0..3, 8..11} -- what frag() reads out of an LDS tile, in the order it reads it. Columns
+ *   below lr are mix_down decoded (or copied, at bf16), the next hc the inject weights, and the
+ *   pad up to the n-tile clamps to the last real column, as the wide form's staging does.
+ *   `udec`, mix_up decoded to plain [HN][lr] bf16 (E4M3 only; a bf16 mix_up is read in place).
+ *
+ * Every decoded element is f2bf(code * scale) of the same code and the same group scale the wide
+ * form's staging multiplies -- the same bf16. */
+__global__ __launch_bounds__(kThreads)
+void hc_pf2_prep_kernel(const unsigned short* __restrict__ h, float* __restrict__ scaleout,
+                        long rows, long n, int hc, long hrow, float eps, long nnb,
+                        const void* __restrict__ downv, long dld, bool f8,
+                        const unsigned short* __restrict__ injw,
+                        const unsigned char* __restrict__ up8, long uld,
+                        uint4* __restrict__ plane, unsigned short* __restrict__ udec,
+                        long lr, long ncol, long ntt) {
+    __shared__ float s_t[kWaves][kThreads];
+    const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const long HN = (long)hc * n;
+    if ((long)blockIdx.x < nnb) {
+        const long p = (long)blockIdx.x * kWaves + wave;
+        if (p >= rows * hc) return;
+        const long r = p / hc;
+        const int  c = (int)(p - r * hc);
+        const unsigned short* hp = h + r * hrow + (long)c * n;
+        /* Five chunks' loads in flight before the first is summed; the chunks are still summed
+         * in ascending order, so a thread's running sum is the same sequence of adds. */
+        constexpr int kU = 5;
+        float acc[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[e] = 0.0f;
+        long j0 = 0;
+        for (; j0 + kU * kThreads <= n; j0 += kU * kThreads) {
+            uint4 v[kU];
+#pragma unroll
+            for (int u = 0; u < kU; ++u) v[u] = *(const uint4*)(hp + j0 + u * kThreads + lane * 8);
+#pragma unroll
+            for (int u = 0; u < kU; ++u) {
+                float f[8];
+                bf16x8(v[u], f);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) acc[e] += f[e] * f[e];
+            }
+        }
+        for (; j0 < n; j0 += kThreads) {
+            float f[8];
+            bf16x8(*(const uint4*)(hp + j0 + lane * 8), f);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc[e] += f[e] * f[e];
+        }
+        float* const st = s_t[wave];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) st[lane * 8 + e] = acc[e];
+        float ss = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kWaves; ++k) ss += wave_sum(st[k * kWave + lane]);
+        if (lane == 0) scaleout[r * kHcMax + c] = __frsqrt_rn(ss / (float)n + eps);
+        return;
+    }
+
+    const long KS   = HN / 16;
+    const long nswz = ntt * KS * kWave;
+    const long nup  = f8 ? HN * (lr / 8) : 0;
+    const long step = ((long)gridDim.x - nnb) * kThreads;
+    for (long v = ((long)blockIdx.x - nnb) * kThreads + tid; v < nswz + nup; v += step) {
+        if (v < nswz) {
+            const long f   = v / kWave;
+            const int  l   = (int)(v - f * kWave);
+            const long nt  = f / KS, g = f - nt * KS;
+            long col = nt * 16 + (l & 15);
+            if (col >= ncol) col = ncol - 1;
+            const long k = g * 16 + 4 * (l >> 4);
+            uint4 o;
+            if (col < lr && f8) {
+                const unsigned char* row = (const unsigned char*)downv + col * dld;
+                const float sc = ((const float*)(row + HN))[k / r4d_hc8::kDownGroup];
+                float fv[8];
+                e4m3x8(*(const uint32_t*)(row + k), *(const uint32_t*)(row + k + 8), fv);
+                union { uint4 v; unsigned short s[8]; } u;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) u.s[e] = f2bf(fv[e] * sc);
+                o = u.v;
+            } else {
+                const unsigned short* src = (col < lr) ? (const unsigned short*)downv + col * HN
+                                                       : injw + (col - lr) * HN;
+                const uint2 lo = *(const uint2*)(src + k), hi = *(const uint2*)(src + k + 8);
+                o = make_uint4(lo.x, lo.y, hi.x, hi.y);
+            }
+            plane[v] = o;
+        } else {
+            const long u  = v - nswz;
+            const long j  = u / (lr / 8), k8 = (u - j * (lr / 8)) * 8;
+            const unsigned char* row = up8 + j * uld;
+            *(uint4*)(udec + j * lr + k8) =
+                e4m3x8_bf16(row + k8, ((const float*)(row + lr))[k8 / r4d_hc8::up_group(lr)]);
+        }
+    }
+}
+
+/* d = silu(W_down @ N / hc) and the inject gains, PF2: a workgroup owns 64 rows, every column and
+ * one K chunk -- hc_down_kchunk's at the 128-row tile, so the partials are the wide form's.
+ *
+ * Wave w owns n-tiles w, w + 8 and w + 16 (those below ntt) across all four m-tiles: twelve
+ * accumulators, a fragment of B taken to four WMMAs and a fragment of A to three. B comes straight
+ * from `plane`, a slice ahead: the loads of the next slice's fragment for a k-step are issued as
+ * soon as the WMMAs of this slice's have read it, so they have a whole slice to land. N is built
+ * from `h` into one of two LDS tiles while the other is read, one barrier a slice.
+ *
+ * Each accumulator sees the K steps of its chunk in ascending order from zero, its fragments are
+ * the ones the wide form's would be, and its element sits at the same place in its 16x16 tile:
+ * the same partial, written to the same place, or the same epilogue applied when there is one
+ * chunk. */
+__global__ __launch_bounds__(kThreads)
+void hc_down_pf2_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                        const uint4* __restrict__ plane, const float* __restrict__ scalein,
+                        unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                        float* __restrict__ part,
+                        long rows, long n, int hc, long lr, long ncol, long ntt, long hrow,
+                        long irow, long kc, float wadd) {
+    constexpr int RT = kPf2RT, MT = RT / 16, NW = kPf2NW;
+    constexpr int kKV = kTKT / 8;                    /* 16-byte vectors a staged row */
+    constexpr int kRS = kThreads / kKV;              /* rows between a thread's A rows */
+    constexpr int kAV = RT / kRS;
+    constexpr int KST = kTKT / 16;                   /* k-steps a slice */
+    static_assert(RT % kRS == 0 && MT * 16 == RT, "whole A rows a pass");
+    __shared__ unsigned short sA[2 * RT * kTAP];
+
+    /* `wave` through readfirstlane: the n-tile a wave skips is then a scalar branch around its
+     * WMMAs rather than an EXEC mask over them. */
+    const int  tid = threadIdx.x, lane = tid & (kWave - 1);
+    const int  wave = __builtin_amdgcn_readfirstlane(tid / kWave);
+    const long HN = (long)hc * n, KS = HN / 16;
+    const long r0 = (long)blockIdx.x * RT;
+    const long ka = (long)blockIdx.y * kc;
+    const long kb = (ka + kc < HN) ? ka + kc : HN;
+    if (r0 >= rows || ka >= HN) return;
+    const long nsl = (kb - ka) / kTKT;
+
+    const int k8a = (tid % kKV) * 8, ar = tid / kKV;
+    long arow[kAV];
+#pragma unroll
+    for (int i = 0; i < kAV; ++i) {
+        const long r = r0 + ar + i * kRS;
+        arow[i] = r < rows ? r : rows - 1;
+    }
+    uint4 pa[kAV];
+    float psc[kAV], pw[8];
+    auto fetchA = [&](long k0) {
+        const int c = (int)(k0 / n);
+#pragma unroll
+        for (int i = 0; i < kAV; ++i) {
+            pa[i]  = *(const uint4*)(h + arow[i] * hrow + k0 + k8a);
+            psc[i] = scalein[arow[i] * kHcMax + c];
+        }
+#pragma unroll
+        for (int e = 0; e < 8; ++e) pw[e] = w[k0 + k8a + e];
+    };
+    auto stageA = [&](unsigned short* dst) {
+#pragma unroll
+        for (int i = 0; i < kAV; ++i) {
+            union { uint4 v; unsigned short s[8]; } in, out;
+            in.v = pa[i];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) out.s[e] = f2bf(bf2f(in.s[e]) * psc[i] * (pw[e] + wadd));
+            *(uint4*)(dst + (ar + i * kRS) * kTAP + k8a) = out.v;
+        }
+    };
+
+    /* This lane's fragment stream for each of the wave's n-tiles, from the chunk's first k-step. */
+    bool live[NW];
+    const uint4* bp[NW];
+#pragma unroll
+    for (int i = 0; i < NW; ++i) {
+        const long nt = wave + i * kWaves;
+        live[i] = nt < ntt;
+        bp[i] = plane + ((live[i] ? nt : 0) * KS + ka / 16) * kWave + lane;
+    }
+    uint4 rb[KST][NW];
+#pragma unroll
+    for (int s = 0; s < KST; ++s)
+#pragma unroll
+        for (int i = 0; i < NW; ++i)
+            rb[s][i] = live[i] ? bp[i][(long)s * kWave] : make_uint4(0u, 0u, 0u, 0u);
+
+    v8f acc[MT][NW];
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+        for (int i = 0; i < NW; ++i) acc[m][i] = (v8f){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    /* THE LOOP BODY HAS NO BRANCH ON THE SLICE. The last slice prefetches itself again and stages
+     * into the tile nobody reads next, which costs one slice of redundant loads a call and keeps
+     * every load's wait a straight-line count. */
+    fetchA(ka);
+    stageA(sA);
+    __syncthreads();
+    for (long t = 0; t < nsl; ++t) {
+        const long tn = (t + 1 < nsl) ? t + 1 : t;
+        const unsigned short* const cur = sA + (t & 1) * (RT * kTAP);
+        fetchA(ka + tn * kTKT);
+#pragma unroll
+        for (int s = 0; s < KST; ++s) {
+            v8bf af[MT];
+#pragma unroll
+            for (int m = 0; m < MT; ++m) af[m] = frag(cur, kTAP, m * 16, s * 16, lane);
+#pragma unroll
+            for (int i = 0; i < NW; ++i) {
+                if (!live[i]) continue;
+                union { uint4 q; v8bf f; } bu;
+                bu.q = rb[s][i];
+#pragma unroll
+                for (int m = 0; m < MT; ++m) acc[m][i] = mma(af[m], bu.f, acc[m][i]);
+                rb[s][i] = bp[i][(tn * KST + s) * kWave];
+            }
+        }
+        stageA(sA + ((t + 1) & 1) * (RT * kTAP));
+        __syncthreads();
+    }
+
+    const float inv_hc = 1.0f / (float)hc;
+    const int   e0 = 8 * (lane >> 4), nn = lane & 15;
+#pragma unroll
+    for (int i = 0; i < NW; ++i) {
+        if (!live[i]) continue;
+        const long col = (long)(wave + i * kWaves) * 16 + nn;
+        if (col >= ncol) continue;
+#pragma unroll
+        for (int m = 0; m < MT; ++m)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const long r = r0 + m * 16 + e0 + e;
+                if (r >= rows) continue;
+                const float v = acc[m][i][e];
+                if (part)          part[((long)blockIdx.y * rows + r) * ncol + col] = v;
+                else if (col < lr) dout[r * lr + col] = f2bf(siluf_(v * inv_hc));
+                else               inj[r * irow + (col - lr)] = f2bf(2.0f * sigmoidf_(v * inv_hc));
+            }
+    }
+}
+
+/* THE SAME PRODUCT AT 128 ROWS, sixteen waves (PF2 form 4). hc_down_pf2_kernel reads the whole of
+ * B from L2 once per 64 rows -- 3.4 MB a workgroup at a 2048-row chunk, 220 MB a call. Here the
+ * waves of two m-halves share each B slice through LDS, which halves that stream for the price of
+ * staging it and of two barriers a slice. Which of the two the part prefers is a measurement.
+ *
+ * The B slice goes into LDS exactly as it lies in `plane` -- [n-tile][k-step][lane], 2 KB an n-tile
+ * -- so staging is a straight copy and a wave's fragment is one conflict-free 16-byte LDS read.
+ * Wave w is m-half w / 8 (four m-tiles) and n-group w % 8 (n-tiles w % 8, + 8, + 16). Same chains,
+ * same fragments, same places in the tile: the same bytes as every other form. */
+__global__ __launch_bounds__(kPf2WThreads)
+void hc_down_pf2w_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                         const uint4* __restrict__ plane, const float* __restrict__ scalein,
+                         unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                         float* __restrict__ part,
+                         long rows, long n, int hc, long lr, long ncol, long ntt, long hrow,
+                         long irow, long kc, float wadd) {
+    constexpr int NTH = kPf2WThreads, RT = kPf2WRT, MW = 4, NW = kPf2NW;
+    constexpr int kKV = kTKT / 8;                    /* 16-byte vectors a staged A row */
+    constexpr int kRS = NTH / kKV;                   /* rows between a thread's A rows */
+    constexpr int kAV = RT / kRS;
+    constexpr int KST = kTKT / 16;                   /* k-steps a slice */
+    constexpr int kFV = KST * kWave;                 /* 16-byte vectors of one n-tile's slice */
+    constexpr int kBV = (kPf2WMaxNT * kFV + NTH - 1) / NTH;
+    static_assert(RT % kRS == 0 && MW * 16 * 2 == RT && 2 * kWaves * kWave == NTH,
+                  "two m-halves of four m-tiles, eight n-groups");
+    __shared__ unsigned short sA[RT * kTAP];
+    __shared__ uint4 sB[kPf2WMaxNT * kFV];
+
+    const int  tid = threadIdx.x, lane = tid & (kWave - 1);
+    const int  wave = __builtin_amdgcn_readfirstlane(tid / kWave);
+    const int  mh = wave / kWaves, ng = wave % kWaves;
+    const long HN = (long)hc * n, KS = HN / 16;
+    const long r0 = (long)blockIdx.x * RT;
+    const long ka = (long)blockIdx.y * kc;
+    const long kb = (ka + kc < HN) ? ka + kc : HN;
+    if (r0 >= rows || ka >= HN) return;
+    const long nsl = (kb - ka) / kTKT;
+    const long nbv = ntt * kFV;
+    const long g0  = ka / 16;
+
+    const int k8a = (tid % kKV) * 8, ar = tid / kKV;
+    long arow[kAV];
+#pragma unroll
+    for (int i = 0; i < kAV; ++i) {
+        const long r = r0 + ar + i * kRS;
+        arow[i] = r < rows ? r : rows - 1;
+    }
+    uint4 pa[kAV], pb[kBV];
+    float psc[kAV], pw[8];
+    auto fetch = [&](long t) {
+        const long k0 = ka + t * kTKT;
+        const int  c  = (int)(k0 / n);
+#pragma unroll
+        for (int i = 0; i < kAV; ++i) {
+            pa[i]  = *(const uint4*)(h + arow[i] * hrow + k0 + k8a);
+            psc[i] = scalein[arow[i] * kHcMax + c];
+        }
+#pragma unroll
+        for (int e = 0; e < 8; ++e) pw[e] = w[k0 + k8a + e];
+#pragma unroll
+        for (int b = 0; b < kBV; ++b) {
+            const long idx = tid + (long)b * NTH;
+            if (idx >= nbv) continue;
+            const long nt = idx / kFV, wi = idx - nt * kFV;
+            pb[b] = plane[(nt * KS + g0 + t * KST) * kWave + wi];
+        }
+    };
+    auto stage = [&]() {
+#pragma unroll
+        for (int i = 0; i < kAV; ++i) {
+            union { uint4 v; unsigned short s[8]; } in, out;
+            in.v = pa[i];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) out.s[e] = f2bf(bf2f(in.s[e]) * psc[i] * (pw[e] + wadd));
+            *(uint4*)(sA + (ar + i * kRS) * kTAP + k8a) = out.v;
+        }
+#pragma unroll
+        for (int b = 0; b < kBV; ++b) {
+            const long idx = tid + (long)b * NTH;
+            if (idx < nbv) sB[idx] = pb[b];
+        }
+    };
+
+    bool live[NW];
+#pragma unroll
+    for (int i = 0; i < NW; ++i) live[i] = ng + i * kWaves < ntt;
+    v8f acc[MW][NW];
+#pragma unroll
+    for (int m = 0; m < MW; ++m)
+#pragma unroll
+        for (int i = 0; i < NW; ++i) acc[m][i] = (v8f){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    fetch(0);
+    for (long t = 0; t < nsl; ++t) {
+        __syncthreads();
+        stage();
+        __syncthreads();
+        fetch((t + 1 < nsl) ? t + 1 : t);       /* the last slice re-reads itself: no branch */
+#pragma unroll
+        for (int s = 0; s < KST; ++s) {
+            v8bf af[MW];
+#pragma unroll
+            for (int m = 0; m < MW; ++m) af[m] = frag(sA, kTAP, (mh * MW + m) * 16, s * 16, lane);
+#pragma unroll
+            for (int i = 0; i < NW; ++i) {
+                if (!live[i]) continue;
+                union { uint4 q; v8bf f; } bu;
+                bu.q = sB[((ng + i * kWaves) * KST + s) * kWave + lane];
+#pragma unroll
+                for (int m = 0; m < MW; ++m) acc[m][i] = mma(af[m], bu.f, acc[m][i]);
+            }
+        }
+    }
+
+    const float inv_hc = 1.0f / (float)hc;
+    const int   e0 = 8 * (lane >> 4), nn = lane & 15;
+#pragma unroll
+    for (int i = 0; i < NW; ++i) {
+        if (!live[i]) continue;
+        const long col = (long)(ng + i * kWaves) * 16 + nn;
+        if (col >= ncol) continue;
+#pragma unroll
+        for (int m = 0; m < MW; ++m)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const long r = r0 + (mh * MW + m) * 16 + e0 + e;
+                if (r >= rows) continue;
+                const float v = acc[m][i][e];
+                if (part)          part[((long)blockIdx.y * rows + r) * ncol + col] = v;
+                else if (col < lr) dout[r * lr + col] = f2bf(siluf_(v * inv_hc));
+                else               inj[r * irow + (col - lr)] = f2bf(2.0f * sigmoidf_(v * inv_hc));
+            }
+    }
+}
+
+/* hc_up_mix_wide_kernel at 256 rows, two m-tiles a wave, over a bf16 mix_up (decoded by the
+ * prologue, or the stored one). The (stream, channel) pairing, the prefetch, the N pass and the
+ * mix are that kernel's line for line; what changes is that a B fragment read out of LDS goes to
+ * both of a wave's m-tiles, so the weight's staging and its fragment reads are halved against
+ * the WMMAs they feed. The rows keep their place in a 16-row tile (the tile starts at a multiple
+ * of 256), so every output is the same bytes. */
+template <int HC>
+__global__ __launch_bounds__(kThreads)
+void hc_up_mix_pf2_kernel(const unsigned short* __restrict__ ubf,
+                          const unsigned short* __restrict__ dbuf,
+                          const unsigned short* __restrict__ h, const float* __restrict__ w,
+                          const float* __restrict__ scalein,
+                          unsigned short* __restrict__ x,
+                          long rows, long n, long lr, long hrow, long xrow, float wadd) {
+    constexpr int RT = kPf2UpRT, CH = kWideCH, NT = HC * CH;
+    constexpr int MW = RT / 16 / kWaves;                         /* m-tiles a wave */
+    static_assert(MW * 16 * kWaves == RT, "the waves cover the rows");
+    static_assert(NT <= kTAP, "N must fit in the A tile's LDS");
+    __shared__ unsigned short sA[RT * kTAP];
+    __shared__ unsigned short sB[NT * kTAP];
+
+    const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const long r0 = (long)blockIdx.y * RT;
+    const long i0 = (long)blockIdx.x * CH;
+    if (r0 >= rows) return;
+
+    constexpr int kKV = kTKT / 8;
+    constexpr int kRS = kThreads / kKV;
+    constexpr int kAV = RT / kRS, kBV = NT / kRS;
+    constexpr int kNV = RT * HC * (CH / 8) / kThreads;
+    static_assert(RT % kRS == 0 && NT % kRS == 0 && (RT * HC * (CH / 8)) % kThreads == 0,
+                  "every thread stages whole vectors");
+    const int k8a = (tid % kKV) * 8, tr = tid / kKV;
+
+    uint4 pn[kNV];
+    float pns[kNV];
+#pragma unroll
+    for (int i = 0; i < kNV; ++i) {
+        const int  idx = tid + i * kThreads;
+        const int  rl = idx / (HC * CH / 8), rem = idx % (HC * CH / 8);
+        const int  c  = rem / (CH / 8), i8 = (rem % (CH / 8)) * 8;
+        const long r  = r0 + rl;
+        pn[i] = make_uint4(0u, 0u, 0u, 0u);
+        pns[i] = 0.0f;
+        if (r < rows) {
+            pn[i]  = *(const uint4*)(h + r * hrow + (long)c * n + i0 + i8);
+            pns[i] = scalein[r * kHcMax + c];
+        }
+    }
+
+    uint4 pa[kAV], pb[kBV];
+    auto fetch = [&](long k0) {
+        const long k = k0 + k8a;
+        const bool in = k + 8 <= lr;
+#pragma unroll
+        for (int i = 0; i < kAV; ++i) {
+            long r = r0 + tr + i * kRS; if (r >= rows) r = rows - 1;
+            pa[i] = in ? *(const uint4*)(dbuf + r * lr + k) : make_uint4(0u, 0u, 0u, 0u);
+        }
+#pragma unroll
+        for (int i = 0; i < kBV; ++i) {
+            const int  tt = tr + i * kRS;
+            const long j  = (long)(tt / CH) * n + i0 + tt % CH;
+            pb[i] = in ? *(const uint4*)(ubf + j * lr + k) : make_uint4(0u, 0u, 0u, 0u);
+        }
+    };
+
+    v8f acc[MW][HC];
+#pragma unroll
+    for (int mi = 0; mi < MW; ++mi)
+#pragma unroll
+        for (int c = 0; c < HC; ++c) acc[mi][c] = (v8f){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    fetch(0);
+    for (long k0 = 0; k0 < lr; k0 += kTKT) {
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < kAV; ++i) *(uint4*)(sA + (tr + i * kRS) * kTAP + k8a) = pa[i];
+#pragma unroll
+        for (int i = 0; i < kBV; ++i) *(uint4*)(sB + (tr + i * kRS) * kTAP + k8a) = pb[i];
+        __syncthreads();
+        if (k0 + kTKT < lr) fetch(k0 + kTKT);
+#pragma unroll
+        for (int ks = 0; ks < kTKT / 16; ++ks) {
+            v8bf af[MW];
+#pragma unroll
+            for (int mi = 0; mi < MW; ++mi)
+                af[mi] = frag(sA, kTAP, (wave * MW + mi) * 16, ks * 16, lane);
+#pragma unroll
+            for (int c = 0; c < HC; ++c) {
+                const v8bf bf = frag(sB, kTAP, c * 16, ks * 16, lane);
+#pragma unroll
+                for (int mi = 0; mi < MW; ++mi) acc[mi][c] = mma(af[mi], bf, acc[mi][c]);
+            }
+        }
+    }
+    __syncthreads();
+
+    unsigned short* const sN = sA;
+#pragma unroll
+    for (int i = 0; i < kNV; ++i) {
+        const int  idx = tid + i * kThreads;
+        const int  rl = idx / (HC * CH / 8), rem = idx % (HC * CH / 8);
+        const int  c  = rem / (CH / 8), i8 = (rem % (CH / 8)) * 8;
+        if (r0 + rl >= rows) continue;
+        const long j  = (long)c * n + i0 + i8;
+        union { uint4 v; unsigned short s[8]; } in, out;
+        in.v = pn[i];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) out.s[e] = f2bf(bf2f(in.s[e]) * pns[i] * (w[j + e] + wadd));
+        *(uint4*)(sN + (rl * HC + c) * CH + i8) = out.v;
+    }
+    __syncthreads();
+
+    const float inv_hc = 1.0f / (float)HC;
+    const int   e0 = 8 * (lane >> 4), nn = lane & 15;
+#pragma unroll
+    for (int mi = 0; mi < MW; ++mi)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int  rl = (wave * MW + mi) * 16 + e0 + e;
+            const long r  = r0 + rl;
+            float a = 0.0f;
+#pragma unroll
+            for (int c = 0; c < HC; ++c)
+                a += bf2f(f2bf(sigmoidf_(acc[mi][c][e]))) * bf2f(sN[(rl * HC + c) * CH + nn]);
+            if (r < rows) x[r * xrow + i0 + nn] = f2bf(a * inv_hc);
+        }
 }
 
 
@@ -3086,6 +3681,83 @@ static inline void hc_up_tiled_launch(int rt, bool f8, const void* up, long uld,
     }
 #undef HC_UP_CASE
 }
+
+/* THE PF2 FORM, start to finish: prologue, down product, reduce, up product and mix, codes.
+ * `bits` says which halves are PF2's (a side without its bit runs the wide form's kernel, on the
+ * stored weights). `wsp` is the plane space -- the `u` buffer, which no fused form uses -- and the
+ * caller has checked it holds pf2_plane_bytes(). Returns a RAD code. */
+static inline long long pf2_plane_bytes(int bits, long long HN, long long lr, long long ntt,
+                                        bool f8) {
+    const bool down = (bits & (kPf2Down | kPf2DownW)) != 0;
+    return (down ? ntt * 16 * HN * 2 : 0) + ((bits & kPf2Up) && f8 ? HN * lr * 2 : 0);
+}
+
+static int hc_pf2_launch(int bits, bool f8, bool i8, const unsigned short* h, const float* w,
+                         const void* down, long dld, const void* up, long uld,
+                         const unsigned short* injw, unsigned short* dbuf, float* scale,
+                         unsigned char* wsp, float* part, unsigned short* x,
+                         unsigned short* inj, unsigned char* q, float* qs, unsigned char* rq,
+                         float* rqs, long rows, long n, int hc, long lr, long ncol, long hrow,
+                         long irow, long xrow, long qrow, long srow, long rqrow, long rsrow,
+                         long kc, int ks, float eps, float wadd, RadStream s) {
+    const long HN    = (long)hc * n;
+    const bool pdown = (bits & (kPf2Down | kPf2DownW)) != 0;
+    const bool pup   = (bits & kPf2Up) != 0;
+    const long ntt   = pdown ? (ncol + 15) / 16 : 0;          /* plane n-tiles; none unless used */
+    uint4* const          plane = pdown ? (uint4*)wsp : nullptr;
+    unsigned short* const udec  = pup && f8 ? (unsigned short*)(wsp + ntt * 16 * HN * 2) : nullptr;
+    const unsigned short* ubf   = f8 ? udec : (const unsigned short*)up;
+
+    const long nnb  = (rows * hc + kWaves - 1) / kWaves;
+    const long work = ntt * (HN / 16) * kWave + (udec ? HN * (lr / 8) : 0);
+    long ndec = (work + kThreads - 1) / kThreads;
+    if (ndec > 512) ndec = 512;
+    hipLaunchKernelGGL(hc_pf2_prep_kernel, dim3((unsigned)(nnb + ndec)), dim3(kThreads), 0,
+                       (hipStream_t)s, h, scale, rows, n, hc, hrow, eps, nnb, down, dld, f8, injw,
+                       (const unsigned char*)up, uld, plane, udec, lr, ncol, ntt);
+    if (hipGetLastError() != hipSuccess) return RAD_E_DEVICE;
+
+    float* const kpart = ks > 1 ? part : nullptr;
+    if (bits & kPf2Down)
+        hipLaunchKernelGGL(hc_down_pf2_kernel,
+                           dim3((unsigned)((rows + kPf2RT - 1) / kPf2RT), (unsigned)ks),
+                           dim3(kThreads), 0, (hipStream_t)s, h, w, (const uint4*)plane,
+                           (const float*)scale, dbuf, inj, kpart, rows, n, hc, lr, ncol, ntt, hrow,
+                           irow, kc, wadd);
+    else if (bits & kPf2DownW)
+        hipLaunchKernelGGL(hc_down_pf2w_kernel,
+                           dim3((unsigned)((rows + kPf2WRT - 1) / kPf2WRT), (unsigned)ks),
+                           dim3(kPf2WThreads), 0, (hipStream_t)s, h, w, (const uint4*)plane,
+                           (const float*)scale, dbuf, inj, kpart, rows, n, hc, lr, ncol, ntt, hrow,
+                           irow, kc, wadd);
+    else
+        hc_down_wide_launch(f8, h, w, down, dld, scale, injw, dbuf, inj, kpart, rows, n, hc, lr,
+                            ncol, hrow, irow, kc, wadd, s);
+    if (hipGetLastError() != hipSuccess) return RAD_E_DEVICE;
+
+    if (ks > 1) {
+        const long tot = rows * ncol;
+        hipLaunchKernelGGL(hc_down_reduce_kernel,
+                           dim3((unsigned)((tot + kThreads - 1) / kThreads)), dim3(kThreads), 0,
+                           (hipStream_t)s, (const float*)part, dbuf, inj, rows, lr, ncol, irow, ks,
+                           1.0f / (float)hc);
+        if (hipGetLastError() != hipSuccess) return RAD_E_DEVICE;
+    }
+
+    if (pup) {
+        hipLaunchKernelGGL(hc_up_mix_pf2_kernel<4>,
+                           dim3((unsigned)(n / kWideCH), (unsigned)((rows + kPf2UpRT - 1) / kPf2UpRT)),
+                           dim3(kThreads), 0, (hipStream_t)s, ubf, (const unsigned short*)dbuf, h,
+                           w, (const float*)scale, x, rows, n, lr, hrow, xrow, wadd);
+        if (hipGetLastError() != hipSuccess) return RAD_E_DEVICE;
+        hc_quant_rows_launch(i8, x, q, qs, rq, rqs, rows, n, xrow, qrow, srow, rqrow, rsrow, s);
+    } else {
+        hc_up_mix_wide_launch(f8, i8, up, uld, dbuf, h, w, scale, x, q, qs, rq, rqs, rows, n, lr,
+                              hrow, xrow, qrow, srow, rqrow, rsrow, wadd, s);
+    }
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
 }  // namespace
 
 // ============================================================== the plugin ABI entry points
@@ -3503,6 +4175,30 @@ static int rad_hc_read_body(const RadArgs* a, const R4dSink& sk) {
         if (ks > 1 && a->scratch_bytes < fixed + (long long)ks * rows * ncol * 4)
             return R4D_NO(RAD_E_SCRATCH);
         float*     part = (ks > 1) ? (float*)((unsigned char*)a->scratch + fixed) : nullptr;
+
+        /* THE SECOND PREFILL FORM (hc_pf2_launch), at the 128-row tile only and for the same
+         * bytes. Its weight planes live in `u`, which no fused form touches, so a band too narrow
+         * to hold them simply keeps the wide form -- the pin refuses instead, so a test cannot
+         * pass on the form it did not ask for. */
+        const long ntt  = (ncol + 15) / 16;
+        const int  pf2  = g_hc_prefill_form >= 3 ? hc_pf2_bits(g_hc_prefill_form - 2)
+                        : (g_hc_prefill_form == 0 && rows >= kPf2MinRows) ? hc_pf2_env() : 0;
+        const bool pf2_fits = pf2 != 0 && rt == kWideRT && hc == 4 && (n % kThreads) == 0
+                              && ntt <= (long)((pf2 & kPf2DownW) ? kPf2WMaxNT : kPf2MaxNT)
+                              && Mband * HN * 2 >= pf2_plane_bytes(pf2, HN, lr, ntt, f8);
+        if (g_hc_prefill_form >= 3 && !pf2_fits) return R4D_NO(RAD_E_SHAPE);
+        if (pf2_fits) {
+            const int prc = hc_pf2_launch(
+                pf2, f8, i8, (const unsigned short*)h->data, (const float*)w->data, down->data,
+                (long)dld, up->data, (long)uld, fold ? (const unsigned short*)injw->data : nullptr,
+                dbuf, scale, (unsigned char*)ubuf, part, (unsigned short*)x->data,
+                fold ? (unsigned short*)inj->data : nullptr,
+                q ? (unsigned char*)q->data : nullptr, q ? (float*)qs->data : nullptr,
+                rq ? (unsigned char*)rq->data : nullptr, rq ? (float*)rqs->data : nullptr,
+                (long)rows, (long)n, (int)hc, (long)lr, ncol, (long)hrow, (long)irow, (long)xrow,
+                (long)qrow, (long)srow, (long)rqrow, (long)rsrow, kc, ks, eps, wadd, s);
+            return prc == RAD_OK ? RAD_OK : R4D_NO(prc);
+        }
 
         /* The per-stream norm scales, on a grid: one workgroup a (row, stream). */
         hipLaunchKernelGGL(hc_norm_scale_kernel,

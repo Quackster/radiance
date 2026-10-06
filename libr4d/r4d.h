@@ -629,8 +629,10 @@ void r4d_qsa_score_pin_form(int form);
 void r4d_moe_gemm_pin_prefill(int form);
 // THE GATED RESIDUAL READ'S PREFILL TILE, pinned for a test: 0 is the launcher's rule, 1 the decode
 // tiles' kernels at 128 rows (hc_down_tiled, then hc_up_tiled into `ubuf` and hc_mix), 2 the wide
-// kernels (which then refuse a shape they are not built for). The two are bit-identical by
-// construction, and r4d_selftest compares their bytes.
+// kernels (which then refuse a shape they are not built for), 3..6 the PF2 forms that
+// R4D_HC_READ_PF2=1..4 puts in the rule (the same, and also refused where the band cannot hold
+// their weight planes). All are bit-identical by construction, and r4d_selftest compares their
+// bytes.
 void r4d_hc_read_pin_prefill(int form);
 // THE SAME NARROW GEMM WITH r4d_gated_quant_fp8's PASS IN ITS EPILOGUE, for a gate_up projection
 // whose only consumer is that quantiser.  `wq` is the [2*nout][K] gate_up plane -- gate first, the
