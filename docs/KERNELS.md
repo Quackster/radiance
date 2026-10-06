@@ -98,6 +98,9 @@ the core can tune, fuse and check against a container:
 | `kv_store_fp8` | `kv_store` |
 | `logit_rerank` | `logit_rerank` |
 | `logits_gemm_bf16` | `logits_gemm` |
+| `logits_gemm_i4` | `logits_gemm` |
+| `logits_gemm_u4g128` | `logits_gemm` |
+| `logits_gemm_u4g64` | `logits_gemm` |
 | `moe_gather_bf16` | `moe_gather` |
 | `moe_gemm_fp8a8` | `moe_gemm_q` |
 | `moe_gemm_w4a8` | `moe_gemm_q` |

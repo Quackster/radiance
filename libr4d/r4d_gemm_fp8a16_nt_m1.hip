@@ -710,6 +710,194 @@ __global__ __launch_bounds__(kDenseThreads) void lm_wmma_kernel(
             }
     }
 }
+
+// ---------------------------------------------------------------- logits_gemm_i4, the int4 head
+//
+// lm_wmma_kernel at half the code bytes. The stored row is r4d_fp8::lm4_row_bytes': K/2 bytes of
+// two's-complement nibbles (low nibble first), the row's own bf16 scale per 128 columns in its
+// tail, the pad. Everything that is not the code width is lm_wmma_kernel's and is argued there:
+// the weight staged through LDS at a padded pitch, ONE 128-wide scale block's partial at a time
+// inside a staging round of FKB blocks, the activation read straight from global, f32 out.
+//
+// What the width changes: a staging round of FK columns is FK/2 BYTES a row, so the LDS tile is
+// half the size at the same FKB, and FKB = 4 fits (128 rows x 264 bytes). A fragment is eight
+// codes, which are four bytes and not eight -- one dword at (k/2) in the staged row, one bank a
+// lane: the pitch FK/2 + 8 is an odd multiple of eight bytes at every FKB, so the sixteen rows of
+// a tile and the two halves of a K step land on 32 distinct banks.
+//
+// A nibble is exact in bf16 (|v| <= 8), so the arithmetic is lm_wmma_kernel's: bf16 x bf16 WMMA
+// into f32, the block scale applied to the block's partial.
+__device__ __forceinline__ lm_s8v i4x8_to_bf16(uint32_t p) {
+    lm_s8v r;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        r[i] = (short)f32_to_bf16((float)(((int)(p << (28 - 4 * i))) >> 28));
+    return r;
+}
+// The asymmetric grid's eight codes: unsigned nibbles less the group's zero, |v| <= 15, exact.
+__device__ __forceinline__ lm_s8v u4x8_to_bf16(uint32_t p, int z) {
+    lm_s8v r;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        r[i] = (short)f32_to_bf16((float)((int)((p >> (4 * i)) & 15u) - z));
+    return r;
+}
+
+// THE ASYMMETRIC CODES WITHOUT A CONVERSION. 128 + n for a nibble n is exact in bf16 and its bits
+// are 0x4300 | n, so eight codes become four packed bf16 pairs with an AND, a shift and an OR each --
+// where (float)(n - z) then f32_to_bf16 was two conversions a code and the reason this tile ran at
+// ~465 GB/s while the int8-activation draft head on the same bytes ran at ~600. The offset is taken
+// back per group: sum (128 + n) x = sum (n - z) x + (128 + z) sum x, and sum x over the group comes
+// out of one more WMMA against a B fragment of ones, in the same slot layout as the product -- a
+// lane holds one weight row, so its zero is a scalar.
+typedef unsigned int lm_u4v __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ lm_s8v u4x8_to_bf16_off128(uint32_t p) {
+    lm_u4v w;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t b = (p >> (8 * i)) & 0xFFu;
+        w[i] = 0x43004300u | (b & 0xFu) | ((b & 0xF0u) << 12);
+    }
+    return __builtin_bit_cast(lm_s8v, w);
+}
+
+// GS is the scale group along K (64 or 128) and ASYM the asymmetric grid, whose u8 zeros follow
+// the scales in the row's tail. The group is what the inner partial covers, so a row's scale (and
+// zero) multiplies exactly that group's sum -- the FK staging round is a multiple of 128 and so of
+// either group, and stays a staging width only.
+// NPW is how many 16-row weight tiles one WAVE owns (R4D_LM4_NPW; default 1 = the original kernel).
+// The activation fragment and the group's sum-of-x WMMA depend only on the activation, so with
+// NPW = 2 one A load and one xsum WMMA serve two weight tiles: per k step the wave issues MT loads
+// and MT * (2 NPW + 1) WMMA where two NPW = 1 waves issue 2 MT loads and 4 MT WMMA. Every output
+// element still sums the same WMMA partials in the same order, so the result is BIT-IDENTICAL to
+// NPW = 1; only who computes the (identical) xsum, and how often A is loaded, changes.
+// LEAN is a register-pressure knob and nothing else (R4D_LM4_LEAN; unset = auto: 1 from MT 2, 0 at
+// MT 1; 0 = the original unrolling). At MT >= 3 the fully unrolled group loops make the compiler
+// hoist every A fragment of the round and spill (ScratchSize 448 B a lane at MT 3, 748 at MT 4 for the live u4 g64 head: the
+// 3 -> 4 row-tile cliff, 4.5 -> 8.3 ms). LEAN 1 keeps the group loop rolled, LEAN 2 the k-step loop
+// too. The arithmetic and its order are untouched, so the output is bit-identical at every level.
+template <uint32_t MT, uint32_t FKB, uint32_t GS = 128, bool ASYM = false, uint32_t NPW = 1,
+          uint32_t LEAN = 0>
+__global__ __launch_bounds__(kDenseThreads) void lm_wmma_i4_kernel(
+    const uint8_t* __restrict__ W, const uint16_t* __restrict__ A, uint32_t a_ld,
+    float* __restrict__ C, uint32_t c_ld,
+    uint32_t rows, uint32_t cols, uint32_t w_ld, uint32_t m_real) {
+    constexpr uint32_t kFK     = FKB * kBlock;             /* K a staging round */
+    constexpr uint32_t kFB     = kFK / 2u;                 /* code BYTES a row a round */
+    constexpr uint32_t kRows   = kDenseWaves * 16u * NPW;  /* weight rows a workgroup covers */
+    constexpr uint32_t kPitch  = kFB + 8u;                 /* bytes a staged row */
+    constexpr uint32_t kWUnits = kRows * (kFB / 16u);      /* 16-byte staging units */
+    static_assert(kWUnits % kDenseThreads == 0, "a staging round is whole units a thread");
+    static_assert(kRows * kPitch <= 65536u, "staged rows must fit the 64 KiB workgroup LDS");
+
+    __shared__ uint8_t s_w[kRows * kPitch];
+
+    const uint32_t tid  = (uint32_t)threadIdx.x;
+    const uint32_t lane = tid & (kWave - 1u);
+    const uint32_t wv   = tid / kWave;
+    const uint32_t c    = lane & 15u;
+    const uint32_t h    = lane >> 4;
+    const uint32_t cb   = cols / 2u;                       /* code bytes a row */
+    const uint32_t ng   = cols / GS;                       /* scale groups a row */
+
+    for (uint32_t base = (uint32_t)blockIdx.x * kRows; base < rows; base += gridDim.x * kRows) {
+        const uint16_t* scl[NPW];
+        const uint8_t*  zr[NPW];
+        uint32_t nn[NPW];
+#pragma unroll
+        for (uint32_t p = 0; p < NPW; ++p) {
+            nn[p] = base + (wv * NPW + p) * 16u + c;
+            const uint32_t nc = (nn[p] < rows) ? nn[p] : (rows - 1u);
+            scl[p] = (const uint16_t*)(W + (size_t)nc * w_ld + cb);
+            zr[p]  = W + (size_t)nc * w_ld + cb + 2u * ng;
+        }
+
+        f8v acc[NPW][MT];
+#pragma unroll
+        for (uint32_t p = 0; p < NPW; ++p)
+#pragma unroll
+            for (uint32_t t = 0; t < MT; ++t) acc[p][t] = (f8v)(0.0f);
+
+        for (uint32_t kt = 0; kt < cols; kt += kFK) {
+            __syncthreads();
+#pragma unroll (LEAN >= 1 ? 2 : (MT >= 3 ? 4 : 8))
+            for (uint32_t i = 0; i < kWUnits / kDenseThreads; ++i) {
+                const uint32_t u = tid + i * kDenseThreads;
+                const uint32_t r = u / (kFB / 16u), off = (u % (kFB / 16u)) * 16u;
+                const uint32_t g = base + r;
+                const uint8_t* src =
+                    W + (size_t)((g < rows) ? g : (rows - 1u)) * w_ld + kt / 2u + off;
+                *(uint4*)(s_w + (size_t)r * kPitch + off) = *(const uint4*)src;
+            }
+            __syncthreads();
+
+#pragma unroll (LEAN >= 1 ? 1 : 16)
+            for (uint32_t sb = 0; sb < kFK / GS; ++sb) {
+                f8v part[NPW][MT], xsum[MT];
+#pragma unroll
+                for (uint32_t t = 0; t < MT; ++t) xsum[t] = (f8v)(0.0f);
+#pragma unroll
+                for (uint32_t p = 0; p < NPW; ++p)
+#pragma unroll
+                    for (uint32_t t = 0; t < MT; ++t) part[p][t] = (f8v)(0.0f);
+                const uint32_t gi = (kt + sb * GS) / GS;
+                int zg[NPW];
+#pragma unroll
+                for (uint32_t p = 0; p < NPW; ++p) zg[p] = ASYM ? (int)zr[p][gi] : 0;
+                const lm_s8v ones = (lm_s8v)(short)0x3F80;
+#pragma unroll (LEAN >= 2 ? 1 : (MT >= 4 ? 2 : 4))
+                for (uint32_t ks = 0; ks < GS; ks += 16u) {
+                    const uint32_t kf = sb * GS + ks;
+                    lm_s8v af[MT];
+#pragma unroll
+                    for (uint32_t t = 0; t < MT; ++t) {
+                        const uint32_t m = t * 16u + c;
+                        af[t] = (m < m_real) ? *(const lm_s8v*)(A + (size_t)m * a_ld + kt + kf + h * 8u)
+                                             : (lm_s8v)(short)0;
+                    }
+#pragma unroll
+                    for (uint32_t p = 0; p < NPW; ++p) {
+                        const uint32_t raw = *(const uint32_t*)(s_w +
+                            (size_t)((wv * NPW + p) * 16u + c) * kPitch + kf / 2u + h * 4u);
+                        const lm_s8v bf = ASYM ? u4x8_to_bf16_off128(raw) : i4x8_to_bf16(raw);
+#pragma unroll
+                        for (uint32_t t = 0; t < MT; ++t)
+                            part[p][t] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                                af[t], bf, part[p][t]);
+                    }
+                    if constexpr (ASYM)
+#pragma unroll
+                        for (uint32_t t = 0; t < MT; ++t)
+                            xsum[t] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                                af[t], ones, xsum[t]);
+                }
+#pragma unroll
+                for (uint32_t p = 0; p < NPW; ++p) {
+                    const float sc = bscale(scl[p][gi]);
+                    const float off = ASYM ? (float)(128 + zg[p]) : 0.0f;
+#pragma unroll
+                    for (uint32_t t = 0; t < MT; ++t)
+#pragma unroll
+                        for (int j = 0; j < 8; ++j)
+                            acc[p][t][j] = fmaf(ASYM ? fmaf(-off, xsum[t][j], part[p][t][j])
+                                                     : part[p][t][j], sc, acc[p][t][j]);
+                }
+            }
+        }
+
+#pragma unroll
+        for (uint32_t p = 0; p < NPW; ++p) {
+            if (nn[p] >= rows) continue;
+#pragma unroll
+            for (uint32_t t = 0; t < MT; ++t)
+#pragma unroll
+                for (uint32_t j = 0; j < 8; ++j) {
+                    const uint32_t m = t * 16u + h * 8u + j;
+                    if (m < m_real) C[(size_t)m * c_ld + nn[p]] = acc[p][t][j];
+                }
+        }
+    }
+}
 }  // namespace
 
 extern "C" int r4d_gemm_fp8a16_nt_m1_block(void) { return (int)kBlock; }
@@ -822,6 +1010,83 @@ extern "C" int r4d_logits_gemm_fp8(long a, long wq, long c, int M, int K, int N,
 extern "C" int r4d_logits_gemm_i8(long a, long wq, long c, int M, int K, int N,
                                   int a_ld, int c_ld, int w_ld, long stream) {
     return logits_gemm_8<true>(a, wq, c, M, K, N, a_ld, c_ld, w_ld, stream);
+}
+
+// The int4 head (logits_gemm_i4): r4d_fp8::lm4_row_bytes' row, the WMMA tile at every M -- the
+// matvec's M <= 2 edge over the fp8 row is not worth a second int4 kernel for the one-row calls a
+// speculative deployment makes only at prefill. FKB: four blocks a round at MT <= 2, two above,
+// which is the fp8 rule at the same staged BYTES; R4D_LM4_FKB (1, 2 or 4) pins it.
+// The common body of both int4 heads: `group` 128 symmetric (logits_gemm_i4), or 64 / 128
+// asymmetric (logits_gemm_u4g64 / _u4g128).
+extern "C" int r4d_logits_gemm_q4(long a, long wq, long c, int M, int K, int N,
+                                  int a_ld, int c_ld, int w_ld, int group, int asym, long stream) {
+    if (!a || !wq || !c) return -1;
+    if (M <= 0 || K <= 0 || N <= 0) return -2;
+    if (K % (int)kBlock) return -4;
+    if (!(group == 128 || (asym && group == 64))) return -3;
+    if (!a_ld) a_ld = K;
+    if (!c_ld) c_ld = N;
+    if (!w_ld) w_ld = (int)(asym ? r4d_fp8::lm4a_row_bytes(K, group) : r4d_fp8::lm4_row_bytes(K));
+    if (w_ld % 16) return -5;
+    const uint32_t rows = (uint32_t)N, cols = (uint32_t)K;
+    const uint32_t fpin = env_u32_lm("R4D_LM4_FKB");
+    for (int m0 = 0; m0 < M; m0 += 64) {
+        const int Mc = (M - m0) < 64 ? (M - m0) : 64;
+        const uint32_t mt = (uint32_t)((Mc + 15) / 16);
+        uint32_t fkb = (fpin == 1u || fpin == 2u || fpin == 4u) ? fpin : (mt <= 2u ? 4u : 2u);
+        while (fkb > 1u && (cols % (fkb * kBlock)) != 0u) fkb >>= 1;
+        /* R4D_LM4_NPW=2: two weight tiles a wave (bit-identical, see the kernel). Needs the staged
+         * rows to fit 64 KiB, so the round is at most two scale blocks. Default 1 = unchanged. */
+        /* LEAN: unset = auto (1 from MT >= 2, where the default unrolling spills; 0 at MT = 1, where
+         * it does not and the rolled loop is ~10 % slower), 0 = never, 1 / 2 = always. */
+        const char* lenv = std::getenv("R4D_LM4_LEAN");
+        const uint32_t lean = (lenv && *lenv) ? std::min<uint32_t>((uint32_t)std::strtoul(lenv, nullptr, 10), 2u)
+                                              : (mt >= 2u ? 1u : 0u);
+        uint32_t npw = (env_u32_lm("R4D_LM4_NPW") == 2u) ? 2u : 1u;
+        if (!asym) npw = 1u;
+        if (npw == 2u && fkb > 2u) fkb = 2u;
+        const uint32_t per = kDenseWaves * 16u * npw;
+        const uint32_t blocks = std::min<uint32_t>(4096u, (rows + per - 1u) / per);
+        const uint16_t* ac = (const uint16_t*)a + (size_t)m0 * a_ld;
+        float* cc = (float*)c + (size_t)m0 * c_ld;
+#define R4D_LM4K(MTV, FKV, GSV, AV, NV, LV)                                                  \
+    hipLaunchKernelGGL((lm_wmma_i4_kernel<MTV, FKV, GSV, AV, NV, LV>), dim3(blocks),         \
+                       dim3(kDenseThreads), 0, (hipStream_t)stream, (const uint8_t*)wq, ac,  \
+                       (uint32_t)a_ld, cc, (uint32_t)c_ld, rows, cols, (uint32_t)w_ld, (uint32_t)Mc)
+        /* the knobs only exist on the asymmetric heads; the symmetric i4 head stays as it was */
+#define R4D_LM4W3(MTV, FKV, GSV, AV)                                                         \
+    do { if (!(AV) || (lean == 0u && npw == 1u)) R4D_LM4K(MTV, FKV, GSV, AV, 1, 0);          \
+         else if (npw == 2u && (FKV) <= 2) {                                                  \
+             if (lean == 0u) R4D_LM4K(MTV, FKV, GSV, AV, (FKV <= 2 ? 2 : 1), 0);             \
+             else if (lean == 1u) R4D_LM4K(MTV, FKV, GSV, AV, (FKV <= 2 ? 2 : 1), 1);        \
+             else R4D_LM4K(MTV, FKV, GSV, AV, (FKV <= 2 ? 2 : 1), 2); }                      \
+         else if (lean == 0u) R4D_LM4K(MTV, FKV, GSV, AV, 1, 0);                             \
+         else if (lean == 1u) R4D_LM4K(MTV, FKV, GSV, AV, 1, 1);                             \
+         else R4D_LM4K(MTV, FKV, GSV, AV, 1, 2); } while (0)
+#define R4D_LM4W2(MTV, FKV)                                                                  \
+    do { if (!asym) R4D_LM4W3(MTV, FKV, 128, false);                                         \
+         else if (group == 64) R4D_LM4W3(MTV, FKV, 64, true);                                \
+         else R4D_LM4W3(MTV, FKV, 128, true); } while (0)
+#define R4D_LM4W(MTV) do { if (fkb == 4u) R4D_LM4W2(MTV, 4); else if (fkb == 2u) R4D_LM4W2(MTV, 2); \
+                           else R4D_LM4W2(MTV, 1); } while (0)
+        switch (mt) {
+            case 1:  R4D_LM4W(1); break;
+            case 2:  R4D_LM4W(2); break;
+            case 3:  R4D_LM4W(3); break;
+            default: R4D_LM4W(4); break;
+        }
+#undef R4D_LM4W
+#undef R4D_LM4W2
+#undef R4D_LM4W3
+#undef R4D_LM4K
+        if (hipGetLastError() != hipSuccess) return -6;
+    }
+    return 0;
+}
+
+extern "C" int r4d_logits_gemm_i4(long a, long wq, long c, int M, int K, int N,
+                                  int a_ld, int c_ld, int w_ld, long stream) {
+    return r4d_logits_gemm_q4(a, wq, c, M, K, N, a_ld, c_ld, w_ld, 128, 0, stream);
 }
 
 template <bool I8>
@@ -1050,6 +1315,47 @@ extern "C" int r4d_rad_logits_gemm_fp8(const RadArgs* a, RadStream s) {
 /* The int8 head: the same operands and stored row, i8 codes (r4d_rad_layout_i8_logits). */
 extern "C" int r4d_rad_logits_gemm_i8(const RadArgs* a, RadStream s) {
     return rad_logits_gemm_8(a, s, true);
+}
+
+/* The int4 head: the same operands over r4d_fp8::lm4_row_bytes' row. The layout hook stores it as
+ * bytes (RAD_U8), so that is the dtype the declared [n_vocab][n_embd] operand arrives with. */
+static int rad_logits_gemm_q4(const RadArgs* a, RadStream s, int group, int asym) {
+    const RadTensor* x = r4d_opt(a, LG_X);
+    const RadTensor* w = r4d_opt(a, LG_W);
+    const RadTensor* y = r4d_opt(a, LG_Y);
+    if (!x || !w || !y) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(lg_dt_bf16(x));
+    if (w->dtype != RAD_U8) return R4D_NO(RAD_E_DTYPE);
+    if (y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(w)) return R4D_NO(RAD_E_STRIDE);
+    const long long n_vocab = r4d_geti_or(a, "n_vocab", r4d_dim(w, 0));
+    const long long n_embd  = r4d_geti_or(a, "n_embd", 0);
+    if (n_vocab <= 0 || n_embd <= 0 || n_embd % 128) return R4D_NO(RAD_E_SHAPE);
+    if (w->rank != 2 || w->shape[0] != n_vocab || w->shape[1] != n_embd)
+        return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, My = 0;
+    const long long x_ld = r4d_rows_pitch(x, n_embd, &M);
+    const long long y_ld = r4d_rows_pitch(y, n_vocab, &My);
+    if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_aligned(x->data, 16) || !r4d_aligned(w->data, 16)) return R4D_NO(RAD_E_ALIGN);
+    if (n_embd % group) return R4D_NO(RAD_E_SHAPE);
+    const long long stride = asym ? r4d_fp8::lm4a_row_bytes(n_embd, group)
+                                  : r4d_fp8::lm4_row_bytes(n_embd);
+    return r4d_logits_gemm_q4(r4d_addr(x), r4d_addr(w), r4d_addr(y), (int)M, (int)n_embd,
+                              (int)n_vocab, (int)x_ld, (int)y_ld, (int)stride, group, asym,
+                              (long)(uintptr_t)s) == 0
+               ? RAD_OK : RAD_E_DEVICE;
+}
+extern "C" int r4d_rad_logits_gemm_i4(const RadArgs* a, RadStream s) {
+    return rad_logits_gemm_q4(a, s, 128, 0);
+}
+/* The asymmetric int4 heads: (code - zero) * scale, the zeros after the scales in the row. */
+extern "C" int r4d_rad_logits_gemm_u4g64(const RadArgs* a, RadStream s) {
+    return rad_logits_gemm_q4(a, s, 64, 1);
+}
+extern "C" int r4d_rad_logits_gemm_u4g128(const RadArgs* a, RadStream s) {
+    return rad_logits_gemm_q4(a, s, 128, 1);
 }
 #undef R4D_NEED
 

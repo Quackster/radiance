@@ -672,6 +672,12 @@ int  r4d_gemm_i8a8_nt_m16(long a, long ascale, long wq, long ws, long c,
 // bf16 scales in its tail, the pad -- with i8 codes and each row's own scale per 128 columns.
 int  r4d_logits_gemm_i8(long a, long wq, long c, int M, int K, int N, int a_ld, int c_ld,
                         int w_ld, long stream);
+// ...and at INT4 codes (logits_gemm_i4): r4d_fp8::lm4_row_bytes' row, two's-complement nibbles.
+int  r4d_logits_gemm_i4(long a, long wq, long c, int M, int K, int N, int a_ld, int c_ld,
+                        int w_ld, long stream);
+// Both int4 heads: group 128 symmetric, or 64/128 asymmetric (r4d_fp8::lm4a_row_bytes' row).
+int  r4d_logits_gemm_q4(long a, long wq, long c, int M, int K, int N, int a_ld, int c_ld,
+                        int w_ld, int group, int asym, long stream);
 int  r4d_gemm_i8a8_tiled(long a, long ascale, long wq, long ws, long c,
                          int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
                          long stream);

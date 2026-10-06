@@ -3445,6 +3445,39 @@ static const RadKernelInfo kKernels[] = {
   r4d_rad_layout_i8_logits, r4d_rad_relayout_i8_logits,
   nullptr, r4d_rad_unrelayout_i8_logits },
 
+{ "logits_gemm_i4", "logits_gemm", "vocab",
+  "logits_gemm_i8 over an INT4 head: half the bytes of the stored row, two's-complement nibbles "
+  "and each row's own scales in its tail",
+  "any M -- 64 rows a pass on the WMMA tile, then chunked; n_embd a multiple of 128",
+  "bf16 x, i4 head (low nibble first) with a bf16 scale per ROW per 128 columns stored in the "
+  "row's tail, F32 LOGITS OUT, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LOGITS_FP8,
+  ROW(cLogitsGemmFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_logits_gemm_i4, nullptr,
+  r4d_rad_layout_i4_logits, r4d_rad_relayout_i4_logits,
+  nullptr, r4d_rad_unrelayout_i4_logits },
+
+{ "logits_gemm_u4g64", "logits_gemm", "vocab",
+  "logits_gemm_i4 on the ASYMMETRIC int4 grid at group 64: (code - zero) * scale, a bf16 scale "
+  "and a u8 zero a row per 64 columns in the row's tail",
+  "logits_gemm_i4's: any M, n_embd a multiple of 128",
+  "bf16 x, u4 head with a bf16 scale and a u8 zero per ROW per 64 columns, F32 LOGITS OUT",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LOGITS_FP8,
+  ROW(cLogitsGemmFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_logits_gemm_u4g64, nullptr,
+  r4d_rad_layout_u4g64_logits, r4d_rad_relayout_u4g64_logits,
+  nullptr, r4d_rad_unrelayout_u4g64_logits },
+
+{ "logits_gemm_u4g128", "logits_gemm", "vocab",
+  "logits_gemm_u4g64 at group 128",
+  "logits_gemm_i4's: any M, n_embd a multiple of 128",
+  "bf16 x, u4 head with a bf16 scale and a u8 zero per ROW per 128 columns, F32 LOGITS OUT",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LOGITS_FP8,
+  ROW(cLogitsGemmFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_logits_gemm_u4g128, nullptr,
+  r4d_rad_layout_u4g128_logits, r4d_rad_relayout_u4g128_logits,
+  nullptr, r4d_rad_unrelayout_u4g128_logits },
+
 /* ---------------------------- the decomposed sampler chain (r4d_sample_stages_f32.hip) ------
  *
  * NOT sample_chain above, and both stay. That one fuses temperature, softmax, top_k, top_p, min_p

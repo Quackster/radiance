@@ -289,6 +289,9 @@ int r4d_rad_gemm_i8a8_m16  (const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_m16_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int64_t r4d_rad_gemm_i8a8_m16_scratch(const RadArgs*);
 int r4d_rad_logits_gemm_i8(const RadArgs*, RadStream);
+int r4d_rad_logits_gemm_i4(const RadArgs*, RadStream);
+int r4d_rad_logits_gemm_u4g64(const RadArgs*, RadStream);
+int r4d_rad_logits_gemm_u4g128(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_tiled(const RadArgs*, RadStream);
 int r4d_rad_quant_act_i8g(const RadArgs*, RadStream);
 int r4d_rad_quant_act_i8g_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
@@ -341,6 +344,9 @@ R4D_HOOKS(fp8_block)
 R4D_HOOKS(i8_block)
 R4D_HOOKS(fp8_logits)
 R4D_HOOKS(i8_logits)
+R4D_HOOKS(i4_logits)
+R4D_HOOKS(u4g64_logits)
+R4D_HOOKS(u4g128_logits)
 R4D_HOOKS(hc_e4m3)
 R4D_HOOKS(mtp_e4m3)
 R4D_HOOKS(w4)

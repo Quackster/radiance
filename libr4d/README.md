@@ -117,3 +117,11 @@ Three properties of this architecture are assumed throughout and are not restate
   `__builtin_amdgcn_sched_group_barrier` is the fix, and the granularity of the groups matters far
   more than their contents -- coarser is better, up to the point where the pattern asks for more
   outstanding loads than the hardware can hold.
+
+## lm_head launch pins (env, read per launch)
+
+| variable | values | effect |
+| --- | --- | --- |
+| `R4D_LM4_FKB` | 1, 2, 4 | K staging round of the int4 / u4 heads, in 128-column scale blocks (default: 4 at M <= 32, else 2) |
+| `R4D_LM4_LEAN` | unset = auto (1 at M > 16, 0 at M <= 16), 0, 1, 2 | u4 heads only. Register-pressure level of the WMMA tile: 1 keeps the scale-group loop rolled, 2 the k-step loop too. At MT >= 2 the default unrolling spills (ScratchSize 68-2088 B/lane); level 1 has none. Output bit-identical at every level |
+| `R4D_LM4_NPW` | 1 (default), 2 | u4 heads only. Weight tiles a wave owns; 2 shares each activation fragment and the sum-of-x WMMA between two tiles, FKB capped at 2. Bit-identical; spills at MT >= 3 unless `R4D_LM4_LEAN` >= 1 |

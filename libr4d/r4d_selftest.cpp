@@ -3787,6 +3787,268 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
  *
  * The weight is block fp8's two planes, relaid by the row's own hooks into the row it reads; the
  * oracle is those planes, code times its block's scale. The inverse must give the planes back. */
+/* logits_gemm_i4: int4_planes' symmetric grid at group 128 with bf16 scales, relaid into the
+ * lm4 row; the oracle is those planes, nibble times its row's scale. */
+static Planes int4_planes(const std::vector<float>& w, int64_t N, int64_t K, int64_t group,
+                          uint32_t sdt, bool rot);
+static void i4_logits_numeric(const Plugin& pl, int64_t N, int64_t K, int64_t M) {
+    const RadKernelInfo* lg = find(pl, "logits_gemm_i4");
+    if (!lg || !lg->layout || !lg->relayout) {
+        ok("i4 logits vs host reference", false, "row or hooks absent");
+        return;
+    }
+    const int64_t stride = r4d_fp8::lm4_row_bytes(K);
+    const std::string tag = " [N=" + std::to_string(N) + " K=" + std::to_string(K) +
+                            " M=" + std::to_string(M) + "]";
+    std::vector<float> wf((size_t)N * K), xf((size_t)M * K);
+    for (int64_t r = 0; r < N; ++r)
+        for (int64_t c = 0; c < K; ++c)
+            wf[(size_t)r * K + c] =
+                std::ldexp(1.0f, (int)(((r / 128) % 5) * 3 - ((c / 128) % 4)))
+                * (0.031f * (float)((r * 37 + c * 11) % 61) - 0.9f);
+    std::vector<uint16_t> xb((size_t)M * K);
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t c = 0; c < K; ++c) {
+            const float v = 0.017f * (float)((m * 53 + c * 7) % 83) - 0.7f;
+            xb[(size_t)m * K + c] = h_to_bf16(v);
+            xf[(size_t)m * K + c] = h_bf16(xb[(size_t)m * K + c]);
+        }
+    Planes p = int4_planes(wf, N, K, 128, RAD_BF16, false);
+    std::vector<RadParam> lp = { PI("n_vocab", N), PI("n_embd", K) };
+    RadLayout lay;
+    std::vector<uint8_t> wq;
+    const int lrc = stored(lg, lp, 1, p, { "codes", "scale" }, &wq, &lay);
+    if (lrc != RAD_OK) { ok("i4 logits relayout", false, "rc=" + std::to_string(lrc) + tag); return; }
+    ok("i4 logits layout is the lm4 row", lay.bytes == N * stride && lay.shape[0] == N &&
+       lay.shape[1] == stride && (int64_t)wq.size() == N * stride,
+       "bytes " + std::to_string(lay.bytes) + " want " + std::to_string(N * stride) + tag);
+    {
+        std::string why;
+        ok("i4 logits relayout inverts to the planes it was handed",
+           restores(lg, lp, 1, p, { "codes", "scale" }, wq, &why), why + tag);
+    }
+    const int64_t sk = p.cols[1], crow = p.row_bytes(0);
+    std::vector<double> ref((size_t)M * N);
+    for (int64_t r = 0; r < N; ++r) {
+        const uint8_t* row = p.data[0].data() + (size_t)r * crow;
+        const uint16_t* sc = (const uint16_t*)p.data[1].data() + r * sk;
+        for (int64_t m = 0; m < M; ++m) {
+            double acc = 0;
+            for (int64_t c = 0; c < K; ++c) {
+                const int v = ((int)(rad_load_bits(row, 4, c) << 28)) >> 28;
+                acc += (double)v * (double)h_bf16(sc[c / 128]) * xf[(size_t)m * K + c];
+            }
+            ref[(size_t)m * N + r] = acc;
+        }
+    }
+    void* d_w = dalloc(wq.size());
+    void* d_x = dalloc((size_t)M * K * 2);
+    void* d_y = dalloc((size_t)M * N * 4);
+    if (!d_w || !d_x || !d_y) { ok("i4 logits alloc", false, std::string("hipMalloc failed") + tag); return; }
+    st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_x, xb.data(), (size_t)M * K * 2, hipMemcpyHostToDevice);
+    st_memset(d_y, 0x5a, (size_t)M * N * 4);
+    const int rc = launch_row(lg, { T(d_x, RAD_BF16, { M, K }), T(d_w, RAD_U8, { N, K }),
+                                    T(d_y, RAD_F32, { M, N }) },
+                              { PI("M", M), PI("n_vocab", N), PI("n_embd", K),
+                                PS("dtype", "bf16") });
+    if (rc != RAD_OK) { ok("i4 logits launch", false, "rc=" + std::to_string(rc) + tag); return; }
+    std::vector<float> got((size_t)M * N);
+    st_memcpy(got.data(), d_y, got.size() * 4, hipMemcpyDeviceToHost);
+    double num = 0, den = 0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        const double d = (double)got[i] - ref[i];
+        num += d * d;
+        den += ref[i] * ref[i];
+    }
+    const double e = den > 0 ? std::sqrt(num / den) : 1.0;
+    ok("logits_gemm_i4 vs host ref over its planes", e < 2e-3, "rel_l2 " + std::to_string(e) + tag);
+}
+
+
+/* R4D_LM4_NPW=2 against the default, BIT for bit: two weight tiles a wave shares the activation
+ * fragment and the sum-of-x WMMA but sums the same partials in the same order. The head's row is
+ * built straight from bytes (random codes, scales ~0.01, zeros 0..15): identity needs no oracle. */
+static void u4_npw_identity(const Plugin& pl, int64_t N, int64_t K, int64_t M, int64_t G) {
+    const std::string rn = G == 64 ? "logits_gemm_u4g64" : "logits_gemm_u4g128";
+    const RadKernelInfo* lg = find(pl, rn.c_str());
+    char nm[160];
+    std::snprintf(nm, sizeof nm, "%s knobs == default, bitwise N=%lld K=%lld M=%lld", rn.c_str(),
+                  (long long)N, (long long)K, (long long)M);
+    if (!lg) { ok(nm, false, "row absent"); return; }
+    const int64_t stride = r4d_fp8::lm4a_row_bytes(K, G), ng = K / G;
+    std::vector<uint8_t> wq((size_t)(N * stride), 0);
+    uint32_t sd = 12345u;
+    auto rnd = [&]() { sd = sd * 1664525u + 1013904223u; return sd >> 8; };
+    for (int64_t r = 0; r < N; ++r) {
+        uint8_t* row = wq.data() + (size_t)r * stride;
+        for (int64_t i = 0; i < K / 2; ++i) row[i] = (uint8_t)rnd();
+        uint16_t* sc = (uint16_t*)(row + K / 2);
+        for (int64_t g = 0; g < ng; ++g) sc[g] = h_to_bf16(0.004f + 0.0001f * (float)(rnd() % 50));
+        uint8_t* zr = row + K / 2 + 2 * ng;
+        for (int64_t g = 0; g < ng; ++g) zr[g] = (uint8_t)(rnd() % 16);
+    }
+    std::vector<uint16_t> xb((size_t)(M * K));
+    for (auto& v : xb) v = h_to_bf16(0.02f * (float)((int)(rnd() % 200) - 100));
+    void* d_w = dalloc(wq.size());
+    void* d_x = dalloc(xb.size() * 2);
+    void* d_y = dalloc((size_t)M * N * 4);
+    if (!d_w || !d_x || !d_y) { ok(nm, false, "hipMalloc failed"); return; }
+    st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_x, xb.data(), xb.size() * 2, hipMemcpyHostToDevice);
+    /* (NPW, LEAN) = (1, 0) is today's kernel; every other point must reproduce it bit for bit. */
+    static const char* cfg[][2] = { { "1", "0" }, { "1", "1" }, { "1", "2" }, { "2", "0" }, { "2", "1" }, { "2", "2" } };
+    std::vector<float> base;
+    for (const auto& cv : cfg) {
+        setenv("R4D_LM4_NPW", cv[0], 1);
+        setenv("R4D_LM4_LEAN", cv[1], 1);
+        st_memset(d_y, 0x5a, (size_t)M * N * 4);
+        const int rc = launch_row(lg, { T(d_x, RAD_BF16, { M, K }), T(d_w, RAD_U8, { N, K }),
+                                        T(d_y, RAD_F32, { M, N }) },
+                                  { PI("M", M), PI("n_vocab", N), PI("n_embd", K), PS("dtype", "bf16") });
+        std::string nm2 = std::string(nm) + " npw=" + cv[0] + " lean=" + cv[1];
+        if (rc != RAD_OK) { ok(nm2.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
+        std::vector<float> out((size_t)M * N);
+        st_memcpy(out.data(), d_y, out.size() * 4, hipMemcpyDeviceToHost);
+        if (base.empty()) { base = out; continue; }
+        const bool same = std::memcmp(base.data(), out.data(), base.size() * 4) == 0;
+        ok(nm2.c_str(), same, same ? "" : "outputs differ from npw=1 lean=0");
+    }
+    unsetenv("R4D_LM4_NPW"); unsetenv("R4D_LM4_LEAN");
+}
+
+static void perf_row(const Plugin& pl, const char* name, std::vector<RadTensor> ts,
+                     std::vector<RadParam> ps, void* wbase, size_t wbytes, int copies,
+                     double bytes, int iters, int widx = 2, const char* point = nullptr);
+/* --perflm4 N K M: the u4 g64 head at every FKB x NPW the launcher can take, weight rotated past
+ * the caches. Prints us and GB/s of weight stream; the point is the MT = 3..4 band. */
+static void lm4_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters) {
+    const RadKernelInfo* lg = find(pl, "logits_gemm_u4g64");
+    if (!lg) { std::printf("logits_gemm_u4g64 absent\n"); return; }
+    const int64_t stride = r4d_fp8::lm4a_row_bytes(K, 64);
+    const size_t wb = (size_t)(N * stride);
+    int copies = (int)(((size_t)768 << 20) / wb) + 1;
+    if (copies > 8) copies = 8;
+    void* d_w = dalloc(wb * (size_t)copies);
+    void* d_x = dalloc((size_t)M * K * 2);
+    void* d_y = dalloc((size_t)M * N * 4);
+    if (!d_w || !d_x || !d_y) { std::printf("hipMalloc failed\n"); return; }
+    st_memset(d_w, 0x37, wb * (size_t)copies);
+    st_memset(d_x, 0x3c, (size_t)M * K * 2);
+    std::printf("logits_gemm_u4g64 N=%lld K=%lld M=%lld\n", (long long)N, (long long)K, (long long)M);
+    for (const char* npw : { "1", "2" })
+      for (const char* lean : { "0", "1", "2" })
+        for (const char* fkb : { "", "1", "2", "4" }) {
+            setenv("R4D_LM4_NPW", npw, 1);
+            setenv("R4D_LM4_LEAN", lean, 1);
+            if (*fkb) setenv("R4D_LM4_FKB", fkb, 1); else unsetenv("R4D_LM4_FKB");
+            std::vector<RadTensor> ts = { T(d_x, RAD_BF16, { M, K }), T(d_w, RAD_U8, { N, K }),
+                                          T(d_y, RAD_F32, { M, N }) };
+            std::vector<RadParam> ps = { PI("M", M), PI("n_vocab", N), PI("n_embd", K), PS("dtype", "bf16") };
+            char lbl[48];
+            std::snprintf(lbl, sizeof lbl, "npw=%s lean=%s fkb=%s", npw, lean, *fkb ? fkb : "auto");
+            perf_row(pl, "logits_gemm_u4g64", ts, ps, d_w, wb, copies, (double)wb, iters, 1, lbl);
+        }
+    unsetenv("R4D_LM4_NPW"); unsetenv("R4D_LM4_FKB"); unsetenv("R4D_LM4_LEAN");
+}
+
+/* logits_gemm_u4g64 / _u4g128: libquant's asymmetric grid -- min/max a group, a bf16 scale of
+ * (max - min) / 15, a u8 zero, codes (round(x / s) + zero) clamped to 0..15 -- relaid into the
+ * lm4a row; the oracle is the planes, (code - zero) times the scale. */
+static void u4_logits_numeric(const Plugin& pl, int64_t N, int64_t K, int64_t M, int64_t G) {
+    const std::string rn = G == 64 ? "logits_gemm_u4g64" : "logits_gemm_u4g128";
+    const RadKernelInfo* lg = find(pl, rn.c_str());
+    if (!lg || !lg->layout || !lg->relayout) { ok((rn + " present").c_str(), false, "row or hooks absent"); return; }
+    const int64_t stride = r4d_fp8::lm4a_row_bytes(K, G), ng = K / G;
+    const std::string tag = " [N=" + std::to_string(N) + " K=" + std::to_string(K) +
+                            " M=" + std::to_string(M) + " G=" + std::to_string(G) + "]";
+    std::vector<float> wf((size_t)N * K), xf((size_t)M * K);
+    for (int64_t r = 0; r < N; ++r)
+        for (int64_t c = 0; c < K; ++c)
+            wf[(size_t)r * K + c] =
+                std::ldexp(1.0f, (int)(((r / 128) % 5) * 3 - ((c / 128) % 4)))
+                * (0.031f * (float)((r * 37 + c * 11) % 61) - 0.6f);
+    std::vector<uint16_t> xb((size_t)M * K);
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t c = 0; c < K; ++c) {
+            const float v = 0.017f * (float)((m * 53 + c * 7) % 83) - 0.7f;
+            xb[(size_t)m * K + c] = h_to_bf16(v);
+            xf[(size_t)m * K + c] = h_bf16(xb[(size_t)m * K + c]);
+        }
+    Planes p;
+    rad_enc_clear(&p.enc);
+    rad_enc_copy_str(p.enc.scheme, "affine");
+    rad_enc_add_plane(&p.enc, "codes", RAD_U4, 1, 1);
+    rad_enc_add_plane(&p.enc, "scale", RAD_BF16, 1, G);
+    rad_enc_add_plane(&p.enc, "zero", RAD_U8, 1, G);
+    p.size(N, K);
+    const int64_t crow = p.row_bytes(0);
+    for (int64_t r = 0; r < N; ++r)
+        for (int64_t gi = 0; gi < ng; ++gi) {
+            float mn = 0.0f, mx = 0.0f;
+            for (int64_t j = 0; j < G; ++j) {
+                const float v = wf[(size_t)(r * K + gi * G + j)];
+                mn = std::min(mn, v); mx = std::max(mx, v);
+            }
+            rad_store_f32(p.data[1].data(), RAD_BF16, r * ng + gi, mx > mn ? (mx - mn) / 15.0f : 1.0f);
+            const float s = rad_load_f32(p.data[1].data(), RAD_BF16, r * ng + gi);
+            const int z = (int)std::max(0.0f, std::min(15.0f, std::nearbyint(-mn / s)));
+            p.data[2][(size_t)(r * ng + gi)] = (uint8_t)z;
+            for (int64_t j = 0; j < G; ++j) {
+                const float q = std::nearbyint(wf[(size_t)(r * K + gi * G + j)] / s) + (float)z;
+                rad_store_code(p.data[0].data() + r * crow, RAD_U4, gi * G + j,
+                               (int)std::max(0.0f, std::min(15.0f, q)));
+            }
+        }
+    std::vector<RadParam> lp = { PI("n_vocab", N), PI("n_embd", K) };
+    RadLayout lay;
+    std::vector<uint8_t> wq;
+    const int lrc = stored(lg, lp, 1, p, { "codes", "scale", "zero" }, &wq, &lay);
+    if (lrc != RAD_OK) { ok((rn + " relayout").c_str(), false, "rc=" + std::to_string(lrc) + tag); return; }
+    ok((rn + " layout is the lm4a row").c_str(), lay.bytes == N * stride && (int64_t)wq.size() == N * stride,
+       "bytes " + std::to_string(lay.bytes) + " want " + std::to_string(N * stride) + tag);
+    {
+        std::string why;
+        ok((rn + " relayout inverts to the planes it was handed").c_str(),
+           restores(lg, lp, 1, p, { "codes", "scale", "zero" }, wq, &why), why + tag);
+    }
+    std::vector<double> ref((size_t)M * N);
+    for (int64_t r = 0; r < N; ++r) {
+        const uint8_t* row = p.data[0].data() + (size_t)r * crow;
+        for (int64_t m = 0; m < M; ++m) {
+            double acc = 0;
+            for (int64_t c = 0; c < K; ++c) {
+                const int64_t gi = c / G;
+                const int v = (int)rad_load_bits(row, 4, c) - (int)p.data[2][(size_t)(r * ng + gi)];
+                acc += (double)v * (double)rad_load_f32(p.data[1].data(), RAD_BF16, r * ng + gi) *
+                       xf[(size_t)m * K + c];
+            }
+            ref[(size_t)m * N + r] = acc;
+        }
+    }
+    void* d_w = dalloc(wq.size());
+    void* d_x = dalloc((size_t)M * K * 2);
+    void* d_y = dalloc((size_t)M * N * 4);
+    if (!d_w || !d_x || !d_y) { ok((rn + " alloc").c_str(), false, "hipMalloc failed" + tag); return; }
+    st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_x, xb.data(), (size_t)M * K * 2, hipMemcpyHostToDevice);
+    st_memset(d_y, 0x5a, (size_t)M * N * 4);
+    const int rc = launch_row(lg, { T(d_x, RAD_BF16, { M, K }), T(d_w, RAD_U8, { N, K }),
+                                    T(d_y, RAD_F32, { M, N }) },
+                              { PI("M", M), PI("n_vocab", N), PI("n_embd", K), PS("dtype", "bf16") });
+    if (rc != RAD_OK) { ok((rn + " launch").c_str(), false, "rc=" + std::to_string(rc) + tag); return; }
+    std::vector<float> got((size_t)M * N);
+    st_memcpy(got.data(), d_y, got.size() * 4, hipMemcpyDeviceToHost);
+    double num = 0, den = 0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        const double d = (double)got[i] - ref[i];
+        num += d * d;
+        den += ref[i] * ref[i];
+    }
+    const double e = den > 0 ? std::sqrt(num / den) : 1.0;
+    ok((rn + " vs host ref over its planes").c_str(), e < 2e-3, "rel_l2 " + std::to_string(e) + tag);
+}
+
 /* `i8`: the int8 head, logits_gemm_i8 -- i8 codes with a bf16 scale a ROW per 128 columns. */
 static void fp8_logits_numeric(const Plugin& pl, int64_t N, int64_t K, int64_t M, bool i8 = false) {
     const char* row = i8 ? "logits_gemm_i8" : "logits_gemm_fp8";
@@ -4702,7 +4964,7 @@ static void fp8_real(const Plugin& pl, const char* file, long long woff, long lo
  */
 static void perf_row(const Plugin& pl, const char* name, std::vector<RadTensor> ts,
                      std::vector<RadParam> ps, void* wbase, size_t wbytes, int copies,
-                     double bytes, int iters, int widx = 2, const char* point = nullptr) {
+                     double bytes, int iters, int widx, const char* point) {
     const RadKernelInfo* r = find(pl, name);
     if (!r) { std::printf("  %-22s row absent\n", name); return; }
     /* The label is the row unless a sweep named the tuned point, because a sweep that prints one
@@ -10798,6 +11060,27 @@ static void device_phase(const Plugin& pl) {
         for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)33 })
             fp8_logits_numeric(pl, 2560, 2560, M);
     }
+    /* The int4 head: every MT, a chunked M, and the padded K = 2560 row (1320 -> 1328 bytes). */
+    if (sel("logits_gemm_i4")) {
+        for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)33, (int64_t)64, (int64_t)70 })
+            i4_logits_numeric(pl, 5120, 5120, M);
+        for (const int64_t M : { (int64_t)1, (int64_t)8 })
+            i4_logits_numeric(pl, 2560, 2560, M);
+        i4_logits_numeric(pl, 300, 640, 8);
+    }
+    if (sel("logits_gemm_u4g64") || sel("logits_gemm_u4g128")) {
+        for (const int64_t G : { (int64_t)64, (int64_t)128 }) {
+            for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)33, (int64_t)70 })
+                u4_logits_numeric(pl, 5120, 5120, M, G);
+            u4_logits_numeric(pl, 2560, 2560, 8, G);
+            u4_logits_numeric(pl, 300, 640, 8, G);
+            for (const int64_t M : { (int64_t)8, (int64_t)16, (int64_t)17, (int64_t)33, (int64_t)48,
+                                     (int64_t)49, (int64_t)64, (int64_t)70 })
+                u4_npw_identity(pl, 5120, 5120, M, G);
+            u4_npw_identity(pl, 300, 640, 64, G);   /* ragged N: the tail tiles of an NPW pair */
+            u4_npw_identity(pl, 2000, 2560, 33, G);
+        }
+    }
     /* The int8 head over the same stored row: both forms, and the padded K = 2560 row. */
     if (sel("logits_gemm_i8") || sel("logit_rerank_i8")) {
         for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)33, (int64_t)64 })
@@ -10978,6 +11261,7 @@ static void usage(void) {
                 "  --perf N K M [iters]:  time the fp8 decode GEMMs at one shape and print the\n"
                 "             weight bandwidth each reaches. R4D_F8_MW and R4D_F8_SPLITTGT pin\n"
                 "             the narrow tile's launch heuristics for a sweep.\n"
+                "  --perflm4 N K M [iters]:   the u4 g64 lm_head at every FKB x R4D_LM4_NPW x R4D_LM4_LEAN.\n"
                 "  --perfbf16 N K M [iters]:  the bf16 skinny GEMM at every variant it has.\n"
                 "  --perfw8 N K M [iters]:  the 8-bit trunk GEMMs -- block E4M3 W8A8 and the int8\n"
                 "             rows -- at one shape, each with its TFLOP/s.\n"
@@ -11009,7 +11293,7 @@ int main(int argc, char** argv) {
     const char* real_file = nullptr;
     long long real_woff = 0, real_soff = 0, real_n = 0, real_k = 0;
     long long perf_n = 0, perf_k = 0, perf_m = 0;
-    int perf_it = 50, perf_w2 = 0, perf_bf = 0, perf_w8 = 0;
+    int perf_it = 50, perf_w2 = 0, perf_bf = 0, perf_w8 = 0, perf_lm4 = 0;
     long long sop_m = 0, sop_k = 0;
     int sop_it = 2000;
     long long qsa_ctx = 0, qsa_m = 4;
@@ -11031,6 +11315,13 @@ int main(int argc, char** argv) {
             real_k    = std::strtoll(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perf")) {
             if (i + 3 >= argc) { usage(); return 2; }
+            perf_n = std::strtoll(argv[++i], nullptr, 0);
+            perf_k = std::strtoll(argv[++i], nullptr, 0);
+            perf_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perflm4")) {
+            if (i + 3 >= argc) { usage(); return 2; }
+            perf_lm4 = 1;
             perf_n = std::strtoll(argv[++i], nullptr, 0);
             perf_k = std::strtoll(argv[++i], nullptr, 0);
             perf_m = std::strtoll(argv[++i], nullptr, 0);
@@ -11169,7 +11460,8 @@ int main(int argc, char** argv) {
     if (perf_n) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
-        if (perf_bf)      bf16_perf(pl, perf_n, perf_k, perf_m, perf_it);
+        if (perf_lm4)     lm4_perf(pl, perf_n, perf_k, perf_m, perf_it);
+        else if (perf_bf) bf16_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_w8) w8_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_w2) w2_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else         fp8_perf(pl, perf_n, perf_k, perf_m, perf_it);
