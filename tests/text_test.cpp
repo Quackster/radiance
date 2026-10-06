@@ -396,6 +396,37 @@ TEST(detokenize_stop_string_straddle) {
     CHECK_EQ(d.flush(), std::string());
 }
 
+/* A reply that starts inside its reasoning block: a stop string written while thinking is text,
+ * not a stop, and the first one after the closer cuts as usual. */
+TEST(detokenize_stops_wait_for_the_reasoning_closer) {
+    if (!need_vocab("detokenize_stops_wait_for_the_reasoning_closer")) return;
+    Tokenizer t;
+    CHECK_OK(t.init(qwen_vocab()));
+
+    const std::string think = "restating it, Q: what is two and two</think>";
+    std::vector<int32_t> ids;
+    CHECK_OK(t.encode(think + "The answer is 4. Q: next", ids, false, true));
+    Detokenizer d(qwen_vocab(), { "Q:" });
+    d.defer_stops_until("</think>");
+    std::string s;
+    for (int32_t id : ids) {
+        s += d.push(id);
+        if (d.stopped()) break;
+    }
+    CHECK(d.stopped());
+    CHECK_EQ(d.stop_hit(), std::string("Q:"));
+    CHECK_EQ(s, think + "The answer is 4. ");
+
+    /* Without the deferral the same text stops inside the reasoning. */
+    Detokenizer plain(qwen_vocab(), { "Q:" });
+    std::string p;
+    for (int32_t id : ids) {
+        p += plain.push(id);
+        if (plain.stopped()) break;
+    }
+    CHECK_EQ(p, std::string("restating it, "));
+}
+
 /* A stop string that never completes must be released at flush() rather than swallowed. */
 TEST(detokenize_incomplete_stop_is_flushed) {
     if (!need_vocab("detokenize_incomplete_stop_is_flushed")) return;

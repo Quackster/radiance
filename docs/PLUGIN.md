@@ -103,7 +103,9 @@ op's parameters. `RAD_CEQ(RAD_FACT_P2P, 1)` (`device.p2p`) is how a kernel says 
 another card's memory. On a machine where some pair of the ranks' cards cannot reach each other,
 such a kernel is not selected. The next row that does not need it takes the op. With no such row,
 startup stops and the selection table names the fact (`device.p2p == 1, have 0 -- this machine,
-measured at launch`). Every collective in libr4d carries it. A machine fact is in no geometry, so
+measured at launch`). Every collective in libr4d carries it, and each has a `_host` twin that
+requires `device.p2p == 0` and exchanges through pinned host memory, so exactly one of the pair
+matches any machine. A machine fact is in no geometry, so
 it changes no tuning key. A tool that selects without an engine has measured nothing, and such a
 kernel is not selected there either.
 

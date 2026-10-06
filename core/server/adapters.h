@@ -268,6 +268,7 @@ public:
         o.draft_acceptance = m.draft_acceptance;
         o.prefill_tokens = m.prefill_tokens;   o.decode_tokens = m.decode_tokens;
         o.draft_tokens = m.draft_tokens;       o.draft_accepted = m.draft_accepted;
+        o.draft_refills = m.draft_refills;     o.draft_refill_tokens = m.draft_refill_tokens;
         o.linear_hit_rate = m.linear_hit_rate;
         o.attn_cached_tokens = m.attn_cached_tokens;
         o.linear_cached_tokens = m.linear_cached_tokens;
@@ -311,6 +312,7 @@ public:
     std::string push(int32_t t) override { return d_.push(t); }
     std::string flush() override { return d_.flush(); }
     bool stopped() const override { return d_.stopped(); }
+    void defer_stops_until(const std::string& m) override { d_.defer_stops_until(m); }
 private:
     Detokenizer d_;
 };

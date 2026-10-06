@@ -87,6 +87,13 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                  n_paged, pc->cached_groups().size(),
                  hit_holes_draft_ ? "LEAVES a hole in a drafter's own KV" : "leaves no hole");
     }
+    draft_refill_ = 0;
+    if (cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.window > 0 &&
+        hit_holes_draft_) {
+        draft_refill_ = prog.drafter.window;
+        RAD_INFO("draft refill: a prefix hit ends %lld tokens before the prompt's end, so the "
+                 "drafter's window is recomputed", (long long)draft_refill_);
+    }
 
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
@@ -788,7 +795,16 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget) {
          * context back instead of re-prefilling it: it costs a copy, and the alternative
          * costs a prefill. */
         if (pc_->restore(r) == IPrefixCache::Restore::Wait) return kAdmitWait;
-        CacheHit h = pc_->lookup(r, &hit_blocks_);
+        HitCap cap;
+        if (draft_refill_ > 0) {
+            cap.tokens = std::max<int64_t>(0, (int64_t)r.prompt.size() - draft_refill_);
+            cap.max_give_back = 2 * draft_refill_;
+        }
+        const CacheHit h = pc_->lookup(r, &hit_blocks_, draft_refill_ > 0 ? &cap : nullptr);
+        if (h.given_back > 0) {
+            m_.draft_refill_tokens += h.given_back;
+            ++m_.draft_refills;
+        }
         int32_t reuse = h.n_attn_tokens;
         if (geo_.checkpoints() && h.n_linear_tokens < reuse) {
             /* A hit landing between checkpoints reuses the attention blocks and must replay the

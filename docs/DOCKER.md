@@ -123,6 +123,7 @@ the cards the engine runs on.
 | `flashnext-bf16.yaml` | `qwen3.8-flash-next-bf16.rad` | Qwen3.8-Flash-Next in bf16, streamed from the disk tier. A reference, not a production server |
 | `qwen3.6-35b-a3b.yaml` | `qwen3.6-35b-a3b-fp8.rad` | Qwen3.6-35B-A3B, FP8 |
 | `qwen3.8-27b-fp8.yaml` | `qwen3.8-27b-fp8.rad` | Qwen3.8-27B FP8 with its DFlash2 drafter and vision tower |
+| `qwen3.8-27b-mxfp4.yaml` | `qwen3.8-27b-mxfp4.rad` | Qwen3.8-27B with AMD's Quark AWQ-MXFP4 trunk, its DFlash2 drafter and vision tower |
 | `qwen3.8-27b-bf16.yaml` | `qwen3.8-27b-bf16.rad` | Qwen3.8-27B in bf16 |
 | `minicpm5-2b.yaml` | `minicpm5-2b-fp8.rad` | MiniCPM5-2B FP8 with its DSpark drafter |
 | `minicpm5-2b-bf16.yaml` | `minicpm5-2b-bf16.rad` | MiniCPM5-2B in bf16 with its DSpark drafter |

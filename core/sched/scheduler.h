@@ -472,6 +472,15 @@ private:
      * also skips on a block-size mismatch. A bound like this lives in exactly one place; a second
      * copy is free to drift out of step with the first. */
     bool          hit_holes_draft_ = true;
+    /* DRAFT REFILL. Where a hit leaves a hole in a WINDOWED block drafter's cache, the drafter is
+     * declined until its window has slid past the hole, which on the follow-up turn of a chat --
+     * the turn a prefix hit is for -- is most or all of the reply. So the hit is ended one window
+     * before the end of the prompt (HitCap): the trunk recomputes that window, the drafter's
+     * context pass covers it, and the sequence drafts from its first decode step. Output is
+     * unchanged; only which tokens are recomputed moves. A hit whose nearest checkpoint below
+     * that point would give back more than two windows is kept whole. The drafter's window, or 0
+     * where no hit can leave such a hole. */
+    int64_t       draft_refill_ = 0;
     BatchBuilder  builder_;
     DraftController draft_;
 

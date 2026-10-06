@@ -148,8 +148,9 @@ struct IPrefixCache {
     /* The request is gone -- finished, failed or cancelled -- and holds nothing any more. */
     virtual void release(const Request&) {}
 
-    virtual CacheHit lookup(const Request& r,
-                            std::vector<std::vector<int32_t>>* blocks_out) const = 0;
+    /* `cap`, when not null, ends the hit early (HitCap, core/mem/prefix.h). */
+    virtual CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* blocks_out,
+                            const HitCap* cap) const = 0;
     virtual const std::vector<int32_t>& cached_groups() const = 0;
 
     /* PUBLISH what this sequence computed, so the next request sharing the prefix can adopt it.
@@ -335,10 +336,10 @@ struct PCBinding final : IPrefixCache {
     mutable std::vector<MMContentKey> mm_;
     explicit PCBinding(PC* p) : m(p) {}
 
-    CacheHit lookup(const Request& r,
-                    std::vector<std::vector<int32_t>>* out) const override {
+    CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* out,
+                    const HitCap* cap) const override {
         media_keys(r, &mm_);
-        return m->lookup(r.prompt, mm_, out);
+        return m->lookup(r.prompt, mm_, out, cap);
     }
 
     /* Installed by the engine when the idle tiers are on; empty otherwise. */

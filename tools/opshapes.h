@@ -261,19 +261,37 @@ inline int rad_operand_shapes(const std::string& op, const Geometry& g, int n_op
          *
          * `a_sum` and `b_ref` belong to the asymmetric-integer and mxfp4 grids and are absent. */
         const char* q = g.get_s("dtype");
-        const bool a8  = q && std::strcmp(q, "fp8a8")  == 0;
-        const bool a16 = q && std::strcmp(q, "fp8a16") == 0;
-        if ((!a8 && !a16) || N <= 0 || K <= 0 || group <= 0) return RAD_E_UNSUPPORTED;
-        const int64_t kb = (K + group - 1) / group;
-        const int64_t nb = (N + group - 1) / group;
-        /* a, a_scale */
-        if (a8) { add((uint32_t)RAD_F8E4M3, {M, K}); add((uint32_t)RAD_F32, {M, kb}); }
-        else    { add((uint32_t)RAD_BF16,   {M, K}); skip_opd(); }
-        add((uint32_t)RAD_F8E4M3, {N, K});    /* b       -- the checkpoint's own bytes */
-        add((uint32_t)RAD_BF16,   {nb, kb});  /* b_scale -- weight_scale_inv, one per 128x128 tile */
-        add((uint32_t)RAD_BF16,   {M, N});    /* y */
-        skip_opd();                           /* a_sum */
-        skip_opd();                           /* b_ref */
+        /* OCP-MXFP4 is the other grid: e2m1 codes with one E8M0 exponent per 32 of K (`group`
+         * 32), read against the fp8 family's own activation pair -- E4M3 with an f32 scale per
+         * (row, 128 of K), which is what LinearFP8 feeds it. The weight operands arrive in libr4d's
+         * stored layout, and their BYTE COUNTS are what is sized here: the codes are K/2 bytes a
+         * row in fragment order, the exponents [K/32][N] and the per-row reference [N]. Drawn
+         * bytes are fine for timing -- the kernel's work does not depend on which exponents it
+         * folds. */
+        if (q && std::strcmp(q, "mxfp4a8") == 0) {
+            if (N <= 0 || K <= 0 || group != 32) return RAD_E_UNSUPPORTED;
+            add((uint32_t)RAD_F8E4M3, {M, K});
+            add((uint32_t)RAD_F32,    {M, (K + 127) / 128});
+            add((uint32_t)RAD_U8,     {N, K / 2});     /* b       -- e2m1 codes, fragment order */
+            add((uint32_t)RAD_U8,     {K / 32, N});    /* b_scale -- E8M0, [K/32][N] */
+            add((uint32_t)RAD_BF16,   {M, N});         /* y */
+            skip_opd();                                /* a_sum */
+            add((uint32_t)RAD_U8,     {N});            /* b_ref   -- the per-row reference */
+        } else {
+            const bool a8  = q && std::strcmp(q, "fp8a8")  == 0;
+            const bool a16 = q && std::strcmp(q, "fp8a16") == 0;
+            if ((!a8 && !a16) || N <= 0 || K <= 0 || group <= 0) return RAD_E_UNSUPPORTED;
+            const int64_t kb = (K + group - 1) / group;
+            const int64_t nb = (N + group - 1) / group;
+            /* a, a_scale */
+            if (a8) { add((uint32_t)RAD_F8E4M3, {M, K}); add((uint32_t)RAD_F32, {M, kb}); }
+            else    { add((uint32_t)RAD_BF16,   {M, K}); skip_opd(); }
+            add((uint32_t)RAD_F8E4M3, {N, K});    /* b       -- the checkpoint's own bytes */
+            add((uint32_t)RAD_BF16,   {nb, kb});  /* b_scale -- weight_scale_inv, one per 128x128 */
+            add((uint32_t)RAD_BF16,   {M, N});    /* y */
+            skip_opd();                           /* a_sum */
+            skip_opd();                           /* b_ref */
+        }
     }
     else if (op == "dequant") {
         add((uint32_t)RAD_I8, {M, n}); add((uint32_t)RAD_F32, {M, group ? n / group : 1});

@@ -1,0 +1,12 @@
+# Qwen3.8-27B with AMD's Quark AWQ-MXFP4 trunk (4-bit weights, E4M3 activations) and its DFlash2
+# block-diffusion drafter merged into the container; the speculation depth is the drafter's own
+# operating point.
+name: radiance-qwen3.8-27b-mxfp4
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-qwen3.8-27b-mxfp4
+    command: >
+      --model /models/qwen3.8-27b-mxfp4.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 2 --max-num-seqs 32 --max-model-len 200000 --kv-cache-dtype fp8

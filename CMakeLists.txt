@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 # VERSION is what /version reports and what a client checks compatibility against. It is NOT the
 # ABI version -- that lives in abi/rad_abi.h and is read out of the header below, because
 # a plugin contract and a server release do not move together.
-project(radiance VERSION 1.1.1 LANGUAGES C CXX)
+project(radiance VERSION 1.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

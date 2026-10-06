@@ -108,6 +108,18 @@ struct CacheHit {
     int32_t n_attn_tokens   = 0;   /* attention KV reused directly, always a whole block multiple */
     int32_t n_linear_tokens = 0;   /* linear state reused; <= n_attn_tokens, a checkpoint multiple */
     int32_t checkpoint_slot = -1;  /* the snapshot holding that state, -1 if none */
+    int32_t given_back      = 0;   /* reusable tokens a HitCap took off the whole hit */
+};
+
+/* A HIT ENDED EARLY ON PURPOSE. The hit ends no later than `tokens` -- at a block and, for a model
+ * with recurrent state, at the deepest checkpoint at or below it -- unless that gives back more
+ * than `max_give_back` of what the whole hit would reuse, in which case the whole hit stands. It
+ * exists for a drafter whose own KV the cache does not hold (Scheduler::init, --draft-refill):
+ * recomputing the prompt's tail gives it context, and a cap whose nearest checkpoint is far below
+ * would recompute far more than that tail. */
+struct HitCap {
+    int64_t tokens = 0;
+    int64_t max_give_back = 0;
 };
 
 /* ------------------------------------------------------------------ retention policy */
@@ -181,10 +193,11 @@ public:
      *
      * NEVER returns the whole prompt: at least one token must remain for the step to compute a
      * logit from, so a full hit is backed off by one block. That is not a subtlety the caller
-     * should have to know. */
+     * should have to know. `cap`, when given, ends the hit early (HitCap). */
     CacheHit lookup(const std::vector<int32_t>& tokens,
                     const std::vector<MMContentKey>& mm,
-                    std::vector<std::vector<int32_t>>* blocks_out = nullptr) const;
+                    std::vector<std::vector<int32_t>>* blocks_out = nullptr,
+                    const HitCap* cap = nullptr) const;
 
     /* Publish the whole blocks a sequence just filled. `blocks[i]` is the block table of
      * cached_groups()[i]. Takes a KV reference on every newly indexed block. */

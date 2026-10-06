@@ -355,17 +355,20 @@ static void cross_check(const Plugin& pl) {
                              "' which op '" + r->op + "' does not declare; ";
             }
         }
-        /* EVERY MULTI-CARD ROW NEEDS PEER ACCESS. Each kernel in this library that runs only at
-         * two or more ranks reads or writes the other cards' memory directly, so without
-         * device.p2p a machine whose cards cannot reach each other resolves it and the launch
-         * faults or hangs instead of being refused by name at selection. */
+        /* EVERY MULTI-CARD ROW STATES THE TRANSPORT IT NEEDS. A kernel in this library that runs
+         * only at two or more ranks either reads and writes the other cards' memory directly and
+         * requires device.p2p == 1, or is a host twin whose mailbox is pinned host memory and
+         * requires device.p2p == 0. Without the key, a machine whose cards cannot reach each other
+         * resolves a P2P kernel and the launch faults or hangs instead of being refused by name at
+         * selection; and a host twin without it would compete with its original where P2P works. */
         bool multi = false, p2p = false;
         for (int c = 0; c < r->n_constraints; ++c) {
             const RadConstraint& rc = r->constraints[c];
             if (!std::strcmp(rc.key, "world_size") &&
                 (rc.op == RAD_C_EQ || rc.op == RAD_C_GE) && rc.ival >= 2)
                 multi = true;
-            if (!std::strcmp(rc.key, RAD_FACT_P2P) && rc.op == RAD_C_EQ && rc.ival == 1)
+            if (!std::strcmp(rc.key, RAD_FACT_P2P) && rc.op == RAD_C_EQ &&
+                (rc.ival == 1 || rc.ival == 0))
                 p2p = true;
         }
         if (multi && !p2p) {
@@ -381,7 +384,8 @@ static void cross_check(const Plugin& pl) {
     ok("no row declares the same axis key twice", dup_axis == 0, axisdetail);
     ok("every row's op has a schema", no_schema == 0, keydetail);
     ok("every constraint key is a declared parameter of its op", bad_key == 0, keydetail);
-    ok("every row that needs two or more ranks requires device.p2p", no_p2p == 0, p2pdetail);
+    ok("every row that needs two or more ranks requires device.p2p 1 or 0", no_p2p == 0,
+       p2pdetail);
 
     /* The libr4d orderings the integer priority has to preserve. */
     int p_ts = -1, p_os = -1, p_dec = -1, p_pre = -1, p_m16 = -1, p_m64 = -1, p_bt = -1;
@@ -3338,6 +3342,351 @@ static void w8a16_numeric(const Plugin& pl, const char* row, int64_t M, int64_t 
     ok(nm, rel < 1e-2, d);
 }
 
+
+/* An OCP-MXFP4 weight's planes, drawn through st_mix32 of each coordinate and `seed`: codes over
+ * all sixteen e2m1 values, and an exponent per (row, 32 of K) within three binades of 127. With
+ * `deep`, about one block in eleven sits 6..12 binades lower still -- the folded table's subnormal
+ * tail. */
+static void mxfp4_fill(Planes& p, int ic, int is, int64_t N, int64_t K, uint32_t seed, bool deep) {
+    const int64_t nblk = K / 32;
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t k = 0; k < K; k += 2) {
+            const uint32_t h = st_mix32((uint32_t)(n * K + k) ^ (seed * 0x9e3779b9u));
+            p.data[(size_t)ic][(size_t)((n * K + k) / 2)] =
+                (uint8_t)((h & 15) | (((h >> 8) & 15) << 4));
+        }
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t b = 0; b < nblk; ++b) {
+            const uint32_t h = st_mix32((uint32_t)(n * nblk + b) ^ (seed * 0x85ebca6bu) ^ 0x2545u);
+            int e = 127 + (int)(h % 7) - 3;
+            if (deep && (h >> 8) % 11 == 0) e -= 6 + (int)((h >> 16) % 7);
+            p.data[(size_t)is][(size_t)(n * nblk + b)] = (uint8_t)e;
+        }
+}
+
+/* An E4M3-representable activation value in [-4, 4], drawn the same way. */
+static float mxfp4_act(int64_t i, int64_t k, uint32_t seed) {
+    const uint32_t h = st_mix32((uint32_t)(i * 0x10001 + k) ^ (seed * 0xc2b2ae35u));
+    return (float)((int)(h % 401) - 200) * 0.02f;
+}
+
+/* THE MXFP4 GEMMS AGAINST WHAT THE PLANES MEAN. The weight is an OCP-MXFP4 plane pair -- e2m1
+ * codes and an E8M0 exponent per 32 K -- stored through the row's own hooks, so the fragment
+ * order, the [K/32][N] exponents and the per-row reference all come from r4d_layout.cpp and the
+ * kernel is checked on what the loader would hand it. The reference decodes the planes on the host
+ * with no fold at all, so a misread arrangement shows as a column that disagrees.
+ *
+ * Codes, exponents and activations are drawn through st_mix32 of their coordinates, so a misread
+ * pitch or lane map reads unrelated numbers rather than a shifted copy of the right ones. The
+ * exponents are spread so a row's blocks sit up to 12 binades under its reference: d <= 8 is exact
+ * in the folded e4m3 table and d = 9..12 rounds, which is the subnormal tail every MXFP4 row
+ * shares. M and N are chosen ragged against the tiled row's 256-row block and 64/128-column tile,
+ * so the clamped staging and the guarded epilogue both run. `tn` pins the tiled row's column
+ * width; 0 leaves it to the row's own M rule (and is ignored by the skinny row).
+ *
+ * `ablk` hands the activation scale as the block-scaled fp8 family's grid, one f32 per (row, 128
+ * of K), instead of one per row -- what an architecture's fused quantisers write. The scales are
+ * spread over two decades and every eleventh block's is ZERO with zero codes behind it (an
+ * all-zero activation block), which is the case the kernels carry their previous scale through. */
+static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N, int64_t K,
+                            int tn, bool ablk = false, std::vector<RadParam> extra = {}) {
+    if (!sel(row)) return;
+    char nm[160];
+    std::string ex;
+    for (const RadParam& p : extra) ex += std::string(" ") + p.key + "=" + std::to_string(p.ival);
+    std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld tn=%d%s%s", row, (long long)M,
+                  (long long)N, (long long)K, tn, ablk ? " ascale=row x 128" : "", ex.c_str());
+    const RadKernelInfo* r = find(pl, row);
+    if (!r || !r->layout || !r->relayout) { ok(nm, false, "row or hooks absent"); return; }
+    const int64_t nblk = K / 32;
+
+    Planes p;
+    p.enc = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    p.size(N, K);
+    const int ic = p.find("codes"), is = p.find("scale");
+    if (ic < 0 || is < 0) { ok(nm, false, "encoding has no codes/scale plane"); return; }
+    mxfp4_fill(p, ic, is, N, K, 0x51u, true);
+    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 32) };
+    std::vector<uint8_t> wq, ws, wr;
+    const int rw = stored(r, lp, 2, p, { "codes" }, &wq);
+    const int rs = stored(r, lp, 3, p, { "scale" }, &ws);
+    const int rr = stored(r, lp, 6, p, { "scale" }, &wr);
+    if (rw != RAD_OK || rs != RAD_OK || rr != RAD_OK) {
+        ok(nm, false, "relayout rc " + std::to_string(rw) + "/" + std::to_string(rs) + "/" +
+                      std::to_string(rr));
+        return;
+    }
+
+    const int64_t nkb = (K + 127) / 128, asc = ablk ? nkb : 1;
+    std::vector<uint8_t> ha((size_t)(M * K));
+    std::vector<float> av((size_t)(M * K)), as((size_t)(M * asc));
+    for (int64_t i = 0; i < M; ++i) {
+        for (int64_t c = 0; c < asc; ++c) {
+            const uint32_t h = st_mix32((uint32_t)(i * asc + c) ^ 0xa5u);
+            as[(size_t)(i * asc + c)] =
+                ablk ? ((i + c) % 11 == 5 ? 0.0f : 0.002f * (float)(1 + h % 97))
+                     : 0.0125f * (float)(1 + h % 5);
+        }
+        for (int64_t k = 0; k < K; ++k) {
+            const bool zero = ablk && as[(size_t)(i * asc + k / 128)] == 0.0f;
+            const float v = zero ? 0.0f : mxfp4_act(i, k, 0x3cu);
+            rad_store_f32(ha.data(), RAD_F8E4M3, i * K + k, v);
+            av[(size_t)(i * K + k)] = rad_load_f32(ha.data(), RAD_F8E4M3, i * K + k);
+        }
+    }
+    std::vector<uint16_t> hy((size_t)(M * N), 0);
+    void* d_a = dalloc(ha.size());
+    void* d_s = dalloc(as.size() * 4);
+    void* d_w = dalloc(wq.size());
+    void* d_e = dalloc(ws.size());
+    void* d_r = dalloc(wr.size());
+    void* d_y = dalloc(hy.size() * 2);
+    if (!d_a || !d_s || !d_w || !d_e || !d_r || !d_y) { ok(nm, false, "hipMalloc failed"); return; }
+    st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_s, as.data(), as.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_e, ws.data(), ws.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_r, wr.data(), wr.size(), hipMemcpyHostToDevice);
+    std::vector<RadTensor> ts = {
+        T(d_a, RAD_F8E4M3, { M, K }),
+        ablk ? T(d_s, RAD_F32, { M, asc }) : T(d_s, RAD_F32, { M }),
+        T(d_w, RAD_U8, { (int64_t)wq.size() }), T(d_e, RAD_U8, { (int64_t)ws.size() }),
+        T(d_y, RAD_BF16, { M, N }), T(nullptr, RAD_F32, { 1 }), T(d_r, RAD_U8, { (int64_t)wr.size() }),
+    };
+    absent(ts[5]);
+    std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PI("group", 32),
+                                 PS("dtype", "mxfp4a8") };
+    if (tn) ps.push_back(PI("tn", tn));
+    for (const RadParam& p : extra) ps.push_back(p);
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    a.world_size = 1;
+    /* A row with a scratch hook (the decode row's split partial) gets what it asks for, as the
+     * core would hand it; the decode row refuses a split with too little. */
+    if (r->scratch) {
+        const int64_t sb = r->scratch(&a);
+        if (sb > 0) {
+            a.scratch = dalloc((size_t)sb);
+            a.scratch_bytes = sb;
+            if (!a.scratch) { ok(nm, false, "hipMalloc failed"); return; }
+        }
+    }
+    const int rc = r->launch(&a, (RadStream) nullptr);
+    if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+        ok(nm, false, "rc=" + std::to_string(rc));
+        return;
+    }
+    st_memcpy(hy.data(), d_y, hy.size() * 2, hipMemcpyDeviceToHost);
+
+    /* Every column for small N, a stride otherwise -- always including the last column, which is
+     * the clamped tail of the tiled row's weight staging. */
+    const int64_t nstep = N > 96 ? N / 96 : 1;
+    double num = 0, den = 0, worst = 0;
+    for (int64_t i = 0; i < M; ++i)
+        for (int64_t n = 0; n < N; n = (n + 1 == N) ? N : std::min(n + nstep, N - 1)) {
+            double acc = 0;
+            for (int64_t k = 0; k < K; ++k) {
+                const double w = (double)rad_load_f32(p.data[(size_t)ic].data(), RAD_FP4E2M1, n * K + k) *
+                                 (double)rad_load_f32(p.data[(size_t)is].data(), RAD_E8M0, n * nblk + k / 32);
+                acc += (double)av[(size_t)(i * K + k)] * w *
+                       (ablk ? (double)as[(size_t)(i * asc + k / 128)] : 1.0);
+            }
+            if (!ablk) acc *= (double)as[(size_t)i];
+            const double d = (double)h_bf16(hy[(size_t)(i * N + n)]) - acc;
+            num += d * d;
+            den += acc * acc;
+            worst = std::max(worst, std::fabs(d) / (std::fabs(acc) + 1e-3));
+        }
+    const double rel = den > 0 ? std::sqrt(num / den) : std::sqrt(num);
+    char d[96];
+    std::snprintf(d, sizeof d, "rel_l2 %.3e, worst %.3e", rel, worst);
+    ok(nm, rel < 1e-2, d);
+}
+
+
+/* TWO DECODE GEMMS THE ENGINE MAY OVERLAP (gemm_mxfp4a8_decode is a concurrent row: its split partial
+ * is the op's scratch and its arrival counters are keyed on the output). Each GEMM has its own
+ * weights, activations and output and a DISJOINT slice of one scratch allocation, with a split
+ * (ks > 1) so the partial and the counters are live. The reference is each launched alone, then the
+ * pair is launched on two non-blocking streams with nothing ordering them -- repeated, so the
+ * launches overlap in different phases -- and every output must be BYTE-identical to the serial one
+ * (the reducer sums the splits in a fixed order, so a lost or shared counter / partial shows as a
+ * different byte or a hang). A last serial launch after the loop checks that the counters were
+ * left at zero. */
+struct MxdOverlapGemm {
+    int64_t M, N, K;
+    int ks;
+    std::vector<RadTensor> ts;
+    std::vector<RadParam> ps;
+    void* y = nullptr;
+    int64_t scratch = 0;
+    bool ready = false;
+};
+
+static bool mxd_overlap_build(const RadKernelInfo* r, MxdOverlapGemm& g, int seed) {
+    const int64_t M = g.M, N = g.N, K = g.K, nkb = K / 128;
+    Planes p;
+    p.enc = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    p.size(N, K);
+    const int ic = p.find("codes"), is = p.find("scale");
+    if (ic < 0 || is < 0) return false;
+    mxfp4_fill(p, ic, is, N, K, (uint32_t)seed, false);
+    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 32) };
+    std::vector<uint8_t> wq, ws, wr;
+    if (stored(r, lp, 2, p, { "codes" }, &wq) != RAD_OK ||
+        stored(r, lp, 3, p, { "scale" }, &ws) != RAD_OK ||
+        stored(r, lp, 6, p, { "scale" }, &wr) != RAD_OK)
+        return false;
+    std::vector<uint8_t> ha((size_t)(M * K));
+    std::vector<float> as((size_t)(M * nkb));
+    for (int64_t i = 0; i < M; ++i) {
+        for (int64_t c = 0; c < nkb; ++c)
+            as[(size_t)(i * nkb + c)] =
+                0.002f * (float)(1 + st_mix32((uint32_t)(i * nkb + c) ^ (uint32_t)seed) % 97);
+        for (int64_t k = 0; k < K; ++k)
+            rad_store_f32(ha.data(), RAD_F8E4M3, i * K + k, mxfp4_act(i, k, (uint32_t)seed));
+    }
+    void* d_a = dalloc(ha.size());
+    void* d_s = dalloc(as.size() * 4);
+    void* d_w = dalloc(wq.size());
+    void* d_e = dalloc(ws.size());
+    void* d_r = dalloc(wr.size());
+    g.y = dalloc((size_t)(M * N) * 2);
+    if (!d_a || !d_s || !d_w || !d_e || !d_r || !g.y) return false;
+    st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_s, as.data(), as.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_e, ws.data(), ws.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_r, wr.data(), wr.size(), hipMemcpyHostToDevice);
+    g.ts = { T(d_a, RAD_F8E4M3, { M, K }), T(d_s, RAD_F32, { M, nkb }),
+             T(d_w, RAD_U8, { (int64_t)wq.size() }), T(d_e, RAD_U8, { (int64_t)ws.size() }),
+             T(g.y, RAD_BF16, { M, N }), T(nullptr, RAD_F32, { 1 }),
+             T(d_r, RAD_U8, { (int64_t)wr.size() }) };
+    absent(g.ts[5]);
+    g.ps = { PI("M", M), PI("N", N), PI("K", K), PI("group", 32), PS("dtype", "mxfp4a8"),
+             PI("ks", g.ks), PI("bk", 128), PI("nt", 1) };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = g.ts.data(); a.n_t = (int)g.ts.size();
+    a.p = g.ps.data(); a.n_p = (int)g.ps.size();
+    a.world_size = 1;
+    g.scratch = r->scratch ? r->scratch(&a) : 0;
+    g.ready = g.scratch >= (int64_t)g.ks * M * N * 4;
+    return g.ready;
+}
+
+static int mxd_overlap_launch(const RadKernelInfo* r, MxdOverlapGemm& g, void* scratch,
+                              hipStream_t st, int64_t scratch_bytes = -1) {
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = g.ts.data(); a.n_t = (int)g.ts.size();
+    a.p = g.ps.data(); a.n_p = (int)g.ps.size();
+    a.world_size = 1;
+    a.scratch = scratch;
+    a.scratch_bytes = scratch_bytes < 0 ? g.scratch : scratch_bytes;
+    return r->launch(&a, (RadStream)st);
+}
+
+static void mxd_overlap_case(const Plugin& pl) {
+    if (!sel("gemm_mxfp4a8_decode_overlap") && !sel("gemm_mxfp4a8_decode")) return;
+    const char* nm = "gemm_mxfp4a8_decode: two split GEMMs on two streams, disjoint scratch, "
+                     "byte-identical to serial";
+    const RadKernelInfo* r = find(pl, "gemm_mxfp4a8_decode");
+    if (!r || !r->layout || !r->relayout || !r->scratch) { ok(nm, false, "row or hooks absent"); return; }
+    MxdOverlapGemm g[3];
+    g[0] = MxdOverlapGemm{}; g[0].M = 8;  g[0].N = 400;  g[0].K = 2560; g[0].ks = 4;
+    g[1] = MxdOverlapGemm{}; g[1].M = 8;  g[1].N = 272;  g[1].K = 2560; g[1].ks = 2;
+    g[2] = MxdOverlapGemm{}; g[2].M = 24; g[2].N = 1040; g[2].K = 1152; g[2].ks = 4;
+    for (int i = 0; i < 3; ++i)
+        if (!mxd_overlap_build(r, g[i], 1 + 2 * i)) {
+            ok(nm, false, "operands or scratch hook (ks > 1 needs a split partial)");
+            return;
+        }
+    /* One allocation, a slice each, 256-byte aligned: the core's disjoint scratch slices. */
+    int64_t off[3], tot = 0;
+    for (int i = 0; i < 3; ++i) { off[i] = tot; tot += (g[i].scratch + 255) & ~int64_t(255); }
+    char* base = (char*)dalloc((size_t)tot);
+    if (!base) { ok(nm, false, "hipMalloc failed"); return; }
+    /* The serial reference gets its own scratch, so the two runs share nothing but the kernel. */
+    std::vector<std::vector<uint16_t>> want(3);
+    for (int i = 0; i < 3; ++i) {
+        void* sc = dalloc((size_t)g[i].scratch);
+        if (!sc) { ok(nm, false, "hipMalloc failed"); return; }
+        const int rc = mxd_overlap_launch(r, g[i], sc, nullptr);
+        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+            ok(nm, false, "serial rc=" + std::to_string(rc));
+            return;
+        }
+        want[(size_t)i].assign((size_t)(g[i].M * g[i].N), 0);
+        st_memcpy(want[(size_t)i].data(), g[i].y, want[(size_t)i].size() * 2, hipMemcpyDeviceToHost);
+    }
+    hipStream_t s1 = nullptr, s2 = nullptr;
+    if (hipStreamCreateWithFlags(&s1, hipStreamNonBlocking) != hipSuccess ||
+        hipStreamCreateWithFlags(&s2, hipStreamNonBlocking) != hipSuccess) {
+        ok(nm, false, "hipStreamCreate failed");
+        return;
+    }
+    int bad = 0, iters = 0;
+    std::string why;
+    for (int it = 0; it < 200 && !bad; ++it) {
+        const int a = it % 3, b = (it + 1 + (it / 3) % 2) % 3;   /* every ordered pair of distinct GEMMs */
+        for (int i : { a, b }) st_memset(g[i].y, 0, (size_t)(g[i].M * g[i].N) * 2);
+        /* The streams are non-blocking, so nothing orders them after the legacy-stream memset. */
+        (void)hipDeviceSynchronize();
+        const int ra = mxd_overlap_launch(r, g[a], base + off[a], s1);
+        const int rb = mxd_overlap_launch(r, g[b], base + off[b], s2);
+        const bool sa = st_stream_sync(s1) == hipSuccess, sb = st_stream_sync(s2) == hipSuccess;
+        if (ra != RAD_OK || rb != RAD_OK || !sa || !sb) {
+            bad = 1;
+            why = "launch rc " + std::to_string(ra) + "/" + std::to_string(rb);
+            break;
+        }
+        for (int i : { a, b }) {
+            std::vector<uint16_t> got((size_t)(g[i].M * g[i].N));
+            st_memcpy(got.data(), g[i].y, got.size() * 2, hipMemcpyDeviceToHost);
+            if (std::memcmp(got.data(), want[(size_t)i].data(), got.size() * 2) != 0) {
+                bad = 1;
+                size_t nd = 0, first = got.size(), nz = 0;
+                for (size_t j = 0; j < got.size(); ++j) {
+                    if (got[j] != want[(size_t)i][j]) { ++nd; if (first == got.size()) first = j; }
+                    if (got[j] == 0) ++nz;
+                }
+                why = "iter " + std::to_string(it) + ": GEMM " + std::to_string(i) + " (ks=" +
+                      std::to_string(g[i].ks) + ") differs from serial: " + std::to_string(nd) +
+                      "/" + std::to_string(got.size()) + " elements, first at " +
+                      std::to_string(first) + " (m=" + std::to_string(first / (size_t)g[i].N) +
+                      " n=" + std::to_string(first % (size_t)g[i].N) + "), " +
+                      std::to_string(nz) + " zero, partner GEMM " + std::to_string(i == a ? b : a);
+            }
+        }
+        ++iters;
+    }
+    (void)hipStreamDestroy(s1);
+    (void)hipStreamDestroy(s2);
+    ok(nm, !bad, bad ? why : std::to_string(iters) + " overlapped pairs identical");
+    /* The counters must be zero again: a serial launch after the storm is still byte-identical. */
+    bool again = true;
+    for (int i = 0; i < 3 && again; ++i) {
+        st_memset(g[i].y, 0, (size_t)(g[i].M * g[i].N) * 2);
+        const int rc = mxd_overlap_launch(r, g[i], base + off[i], nullptr);
+        std::vector<uint16_t> got((size_t)(g[i].M * g[i].N));
+        again = rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+        if (again) {
+            st_memcpy(got.data(), g[i].y, got.size() * 2, hipMemcpyDeviceToHost);
+            again = std::memcmp(got.data(), want[(size_t)i].data(), got.size() * 2) == 0;
+        }
+    }
+    ok("gemm_mxfp4a8_decode: serial after the overlap storm is still identical (counters left at "
+       "zero)", again);
+    /* A split given less scratch than its partial is refused, not run unsplit: the hook sized it
+     * for the whole band, so a short one is a caller's error and must surface as one. */
+    const int rc = mxd_overlap_launch(r, g[0], base + off[0], nullptr, g[0].scratch / 2);
+    (void)st_stream_sync(nullptr);
+    ok("gemm_mxfp4a8_decode: a split with half its scratch is refused", rc != RAD_OK,
+       "rc=" + std::to_string(rc));
+}
 
 /* THE INT8 TRUNK CHAIN: quant_act_i8g on a bf16 activation, then one of the i8a8 GEMMs on what it
  * wrote, against the planes' meaning. The weight is i8 with a bf16 scale per row per 128 K (what
@@ -9231,10 +9580,10 @@ static void ar_worker(ArThread* t) {
     st_free(out);
 }
 
-static void ar_two_rank(const Plugin& pl, const std::vector<int>& devs) {
-    const RadKernelInfo* row = find(pl, "ar_oneshot_2rank_exact");
-    if (!row) { ok("ar_oneshot_2rank_exact", false, "row absent"); return; }
-    if (devs.size() < 2) { skip("ar_oneshot_2rank_exact (2 ranks)", "fewer than two gfx1201 cards"); return; }
+static void ar_two_rank(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    if (devs.size() < 2) { skip(name, "fewer than two gfx1201 cards"); return; }
 
     /* 8192 fp32 elements: a whole number of 16-byte pushes and small enough that the handshake,
      * not the link, is what is being exercised. */
@@ -9274,6 +9623,11 @@ static void ar_two_rank(const Plugin& pl, const std::vector<int>& devs) {
  * a hang. The sizes give 11, 4 and 7 blocks under the default block rule. */
 static const int64_t kArSweepNumel[] = { 65536, 8192, 40000, 65536, 12000, 24576, 65536, 8192 };
 constexpr int kArSweepN = (int)(sizeof(kArSweepNumel) / sizeof(kArSweepNumel[0]));
+/* The sweep again and again with new values each round, so every slot is reused many times over.
+ * A reader that is served a slot's previous contents -- a cached line of host memory or of a
+ * peer's, a flag seen before the bytes behind it -- folds the value of an earlier launch, and every
+ * launch's value is distinct, so that is a wrong sum and not a lucky one. */
+constexpr int kArSweepRounds = 32;
 
 struct ArSweep {
     const RadKernelInfo* row;
@@ -9293,7 +9647,7 @@ static void ar_sweep_worker(ArSweep* t) {
     };
     t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, t->world, &t->inst);
     if (t->rc_init != RAD_OK) return;
-    /* Rank r contributes (r + 1) * (j + 1), so launch j sums to (1 + 2 + .. + world) * (j + 1). */
+    /* Rank r contributes (r + 1) * v, so a launch with value v sums to (1 + 2 + .. + world) * v. */
     const float tri = (float)(t->world * (t->world + 1) / 2);
 
     void* in[kArSweepN] = {};
@@ -9304,40 +9658,45 @@ static void ar_sweep_worker(ArSweep* t) {
             t->rc_launch = RAD_E_NOMEM;
             return;
         }
-        /* Rank r contributes (r + 1) * (j + 1), so launch j sums to 3 * (j + 1) exactly. */
-        std::vector<float> h((size_t)kArSweepNumel[j], (float)((t->rank + 1) * (j + 1)));
-        st_memcpy(in[j], h.data(), bytes, hipMemcpyHostToDevice);
-        st_memset(out[j], 0, bytes);
     }
-    for (int j = 0; j < kArSweepN && t->rc_launch == RAD_OK; ++j) {
-        RadTensor ts[2] = { T(in[j], RAD_F32, { kArSweepNumel[j] }),
-                            T(out[j], RAD_F32, { kArSweepNumel[j] }) };
-        RadArgs a;
-        std::memset(&a, 0, sizeof(a));
-        a.t = ts; a.n_t = 2;
-        a.p = ps.data(); a.n_p = (int)ps.size();
-        a.instance = t->inst;
-        a.rank = t->rank;
-        a.world_size = t->world;
-        t->rc_launch = t->row->launch(&a, nullptr);
+    for (int round = 0; round < kArSweepRounds && t->rc_launch == RAD_OK; ++round) {
+        for (int j = 0; j < kArSweepN; ++j) {
+            const size_t bytes = (size_t)kArSweepNumel[j] * 4;
+            const float v = (float)(round * kArSweepN + j + 1);
+            std::vector<float> h((size_t)kArSweepNumel[j], (float)(t->rank + 1) * v);
+            st_memcpy(in[j], h.data(), bytes, hipMemcpyHostToDevice);
+            st_memset(out[j], 0, bytes);
+        }
+        for (int j = 0; j < kArSweepN && t->rc_launch == RAD_OK; ++j) {
+            RadTensor ts[2] = { T(in[j], RAD_F32, { kArSweepNumel[j] }),
+                                T(out[j], RAD_F32, { kArSweepNumel[j] }) };
+            RadArgs a;
+            std::memset(&a, 0, sizeof(a));
+            a.t = ts; a.n_t = 2;
+            a.p = ps.data(); a.n_p = (int)ps.size();
+            a.instance = t->inst;
+            a.rank = t->rank;
+            a.world_size = t->world;
+            t->rc_launch = t->row->launch(&a, nullptr);
+        }
+        st_stream_sync(nullptr);
+        for (int j = 0; j < kArSweepN; ++j) {
+            const float v = (float)(round * kArSweepN + j + 1);
+            std::vector<float> h((size_t)kArSweepNumel[j]);
+            st_memcpy(h.data(), out[j], h.size() * 4, hipMemcpyDeviceToHost);
+            for (float x : h) if (x != tri * v) ++t->bad;
+        }
     }
-    st_stream_sync(nullptr);
     for (int j = 0; j < kArSweepN; ++j) {
-        std::vector<float> h((size_t)kArSweepNumel[j]);
-        st_memcpy(h.data(), out[j], h.size() * 4, hipMemcpyDeviceToHost);
-        for (float v : h) if (v != tri * (float)(j + 1)) ++t->bad;
         st_free(in[j]);
         st_free(out[j]);
     }
 }
 
-static void ar_two_rank_sweep(const Plugin& pl, const std::vector<int>& devs) {
-    const RadKernelInfo* row = find(pl, "ar_oneshot_2rank_exact");
-    if (!row) { ok("ar_oneshot_2rank_exact", false, "row absent"); return; }
-    if (devs.size() < 2) {
-        skip("ar_oneshot_2rank_exact (block counts)", "fewer than two gfx1201 cards");
-        return;
-    }
+static void ar_two_rank_sweep(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    if (devs.size() < 2) { skip(name, "fewer than two gfx1201 cards"); return; }
     ArSweep a{ row, 0, devs[0] }, b{ row, 1, devs[1] };
     std::thread ta(ar_sweep_worker, &a), tb(ar_sweep_worker, &b);
     ta.join();
@@ -9346,8 +9705,8 @@ static void ar_two_rank_sweep(const Plugin& pl, const std::vector<int>& devs) {
        a.rc_init == RAD_OK && b.rc_init == RAD_OK,
        "rc " + std::to_string(a.rc_init) + "/" + std::to_string(b.rc_init));
     if (a.rc_init != RAD_OK || b.rc_init != RAD_OK) return;
-    ok("2-rank all-reduce, launches back to back at changing block counts, every sum exact on "
-       "both ranks",
+    ok("2-rank all-reduce, 32 rounds of launches back to back at changing block counts, every "
+       "sum exact on both ranks",
        a.rc_launch == RAD_OK && b.rc_launch == RAD_OK && a.bad == 0 && b.bad == 0,
        "rc " + std::to_string(a.rc_launch) + "/" + std::to_string(b.rc_launch) + ", " +
        std::to_string(a.bad + b.bad) + " elements wrong");
@@ -9400,10 +9759,10 @@ static void gather_worker(ArThread* t) {
     st_free(out);
 }
 
-static void gather_two_rank(const Plugin& pl, const std::vector<int>& devs) {
-    const RadKernelInfo* row = find(pl, "ar_gather_2rank");
-    if (!row) { ok("ar_gather_2rank", false, "row absent"); return; }
-    if (devs.size() < 2) { skip("ar_gather_2rank (2 ranks)", "fewer than two gfx1201 cards"); return; }
+static void gather_two_rank(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    if (devs.size() < 2) { skip(name, "fewer than two gfx1201 cards"); return; }
 
     const int64_t numel = 8192;   /* the sampler's own message at 4 rows and 1024 candidates */
     ArThread a{ row, 0, devs[0], numel }, b{ row, 1, devs[1], numel };
@@ -9490,10 +9849,10 @@ static void gather_two_rank(const Plugin& pl, const std::vector<int>& devs) {
  * the instantiation, the dispatch rows and the entry points agree: a rendezvous of three, a sum of
  * 1 + 2 + 3 on every rank bit for bit, the slot parity surviving a block-count sweep, and the
  * gather placing three slices in both of its layouts. Skipped, not failed, on fewer cards. */
-static void ar_three_rank(const Plugin& pl, const std::vector<int>& devs) {
-    const RadKernelInfo* row = find(pl, "ar_oneshot_3rank_exact");
-    if (!row) { ok("ar_oneshot_3rank_exact", false, "row absent"); return; }
-    if (devs.size() < 3) { skip("ar_oneshot_3rank_exact (3 ranks)", "fewer than three gfx1201 cards"); return; }
+static void ar_three_rank(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    if (devs.size() < 3) { skip(name, "fewer than three gfx1201 cards"); return; }
     const int64_t numel = 8192;
     ArThread a{ row, 0, devs[0], numel }, b{ row, 1, devs[1], numel }, c{ row, 2, devs[2], numel };
     a.world = b.world = c.world = 3;
@@ -9532,7 +9891,7 @@ static void ar_three_rank(const Plugin& pl, const std::vector<int>& devs) {
     tz.join();
     const bool up = x.rc_init == RAD_OK && y.rc_init == RAD_OK && z.rc_init == RAD_OK &&
                     x.rc_launch == RAD_OK && y.rc_launch == RAD_OK && z.rc_launch == RAD_OK;
-    ok("3-rank all-reduce, eight launches at changing block counts on one instance",
+    ok("3-rank all-reduce, 32 rounds of eight launches at changing block counts on one instance",
        up && x.bad == 0 && y.bad == 0 && z.bad == 0,
        up ? std::to_string(x.bad + y.bad + z.bad) + " elements wrong"
           : "rc " + std::to_string(x.rc_init) + "/" + std::to_string(y.rc_init) + "/" +
@@ -9545,10 +9904,10 @@ static void ar_three_rank(const Plugin& pl, const std::vector<int>& devs) {
     }
 }
 
-static void gather_three_rank(const Plugin& pl, const std::vector<int>& devs) {
-    const RadKernelInfo* row = find(pl, "ar_gather_3rank");
-    if (!row) { ok("ar_gather_3rank", false, "row absent"); return; }
-    if (devs.size() < 3) { skip("ar_gather_3rank (3 ranks)", "fewer than three gfx1201 cards"); return; }
+static void gather_three_rank(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    if (devs.size() < 3) { skip(name, "fewer than three gfx1201 cards"); return; }
     const int64_t numel = 8192;   /* the sampler's own message at 4 rows and 1024 candidates */
     const int W = 3;
     /* What each rank sent, rebuilt here rather than read back off the device (gather_two_rank). */
@@ -10378,6 +10737,61 @@ static void device_phase(const Plugin& pl) {
         gemm_case(pl, "gemm_w8a8_nt_m64",    "w8a8",    M, N, K, RAD_I8,  1, 0, 0, N*K,   N*(K/128)*2);
         gemm_case(pl, "gemm_w2a8_nt",        "w2a8",    M, N, K, RAD_I8,  1, 1, 0, N*K/4, N*(K/128)*4);
         gemm_case(pl, "gemm_mxfp4a8_nt_m64", "mxfp4a8", M, N, K, RAD_F8E4M3, 1, 0, 1, N*K/2, (K/32)*N);
+        gemm_case(pl, "gemm_mxfp4a8_tiled",  "mxfp4a8", 256, 256, K, RAD_F8E4M3, 1, 0, 1, 256*K/2, (K/32)*256);
+        /* The skinny row is known-good, so it checks the check; the tiled row at both widths, ragged
+         * in M and N, then at the size where tn=0 crosses over to TN=4. */
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_nt_m64", 40, 272, 640, 0);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 40, 272, 640, 2);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 640, 2);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 400, 640, 4);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 2100, 512, 2560, 0);
+        /* ...and against the fp8 family's (row, 128) activation grid, which is what an architecture
+         * feeds them. K = 640 is five blocks and 2560 twenty, so every split-K segment of the
+         * skinny row and every slab pair of the tiled one crosses block boundaries. */
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_nt_m64", 40, 272, 640, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_nt_m64", 7, 512, 2560, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 640, 2, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 400, 640, 4, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 2100, 512, 2560, 0, true);
+        /* K not a multiple of 128: the TN=2 kernel takes the 64-wide slab. */
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 576, 2);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 576, 2, true);
+        /* The decode row over its whole band: the split rule's own choice, then every split and
+         * slab forced, at both activation grids; N past a 128-column block, K a multiple of 64
+         * but not 128 (the slab falls back to 64), and DTM 1..4. */
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 8, 272, 640, 0, false);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 8, 272, 640, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 40, 400, 2560, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 64, 512, 2560, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 5, 1040, 576, 0, true);
+        mxd_overlap_case(pl);
+        /* Above 64 rows, every branch of the measured table: 110+ column blocks, 48+, 8 or
+         * fewer (with a K that is not a multiple of 128, so the slab falls back to 64), a deep K
+         * on both sides of M=80, and the plain case; then every split and slab forced. */
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 96, 14336, 640, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 128, 6144, 1152, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 100, 1024, 576, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 72, 5120, 6144, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 120, 5120, 6144, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 112, 5120, 2560, 0, false);
+        for (int ks : { 1, 2, 4, 8, 16 })
+            for (int bk : { 64, 128 })
+                mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 96, 400, 2560, 0, true,
+                                { PI("ks", ks), PI("bk", bk), PI("nt", 1) });
+        for (int ks : { 1, 2, 4, 8, 16 })
+            for (int bk : { 64, 128 })
+                mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 24, 400, 2560, 0, true,
+                                { PI("ks", ks), PI("bk", bk), PI("nt", ks == 2 ? 2 : 1) });
+        /* ...and the one-fragment form (DTM = 1: the register prefetch and 16 B loads) at every
+         * split, slab and load hint, on both activation grids, N past a column block. */
+        for (int ks : { 1, 2, 4, 8, 16 })
+            for (int bk : { 64, 128 })
+                for (int nt : { 1, 2 }) {
+                    mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 8, 400, 2560, 0, true,
+                                    { PI("ks", ks), PI("bk", bk), PI("nt", nt) });
+                    mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 13, 272, 1152, 0, false,
+                                    { PI("ks", ks), PI("bk", bk), PI("nt", nt) });
+                }
         gemm_case(pl, "gemm_w4a8_tiled",     "w4a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K/2, 256*(K/128)*4);
         gemm_case(pl, "gemm_w8a8_tiled",     "w8a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K,   256*(K/128)*2);
         gemm_case(pl, "gemm_w4a8_prefill",   "w4a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K/2, 256*(K/128)*4);
@@ -10875,44 +11289,49 @@ static void device_phase(const Plugin& pl) {
         bf16_gemm_numeric(pl, "gemm_bf16_nt_tiled", 300, 1040, 2560);
     }
 
-    if (sel("ar_oneshot_2rank_exact")) {
-        if (!g_case) std::printf("\ncross-rank\n");
-        ar_two_rank(pl, devs);
-        ar_two_rank_sweep(pl, devs);
-    }
-    if (sel("ar_gather_2rank")) {
-        if (!g_case) std::printf("\ncross-rank\n");
-        gather_two_rank(pl, devs);
-    }
-    /* The wide family at three. Its own rows, so the sweep names them (a row the sweep never
-     * mentions is reported as a coverage hole) and so `--case ar_oneshot_3rank_exact` reproduces
-     * one of them alone. */
-    if (sel("ar_oneshot_3rank_exact")) {
-        if (!g_case) std::printf("\ncross-rank, three\n");
-        ar_three_rank(pl, devs);
-    }
-    if (sel("ar_gather_3rank")) {
-        if (!g_case) std::printf("\ncross-rank, three\n");
-        gather_three_rank(pl, devs);
+    /* Every collective has a host twin (r4d_rows.cpp): the same kernel with its mailbox in pinned
+     * host memory. A case is the pair's, so the twin is held to exactly the original's checks. */
+    for (const char* base : { "ar_oneshot_2rank_exact", "ar_gather_2rank", "ar_oneshot_3rank_exact",
+                              "ar_gather_3rank" }) {
+        for (const std::string& n : { std::string(base), std::string(base) + "_host" }) {
+            if (!sel(n.c_str())) continue;
+            const bool three = std::strstr(base, "3rank") != nullptr;
+            if (!g_case) std::printf(three ? "\ncross-rank, three\n" : "\ncross-rank\n");
+            std::printf("  %s\n", n.c_str());
+            if (!std::strcmp(base, "ar_oneshot_2rank_exact")) {
+                ar_two_rank(pl, devs, n.c_str());
+                ar_two_rank_sweep(pl, devs, n.c_str());
+            } else if (!std::strcmp(base, "ar_gather_2rank")) {
+                gather_two_rank(pl, devs, n.c_str());
+            /* The wide family at three. Its own rows, so the sweep names them (a row the sweep
+             * never mentions is reported as a coverage hole) and so `--case
+             * ar_oneshot_3rank_exact` reproduces one of them alone. */
+            } else if (three && std::strstr(base, "gather")) {
+                gather_three_rank(pl, devs, n.c_str());
+            } else {
+                ar_three_rank(pl, devs, n.c_str());
+            }
+        }
     }
     /* The 4- and 8-rank rows cannot be exercised on a two-card box. Reported as skipped rather
      * than quietly passing: a row that has never been launched is not a row that works. */
+    auto skip_pair = [](const char* base, const char* why) {
+        for (const std::string& n : { std::string(base), std::string(base) + "_host" })
+            if (sel(n.c_str())) skip(n.c_str(), why);
+    };
     for (const char* n : { "ar_oneshot_4rank_exact", "ar_oneshot_8rank_exact",
                            "ar_twoshot_4rank_exact", "ar_twoshot_8rank_exact",
                            "ar_twoshot_4rank_ti8" })
-        if (sel(n)) skip(n, "needs 4 or 8 peer-accessible cards");
-    if (sel("ar_oneshot_2rank_wht6"))
-        skip("ar_oneshot_2rank_wht6", "lossy wire: needs a tolerance harness, not a smoke test");
-    if (sel("ar_ln_had_quant_i8"))
-        skip("ar_ln_had_quant_i8", "two-rank fusion: needs the same harness as the wht6 wire");
+        skip_pair(n, "needs 4 or 8 cards");
+    skip_pair("ar_oneshot_2rank_wht6", "lossy wire: needs a tolerance harness, not a smoke test");
+    skip_pair("ar_ln_had_quant_i8", "two-rank fusion: needs the same harness as the wht6 wire");
     /* Same reason, and one more: the norm half of it is rmsnorm_quant_fp8's, called through the
      * same device function, so what a single-rank harness could check here is already checked
      * there. What it cannot check without a peer -- the handshake and the reduced sum -- is what
      * the two-rank harness is for. The engine covers it end to end: a decode step issues this op
      * at every one of the 128 sites, and the generated text is compared byte for byte against a
      * build that issues the pair instead. */
-    if (sel("ar_rmsnorm_quant_fp8"))
-        skip("ar_rmsnorm_quant_fp8", "two-rank fusion: needs a peer rank");
+    skip_pair("ar_rmsnorm_quant_fp8", "two-rank fusion: needs a peer rank");
 
     dfree_all();
 }

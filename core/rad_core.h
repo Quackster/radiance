@@ -583,6 +583,9 @@ struct Request {
 
 /* ================================================================== engine config */
 
+/* --p2p: whether the collectives use the cards' peer access. */
+enum { RAD_P2P_AUTO = 0, RAD_P2P_ON = 1, RAD_P2P_OFF = 2 };
+
 struct Config {
     std::string model;                 /* path to the .rad */
     std::string radiance_home;
@@ -609,6 +612,14 @@ struct Config {
      * floor that compresses everything which benefits while leaving single-sequence decode
      * exact. */
     int64_t tp_wire_min_kb = 128;     /* --tp-wire-min-kb */
+    /* HOW THE COLLECTIVES REACH THE OTHER CARDS. Auto asks the driver, for every ordered pair of
+     * the ranks' cards, whether one can address the other's memory, and takes the P2P kernels only
+     * if every pair can. A driver can answer yes on a board where peer traffic is broken or slower
+     * than going through host memory, and that is what `off` is for: it takes the host-mailbox
+     * collectives whatever the driver says. `on` takes the P2P kernels and stops startup naming
+     * the pairs the driver refuses, rather than falling back -- a deployment that was measured on
+     * P2P should not quietly serve on something else. */
+    int   p2p = RAD_P2P_AUTO;         /* --p2p auto|on|off */
     int64_t max_tok = 8192;            /* --max-num-batched-tokens */
     int64_t max_seqs = 256;
     int64_t max_ctx = 0;               /* 0 = the model's training context */

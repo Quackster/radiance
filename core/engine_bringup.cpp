@@ -3028,9 +3028,11 @@ int Engine::start() {
     /* PEER ACCESS, MEASURED BEFORE ANYTHING IS SELECTED. A kernel that reads or writes another
      * card's memory says so with a constraint on device.p2p (rad_types.h), and the selector reads
      * it from here: on a machine where some pair of the ranks' cards cannot reach each other such a
-     * kernel is not selected, and declare names the constraint instead of the all-reduce faulting
-     * or hanging on its first message. Every ordered pair, because access is granted one way at a
-     * time. */
+     * kernel is not selected, and one that exchanges through host memory takes the op instead (or
+     * declare names the constraint) rather than the all-reduce faulting or hanging on its first
+     * message. Every ordered pair, because access is granted one way at a time. --p2p overrides the
+     * answer in one direction each way (Config::p2p): off turns it down whatever the driver says,
+     * on refuses to start without it. */
     {
         long long p2p = 1;
         std::string blocked;
@@ -3048,14 +3050,27 @@ int Engine::start() {
                     blocked += fmt("%s%d->%d", blocked.empty() ? "" : ", ", devs[i], devs[j]);
                 }
             }
+        if (cfg_.tp > 1 && cfg_.p2p == RAD_P2P_ON && !p2p) {
+            RAD_ERR("device: --p2p on, but the driver reports no peer-to-peer access between cards "
+                    "%s. IOMMU settings and the PCIe topology decide this, not radiance; --p2p auto "
+                    "serves through host memory instead", blocked.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        const bool forced_off = cfg_.p2p == RAD_P2P_OFF;
+        if (forced_off) p2p = 0;
         rad_tools_registry().set_device_fact(RAD_FACT_P2P, p2p);
         if (cfg_.tp > 1) {
             if (p2p) RAD_INFO("device: the %d cards reach each other's memory directly (peer to "
                               "peer)", cfg_.tp);
-            else RAD_WARN("device: no peer-to-peer access between cards %s. A kernel that needs "
-                          "it (device.p2p == 1) is not selected; if nothing else implements its "
-                          "op, startup stops below naming it. IOMMU settings and the PCIe "
-                          "topology decide this, not radiance", blocked.c_str());
+            else if (forced_off)
+                RAD_INFO("device: --p2p off: the collectives exchange through pinned host memory%s",
+                         blocked.empty() ? " although the driver reports peer-to-peer access"
+                                         : "");
+            else RAD_WARN("device: no peer-to-peer access between cards %s. The collectives "
+                          "exchange through pinned host memory instead, and a kernel that needs "
+                          "peer access (device.p2p == 1) is not selected; if nothing else "
+                          "implements its op, startup stops below naming it. IOMMU settings and "
+                          "the PCIe topology decide this, not radiance", blocked.c_str());
         }
     }
 

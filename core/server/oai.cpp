@@ -1456,6 +1456,12 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
         if (std::find(out->stop.begin(), out->stop.end(), s) == out->stop.end())
             out->stop.push_back(s);
 
+    /* A reply that starts inside the reasoning block: its stop strings are the answer's, so they
+     * apply only after the block's closer (Detokenizer::defer_stops_until). The chat format says
+     * whether the rendered prompt leaves the block open and what closes it. */
+    if (render.think_starts_open && !render.think_close.empty())
+        out->stops_after = render.think_close;
+
     /* Checked HERE, where the answer is still a 400. The grammar being validated may be the
      * caller's, or one the template produced for its own tool-call syntax; either way the first
      * moment it can fail is when the automaton is built, and building it on the step path would

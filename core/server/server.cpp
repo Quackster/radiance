@@ -30,6 +30,10 @@ struct Server::Generation {
     Finish      finish = Finish::None;
     bool        closed = false;      /* the server has decided this choice is over */
     size_t      scanned = 0;         /* how far the stop-string scan has reached */
+    /* OaiRequest::stops_after: where in `text` the reasoning block's closer ends (npos until it
+     * has been generated) and how far the search for it has reached. */
+    size_t      stops_floor = std::string::npos;
+    size_t      closer_scanned = 0;
     size_t      stop_cut = std::string::npos;
     size_t      emitted = 0;         /* streaming: text already handed to the delta stream */
     bool        retired = false;     /* reap() has been said for this id, at most once */
@@ -330,6 +334,7 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
                 *err = err_not_implemented("the tokenizer did not supply an incremental decoder");
                 return RAD_E_UNSUPPORTED;
             }
+            if (!r.stops_after.empty()) g.detok->defer_stops_until(r.stops_after);
 
             Request rq;
             rq.prompt = r.prompts[p].tokens;
@@ -338,7 +343,9 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
              * Offsetting is enough: the sampler's stream is seeded, not chained. */
             rq.sp.seed = r.sp.seed + (uint64_t)k;
             rq.max_tokens = r.max_tokens;
-            rq.stop = r.stop;
+            /* With the stop strings deferred past the reasoning block, the scheduler -- which
+             * cannot tell reasoning from answer -- gets none; the decoder and pump() cut. */
+            rq.stop = r.stops_after.empty() ? r.stop : std::vector<std::string>{};
             rq.ignore_eos = r.ignore_eos;
             rq.priority = r.priority;
             rq.stream = r.stream;
@@ -429,8 +436,24 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
          * string straddles token boundaries and only the detokenised text can be searched, so the
          * authoritative cut is made here. Scanning restarts (maxstop-1) bytes behind the previous
          * end so a match spanning two drains is still found. */
-        if (maxstop && g.stop_cut == std::string::npos && !g.text.empty()) {
+        /* Stop strings deferred past the reasoning block match only after its closer. The closer
+         * is searched for incrementally, from (closer length - 1) bytes behind the previous end,
+         * so a reply that thinks for a long time is not rescanned from its start every drain. */
+        size_t floor = 0;
+        if (!r.stops_after.empty()) {
+            if (g.stops_floor == std::string::npos) {
+                const size_t n = r.stops_after.size();
+                const size_t from = g.closer_scanned >= n ? g.closer_scanned - n + 1 : 0;
+                const size_t m = g.text.find(r.stops_after, from);
+                g.closer_scanned = g.text.size();
+                if (m != std::string::npos) g.stops_floor = m + n;
+            }
+            floor = g.stops_floor;
+        }
+        if (maxstop && floor != std::string::npos && g.stop_cut == std::string::npos &&
+            !g.text.empty()) {
             size_t start = g.scanned >= maxstop ? g.scanned - maxstop + 1 : 0;
+            if (start < floor) start = floor;
             for (const auto& s : r.stop) {
                 if (s.empty()) continue;
                 size_t at = g.text.find(s, start);

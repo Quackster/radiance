@@ -321,6 +321,30 @@ struct GemmOps {
     long long M, N, K;
 };
 
+/* THE MXFP4 GEMMS' ACTIVATION SCALE GRID, read off the operand rather than assumed. One f32 a row
+ * (`[M]` or `[M][1]`: a per-token quantiser) is group 0; one per (row, 128 of K) (`[M][ceil(K/128)]`:
+ * the block-scaled fp8 family's quantisers, which every fused producer in arch/common writes) is
+ * group 128, read at the operand's own row stride. Anything else is refused by shape: a grid read
+ * at the wrong width is an answer that is merely wrong. */
+static inline int mx_ascale_grid(const GemmOps& g, int* group, int* rs) {
+    const RadTensor* s = g.ascale;
+    if (!s || g.M <= 0) return R4D_NO(RAD_E_INVAL);
+    long long cols = 1, rstride = 1;
+    if (s->rank >= 2) {
+        cols    = s->shape[s->rank - 1];
+        rstride = s->stride[s->rank - 2];
+        if (s->shape[s->rank - 2] < g.M) return R4D_NO(RAD_E_SHAPE);
+    } else if (s->rank == 1) {
+        if (s->shape[0] < g.M) return R4D_NO(RAD_E_SHAPE);
+        cols = s->shape[0] / g.M;
+        rstride = cols;
+    }
+    const long long kb = (g.K + 127) / 128;
+    if (cols == 1 && (s->rank < 2 || rstride == 1)) { *group = 0; *rs = 1; return RAD_OK; }
+    if (cols == kb && rstride >= kb) { *group = 128; *rs = (int)rstride; return RAD_OK; }
+    return R4D_NO(RAD_E_SHAPE);
+}
+
 /* Common shape and layout checks. A is [M,K] row-major, C is [M,N] row-major and the weight is
  * an opaque packed blob whose element count the layout hook owns -- so the weight's SHAPE is not
  * checked here beyond being present, which is deliberate: the byte count that matters is the one

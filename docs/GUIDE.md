@@ -208,7 +208,7 @@ Three ship with the tree:
 
 | library | |
 |---|---|
-| `libr4d` | the device library: AMD RDNA4 (`gfx12xx`). Paged and dense attention, gated delta net, P2P all-reduce, skinny and tiled quantised GEMM, rotate-and-quantise fusions. Built when ROCm is present and the build targets a `gfx12` card |
+| `libr4d` | the device library: AMD RDNA4 (`gfx12xx`). Paged and dense attention, gated delta net, all-reduce over P2P or a host-memory mailbox, skinny and tiled quantised GEMM, rotate-and-quantise fusions. Built when ROCm is present and the build targets a `gfx12` card |
 | `libref` | every op naively and generically. The last-resort fallback **and** the correctness oracle `rad-kbench` measures against |
 | `libavx` | the host library: the same vocabulary in hand-written x86 SIMD, dispatched by CPU feature at load. Serves every op placed on the host, the n-gram embedding's gather among them. Built on x86-64 |
 
@@ -697,6 +697,15 @@ error that says so rather than being quietly ignored.
 
 When you measure speculation, **measure step time, not tokens per second.**
 
+A drafter with a sliding window over its own cache (DFlash2) keeps that cache outside the prefix
+cache, so a prefix hit leaves it with nothing to attend to for the cached part of the prompt, and
+it cannot draft until its window has slid past the hit. On the follow-up turn of a chat that is
+most of the reply. Such a hit is therefore ended one drafter window before the end of the prompt,
+at a checkpoint: the window is recomputed, which costs that much prefill, and the drafter drafts
+from the first token. The reply is the same either way. A hit whose nearest checkpoint below that
+point would give back more than two windows is kept whole. `radiance:draft_refills_total` counts
+the hits ended early and `radiance:draft_refill_tokens_total` the tokens they recomputed.
+
 ### 4.7 Two cards
 
 ```sh
@@ -729,13 +738,25 @@ the decode and verify steps — up to `--max-num-seqs` × (1 + `--num-speculativ
 prefill chunk, and a message that goes out on the tiered-int8 wire, runs the unfused chain, where
 the all-reduce's own size choice between one-shot and two-shot applies.
 
-**The cards must reach each other's memory directly** (peer to peer, P2P). The all-reduce
-kernels push into the other card's memory. At launch radiance asks the driver, for every pair of
-the cards it will use, whether that works, and logs the answer. When some pair cannot, those
-kernels are not selected, and startup stops naming `device.p2p` instead of the first all-reduce
-faulting or hanging. Whether P2P works is decided by the platform: the IOMMU setting, the PCIe
-topology, and whether the cards sit behind a switch that allows peer traffic. The startup line
-names the pairs that failed.
+**Cards that cannot reach each other's memory still serve.** The all-reduce kernels normally push
+into the other card's memory directly (peer to peer, P2P). At launch radiance asks the driver,
+for every pair of the cards it will use, whether that works, and logs the answer. Whether it does
+is decided by the platform: the IOMMU setting, the PCIe topology, and whether the cards sit behind
+a switch that allows peer traffic. When some pair cannot, the same kernels run with their
+exchange buffers in pinned host memory instead: every card writes its share to host RAM over its
+own link and reads the others' back the same way, and no card touches another card's VRAM. The
+startup line names the pairs that failed, and the selection report names the `_host` rows that
+took the collectives. The results are the same bytes either way; the cost is a message crossing
+two links instead of one. On two R9700s on PCIe 4.0 that cost is within run-to-run noise for
+decode, at one stream and at four, and 2–10% on a 23.6K-token prefill, because there the peer
+link is no faster than the host link. A machine whose cards reach host memory over a narrower
+link than they reach each other pays more.
+
+`--p2p` overrides the driver's answer. `off` takes the host-memory path even where the driver
+reports peer access, for a board where peer traffic is broken or slow while the driver still says
+it works. `on` takes the peer-to-peer kernels and stops at startup, naming the pairs, if the driver
+refuses any of them, so a deployment measured on P2P never quietly serves on host memory. `auto`,
+the default, trusts the driver.
 
 ### 4.8 Finished conversations: copied to host, VRAM given up on demand
 
@@ -925,6 +946,7 @@ one line naming each one the command line moved.
 | `--tp N` | 1 | tensor-parallel ranks |
 | `--tp-wire MODE` | exact | `exact` or `wht6`, the lossy wire (§4.7) |
 | `--tp-wire-min-kb N` | 128 | smallest all-reduce the lossy wire is used for |
+| `--p2p MODE` | auto | `auto` asks the driver, `on` requires peer access, `off` exchanges through host memory (§4.7) |
 
 **Speculation**
 
@@ -1399,6 +1421,7 @@ under the request's own spelling of each. `server.default_max_tokens` is `null` 
 | `decode_tokens_per_second`, `prefill_tokens_per_second` | |
 | `draft_tokens_total`, `draft_accepted_total`, `draft_acceptance_ratio` | |
 | `draft_position_reached_total`, `draft_position_acceptance_ratio` | acceptance by position, since start |
+| `draft_refills_total`, `draft_refill_tokens_total` | prefix hits ended a drafter window early, and the tokens recomputed (§4.6) |
 | `decode_rows_unspeculated_total` | rows that never drafted at all |
 | `attn_cached_tokens_total`, `linear_cached_tokens_total` | prefix reuse, both halves |
 | `linear_checkpoints_written_total`, `linear_prefix_cache_hit_rate` | |
@@ -1487,7 +1510,7 @@ released until it does.
 | KV in VRAM stays high with one session and nothing moves | The idle tiers are **off** — they are sized, and with no size nothing is copied | Pass `--prefix-cache-host-mib N` |
 | `out of memory` / `the carve reserved N of address space and the card would not back it` | Something else is holding VRAM | Check with `rocm-smi`; stop the other process. The budget is stated before allocation, so the log says what it asked for |
 | `pool allocation refused` with `backing allocation of … refused` on the second card, after the first card's pools succeeded | The VRAM budget is measured before any rank allocates. A card that refuses its weights pool lost that memory to another process in between (the line below the refusal says how much is free now). A refused `host_pool` is pinned memory: **every rank pins its own `--host-pool-mib`**, so `--tp 2` pins it twice, and the amdgpu driver caps pinned memory system-wide at `ttm.pages_limit`, half of RAM by default | Stop the other process (`rocm-smi --showpids`). For the host pool, keep `--tp` × `--host-pool-mib` under the cap the refusal names, or raise it with the kernel parameter `ttm.pages_limit` |
-| `host_pool: backing allocation of … refused: rad_dev_alloc(…): locking piece K of N`, and `failed to pin userptr` in `journalctl -k` | The IOMMU would not DMA-map one piece of the pinned host pool. Pinned host memory is locked in pieces of at most 1 GiB because an Intel VT-d host in scalable mode was seen to refuse any single pin above about 2.5 GiB; a piece failing means this machine refuses smaller pins still, or a total its IOMMU will not map | Keep IOMMU translation on: `iommu=pt` lets every pin through but on that host also removed peer access between the cards, and every multi-rank kernel requires it. Report the kernel version, the IOMMU mode and the refusal line |
+| `host_pool: backing allocation of … refused: rad_dev_alloc(…): locking piece K of N`, and `failed to pin userptr` in `journalctl -k` | The IOMMU would not DMA-map one piece of the pinned host pool. Pinned host memory is locked in pieces of at most 1 GiB because an Intel VT-d host in scalable mode was seen to refuse any single pin above about 2.5 GiB; a piece failing means this machine refuses smaller pins still, or a total its IOMMU will not map | Keep IOMMU translation on: `iommu=pt` lets every pin through but on that host also removed peer access between the cards, which moves every all-reduce onto the slower host-memory path. Report the kernel version, the IOMMU mode and the refusal line |
 | `--draft-model is not implemented` | This engine loads its drafter from the container | `rad-convert --draft-model DIR` at conversion time |
 | `context_length_exceeded` on a request | The **prompt alone** does not fit the context. `max_tokens` is clamped rather than refused, so this fires only when there is no room left to generate at all | Shorten the prompt by the number of tokens the message names, or raise `--max-model-len` if the model allows it |
 | `unknown option '--foo'` and the engine exits | Deliberate. A typo in a budget flag is the difference between the plan you asked for and one the planner invented | Check `radiance --help` |

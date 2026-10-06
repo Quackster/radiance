@@ -123,6 +123,10 @@ struct SchedMetrics {
     /* Speculation (§10). */
     int64_t draft_tokens = 0;
     int64_t draft_accepted = 0;
+    /* Prefix hits ended early so a windowed block drafter has context (Scheduler::draft_refill_),
+     * and the reusable tokens they gave back to be recomputed. */
+    int64_t draft_refills = 0;
+    int64_t draft_refill_tokens = 0;
     float   draft_acceptance = 0.0f;
     int     draft_depth = 0;          /* what the controller would choose right now */
     /* Per draft POSITION, so a cliff can be told from a decay: `reached` is how often every

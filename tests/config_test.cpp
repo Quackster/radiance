@@ -307,6 +307,22 @@ TEST(the_wire_mode_is_one_of_two_names) {
     CHECK_EQ(parse({ "--tp-wire", "EXACT" }, &c), RAD_E_INVAL);
 }
 
+TEST(the_p2p_mode_is_one_of_three_names) {
+    Config c;
+    CHECK_EQ(c.p2p, RAD_P2P_AUTO);
+    CHECK_EQ(parse({ "--p2p", "on" }, &c), RAD_OK);
+    CHECK_EQ(c.p2p, RAD_P2P_ON);
+    CHECK_EQ(parse({ "--p2p", "off" }, &c), RAD_OK);
+    CHECK_EQ(c.p2p, RAD_P2P_OFF);
+    CHECK_EQ(parse({ "--p2p", "auto" }, &c), RAD_OK);
+    CHECK_EQ(c.p2p, RAD_P2P_AUTO);
+    /* A name this build does not know stops the server: `on` exists so a deployment measured on
+     * P2P cannot quietly serve on host memory, and a typo falling through to auto would do that. */
+    CHECK_EQ(parse({ "--p2p", "yes" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--p2p", "" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--p2p", "OFF" }, &c), RAD_E_INVAL);
+}
+
 TEST(the_kv_cache_dtype_is_one_of_two_names) {
     Config c;
     CHECK_EQ(parse({ "--kv-cache-dtype", "bf16" }, &c), RAD_OK);

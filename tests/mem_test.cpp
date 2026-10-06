@@ -1141,6 +1141,59 @@ TEST(split_lookup_reuses_attention_between_checkpoints) {
     CHECK_EQ(f.pc.lookup(other, {}).n_linear_tokens, 0);
 }
 
+/* A CAPPED LOOKUP (HitCap) ends the hit at a block and the linear state at a checkpoint at or
+ * below the cap, never past it -- unless that gives back more than the cap allows, in which case
+ * the whole hit stands. The statistics count one lookup either way. */
+TEST(a_capped_lookup_lands_on_a_checkpoint_at_or_below_the_cap) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+    auto prompt = tok_run(7000, 336);
+    publish(f, 1, prompt, 320);
+    BlockHash parent;
+    std::vector<BlockHash> hs;
+    for (int b = 0; b < 21; ++b) {
+        parent = chain_block_hash(parent, prompt.data() + b * 16, 16, nullptr, 0, b * 16);
+        hs.push_back(parent);
+    }
+    int32_t s128 = -1, s256 = -1;
+    CHECK_OK(f.pc.reserve_checkpoint(1, 128, hs[128 / 16 - 1], &s128));
+    f.pc.commit_checkpoint(hs[128 / 16 - 1]);
+    CHECK_OK(f.pc.reserve_checkpoint(1, 256, hs[256 / 16 - 1], &s256));
+    f.pc.commit_checkpoint(hs[256 / 16 - 1]);
+
+    const CacheHit u = f.pc.lookup(prompt, {});
+    CHECK_EQ(u.n_attn_tokens, 320);
+    CHECK_EQ(u.n_linear_tokens, 256);
+    CHECK_EQ(u.given_back, 0);
+
+    HitCap cap;
+    cap.tokens = 250;
+    cap.max_give_back = 1000;
+    const int64_t lookups = f.pc.stats().lookups;
+    const CacheHit c = f.pc.lookup(prompt, {}, nullptr, &cap);
+    CHECK_EQ(f.pc.stats().lookups, lookups + 1);
+    CHECK_EQ(c.n_attn_tokens, 240);
+    CHECK_EQ(c.n_linear_tokens, 128);
+    CHECK_EQ(c.checkpoint_slot, s128);
+    CHECK_EQ(c.given_back, 128);              /* 256 reusable before, 128 after */
+
+    cap.tokens = 100;                         /* below every checkpoint: all 256 go back */
+    const CacheHit z = f.pc.lookup(prompt, {}, nullptr, &cap);
+    CHECK_EQ(z.n_attn_tokens, 96);
+    CHECK_EQ(z.n_linear_tokens, 0);
+    CHECK_EQ(z.checkpoint_slot, -1);
+    CHECK_EQ(z.given_back, 256);
+
+    cap.max_give_back = 255;                  /* ...which is more than this cap allows */
+    const CacheHit w = f.pc.lookup(prompt, {}, nullptr, &cap);
+    CHECK_EQ(w.n_attn_tokens, 320);
+    CHECK_EQ(w.n_linear_tokens, 256);
+    CHECK_EQ(w.given_back, 0);
+
+    cap.tokens = 100000;                      /* a cap above the hit changes nothing */
+    CHECK_EQ(f.pc.lookup(prompt, {}, nullptr, &cap).n_attn_tokens, 320);
+}
+
 /* The chained block hashes of `tokens`, one a block, as the cache computes them. */
 static std::vector<BlockHash> chain_of(const std::vector<int32_t>& tokens, int bs) {
     std::vector<BlockHash> hs;

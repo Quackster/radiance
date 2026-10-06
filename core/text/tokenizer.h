@@ -247,6 +247,19 @@ public:
     bool               stopped() const { return stopped_; }
     const std::string& stop_hit() const { return stop_hit_; }
 
+    /* STOP STRINGS ARE THE ANSWER'S, NOT THE REASONING'S. A generation that starts inside its
+     * reasoning block is matched against its stop strings only after `marker` -- the block's
+     * closer -- has been generated, and only in the text after it. Otherwise a stop string the
+     * model happens to write while thinking ends the request with the reasoning cut short and no
+     * answer at all: a few-shot harness that stops on "Q:" loses every reply whose reasoning
+     * restates the question. "" = match from the first token, the behaviour of every request that
+     * does not start in a block. */
+    void defer_stops_until(std::string marker) {
+        arm_after_ = std::move(marker);
+        armed_ = arm_after_.empty();
+        arm_scanned_ = 0;
+    }
+
     /* Everything pushed so far, stop string included. The scheduler wants this to decide whether
      * a request finished on a stop or on a length limit. */
     const std::string& text() const { return all_; }
@@ -264,6 +277,9 @@ private:
     std::string stop_hit_;
     size_t      max_stop_ = 0;
     bool        first_ = true;
+    std::string arm_after_;        /* see defer_stops_until */
+    bool        armed_ = true;
+    size_t      arm_scanned_ = 0;  /* how far into all_ the search for arm_after_ has reached */
     Tokenizer   tok_;              /* over v_, set up by the first push */
     bool        tok_ready_ = false;
 

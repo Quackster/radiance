@@ -681,6 +681,15 @@ struct LinearFP8 {
      * GEMM. Read off the weight's encoding like `bf16`. */
     bool       i8 = false;
     rad_op     op_q = 0;
+    /* AN OCP-MXFP4 WEIGHT, read by `gemm_nt_q` at dtype mxfp4a8 against the SAME E4M3 pair every
+     * other linear here reads (`a.q`, `a.s` at an f32 scale per (row, 128)): e2m1 codes and one
+     * E8M0 exponent per 32 of K, as libquant writes `codes=fp4_e2m1 group=32 scale=e8m0`. libr4d
+     * folds each block's exponent into the e4m3 operand against a per-row reference, so the scale
+     * plane is handed over TWICE: as `b_scale` and as `b_ref`, whose layout hook reduces the same
+     * plane to that reference -- `wref` is the second view. The activation grid is the fp8 family's, so every producer's fused quantiser
+     * feeds an MXFP4 linear unchanged. Read off the weight's encoding like `bf16` and `i8`. */
+    bool       mx = false;
+    rad_weight wref = 0;
     /* What probe() read: the weight is int8. Lets a model learn its trunk's format from one linear
      * before it declares the activation buffers that format decides (ActFP8::declare_qs's `i8`). */
     bool       probed_i8 = false;
@@ -776,6 +785,16 @@ inline bool linear_is_w8(const RadEncoding& e) {
     const RadEncPlane* sc = rad_enc_plane(&e, "scale");
     return e.plane[0].dtype == RAD_I8 && e.plane[0].block[1] == 1 && sc && sc->dtype == RAD_BF16 &&
            sc->block[0] == 1 && sc->block[1] == RAD_FP8_BLOCK;
+}
+
+/* The OCP-MXFP4 weight LinearFP8 serves at mxfp4a8: e2m1 codes one a value and an E8M0 exponent
+ * per [1 x 32], no transform -- what libr4d's MXFP4 layout hook accepts. */
+enum { RAD_MX_GROUP = 32 };
+inline bool linear_is_mxfp4(const RadEncoding& e) {
+    if (!rad_enc_is(&e, "affine") || e.n_planes != 2 || e.transform[0]) return false;
+    const RadEncPlane* sc = rad_enc_plane(&e, "scale");
+    return e.plane[0].dtype == RAD_FP4E2M1 && e.plane[0].block[1] == 1 && sc &&
+           sc->dtype == RAD_E8M0 && sc->block[0] == 1 && sc->block[1] == RAD_MX_GROUP;
 }
 
 inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char* base,
@@ -918,6 +937,67 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         return RAD_E_DTYPE;
     }
 
+    /* ---- AN OCP-MXFP4 WEIGHT over the E4M3 pair. Three views of one stored weight: the codes,
+     * the exponent plane as `b_scale`, and the same plane again as `b_ref`. Every view takes the
+     * weight's row parts as they are -- the exponent grid is one row tall -- and a column slice in
+     * whole 128s, which is the ACTIVATION's scale block and so the stricter of the two. */
+    mx = known && linear_is_mxfp4(enc);
+    if (mx) {
+        if (!a.q || !a.s) {
+            fprintf(stderr, "radiance: '%s' is an MXFP4 weight read against its input's E4M3 "
+                            "pair, and its input has none\n", wn);
+            return RAD_E_DTYPE;
+        }
+        if (N % 16 || K % RAD_FP8_BLOCK) {
+            fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; an MXFP4 weight takes rows in "
+                            "16s and K in whole %d-column activation scale blocks.\n",
+                    base, (long long)N, (long long)K, RAD_FP8_BLOCK);
+            return RAD_E_INVAL;
+        }
+        int64_t parts[RAD_MAX_ROW_PARTS] = {0};
+        int     np = 0;
+        for (int64_t p : row_parts) {
+            if (np >= RAD_MAX_ROW_PARTS) return RAD_E_INVAL;
+            if (p % 16) {
+                fprintf(stderr, "radiance: '%s' stacks a %lld-row part, which is not a whole "
+                                "number of 16-row MXFP4 tiles; it cannot be row-sharded.\n",
+                        base, (long long)p);
+                return RAD_E_INVAL;
+            }
+            parts[np++] = p;
+        }
+        const char* sn = nm.f("%s.scale", base);
+        const char* rn = nm.f("%s.ref", base);
+        w    = decl_view(b, wn, nullptr, "codes", RAD_FP4E2M1, { N, K }, RAD_ACCESS_PER_TOKEN,
+                         shard, grp, parts, np);
+        ws   = decl_view(b, sn, wn, "scale", RAD_E8M0, { N, K / RAD_MX_GROUP },
+                         RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
+        wref = decl_view(b, rn, wn, "scale", RAD_E8M0, { N, K / RAD_MX_GROUP },
+                         RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
+        if (!w || !ws || !wref) return RAD_E_INVAL;
+        if (span_hi > 0) {
+            const bool col = shard == RAD_SHARD_COL;
+            if (col && (span_lo % RAD_FP8_BLOCK || span_hi % RAD_FP8_BLOCK)) {
+                fprintf(stderr, "radiance: '%s' is sliced [%lld, %lld) on this rank, which cuts a "
+                                "%d-column activation scale block.\n", base, (long long)span_lo,
+                        (long long)span_hi, RAD_FP8_BLOCK);
+                return RAD_E_INVAL;
+            }
+            const int64_t lo = col ? span_lo / RAD_MX_GROUP : span_lo;
+            const int64_t hi = col ? span_hi / RAD_MX_GROUP : span_hi;
+            RAD_ARCH_TRY(rad_weight_shard_span(b, w, span_lo, span_hi));
+            RAD_ARCH_TRY(rad_weight_shard_span(b, ws, lo, hi));
+            RAD_ARCH_TRY(rad_weight_shard_span(b, wref, lo, hi));
+        }
+        const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
+        op = rw(b, RAD_OP(b, "gemm_nt_q",
+                   RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                              RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8")),
+                   RAD_WEIGHTS(w, ws, wref)),
+               { a.q, a.s }, { y });
+        return op ? RAD_OK : RAD_E_INVAL;
+    }
+
     /* The one geometric precondition, checked here so it is reported once per weight with the
      * weight named rather than as a kernel miss with a band in it. These are PER-RANK extents, so
      * this is also the check that a tensor-parallel width does not cut a scale block in half. */
@@ -1014,6 +1094,12 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
         RAD_ISSUE_N(c, op, rows, brow_slice(a.q8, r0, rows, K),
                     brow_slice(a.s8, r0, rows, K / RAD_FP8_BLOCK),
                     RAD_W(w), RAD_W(ws), brow_slice(y, r0, rows, N), RAD_NONE, RAD_NONE);
+        return;
+    }
+    if (mx) {
+        RAD_ISSUE_N(c, op, rows, brow_slice(a.q, r0, rows, K),
+                    brow_slice(a.s, r0, rows, K / RAD_FP8_BLOCK),
+                    RAD_W(w), RAD_W(ws), brow_slice(y, r0, rows, N), RAD_NONE, RAD_W(wref));
         return;
     }
     if (op_m1 && rows <= mv_rows)

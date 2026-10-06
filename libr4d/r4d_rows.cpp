@@ -34,6 +34,8 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #define ROW(a) (a), (int)(sizeof(a) / sizeof((a)[0]))
 #define NELEM(a) ((int)(sizeof(a) / sizeof((a)[0])))
@@ -2931,6 +2933,18 @@ static const RadConstraint cGemmNtW8A8[] = {
 static const RadConstraint cGemmW4A8Tiled[] = {
     C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 256), C_IN("dtype", "w4a8 w4a8_asym"),
 };
+/* r4d_gemm_mxfp4a8_decode. Entry point: M <= 128, N % 16, K % 64, and N up to its counter block's
+ * 36864. Above the skinny row by priority, so it takes the decode band; the skinny row keeps the
+ * wider N up to M = 64, the tiled row everything else. */
+static const RadConstraint cGemmMxfp4A8Decode[] = {
+    C_LE("M", 128), C_LE("N", 36864), C_DIV("K", 64), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
+};
+/* r4d_gemm_mxfp4a8_tiled. Entry point: N % 16 (the fragment-order weight), K % 64 (its narrowest
+ * K slab), M >= 1. The decode and skinny rows outrank it in their bands by priority, so the band
+ * starts at 1 rather than at a hand-picked crossover. */
+static const RadConstraint cGemmMxfp4A8Tiled[] = {
+    C_GE("M", 1), C_DIV("K", 64), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
+};
 /* r4d_gemm_w8a8_tiled. The same kernel at radix 8; the asym arm exists in the .hip but is NOT
  * declared in r4d.h, so this plugin cannot reach it and `w8a8_asym` is deliberately absent from
  * the dtype set. */
@@ -3048,6 +3062,25 @@ static const int64_t kPrefillArms[] = { 0, 2, 3, 5, 6, 8, 9, 10, 13, 14, 27, 28,
 static const RadTunable tGemmPrefill[] = {
   { "tile", kPrefillArms, NELEM(kPrefillArms), 0,
     "compiled tile arm; 0 is BM 128 x BN 256, libr4d's own default" },
+};
+
+/* The MXFP4 tiled GEMM's one axis. Both values are compiled arms of one template; 0 is the M
+ * crossover (TN=4 from M >= 2048), which needs M and so cannot be a constant. */
+static const int64_t kMxTn[] = { 0, 2, 4 };
+static const RadTunable tGemmMxfp4Tiled[] = {
+  { "tn", kMxTn, NELEM(kMxTn), 0,
+    "16-column fragments per wave: 2 = 256x64 block, 4 = 256x128. 0 = TN 4 from M >= 2048" },
+};
+
+/* The MXFP4 decode GEMM's axes. 0 on each is the kernel's own rule (r4d_gemm_mxfp4a8_decode.hip);
+ * `nt` 1 streams the weight past the caches, 2 loads it plainly. */
+static const int64_t kMxDecKs[] = { 0, 1, 2, 4, 8, 16 };
+static const int64_t kMxDecBk[] = { 0, 64, 128 };
+static const int64_t kMxDecNt[] = { 0, 1, 2 };
+static const RadTunable tGemmMxfp4Decode[] = {
+  { "ks", kMxDecKs, NELEM(kMxDecKs), 0, "split-K workgroups a column block. 0 = the fill rule" },
+  { "bk", kMxDecBk, NELEM(kMxDecBk), 0, "K slab in bytes. 0 = 128, or 64 for a wide unsplit DTM 4" },
+  { "nt", kMxDecNt, NELEM(kMxDecNt), 0, "weight loads: 1 non-temporal, 2 plain. 0 = by weight size" },
 };
 
 /* ------------------------------------------------------------------------ split-KV attention
@@ -4327,6 +4360,32 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_gemm_mxfp4a8_m64, nullptr, r4d_rad_layout_mxfp4,
   r4d_rad_relayout_mxfp4 },
 
+{ "gemm_mxfp4a8_decode", "gemm_nt_q", "gemm",
+  "the OCP-MXFP4 GEMM for the DECODE band: split-K across workgroups with a fused last-arriver "
+  "reduction, the weight unpacked through LDS, streaming weight loads",
+  "M <= 128; N a multiple of 16; K a multiple of 64; the skinny kernel's fragment-order weight, "
+  "[K/32][N] E8M0 exponents and per-row reference exponent; the split partial in the op's scratch",
+  "e4m3 A with an f32 scale per row or per (row, 128), e2m1 W with an E8M0 scale per 32 K folded "
+  "into the element against a per-row reference, bf16 C, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_MXDEC,
+  ROW(cGemmMxfp4A8Decode), ROW(tGemmMxfp4Decode), nullptr,
+  nullptr, nullptr, r4d_rad_gemm_mxfp4a8_decode, r4d_rad_gemm_mxfp4a8_decode_scratch,
+  r4d_rad_layout_mxfp4, r4d_rad_relayout_mxfp4 },
+
+{ "gemm_mxfp4a8_tiled", "gemm_nt_q", "gemm",
+  "the OCP-MXFP4 GEMM tiled for PREFILL row counts: the activation re-tiled into fragment order in "
+  "the op's scratch, its fragments read straight into registers, the weight unpacked once per K "
+  "slab into LDS for a 256-row block",
+  "any M; N a multiple of 16; K a multiple of 64; the skinny kernel's fragment-order weight, "
+  "[K/32][N] E8M0 exponents and per-row reference exponent; the re-tiled activation in the op's "
+  "scratch",
+  "e4m3 A with an f32 scale per row or per (row, 128), e2m1 W with an E8M0 scale per 32 K folded "
+  "into the element against a per-row reference, bf16 C, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_TILED,
+  ROW(cGemmMxfp4A8Tiled), ROW(tGemmMxfp4Tiled), nullptr,
+  nullptr, nullptr, r4d_rad_gemm_mxfp4a8_tiled, r4d_rad_gemm_mxfp4a8_tiled_scratch,
+  r4d_rad_layout_mxfp4, r4d_rad_relayout_mxfp4 },
+
 /* BAND READ OFF THE ENTRY POINT'S OWN REJECTION TESTS. */
 { "gemm_w4a8_prefill", "gemm_nt_q", "gemm",
   "the 4-bit GEMM for PREFILL row counts, where the matrix pipe rather than the weight stream is "
@@ -5075,8 +5134,9 @@ static const RadPluginInfo kInfo = {
     RAD_PLUGIN_KERNEL,
     "libr4d",
     "0.5.0",
-    "the RDNA4 (gfx1201) kernel library: paged and dense attention, gated delta net, P2P "
-    "all-reduce, skinny and tiled quantised GEMM, and the rotate-and-quantise fusions",
+    "the RDNA4 (gfx1201) kernel library: paged and dense attention, gated delta net, "
+    "all-reduce over P2P or a host-memory mailbox, skinny and tiled quantised GEMM, and the "
+    "rotate-and-quantise fusions",
     "gfx1201",
 };
 
@@ -5090,12 +5150,91 @@ extern "C" const RadOpSchema* rad_kernel_schema_at(int i) {
     if (i < 0 || i >= rad_kernel_schema_count()) return nullptr;
     return &kSchemas[i];
 }
+/* ================================================================================ the host twins
+ *
+ * A MACHINE WITHOUT PEER ACCESS RUNS THE SAME COLLECTIVES WITH THEIR MAILBOX IN HOST MEMORY. Every
+ * row that takes one of the three all-reduce inits has a twin: the same op, kernel, launch, fini,
+ * priority and tuning axes, `_host` appended to its name, its device.p2p == 1 turned into
+ * device.p2p == 0, and the init that puts every rank's exchange buffers in pinned host memory
+ * (r4d_ar_entry.hip, build). Exactly one of a pair matches any machine, so neither outranks the
+ * other, and a band report names which transport the step runs.
+ *
+ * DERIVED, NOT WRITTEN OUT, so a collective row added to the table above has its twin by being
+ * added and the two cannot drift: the transport is the only thing they differ in. A collective row
+ * that does not require device.p2p == 1 gets no twin, and r4d_selftest fails it for the missing
+ * constraint. */
+namespace {
+
+struct HostTwin {
+    RadKernelInfo              info;
+    std::string                name, computes, shape;
+    std::vector<RadConstraint> c;
+};
+
+RadInitFn host_init_for(RadInitFn f) {
+    if (f == r4d_rad_ar_init)         return r4d_rad_ar_host_init;
+    if (f == r4d_rad_ar_ln_init)      return r4d_rad_ar_ln_host_init;
+    if (f == r4d_rad_ar_hc_wide_init) return r4d_rad_ar_hc_wide_host_init;
+    return nullptr;
+}
+
+std::string replaced(std::string s, const char* from, const char* to) {
+    const size_t at = s.find(from);
+    if (at != std::string::npos) s.replace(at, std::strlen(from), to);
+    return s;
+}
+
+const std::vector<HostTwin>& host_twins() {
+    static const std::vector<HostTwin> v = [] {
+        std::vector<HostTwin> t;
+        for (const RadKernelInfo& k : kKernels) {
+            const RadInitFn init = host_init_for(k.init);
+            if (!init) continue;
+            HostTwin h;
+            h.c.assign(k.constraints, k.constraints + k.n_constraints);
+            int p2p = 0;
+            for (RadConstraint& c : h.c)
+                if (!std::strcmp(c.key, RAD_FACT_P2P) && c.op == RAD_C_EQ && c.ival == 1) {
+                    c.ival = 0;
+                    ++p2p;
+                }
+            if (p2p != 1) continue;
+            h.info = k;
+            h.info.init = init;
+            h.name = std::string(k.name) + "_host";
+            h.computes = k.computes;
+            if (h.computes.find("over P2P IPC scratch") != std::string::npos)
+                h.computes = replaced(h.computes, "over P2P IPC scratch",
+                                      "through a pinned host-memory mailbox");
+            else
+                h.computes += ", exchanged through a pinned host-memory mailbox";
+            h.shape = replaced(replaced(k.shape, "all peer-accessible", "no peer access needed"),
+                               "peer-accessible", "no peer access needed");
+            t.push_back(std::move(h));
+        }
+        /* The strings are pointed into only once the vector has stopped growing. */
+        for (HostTwin& h : t) {
+            h.info.name          = h.name.c_str();
+            h.info.computes      = h.computes.c_str();
+            h.info.shape         = h.shape.c_str();
+            h.info.constraints   = h.c.data();
+            h.info.n_constraints = (int)h.c.size();
+        }
+        return t;
+    }();
+    return v;
+}
+
+}  /* namespace */
+
 extern "C" int rad_kernel_count(void) {
-    return (int)(sizeof(kKernels) / sizeof(kKernels[0]));
+    return (int)(sizeof(kKernels) / sizeof(kKernels[0])) + (int)host_twins().size();
 }
 extern "C" const RadKernelInfo* rad_kernel_at(int i) {
+    const int base = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
     if (i < 0 || i >= rad_kernel_count()) return nullptr;
-    return &kKernels[i];
+    if (i < base) return &kKernels[i];
+    return &host_twins()[(size_t)(i - base)].info;
 }
 
 /* WHICH ROWS TOUCH NOTHING BUT THEIR OPERANDS AND SCRATCH (rad_abi.h). Nothing on an R4D launch
@@ -5108,11 +5247,13 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
  *   gemm_w8a8_tiled
  *   every collective    the peer flags and exchange buffers the all-reduces own
  *
- * gemm_fp8a8_nt_m16's finisher counters are keyed on the stream AND the output, and
+ * gemm_fp8a8_nt_m16's finisher counters are keyed on the stream AND the output;
+ * gemm_mxfp4a8_decode's split partial is the op's scratch and its arrival counters are keyed on the
+ * output alone, so no argument depends on the stream a pass is recorded or replayed on; and
  * router_gemm_topk_scatter_bf16's arrival counter is its op instance's (taken at init, one a
- * declared op and band), so two launches that could run at once never share them, and both rows
- * are concurrent. A row added with state of its own that the stream's order protects belongs in
- * this list. */
+ * declared op and band). Two launches that could run at once never share any of them, so all three
+ * rows are concurrent. A row added with state of its own that the stream's order protects belongs
+ * in this list. */
 extern "C" int rad_kernel_concurrent(int i) {
     const RadKernelInfo* k = rad_kernel_at(i);
     if (!k) return 0;
@@ -5186,6 +5327,14 @@ extern "C" void r4d_cfg_tiled(const RadArgs* a, R4dTileCfg* out) {
 }
 extern "C" void r4d_cfg_prefill(const RadArgs* a, R4dTileCfg* out) {
     tile_bmbn(TUNE(a, tGemmPrefill, "tile"), 1, out);
+}
+extern "C" void r4d_cfg_mxfp4_decode(const RadArgs* a, R4dMxDecCfg* out) {
+    out->ks = TUNE(a, tGemmMxfp4Decode, "ks");
+    out->bk = TUNE(a, tGemmMxfp4Decode, "bk");
+    out->nt = TUNE(a, tGemmMxfp4Decode, "nt");
+}
+extern "C" void r4d_cfg_mxfp4_tiled(const RadArgs* a, R4dMxTileCfg* out) {
+    out->tn = TUNE(a, tGemmMxfp4Tiled, "tn");
 }
 extern "C" void r4d_cfg_split(const RadArgs* a, R4dSplitCfg* out) {
     out->splits = TUNE(a, tAttnSplit, "splits");

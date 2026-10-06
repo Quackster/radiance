@@ -160,6 +160,9 @@ void Metrics::sample(const SchedMetrics& m) {
     c_decode_tokens_.inc(std::max(0.0, (double)m.decode_tokens - c_decode_tokens_.get()));
     c_draft_tokens_.inc(std::max(0.0, (double)m.draft_tokens - c_draft_tokens_.get()));
     c_draft_accepted_.inc(std::max(0.0, (double)m.draft_accepted - c_draft_accepted_.get()));
+    c_draft_refills_.inc(std::max(0.0, (double)m.draft_refills - c_draft_refills_.get()));
+    c_draft_refill_tokens_.inc(
+        std::max(0.0, (double)m.draft_refill_tokens - c_draft_refill_tokens_.get()));
     c_attn_cached_.inc(std::max(0.0, (double)m.attn_cached_tokens - c_attn_cached_.get()));
     c_linear_cached_.inc(std::max(0.0, (double)m.linear_cached_tokens - c_linear_cached_.get()));
     c_checkpoints_.inc(std::max(0.0, (double)m.checkpoints_written - c_checkpoints_.get()));
@@ -345,6 +348,12 @@ std::string Metrics::render() const {
     w.counter("radiance:draft_accepted_total",
               "Speculative tokens accepted; the pair the acceptance ratio is computed from.",
               L, c_draft_accepted_.get());
+    w.counter("radiance:draft_refills_total",
+              "Prefix hits ended a drafter window early so a windowed block drafter has context.",
+              L, c_draft_refills_.get());
+    w.counter("radiance:draft_refill_tokens_total",
+              "Cached prompt tokens those hits gave back to be recomputed.",
+              L, c_draft_refill_tokens_.get());
 
     /* PREFIX CACHING, DECOUPLED (spec §7.3). vllm:gpu_prefix_cache_hit_rate is the ATTENTION one,
      * because that is what vLLM's single number has always meant. The linear side hits at a

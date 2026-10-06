@@ -102,6 +102,9 @@ struct SchedMetrics {
     /* The exact pair the ratio is computed from, for the same reason. */
     int64_t draft_tokens = 0;
     int64_t draft_accepted = 0;
+    /* Prefix hits ended early for a windowed block drafter, and the tokens they gave back. */
+    int64_t draft_refills = 0;
+    int64_t draft_refill_tokens = 0;
     /* THE PER-POSITION DRAFT HAZARD. `draft_acceptance` above is pooled over the whole window and
      * cannot distinguish a drafter that decays with depth from one whose later rounds are broken:
      * both read as one small number. These carry the conditional rate at each position -- of the
@@ -299,6 +302,9 @@ public:
      * search text that can no longer contain what it is searching for, and the generation would
      * run to max_tokens. Default false, for a decoder that leaves stop handling to us. */
     virtual bool stopped() const { return false; }
+    /* Match the stop strings only after `marker` has been generated (core/text Detokenizer::
+     * defer_stops_until): the reply starts inside its reasoning block. */
+    virtual void defer_stops_until(const std::string& /*marker*/) {}
 };
 
 class ITokenizer {

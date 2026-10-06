@@ -359,14 +359,35 @@ struct FakePC : IPrefixCache {
     }
 
     mutable int64_t lookups = 0;
-    CacheHit lookup(const Request&, std::vector<std::vector<int32_t>>* out) const override {
+    /* A cap (HitCap) as prefix.cpp applies one: attention ends at a block at or below it, the
+     * linear state at the deepest checkpoint under that -- checkpoints at multiples of `interval`,
+     * none below `ckpt_lo` -- and the whole hit stands if that gives back too much. */
+    int64_t ckpt_lo = 0;
+    CacheHit lookup(const Request&, std::vector<std::vector<int32_t>>* out,
+                    const HitCap* cap) const override {
         ++lookups;
         if (out) {
             out->resize(groups.size());
             for (size_t i = 0; i < groups.size() && i < seeded.size(); ++i)
                 (*out)[i] = seeded[i];
         }
-        return CacheHit{ attn, lin, src };
+        CacheHit h{ attn, lin, src };
+        const int64_t whole = src >= 0 ? lin : 0;
+        if (cap && attn > cap->tokens / 16 * 16 && whole > cap->tokens) {
+            const int64_t a = cap->tokens / 16 * 16;
+            int64_t l = std::min<int64_t>(lin, a) / interval * interval;
+            if (l < ckpt_lo) l = 0;
+            if (whole - l <= cap->max_give_back) {
+                h.n_attn_tokens = (int32_t)a;
+                h.n_linear_tokens = (int32_t)l;
+                h.checkpoint_slot = l > 0 ? src : -1;
+                h.given_back = (int32_t)(whole - l);
+                if (out)
+                    for (auto& b : *out)
+                        if ((int64_t)b.size() > a / 16) b.resize((size_t)(a / 16));
+            }
+        }
+        return h;
     }
     const std::vector<int32_t>& cached_groups() const override { return groups; }
 
@@ -462,7 +483,8 @@ struct Fixture {
 
     ~Fixture() { sch.fini(); for (void* p : owned) std::free(p); }
 
-    void build(int64_t blocks = 4096, int64_t states = 64, int64_t max_tok = 512) {
+    void build(int64_t blocks = 4096, int64_t states = 64, int64_t max_tok = 512,
+               int64_t max_ctx = 4096) {
         g_gdn_ki = RadKernelInfo{};
         g_gdn_ki.name = "gdn_fake";
         g_gdn_ki.op = "gdn_chunked";
@@ -513,7 +535,7 @@ struct Fixture {
 
         cfg.max_tok = max_tok;
         cfg.max_seqs = 32;
-        cfg.max_ctx = 4096;
+        cfg.max_ctx = max_ctx;
         cfg.checkpoint_interval = 256;
         cfg.prefix_cache = true;
         /* `Config::n_spec` defaults to -1, which is `auto`: a REQUEST that engine_bringup resolves
@@ -1208,14 +1230,88 @@ TEST(a_prefix_hit_does_not_stop_a_full_attention_drafter) {
      * wrote: there is no hole and the floor is 0. Taking the floor to be the hit position
      * instead stops a windowless drafter from ever drafting again after a hit.
      *
-     * THE OTHER SIDE -- a drafter whose group the cache SKIPS must still decline -- is not
-     * testable here: giving the fixture a second paged group the FakePC does not index makes
-     * its lookup hand back a block list that does not cover it, so the hit is refused and
-     * ctx_len is 0 either way. That case needs a windowed drafter over a cache that leaves a
-     * hole, which this fixture cannot construct. */
+     * THE OTHER SIDE -- a windowed drafter whose group the cache SKIPS, so a hit leaves a hole
+     * -- is the draft-refill cases below. */
     Scheduler::BlockRow rows[4];
     CHECK_EQ(f.sch.block_begin(/*block=*/8, /*depth=*/7, /*window=*/0, /*mask=*/99, rows, 4), 1);
     CHECK_EQ((int)rows[0].seq, (int)a);
+}
+
+/* ====================================== a prefix hit and a windowed block drafter (draft refill)
+ * The drafter's own windowed KV group is not prefix-cached, so a hit leaves it without K and V for
+ * the cached tokens, and block_begin declines the sequence until the window has slid past the hole.
+ * The scheduler ends such a hit one drafter window before the end of the prompt, at a checkpoint,
+ * so the recompute covers the window and the drafter drafts from the first decode step. */
+namespace {
+struct RefillRun {
+    int64_t n_after_first = 0;     /* n_computed after the admitting step */
+    int rows = -1;                 /* drafting rows block_begin offers at the first decode step */
+    SchedMetrics m;
+};
+RefillRun refill_run(int n_prompt, int32_t seeded, int64_t ckpt_lo = 0) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192);
+    f.cfg.n_spec = 7;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    f.prog.drafter.window = 512;
+    KVGroupInfo w;                 /* the drafter's own group: paged, windowed, not prefix-cached */
+    w.name = "draft";
+    w.decl.kind = RAD_KV_WINDOW;
+    w.decl.window = 512;
+    w.block_size = 16;
+    f.prog.kv_groups.push_back(w);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.pc.groups = { 0 };
+    f.pc.ckpt_lo = ckpt_lo;
+    CHECK_OK(f.start());
+    if (seeded > 0) { f.pc.seed(seeded); f.pc.lin = seeded; f.pc.src = 3; }
+    RefillRun r;
+    const uint64_t a = f.submit(n_prompt, 64);
+    Scheduler::BlockRow rows[4];
+    for (int st = 0; st < 40; ++st) {
+        CHECK(f.sch.step() != nullptr);
+        if (st == 0) r.n_after_first = f.sch.find(a)->n_computed;
+        f.commit_plain(11);
+        const int n = f.sch.block_begin(8, 7, 512, 99, rows, 4);
+        f.sch.block_end();
+        if (!f.sch.find(a)->output.empty()) { r.rows = n; break; }
+    }
+    r.m = f.sch.metrics();
+    return r;
+}
+}  /* namespace */
+
+TEST(a_prefix_hit_ends_a_drafter_window_before_the_prompt_and_the_drafter_drafts_at_once) {
+    const RefillRun r = refill_run(/*prompt=*/1100, /*seeded=*/1024);
+    /* The cap is 1100 - 512 = 588: attention 576, and the checkpoint under it 512. */
+    CHECK_EQ(r.n_after_first, 512);
+    CHECK_EQ(r.rows, 1);
+    CHECK_EQ(r.m.draft_refills, (int64_t)1);
+    CHECK_EQ(r.m.draft_refill_tokens, (int64_t)512);
+    CHECK_EQ(r.m.linear_cached_tokens, (int64_t)512);    /* what was actually skipped */
+}
+
+TEST(a_prefix_hit_already_a_window_back_is_kept_whole) {
+    /* 5000 - 512 is past the 1024-token hit: the drafter's window is recomputed anyway. */
+    const RefillRun r = refill_run(5000, 1024);
+    CHECK_EQ(r.n_after_first, 1024);
+    CHECK_EQ(r.m.draft_refills, (int64_t)0);
+    CHECK_EQ(r.rows, 1);
+}
+
+TEST(a_prefix_hit_with_no_checkpoint_near_the_cap_is_kept_whole) {
+    /* No checkpoint below 2048: the cap would give back all 2048 tokens, more than two windows,
+     * so the whole hit stands and the drafter waits for its window as it would without a cap. */
+    const RefillRun r = refill_run(2200, 2048, /*ckpt_lo=*/2048);
+    CHECK_EQ(r.m.draft_refills, (int64_t)0);
+    CHECK_EQ(r.m.linear_cached_tokens, (int64_t)2048);
+    CHECK_EQ(r.rows, 0);
+}
+
+TEST(no_prefix_hit_gives_nothing_back) {
+    const RefillRun r = refill_run(1100, 0);
+    CHECK_EQ(r.m.draft_refills, (int64_t)0);
+    CHECK_EQ(r.rows, 1);
 }
 
 /* ================================================================== speculation */

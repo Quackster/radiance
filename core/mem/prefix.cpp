@@ -224,7 +224,8 @@ void PrefixCache::touch(const BlockHash& h) const {
 
 CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
                              const std::vector<MMContentKey>& mm,
-                             std::vector<std::vector<int32_t>>* blocks_out) const {
+                             std::vector<std::vector<int32_t>>* blocks_out,
+                             const HitCap* cap) const {
     CacheHit hit;
     if (blocks_out) { blocks_out->assign(groups_.size(), {}); }
     if (!enabled_ || tokens.empty()) return hit;
@@ -261,6 +262,43 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
      * forward pass. */
     if (matched * block_size_ >= (int64_t)tokens.size() && matched > 0) --matched;
 
+    /* OVER THE SNAPSHOTS, NOT OVER THE POSITIONS. A checkpoint sits on the interval or at the
+     * tail of a prompt (Scheduler::plan_chunk), which is any block boundary, so the deepest one
+     * at or below `limit` is found by asking each snapshot whether this chain passes through it:
+     * its key is the chained hash at its own position, which matches only on the same prefix. The
+     * index holds a few hundred snapshots against tens of thousands of block positions. */
+    auto deepest = [&](int64_t limit) {
+        auto best = ck_by_prefix_.end();
+        for (auto it = ck_by_prefix_.begin(); it != ck_by_prefix_.end(); ++it) {
+            const Ckpt& c = it->second;
+            if (!c.valid || c.detached || c.slot < 0 || c.pos <= 0 || c.pos > limit ||
+                c.pos % block_size_ != 0)
+                continue;
+            if (best != ck_by_prefix_.end() && c.pos <= best->second.pos) continue;
+            if (hs[(size_t)(c.pos / block_size_ - 1)] != it->first) continue;
+            best = it;
+        }
+        return best;
+    };
+    /* What a hit of `m` blocks lets a sequence skip: all of it, or with recurrent state only up
+     * to the deepest checkpoint under it (Scheduler::admit_one resumes there). */
+    auto reusable = [&](int64_t m) -> int64_t {
+        if (!has_linear_) return m * block_size_;
+        const auto b = deepest(m * block_size_);
+        return b == ck_by_prefix_.end() ? 0 : b->second.pos;
+    };
+    if (cap && matched > cap->tokens / block_size_) {
+        const int64_t whole = reusable(matched);
+        if (whole > cap->tokens) {
+            const int64_t m = cap->tokens > 0 ? cap->tokens / block_size_ : 0;
+            const int64_t lost = whole - reusable(m);
+            if (lost <= cap->max_give_back) {
+                matched = m;
+                hit.given_back = (int32_t)lost;
+            }
+        }
+    }
+
     for (int64_t b = 0; b < matched; ++b) {
         touch(hs[(size_t)b]);
         if (!blocks_out) continue;
@@ -287,21 +325,7 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
         hit.n_linear_tokens = hit.n_attn_tokens;
         return hit;
     }
-    /* OVER THE SNAPSHOTS, NOT OVER THE POSITIONS. A checkpoint sits on the interval or at the
-     * tail of a prompt (Scheduler::plan_chunk), which is any block boundary, so the deepest one
-     * under the hit is found by asking each snapshot whether this chain passes through it: its
-     * key is the chained hash at its own position, which matches only on the same prefix. The
-     * index holds a few hundred snapshots against tens of thousands of block positions. */
-    auto best = ck_by_prefix_.end();
-    for (auto it = ck_by_prefix_.begin(); it != ck_by_prefix_.end(); ++it) {
-        const Ckpt& c = it->second;
-        if (!c.valid || c.detached || c.slot < 0 || c.pos <= 0 || c.pos > hit.n_attn_tokens ||
-            c.pos % block_size_ != 0)
-            continue;
-        if (best != ck_by_prefix_.end() && c.pos <= best->second.pos) continue;
-        if (hs[(size_t)(c.pos / block_size_ - 1)] != it->first) continue;
-        best = it;
-    }
+    const auto best = deepest(hit.n_attn_tokens);
     if (best == ck_by_prefix_.end()) {
         ++stats_.ckpt_misses;
         return hit;

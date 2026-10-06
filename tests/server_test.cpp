@@ -258,6 +258,7 @@ struct FakeScheduler : IScheduler {
     std::mutex mu;
     std::vector<uint64_t> submitted;
     SamplingParams last_sp;              /* what the last submitted request was to sample with */
+    std::vector<std::string> last_stop;  /* ...and the stop strings it was handed */
     std::vector<uint64_t> cancelled;
     std::vector<std::thread> workers;
     std::atomic<uint64_t> next_id{1};
@@ -275,6 +276,7 @@ struct FakeScheduler : IScheduler {
             std::lock_guard<std::mutex> lk(mu);
             submitted.push_back(id);
             last_sp = r.sp;
+            last_stop = r.stop;
         }
         void* sink = r.sink;
         int32_t cap = r.max_tokens;
@@ -1795,6 +1797,38 @@ TEST(usage_reports_the_reasoning_tokens_inside_completion_tokens) {
         CHECK_EQ(r.status, 200);
         CHECK(!json::parse(r.body)["usage"].contains("completion_tokens_details"));
     }
+}
+
+/* A REPLY THAT STARTS INSIDE ITS REASONING BLOCK keeps its stop strings for the answer: one
+ * written while thinking is text, and the first one after the closer cuts. The scheduler, which
+ * cannot tell reasoning from answer, is handed none. A closer of several tokens arrives across
+ * drains, which the incremental search for it has to bridge. */
+TEST(stop_strings_wait_for_the_reasoning_closer) {
+    for (const char* close : { "|", "</t>" }) {
+        Fixture f;
+        f.tmpl.think_close = close;
+        f.tmpl.think_starts_open = true;
+        f.sched.reply = std::string("aENDb") + close + "cENDd";
+        HttpResponse r = f.post("/v1/chat/completions",
+                                R"({"messages":[{"role":"user","content":"hi"}],"stop":["END"]})");
+        CHECK_EQ(r.status, 200);
+        const json j = json::parse(r.body);
+        CHECK_EQ(j["choices"][0]["message"]["content"].get<std::string>(),
+                 std::string("aENDb") + close + "c");
+        CHECK_EQ(j["choices"][0]["finish_reason"].get<std::string>(), std::string("stop"));
+        CHECK(f.sched.last_stop.empty());
+    }
+    /* A stop string only inside the reasoning never stops the reply. */
+    Fixture f;
+    f.tmpl.think_close = "|";
+    f.tmpl.think_starts_open = true;
+    f.sched.reply = "aENDb|cd";
+    HttpResponse r = f.post("/v1/chat/completions",
+                            R"({"messages":[{"role":"user","content":"hi"}],"stop":["END"]})");
+    CHECK_EQ(r.status, 200);
+    const json j = json::parse(r.body);
+    CHECK_EQ(j["choices"][0]["message"]["content"].get<std::string>(), std::string("aENDb|cd"));
+    CHECK(!f.sched.saw_cancel());             /* ended by the reply itself, not cut */
 }
 
 /* THE BUDGET REACHES THE ENGINE in either spelling, with the block it is held on; one the block

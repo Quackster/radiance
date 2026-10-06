@@ -2,7 +2,9 @@ radiance
 Copyright 2026 Deadcode and the radiance contributors
 
 Written by Deadcode, with contributions from tcclaviger (the N-rank all-reduce kernels), ggz14
-(the MXFP4 GEMM and the GDN kernels' overflow guards), goodman-b (four-rank tensor parallelism
+(the MXFP4 GEMM, the A-tiled MXFP4 prefill GEMM and the GDN kernels' overflow guards), slydlake
+(the MXFP4 decode and prefill GEMMs and the MXFP4 linear, stop strings after the reasoning block,
+and the draft refill on a prefix hit), goodman-b (four-rank tensor parallelism
 for Qwen3.8-Flash-Next), keptn42 (the four-rank all-reduce served in place, the fused four-rank
 writes, the n-gram table in RAM, the four-class expert split, the Grafana dashboard, the routed
 GEMM's decode loads and run search, the gated residual's prefill read form and row groups, and

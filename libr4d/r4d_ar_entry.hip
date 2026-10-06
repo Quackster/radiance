@@ -120,6 +120,9 @@ struct ArInst {
      * that buys nothing but round trips: at a 2048-token prefill chunk the capacity rule asks for
      * 936 blocks and the tuning rule asks for 24. */
     int  nb_cap     = 0;
+    /* Where the exchange buffers live: 0 in each rank's own VRAM, written by its peers over P2P;
+     * 1 in pinned host memory that every card reaches over its own link (build, below). */
+    int  host       = 0;
 };
 
 /* A parameter that may have been declared as a RANGE: init is handed the frozen geometry for one
@@ -150,13 +153,14 @@ long align16(long v) { return (v + 15) & ~15L; }
  * residual that is 40 MiB a slot and 80 MiB for the pair. ONE set serves every op that resolved
  * to the same (rank, world, dtype, bound) -- see the cache below, which is what keeps a 64-layer
  * model from building 128 of these. */
-int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code) {
+int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, int host) {
     if (world < 2 || world > R4D_MAX_RANKS) return RAD_E_SHAPE;
     if (rank < 0 || rank >= world) return RAD_E_INVAL;
     if (max_numel <= 0) return RAD_E_INVAL;
 
     in->rank = rank;
     in->world = world;
+    in->host = host;
     in->dtype = dtype_code;
     in->esize = r4d_ar_esize(dtype_code);
     in->max_numel = (long)max_numel;
@@ -196,12 +200,26 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code) 
      * invalidates. libr4d's driver falls back to coarse when fine fails; so does this, because a
      * deterministic fallback stays symmetric across ranks (same environment, same hardware). */
     int fine_sc = 1, fine_fl = 1, fine_sq = 1;
+    /* WITHOUT PEER ACCESS THE MAILBOX MOVES TO THE HOST, AND NOTHING ELSE CHANGES. Every kernel in
+     * the family touches another rank only through its scratch slots and its flag words -- its
+     * input, its output and its sequence counters are its own card's -- so with those two in
+     * pinned host memory no card ever addresses another card's VRAM, and the same kernels run on a
+     * machine whose PCIe topology or IOMMU forbids peer traffic. A push then lands in host memory
+     * over the writer's link and the reduce reads it back over the reader's, so a message crosses
+     * two links where P2P crosses one; that is the price, and it is paid only where P2P is absent
+     * (the rows that take this path require device.p2p == 0, r4d_rows.cpp). The sequence counters
+     * stay in VRAM: only their own rank reads them. */
     R4D_TRY("ar_ipc_alloc",
         if (hipGetDevice(&dev) != hipSuccess) return RAD_E_DEVICE;
-        sc = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 1, handle, &hlen);
-        if (!sc) { fine_sc = 0; sc = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 0, handle, &hlen); }
-        fl = r4d_ar_ipc_alloc(flag_words * 4, 1, handle, &hlen);
-        if (!fl) { fine_fl = 0; fl = r4d_ar_ipc_alloc(flag_words * 4, 0, handle, &hlen); }
+        if (host) {
+            sc = r4d_ar_host_alloc((long)nslots * in->slot_bytes);
+            fl = r4d_ar_host_alloc(flag_words * 4);
+        } else {
+            sc = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 1, handle, &hlen);
+            if (!sc) { fine_sc = 0; sc = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 0, handle, &hlen); }
+            fl = r4d_ar_ipc_alloc(flag_words * 4, 1, handle, &hlen);
+            if (!fl) { fine_fl = 0; fl = r4d_ar_ipc_alloc(flag_words * 4, 0, handle, &hlen); }
+        }
         sq = r4d_ar_ipc_alloc(2L * maxb * 4, 1, handle, &hlen);
         if (!sq) { fine_sq = 0; sq = r4d_ar_ipc_alloc(2L * maxb * 4, 0, handle, &hlen); });
     if (!sc || !fl || !sq) return RAD_E_NOMEM;
@@ -258,7 +276,7 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code) 
         in->peer_scratch[j] = g_rv.scratch[r];
         in->peer_flags[j]   = g_rv.flags[r];
         ++j;
-        R4D_TRY("ar_ipc_enable_peer", r4d_ar_ipc_enable_peer((long)g_rv.dev[r]));
+        if (!host) R4D_TRY("ar_ipc_enable_peer", r4d_ar_ipc_enable_peer((long)g_rv.dev[r]));
     }
 
     /* Second barrier: no rank may launch until every rank has enabled peer access, or the first
@@ -295,8 +313,10 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code) 
 struct CacheKey {
     int       rank, world, dtype;
     long long numel;
+    int       host;
     bool operator==(const CacheKey& o) const {
-        return rank == o.rank && world == o.world && dtype == o.dtype && numel == o.numel;
+        return rank == o.rank && world == o.world && dtype == o.dtype && numel == o.numel &&
+               host == o.host;
     }
 };
 
@@ -320,7 +340,7 @@ int acquire(const CacheKey& k, ArInst** out) {
      * and a rank-keyed entry means no two builders race for the same key. */
     ArInst* in = new (std::nothrow) ArInst();
     if (!in) return RAD_E_NOMEM;
-    int rc = build(in, k.rank, k.world, k.numel, k.dtype);
+    int rc = build(in, k.rank, k.world, k.numel, k.dtype, k.host);
     if (rc != RAD_OK) { delete in; return rc; }
     {
         std::lock_guard<std::mutex> lk(g_cache_mu);
@@ -343,8 +363,13 @@ void release(ArInst* in) {
     }
     /* Only this rank's own allocations. A peer pointer is the peer's to free, and freeing it here
      * would be a double free the moment two ranks tear down in either order. */
-    r4d_ar_ipc_free(in->my_scratch);
-    r4d_ar_ipc_free(in->my_flags);
+    if (in->host) {
+        r4d_ar_host_free(in->my_scratch);
+        r4d_ar_host_free(in->my_flags);
+    } else {
+        r4d_ar_ipc_free(in->my_scratch);
+        r4d_ar_ipc_free(in->my_flags);
+    }
     r4d_ar_ipc_free(in->my_seq);
     r4d_ar_ipc_free(in->locpack);
     delete in;
@@ -354,8 +379,7 @@ void release(ArInst* in) {
 
 /* ------------------------------------------------------------------ init / fini */
 
-extern "C" int r4d_rad_ar_init(const RadParam* p, int n_p, int rank, int world,
-                               void** out) {
+static int ar_init(const RadParam* p, int n_p, int rank, int world, int host, void** out) {
     if (!out) return RAD_E_INVAL;
     *out = nullptr;
 
@@ -373,28 +397,35 @@ extern "C" int r4d_rad_ar_init(const RadParam* p, int n_p, int rank, int world,
     if (numel <= 0) return RAD_E_INVAL;
 
     ArInst* in = nullptr;
-    int rc = acquire(CacheKey{ rank, world, dt, numel }, &in);
+    int rc = acquire(CacheKey{ rank, world, dt, numel, host }, &in);
     if (rc != RAD_OK) return rc;
     *out = in;
     return RAD_OK;
 }
 
+extern "C" int r4d_rad_ar_init(const RadParam* p, int n_p, int rank, int world, void** out) {
+    return ar_init(p, n_p, rank, world, 0, out);
+}
+extern "C" int r4d_rad_ar_host_init(const RadParam* p, int n_p, int rank, int world, void** out) {
+    return ar_init(p, n_p, rank, world, 1, out);
+}
+
 /* The fused all-reduce + norm declares `M`(range) and `n` rather than `numel`: its message is the
  * post-projection activation. Same world, same buffers, different arithmetic to get the bound. */
-static int ar_mn_acquire(const RadParam* p, int n_p, int rank, int world, void** out) {
+static int ar_mn_acquire(const RadParam* p, int n_p, int rank, int world, int host,
+                         void** out) {
     const long long M = pgeti_hi(p, n_p, "M", 0);
     const long long K = pgeti_hi(p, n_p, "n", 0);
     if (M <= 0 || K <= 0) return RAD_E_INVAL;
 
     ArInst* in = nullptr;
-    int rc = acquire(CacheKey{ rank, world, 0 /* bf16 */, M * K }, &in);
+    int rc = acquire(CacheKey{ rank, world, 0 /* bf16 */, M * K, host }, &in);
     if (rc != RAD_OK) return rc;
     *out = in;
     return RAD_OK;
 }
 
-extern "C" int r4d_rad_ar_ln_init(const RadParam* p, int n_p, int rank, int world,
-                                  void** out) {
+static int ar_ln_init(const RadParam* p, int n_p, int rank, int world, int host, void** out) {
     if (!out) return RAD_E_INVAL;
     *out = nullptr;
 
@@ -402,7 +433,15 @@ extern "C" int r4d_rad_ar_ln_init(const RadParam* p, int n_p, int rank, int worl
     if (ws_param != world) return RAD_E_SHAPE;
     if (world != 2) return RAD_E_SHAPE;   /* the handshake is one peer flag per block */
 
-    return ar_mn_acquire(p, n_p, rank, world, out);
+    return ar_mn_acquire(p, n_p, rank, world, host, out);
+}
+
+extern "C" int r4d_rad_ar_ln_init(const RadParam* p, int n_p, int rank, int world, void** out) {
+    return ar_ln_init(p, n_p, rank, world, 0, out);
+}
+extern "C" int r4d_rad_ar_ln_host_init(const RadParam* p, int n_p, int rank, int world,
+                                       void** out) {
+    return ar_ln_init(p, n_p, rank, world, 1, out);
 }
 
 /* The four-rank ar_hc_write and ar_gather_hc_write. The key is the family's -- {rank, 4, bf16,
@@ -413,8 +452,8 @@ extern "C" int r4d_rad_ar_ln_init(const RadParam* p, int n_p, int rank, int worl
  * (r4d_ar_wide.h), so ops sharing an instance interleave in any order every rank issues them in,
  * and ops on separate instances touch nothing of each other's. Exact wire only: the rows constrain
  * `wire` to 0, and a `wire` 6 that reaches this init anyway is refused. */
-extern "C" int r4d_rad_ar_hc_wide_init(const RadParam* p, int n_p, int rank, int world,
-                                       void** out) {
+static int ar_hc_wide_init(const RadParam* p, int n_p, int rank, int world, int host,
+                           void** out) {
     if (!out) return RAD_E_INVAL;
     *out = nullptr;
 
@@ -423,7 +462,16 @@ extern "C" int r4d_rad_ar_hc_wide_init(const RadParam* p, int n_p, int rank, int
     if (world != 4) return RAD_E_SHAPE;   /* the peer bundle is compiled for four */
     if (pgeti_hi(p, n_p, "wire", 0) != 0) return RAD_E_UNSUPPORTED;
 
-    return ar_mn_acquire(p, n_p, rank, world, out);
+    return ar_mn_acquire(p, n_p, rank, world, host, out);
+}
+
+extern "C" int r4d_rad_ar_hc_wide_init(const RadParam* p, int n_p, int rank, int world,
+                                       void** out) {
+    return ar_hc_wide_init(p, n_p, rank, world, 0, out);
+}
+extern "C" int r4d_rad_ar_hc_wide_host_init(const RadParam* p, int n_p, int rank, int world,
+                                            void** out) {
+    return ar_hc_wide_init(p, n_p, rank, world, 1, out);
 }
 
 extern "C" void r4d_rad_ar_fini(void* instance) {

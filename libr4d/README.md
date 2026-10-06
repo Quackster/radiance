@@ -52,6 +52,8 @@ target architecture. They are reported by the `r4d_*_dims()` accessors in
 | `gemm_w8a16_nt_m64` | 8-bit weight, f16 activation, skinny |
 | `gemm_w2a8_nt` | 2-bit weight against int8 activation — the fast draft head |
 | `gemm_mxfp4a8_nt_m64` | OCP-MXFP4 weight, fp8 activation, skinny |
+| `gemm_mxfp4a8_decode` | the same operands for the decode band (M ≤ 128): split-K across workgroups with a last-arriver reduction, the partial in the op's scratch |
+| `gemm_mxfp4a8_tiled` | the prefill sibling: the activation re-tiled into fragment order in the op's scratch and read straight into registers, the weight unpacked once per K slab for a 256-row block |
 | `attn_decode_h128_gqa4_fp8kv` / `..._bf16kv` | head_dim 128, 4 queries per KV head, sliding window — a block-diffusion drafter's geometry. Decode only; `attn_h128_gqa4_have_prefill()` reports 0 so a caller routes long queries to its own fallback |
 | `rowtopk_bf16` / `rowtopk_bf16_chunks` | exact per-row top-K over a bf16 matrix, two-stage |
 | `dflash_conv_t2_g16_bf16` | the drafter's causal conv, two taps, 16 groups |

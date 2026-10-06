@@ -1606,13 +1606,32 @@ std::string Detokenizer::push(int32_t token) {
     all_ += p;
     pending_ += p;
 
+    /* Inside the reasoning block no stop string applies (defer_stops_until). The closer is
+     * searched for incrementally in all_, from (closer length - 1) bytes behind the previous end.
+     * Once it has been generated, matching starts in the text AFTER it: the closer may still be in
+     * pending_, and nothing before its end may count. */
+    size_t from = 0;
+    if (!armed_) {
+        const size_t n = arm_after_.size();
+        const size_t start = arm_scanned_ >= n ? arm_scanned_ - n + 1 : 0;
+        const size_t m = all_.find(arm_after_, start);
+        arm_scanned_ = all_.size();
+        if (m == std::string::npos) {
+            from = std::string::npos;
+        } else {
+            armed_ = true;
+            const size_t pending_at = all_.size() - pending_.size();
+            from = m + n > pending_at ? m + n - pending_at : 0;
+        }
+    }
+
     /* A complete stop string inside pending_ ends the stream. Everything before it is emitted;
      * the stop string and anything after it never is. */
-    if (!stops_.empty()) {
+    if (!stops_.empty() && from != std::string::npos) {
         size_t best = std::string::npos;
         const std::string* which = nullptr;
         for (const std::string& s : stops_) {
-            const size_t m = pending_.find(s);
+            const size_t m = pending_.find(s, from);
             if (m != std::string::npos && m < best) { best = m; which = &s; }
         }
         if (which) {

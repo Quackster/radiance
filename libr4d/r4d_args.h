@@ -334,6 +334,16 @@ struct R4dGemmCfg { int wv, sk, mb, npw, nt; };
  * not compute the GEMM and then pick it. */
 struct R4dTileCfg { int variant; int bm; int bn; };
 
+/* The MXFP4 tiled GEMM's column width in 32-column units per wave: TN=2 gives a 256 x 64 block,
+ * TN=4 a 256 x 128 one. Its crossover is a function of M (r4d_gemm_mxfp4a8_tiled.hip carries the
+ * measurement), so 0 -- the default -- decides at issue and a fixed value is for a tuner. */
+struct R4dMxTileCfg { int tn; };
+
+/* The MXFP4 decode GEMM's split-K width, K slab and weight-load hint. 0 on each is the rule in
+ * r4d_gemm_mxfp4a8_decode.hip (it needs M and the shape, which exist only at issue); `nt` 1 streams
+ * the weight past L2/MALL, 2 loads it plainly. */
+struct R4dMxDecCfg { int ks; int bk; int nt; };
+
 /* Split-KV segment count for the paged decode kernels. 0 is libr4d's own split law, which is
  * measured (r4d_attn_paged_h256_gqa6.hip carries the table) and reads num_seqs and max_ctx that
  * only exist at issue -- so it stays the default and the fixed counts are there for a tuner that
@@ -375,6 +385,8 @@ extern "C" {
 void r4d_cfg_gemm   (const RadArgs*, struct R4dGemmCfg*);
 void r4d_cfg_tiled  (const RadArgs*, struct R4dTileCfg*);
 void r4d_cfg_prefill(const RadArgs*, struct R4dTileCfg*);
+void r4d_cfg_mxfp4_tiled(const RadArgs*, struct R4dMxTileCfg*);
+void r4d_cfg_mxfp4_decode(const RadArgs*, struct R4dMxDecCfg*);
 void r4d_cfg_split  (const RadArgs*, struct R4dSplitCfg*);
 void r4d_cfg_ar     (const RadArgs*, struct R4dArCfg*);
 void r4d_cfg_topk   (const RadArgs*, struct R4dTopkCfg*);

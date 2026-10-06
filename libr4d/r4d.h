@@ -262,6 +262,11 @@ int r4d_p2p_copy2d(long dst, long src, long dpitch, long spitch, long width, lon
 void r4d_ar_ipc_free(long p);
 void r4d_ar_ipc_memzero(long p, long size);
 void r4d_ar_ipc_enable_peer(long peer);
+// Exchange buffers in pinned, fine-grained HOST memory, for cards that cannot reach each other's
+// VRAM: every card reads and writes the same host pages over its own link. Zeroed, and the
+// returned address is valid on every card and on the CPU alike. Startup-only.
+long r4d_ar_host_alloc(long size);
+void r4d_ar_host_free(long p);
 // Exact sum, fp32 accumulate, bf16 / fp16 / fp32 payload (dtype 0 / 1 / 2).
 void r4d_ar_oneshot_2rank_exact(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                                 long seq_ctrs, long slot_stride16, long inp, long out, long n_elem,
@@ -547,10 +552,25 @@ void r4d_gemm_w8a8_tiled(long a, long ascale, long wq, long ws, long c, int M, i
 
 // OCP-MXFP4 weight, fp8 activation. e2m1 elements with one E8M0 exponent per 32 K, folded
 // against a per-row reference exponent so the inner loop has no rescale; fp8 WMMA.
+// as_group 0 = one f32 activation scale per row, 128 = one per (row, 128 of K) at row stride as_rs.
 void r4d_gemm_mxfp4a8_nt_m64(long a, long ascale, long wq, long ws, long wref, long c,
-                             int M, int K, int N, int WV, int SK, int MB, int NPW, long stream);
+                             int M, int K, int N, int WV, int SK, int MB, int NPW,
+                             int as_group, int as_rs, long stream);
 int  r4d_gemm_mxfp4a8_nt_m64_max_m(void);
 int  r4d_gemm_mxfp4a8_nt_m64_group(void);
+// The same weight tiled for PREFILL: a 256-row block reads A fragments straight from a
+// FRAGMENT-ORDERED copy of the activation (`at`, written by r4d_mxfp4a8_tile_a, at least
+// r4d_mxfp4a8_tile_a_bytes long) and unpacks the weight once per K slab. TN (2 or 4, 0 = by M) is
+// the per-wave column width in 16-column fragments. as_group 0 = one f32 activation scale per row,
+// 128 = one per (row, 128 of K) at row stride as_rs.
+void r4d_gemm_mxfp4a8_tiled(long at, long ascale, long wq, long ws, long wref, long c,
+                            int M, int K, int N, int TN, int as_group, int as_rs, long stream);
+void r4d_mxfp4a8_tile_a(long a, long at, int M, int K, long stream);
+long r4d_mxfp4a8_tile_a_bytes(int M, int K);
+int  r4d_gemm_mxfp4a8_tiled_group(void);
+// The DECODE band (M <= 128) is r4d_rad_gemm_mxfp4a8_decode alone: its split-K partial is the op's
+// scratch, which only the plugin ABI hands over.
+int  r4d_gemm_mxfp4a8_decode_max_m(void);
 
 // ---- BLOCK-SCALED FP8: the format a checkpoint ships in ----------------------------------------
 //

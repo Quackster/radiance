@@ -42,6 +42,8 @@ enum {
      * asks with M=64 to exclude m16. */
     R4D_PRIO_GEMM_M16     = 60,
     R4D_PRIO_GEMM_SKINNY  = 50,
+    /* The MXFP4 decode row outranks the MXFP4 skinny row, whose band it shares up to N = 36864. */
+    R4D_PRIO_GEMM_MXDEC   = 55,
     /* The skinny m64 row has no upper bound on M, so the tiled bf16 row -- M > 64 only -- has to
      * outrank it to be reached, and stays below m16 whose band it never enters. */
     R4D_PRIO_GEMM_BF16_TILED = 55,
@@ -167,6 +169,11 @@ int r4d_rad_hc_write_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, in
 /* -- all-reduce (r4d_ar_entry.hip) -- */
 int  r4d_rad_ar_init(const RadParam*, int, int rank, int world, void** out);
 void r4d_rad_ar_fini(void*);
+/* The same three inits with every rank's exchange buffers in pinned host memory: the host twins
+ * of the collective rows (r4d_rows.cpp) take them, and every launch and the fini are shared. */
+int  r4d_rad_ar_host_init(const RadParam*, int, int rank, int world, void** out);
+int  r4d_rad_ar_ln_host_init(const RadParam*, int, int rank, int world, void** out);
+int  r4d_rad_ar_hc_wide_host_init(const RadParam*, int, int rank, int world, void** out);
 int  r4d_rad_ar_oneshot_2rank_exact(const RadArgs*, RadStream);
 int  r4d_rad_ar_gather_2rank       (const RadArgs*, RadStream);
 /* The gather at a wide group's handshake (r4d_ar_gather_Nrank.hip launches it). */
@@ -207,6 +214,10 @@ int r4d_rad_gemm_w8a8_m64   (const RadArgs*, RadStream);
 int r4d_rad_gemm_w8a8_tiled (const RadArgs*, RadStream);
 int r4d_rad_gemm_w2a8       (const RadArgs*, RadStream);
 int r4d_rad_gemm_mxfp4a8_m64(const RadArgs*, RadStream);
+int r4d_rad_gemm_mxfp4a8_tiled(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_mxfp4a8_tiled_scratch(const RadArgs*);
+int r4d_rad_gemm_mxfp4a8_decode(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_mxfp4a8_decode_scratch(const RadArgs*);
 int r4d_rad_dequant_w4      (const RadArgs*, RadStream);
 int r4d_rad_rowtopk         (const RadArgs*, RadStream);
 int r4d_rad_rowtopk_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);

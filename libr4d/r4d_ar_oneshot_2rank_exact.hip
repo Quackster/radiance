@@ -489,6 +489,29 @@ int r4d_ar_gather_inv(long inv, long sorted, long T, long stream_i) {
 void r4d_ar_ipc_free(long p) { if (p) (void)hipFree((void*)p); }
 void r4d_ar_ipc_memzero(long p, long size) { if (p) HIPOK(hipMemset((void*)p, 0, size)); }
 
+// THE HOST MAILBOX. Coherent so a peer's stores are not held in a CPU cache line this card reads
+// around, mapped so the cards address it, portable so every card does and not only the one
+// current at allocation. A card reaches it through the same fine-grained path a peer's VRAM
+// scratch is reached by, so the kernels' fences mean what they mean there. The address a card
+// uses must be the CPU's own, because one pointer is published to every rank: a mapping that put
+// the pages elsewhere on some card would have each rank write where no other rank reads.
+long r4d_ar_host_alloc(long size) {
+  void* p = nullptr;
+  HIPOK(hipHostMalloc(&p, size, hipHostMallocCoherent | hipHostMallocMapped |
+                                    hipHostMallocPortable));
+  std::memset(p, 0, (size_t)size);
+  void* d = nullptr;
+  const hipError_t e = hipHostGetDevicePointer(&d, p, 0);
+  if (e != hipSuccess || d != p) {
+    (void)hipHostFree(p);
+    throw std::runtime_error(e != hipSuccess
+        ? std::string("host mailbox: no card address: ") + hipGetErrorString(e)
+        : std::string("host mailbox: the card address differs from the CPU address"));
+  }
+  return (long)p;
+}
+void r4d_ar_host_free(long p) { if (p) (void)hipHostFree((void*)p); }
+
 // Enable direct peer access. radiance runs one process with a thread per rank sharing an address
 // space, so a peer pointer is valid here once this has run and no IPC handle exchange is needed;
 // see the header of r4d_ar_entry.hip.

@@ -39,6 +39,9 @@ static const Flag g_flags[] = {
                                         "lossy wire: rotated 6-bit at 2 ranks, tiered int8 at 4,\n"
                                         "none at 8" },
     { "--tp-wire-min-kb",     "N",      "smallest all-reduce, in KiB, the lossy wire is used for" },
+    { "--p2p",                "MODE",   "how the collectives reach the other cards: auto (default)\n"
+                                        "asks the driver, on requires peer access and stops without\n"
+                                        "it, off exchanges through pinned host memory" },
     { "--max-num-batched-tokens", "N",  "the largest token count one step may carry" },
     { "--max-num-seqs",       "N",      "the largest number of sequences one step may carry" },
     { "--max-model-len",      "N",      "context bound; 0 takes the model's training context" },
@@ -361,6 +364,13 @@ int config_parse(int argc, char** argv, Config* c) {
             if      (!std::strcmp(v, "exact")) c->tp_wire_exact = 1;
             else if (!std::strcmp(v, "wht6"))  c->tp_wire_exact = 0;
             else { RAD_ERR("--tp-wire takes exact or wht6, not '%s'", v); return RAD_E_INVAL; }
+        }
+        else if (S("--p2p")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "auto")) c->p2p = RAD_P2P_AUTO;
+            else if (!std::strcmp(v, "on"))   c->p2p = RAD_P2P_ON;
+            else if (!std::strcmp(v, "off"))  c->p2p = RAD_P2P_OFF;
+            else { RAD_ERR("--p2p takes auto, on or off, not '%s'", v); return RAD_E_INVAL; }
         }
         else if (S("--tp-wire-min-kb"))        { if (!(v = need(i))) return RAD_E_INVAL; c->tp_wire_min_kb = atoll(v); }
         else if (S("--max-num-batched-tokens")){ if (!(v = need(i))) return RAD_E_INVAL; c->max_tok = atoll(v); }
