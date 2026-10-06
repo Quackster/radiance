@@ -591,6 +591,63 @@ TEST(kv_a_rank_whose_only_paged_group_is_zero_takes_the_others_block_count) {
     CHECK_EQ(u.kv.carve(u.pools.kv()), RAD_E_STATE);
 }
 
+/* AN UNEVEN WORLD'S CHEAPER RANK pages the common token count in a smaller pool. The inverse of
+ * paged_tokens is exact at the MiB: the size it names reaches the count and one MiB less does not,
+ * and a rank whose only paged group is zero still has to hold its fixed costs. */
+TEST(kv_pool_mib_for_tokens_is_the_inverse_of_paged_tokens) {
+    constexpr int64_t MiB = 1ll << 20;
+    Fixture dear, cheap, zero;
+    for (Fixture* f : { &dear, &cheap, &zero }) { f->cfg.checkpoint_slots = 0; f->cfg.vram_kv_mib = 8; }
+    std::vector<KVGroupInfo> cg = hybrid_groups();
+    cg[G_FULL].decl.n_head_kv = 1;                  /* half the page of the dear rank's */
+    std::vector<KVGroupInfo> zg = hybrid_groups();
+    zg[G_FULL].zero = true;
+    CHECK_OK(dear.kv.plan_groups(hybrid_groups(), dear.cfg));
+    CHECK_OK(cheap.kv.plan_groups(cg, cheap.cfg));
+    CHECK_OK(zero.kv.plan_groups(zg, zero.cfg));
+    const int64_t T = dear.kv.paged_tokens(8 * MiB);
+    CHECK(T > 0);
+    const int64_t need = cheap.kv.pool_mib_for_tokens(T, 8);
+    CHECK(need > 0 && need < 8);
+    CHECK(cheap.kv.paged_tokens(need * MiB) >= T);
+    CHECK(cheap.kv.paged_tokens((need - 1) * MiB) < T);
+    /* The dear rank needs its whole pool for its own count. */
+    CHECK_EQ(dear.kv.pool_mib_for_tokens(T, 8), (int64_t)8);
+    /* Past what the largest size pages: no answer, not a short pool. */
+    CHECK_EQ(cheap.kv.pool_mib_for_tokens(T * 1000, 8), (int64_t)-1);
+    /* All paged groups zero: the count is never its limit, its fixed state still is. */
+    const int64_t zn = zero.kv.pool_mib_for_tokens(T, 8);
+    CHECK(zn >= 0 && zn * MiB >= zero.kv.fixed_bytes());
+    CHECK(zn == 0 || (zn - 1) * MiB < zero.kv.fixed_bytes());
+}
+
+/* The re-split moves what the cheaper rank's KV pool saves into its weights pool, never past every
+ * weight resident and never below the common pool; what the cap leaves is reported, not allocated.
+ * A need that is not below the common pool changes nothing -- the even world's case. */
+TEST(an_uneven_worlds_cheaper_rank_gives_its_saved_kv_to_its_weights_up_to_all_resident) {
+    constexpr int64_t MiB = 1ll << 20;
+    RankSplit s = vram_budget_rank_split(1000, 800, 200, 1300 * MiB);
+    CHECK(s.resplit);
+    CHECK_EQ(s.kv_mib, (int64_t)200);
+    CHECK_EQ(s.weights_mib, (int64_t)1300);
+    CHECK_EQ(s.unusable_mib, (int64_t)300);
+    CHECK(s.weights_mib + s.kv_mib <= 1000 + 800);
+    s = vram_budget_rank_split(1000, 800, 200, 5000 * MiB);     /* room for all of it */
+    CHECK_EQ(s.weights_mib, (int64_t)1600);
+    CHECK_EQ(s.unusable_mib, (int64_t)0);
+    s = vram_budget_rank_split(1000, 800, 200, 500 * MiB);      /* already all resident */
+    CHECK_EQ(s.weights_mib, (int64_t)1000);
+    CHECK_EQ(s.kv_mib, (int64_t)200);
+    CHECK_EQ(s.unusable_mib, (int64_t)600);
+    s = vram_budget_rank_split(1000, 800, 800, 5000 * MiB);     /* costs the same: untouched */
+    CHECK(!s.resplit);
+    CHECK_EQ(s.weights_mib, (int64_t)1000);
+    CHECK_EQ(s.kv_mib, (int64_t)800);
+    s = vram_budget_rank_split(1000, 800, -1, 5000 * MiB);      /* no answer: untouched */
+    CHECK(!s.resplit);
+    CHECK_EQ(s.kv_mib, (int64_t)800);
+}
+
 TEST(kv_refuses_a_group_with_no_block_size) {
     /* Block size comes off the resolved attention kernel. A zero here means the attention op did
      * not resolve, and the manager refuses rather than inventing 16. */

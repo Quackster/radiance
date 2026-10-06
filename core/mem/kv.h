@@ -182,6 +182,11 @@ public:
      * cost it nothing, so it takes what the ranks holding the cache carve and limits nobody. */
     static constexpr int64_t kUnboundedTokens = INT64_MAX;
     int64_t paged_tokens(int64_t budget_bytes) const { return paged_split(budget_bytes, nullptr); }
+    /* THE INVERSE OF paged_tokens: the least whole MiB of pool whose paged split reaches `tokens`,
+     * searched up to max_mib; -1 when even max_mib does not. Pure arithmetic on the plan (no pool,
+     * no cap), for Engine::plan sizing an uneven world's cheaper rank to the token count its
+     * dearest peer sets. paged_split is monotone in the budget, so the search is exact. */
+    int64_t pool_mib_for_tokens(int64_t tokens, int64_t max_mib) const;
     void    cap_paged_tokens(int64_t tokens) { tokens_cap_ = tokens > 0 ? tokens : 0; }
     int     carve(Pool& kv_pool);
 

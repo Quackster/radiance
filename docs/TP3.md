@@ -38,6 +38,24 @@ it, and the tiers skip it when they move an entry. Every rank carves the same bl
 is planned, asked what it could page (`KVManager::paged_tokens`; a rank whose only paged groups are
 zero limits nobody) and capped at the least before any carves.
 
+**The attention-zero rank's pools are its own.** The budget resolver derives one split for every
+card, the dearest rank's -- and an attention-zero rank's cache costs a fraction of its peers' per
+token (at TP3 on Flash-Next it keeps only the QSA block keys: 2.3 GiB at the worst case where an
+attention rank's costs 15.2). Under `expert_tiered` with both pools derived, `Engine::plan` gives
+such a rank a KV pool that pages exactly the common token count (`KVManager::pool_mib_for_tokens`,
+the inverse of `paged_tokens`, plus a 64 MiB margin) and moves the difference into its weights pool,
+no further than every one of its weights resident. Both readers of the resolved sizes take the
+rank's own split -- `Pools::configure` and the planner -- so the grown pool is planned into. The
+token count, the carve, the loan and the attention ranks' pools are unchanged; a stated
+`--vram-kv-mib` / `--vram-weights-mib` keeps meaning "this many on every card", and `auto` keeps the
+common split (a fully resident rank would choose all_vram while its peers spill). At TP2/TP4 every
+rank costs the same and nothing is re-split. The log line, and its effect on the third rank:
+
+```
+kv: rank 2's cache costs 2.27 GiB at the worst case where its dearest peer's costs 15.16 GiB, so its KV pool pages the common 1446302 tokens in 1875 MiB instead of 10881; its weights pool grows 19747 -> 21692 MiB (every weight resident wants 21.18 GiB), and 7061 MiB stay unclaimed
+I[2] mover: 25142 slab slots (64 shadow), 0 pinned pool slots      (was 22479 slots, 2663 pinned)
+```
+
 Under a smaller attention world the plain even shard over `world` is the wrong cut for every
 attention projection, so the attention ranks declare **spans** (`rad_weight_shard_span`, the same
 call the KV replication uses for k/v): q|gate rows and output columns `[attn_rank * n_head,

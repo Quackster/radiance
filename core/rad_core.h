@@ -634,7 +634,9 @@ struct Config {
      * what the driver already holds is measured rather than assumed. core/mem/vram_budget.cpp does
      * that sum and writes the answer back into the two fields below, so every consumer downstream
      * -- the planner, the KV manager, the pool report -- reads one resolved number and there is no
-     * second place for them to disagree.
+     * second place for them to disagree. Under an uneven world Engine::plan derives each rank's own
+     * copy from it (rank_cfg_, see docs/TP3.md §1), and the rank's pools and planner both read that
+     * copy -- still one number per card, and the same number on every card of an even world.
      *
      * Zero means "derive"; a stated --vram-weights-mib / --vram-kv-mib still wins outright. */
     int64_t vram_weights_mib = 0;

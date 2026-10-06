@@ -395,6 +395,27 @@ int64_t KVManager::paged_split(int64_t budget_bytes, std::vector<int64_t>* block
     return tokens;
 }
 
+int64_t KVManager::pool_mib_for_tokens(int64_t tokens, int64_t max_mib) const {
+    const int64_t MiB = (int64_t)1 << 20;
+    if (max_mib <= 0) return -1;
+    const auto reaches = [&](int64_t mib) {
+        /* The fixed costs (recurrent state, its alignment) come first on every rank -- a rank
+         * whose only paged group is zero still has to hold them. */
+        if (mib * MiB < fixed_) return false;
+        const int64_t t = paged_split(mib * MiB, nullptr);
+        return t == kUnboundedTokens || t >= tokens;
+    };
+    if (!reaches(max_mib)) return -1;
+    /* reaches(hi) holds throughout; lo is the largest size known to fall short (or 0). */
+    int64_t lo = 0, hi = max_mib;
+    if (reaches(lo)) return 0;
+    while (hi - lo > 1) {
+        const int64_t mid = lo + (hi - lo) / 2;
+        if (reaches(mid)) hi = mid; else lo = mid;
+    }
+    return hi;
+}
+
 int64_t KVManager::zero_blocks(const KVGroupPlan& p, int64_t tokens) const {
     if (tokens == kUnboundedTokens) return 0;
     const int64_t b = tokens / p.block_size;

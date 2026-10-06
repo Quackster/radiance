@@ -1232,9 +1232,74 @@ int Engine::plan() {
                 r->program.arena_stage_bytes = vb.stage;
                 r->program.arena_bytes       = r->program.arena_stage_off + vb.stage;
             }
+
+        /* ---- AN UNEVEN WORLD: EACH RANK'S OWN POOLS FOR THE ONE TOKEN COUNT -------------------
+         *
+         * The split above is the dearest rank's, applied to every card, and one block table serves
+         * every rank -- configure_kv caps each at the least rank's paged tokens. A rank whose cache
+         * costs less per token (an attention-zero rank keeps no attention cache, only what its
+         * other groups cost) would reserve the common KV pool and page a fraction of it, while its
+         * experts beyond the common weights pool sit in the pinned host pool. So such a rank gets a
+         * KV pool that pages exactly the common token count and the difference in its weights
+         * pool, up to every one of its weights resident. The token count, the carve, the loan and
+         * the dearest ranks' pools are what they were.
+         *
+         * Only a DERIVED split under expert_tiered is re-split. An operator who stated either pool
+         * has decided what every card gets. And under `auto` a rank whose grown pool covers all of
+         * its weights would choose all_vram while its peers spill -- one strategy per world is the
+         * contract that keeps their movers alike, so `auto` keeps the common split.
+         * Where every rank costs the same -- every world the heads divide -- no rank qualifies and
+         * rank_cfg_ is cfg_ on every rank, field for field. */
+        rank_cfg_.assign(ranks_.size(), cfg_);
+        kv_planned_tokens_ = 0;
+        if (vb.derived_kv && vb.derived_weights && vb.lends && cfg_.placement == "expert_tiered" &&
+            facts.size() == ranks_.size() && ranks_.size() > 1) {
+            constexpr int64_t kMiB = (int64_t)1 << 20;
+            int64_t kv_max = 0;
+            for (const VramFacts& f : facts) kv_max = std::max(kv_max, f.kv_ceiling);
+            /* THE TOKEN COUNT configure_kv WILL SETTLE ON: every rank's paged tokens in the common
+             * pool, the least of them. Asked of the same plan configure_kv makes. */
+            std::vector<std::unique_ptr<KVManager>> probes(ranks_.size());
+            int64_t T = -1;
+            for (size_t i = 0; i < ranks_.size(); ++i) {
+                probes[i] = std::make_unique<KVManager>();
+                if (probes[i]->plan_groups(ranks_[i]->program.kv_groups, cfg_) != RAD_OK) { T = -1; break; }
+                const int64_t t = probes[i]->paged_tokens(cfg_.vram_kv_mib * kMiB);
+                if (t == KVManager::kUnboundedTokens) continue;
+                if (T < 0 || t < T) T = t;
+            }
+            for (size_t i = 0; T > 0 && i < ranks_.size(); ++i) {
+                if (facts[i].kv_ceiling >= kv_max) continue;
+                const int64_t need = probes[i]->pool_mib_for_tokens(T, cfg_.vram_kv_mib);
+                if (need < 0) continue;
+                /* A MARGIN, so that whatever the pool's own alignment costs never makes the re-split
+                 * rank the least: configure_kv names it if it ever does. */
+                const int64_t need_m = std::min(need + 64, cfg_.vram_kv_mib);
+                const int64_t cap = facts[i].statics + expert_vram_floor(wfs[i], 0);
+                const RankSplit rs =
+                    vram_budget_rank_split(cfg_.vram_weights_mib, cfg_.vram_kv_mib, need_m, cap);
+                if (!rs.resplit) continue;
+                rank_cfg_[i].vram_kv_mib      = rs.kv_mib;
+                rank_cfg_[i].vram_weights_mib = rs.weights_mib;
+                kv_planned_tokens_ = T;
+                RAD_INFO("kv: rank %d's cache costs %s at the worst case where its dearest peer's costs "
+                         "%s, so its KV pool pages the common %lld tokens in %lld MiB instead of %lld; "
+                         "its weights pool grows %lld -> %lld MiB (every weight resident wants %s)%s",
+                         ranks_[i]->index, humanb(facts[i].kv_ceiling).c_str(), humanb(kv_max).c_str(),
+                         (long long)T, (long long)rs.kv_mib, (long long)cfg_.vram_kv_mib,
+                         (long long)cfg_.vram_weights_mib, (long long)rs.weights_mib,
+                         humanb(cap).c_str(),
+                         rs.unusable_mib > 0
+                             ? fmt(", and %lld MiB stay unclaimed", (long long)rs.unusable_mib).c_str()
+                             : "");
+            }
+        }
     }
 
-    for (auto& r : ranks_) {
+    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+        auto& r = ranks_[ri];
+        /* This rank's own split: cfg_ itself on an even world, its re-split copy otherwise. */
+        const Config& rc = rank_cfg_.size() == ranks_.size() ? rank_cfg_[ri] : cfg_;
         LogRank lr(r->index);
         /* THE MAIN THREAD RUNS EVERY RANK'S STARTUP, one rank after another, and every allocator
          * reachable from here takes the CURRENT device -- rad_dev_alloc has no device argument.
@@ -1248,18 +1313,18 @@ int Engine::plan() {
         /* Every pool is budgeted explicitly. No profiling pass, no utilisation fraction, no
          * inference about what the workload will be (spec §6). Pools refuses by name and by how
          * much rather than shrinking anything. */
-        int s = r->pools.configure(cfg_, props.vram_bytes);
+        int s = r->pools.configure(rc, props.vram_bytes);
         RAD_INFO("pools:\n%s", r->pools.fit_report().c_str());
         if (s < 0) {
-            report_pool_refusal(r->index, r->device, r->pools, cfg_);
+            report_pool_refusal(r->index, r->device, r->pools, rc);
             return s;
         }
 
         /* Under tensor parallel the placement unit is a SHARD of a weight, so each rank plans
-         * against its own card's budget (spec §5.3). */
+         * against its own card's budget (spec §5.3) -- the same split its pools were given. */
         PlannerInput in{};
         in.program    = &r->program;
-        in.config     = &cfg_;
+        in.config     = &rc;
         in.rank       = r->index;
         in.world_size = cfg_.tp;
         if (file_ && file_->header().prof_count) {
@@ -2558,13 +2623,23 @@ int Engine::configure_kv() {
      * every rank is capped at the least before any carves. At an even split the cap is what
      * every rank would have carved anyway. */
     int64_t least = -1;
-    for (auto& r : ranks_) {
+    size_t least_pos = 0;
+    for (size_t i = 0; i < ranks_.size(); ++i) {
+        auto& r = ranks_[i];
         LogRank lr(r->index);
         RAD_TRY(r->kv.plan_groups(r->program.kv_groups, cfg_));
         const int64_t t = r->kv.paged_tokens(r->pools.kv().avail());
         if (t == KVManager::kUnboundedTokens) continue;   /* holds no cache; limits nobody */
-        if (least < 0 || t < least) least = t;
+        if (least < 0 || t < least) { least = t; least_pos = i; }
     }
+    /* A RANK plan() RE-SIZED FOR THE COMMON TOKEN COUNT MUST NEVER BE THE ONE THAT SETS IT: its pool
+     * was sized, with a margin, to page what its dearest peer pages. If it does bind, every rank
+     * carves fewer tokens than its dearest peer could -- named, because nothing else would show it. */
+    if (least >= 0 && least_pos < rank_cfg_.size() &&
+        rank_cfg_[least_pos].vram_kv_mib < cfg_.vram_kv_mib)
+        RAD_WARN("kv: rank %d's re-sized pool pages %lld tokens and binds every rank (planned for "
+                 "%lld); its margin was short", ranks_[least_pos]->index, (long long)least,
+                 (long long)kv_planned_tokens_);
     for (auto& r : ranks_) {
         LogRank lr(r->index);
         RAD_TRY(rad_dev_set(r->device));   /* allocates on the CURRENT device; see plan() */

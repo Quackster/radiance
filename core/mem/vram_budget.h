@@ -125,7 +125,8 @@ struct VramBudget {
 };
 
 /* Writes the answer into cfg.vram_weights_mib / cfg.vram_kv_mib -- ONE resolved number that every
- * consumer downstream reads, so the planner, the KV manager and the pool report cannot disagree.
+ * consumer downstream reads, so the planner, the KV manager and the pool report cannot disagree
+ * (an uneven world's cheaper rank takes its own copy of it: vram_budget_rank_split below).
  * Takes the SMALLEST capacity and free across ranks and the LARGEST arena, because a split has to
  * fit on every card it is applied to.
  *
@@ -136,5 +137,21 @@ int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, Vra
  * deciding between two programs before it resolves the one it keeps (Engine::plan's table
  * placement). */
 int vram_budget_trial(const Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out);
+
+/* AN UNEVEN WORLD'S CHEAPER RANK. The resolver above derives one split, the dearest rank's, and one
+ * block table serves every rank -- so a rank whose cache costs less per token (an attention-zero
+ * rank keeps no attention cache) would reserve the common KV pool for tokens configure_kv then caps
+ * away. Given the common split, the MiB that rank's pool needs to page the SAME tokens, and what
+ * every one of its weights would take resident (statics + all experts + their spare slots), this
+ * moves the difference to its weights pool, no further than that cap; what the cap leaves stays
+ * unclaimed. Nothing changes when the need is not below the common pool. */
+struct RankSplit {
+    int64_t weights_mib  = 0;
+    int64_t kv_mib       = 0;
+    int64_t unusable_mib = 0;   /* saved from the KV pool but past the weights cap: never allocated */
+    bool    resplit      = false;
+};
+RankSplit vram_budget_rank_split(int64_t common_weights_mib, int64_t common_kv_mib,
+                                 int64_t need_kv_mib, int64_t weights_cap_bytes);
 
 }  /* namespace rad */

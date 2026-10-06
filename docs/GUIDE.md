@@ -427,6 +427,15 @@ The cache never gets less than one `--max-model-len` sequence, and when both sid
 whole. With a lending cache, `--host-pool-mib` is what moves the split: a larger pool takes experts
 off the card and gives the cache more.
 
+**An uneven world re-splits its cheaper ranks.** The split above is worked out once, for the rank
+whose cache costs most, and one block table serves every rank. Where a rank's cache costs less per
+token -- an attention-zero rank at `--tp 3` keeps no attention cache -- it gets, under
+`expert_tiered` with both pools derived, a KV pool that pages exactly the common token count and the
+difference in its weights pool, up to every one of its weights resident; the startup log names the
+rank and both sizes (`kv: rank N's cache costs ...`). A stated `--vram-kv-mib` or
+`--vram-weights-mib` is applied to every card unchanged, and an even world is never re-split
+([`TP3.md`](TP3.md) §1).
+
 **The cache's size decides whether multi-turn works.** The KV side is not only concurrency: prefix
 caching holds a finished sequence's blocks so the next turn can reuse them. When the pool cannot
 hold the *live sessions*, the cache drops prefixes the next turn wanted and that turn re-prefills

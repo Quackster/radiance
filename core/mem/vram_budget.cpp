@@ -47,10 +47,11 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
     VramBudget b;
     if (per_rank.empty()) { if (out) *out = b; return RAD_OK; }
 
-    /* THE SMALLEST CARD AND THE LARGEST PROGRAM, because one split is applied to every rank. Ranks
+    /* THE SMALLEST CARD AND THE LARGEST PROGRAM, because one split is derived for every rank. Ranks
      * of one deployment normally hold the same shard shapes and the same program, so these folds
      * are no-ops -- they exist so that a mixed pair degrades to the card that binds instead of
-     * overcommitting the smaller one on the first allocation. */
+     * overcommitting the smaller one on the first allocation. An uneven world's cheaper ranks are
+     * re-split from this answer afterwards (vram_budget_rank_split, called by Engine::plan). */
     b.capacity   = per_rank[0].capacity;
     int64_t freeb = per_rank[0].free;
     int64_t layer_max = 0, kv_one = 0;
@@ -391,6 +392,25 @@ int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, Vra
 int vram_budget_trial(const Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out) {
     Config c = cfg;
     return resolve(c, per_rank, out, false);
+}
+
+RankSplit vram_budget_rank_split(int64_t common_weights_mib, int64_t common_kv_mib,
+                                 int64_t need_kv_mib, int64_t weights_cap_bytes) {
+    RankSplit s;
+    s.weights_mib = common_weights_mib;
+    s.kv_mib      = common_kv_mib;
+    if (need_kv_mib < 0 || need_kv_mib >= common_kv_mib) return s;
+    const int64_t saved = common_kv_mib - need_kv_mib;
+    /* NEVER LESS THAN THE COMMON WEIGHTS POOL, and never more than every weight resident: a weights
+     * pool is one whole allocation, so MiB past what this rank could ever place are left unclaimed
+     * rather than allocated empty. */
+    const int64_t cap   = std::max(common_weights_mib, to_mib_up(weights_cap_bytes));
+    const int64_t grown = std::min(common_weights_mib + saved, cap);
+    s.kv_mib       = need_kv_mib;
+    s.weights_mib  = grown;
+    s.unusable_mib = saved - (grown - common_weights_mib);
+    s.resplit      = true;
+    return s;
 }
 
 }  /* namespace rad */

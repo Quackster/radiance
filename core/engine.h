@@ -93,6 +93,13 @@ private:
     std::vector<std::thread>           rank_threads_;
 
     Config cfg_;
+    /* THE SPLIT EACH RANK ACTUALLY TAKES. Equal to cfg_ on every rank of an even world; under an
+     * uneven one (an attention-zero rank) a rank whose cache costs less per token gets a KV pool
+     * sized for the common token count and the difference in its weights pool. Engine::plan fills
+     * it, and every reader of the resolved pool sizes -- Pools::configure and the planner -- takes
+     * its rank's entry, never cfg_: a grown pool the planner never reads is an empty pool. */
+    std::vector<Config> rank_cfg_;
+    int64_t kv_planned_tokens_ = 0;   /* the common token count plan() sized the re-split pools for */
 
     /* The model's source, one of the two. A container stays mapped for the life of the engine:
      * the mapped and file tiers read it where it lies (spec §4.2). A checkpoint served directly
