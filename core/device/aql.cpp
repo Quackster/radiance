@@ -739,6 +739,87 @@ inline int acquire_scope(Stream* s, uint64_t idx, bool forced) {
     return HSA_FENCE_SCOPE_AGENT;
 }
 
+/* ------------------------------------------------------------------ dispatch trace
+ *
+ * RADIANCE_DISPATCH_TRACE=N: every kernel dispatch that carries no completion signal of its own
+ * gets one from a pool, and the packet processor's start/end timestamps on it (the queues already
+ * have profiling enabled) are read back once the signal has fired -- up to N dispatches, written
+ * at exit to RADIANCE_DISPATCH_TRACE_OUT (default /tmp/radiance-dispatch.csv) in rocprofv3's
+ * kernel_trace column names. Unlike --profile-ops it adds no barrier packet and no host wait
+ * between kernels: a completion signal on a dispatch is written when the dispatch retires and
+ * orders nothing. The host never waits for a signal here -- the pool grows instead -- so a step
+ * runs as it would without the trace. Dispatches that already carry a signal (a record riding on
+ * a replayed dispatch) are not traced. */
+struct TraceLive { hsa_signal_t sig; hsa_agent_t agent; uint64_t obj; };
+struct TraceRec  { uint64_t obj; uint64_t start, end; };
+std::mutex              g_tr_mu;
+std::vector<hsa_signal_t> g_tr_free;
+std::deque<TraceLive>   g_tr_live;
+std::vector<TraceRec>   g_tr_rec;
+bool                    g_tr_full = false;
+
+long trace_cap() {
+    static const long n = [] {
+        const char* e = std::getenv("RADIANCE_DISPATCH_TRACE");
+        return e ? std::atol(e) : 0L;
+    }();
+    return n;
+}
+
+void trace_dump() {
+    std::lock_guard<std::mutex> lk(g_tr_mu);
+    const char* p = std::getenv("RADIANCE_DISPATCH_TRACE_OUT");
+    const std::string path = p && *p ? p : "/tmp/radiance-dispatch.csv";
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) return;
+    std::fprintf(f, "Kernel_Name,Start_Timestamp,End_Timestamp\n");
+    std::lock_guard<std::mutex> nl(g_names_mu);
+    for (const TraceRec& r : g_tr_rec) {
+        auto it = g_names.find(r.obj);
+        std::string n = it != g_names.end() ? it->second : fmt("%#" PRIx64, r.obj);
+        for (char& c : n) if (c == ',' || c == '"') c = ';';
+        std::fprintf(f, "\"%s\",%" PRIu64 ",%" PRIu64 "\n", n.c_str(), r.start, r.end);
+    }
+    std::fclose(f);
+    std::fprintf(stderr, "radiance: dispatch trace: %zu dispatches written to %s\n", g_tr_rec.size(),
+                 path.c_str());
+}
+
+/* The retired signals, oldest first, into records; the rest stay live. Never waits. */
+void trace_harvest_locked() {
+    const double ns = 1e9 / (double)G().ts_freq;
+    while (!g_tr_live.empty()) {
+        const TraceLive& l = g_tr_live.front();
+        if (hsa_signal_load_scacquire(l.sig) != 0) break;
+        hsa_amd_profiling_dispatch_time_t t{};
+        if (hsa_amd_profiling_get_dispatch_time(l.agent, l.sig, &t) == HSA_STATUS_SUCCESS &&
+            (long)g_tr_rec.size() < trace_cap())
+            g_tr_rec.push_back(TraceRec{l.obj, (uint64_t)((double)t.start * ns),
+                                        (uint64_t)((double)t.end * ns)});
+        hsa_signal_store_relaxed(l.sig, 1);
+        g_tr_free.push_back(l.sig);
+        g_tr_live.pop_front();
+    }
+}
+
+/* A signal for this dispatch, or 0 when tracing is off or full. */
+hsa_signal_t trace_take(hsa_agent_t agent, uint64_t obj) {
+    if (trace_cap() <= 0) return hsa_signal_t{0};
+    std::lock_guard<std::mutex> lk(g_tr_mu);
+    static bool registered = false;
+    if (!registered) { registered = true; std::atexit([] { trace_dump(); }); }
+    trace_harvest_locked();
+    if ((long)g_tr_rec.size() >= trace_cap()) {
+        if (!g_tr_full) { g_tr_full = true; std::fprintf(stderr, "radiance: dispatch trace full\n"); }
+        return hsa_signal_t{0};
+    }
+    hsa_signal_t s{0};
+    if (!g_tr_free.empty()) { s = g_tr_free.back(); g_tr_free.pop_back(); }
+    else if (hsa_signal_create(1, 0, nullptr, &s) != HSA_STATUS_SUCCESS) return hsa_signal_t{0};
+    g_tr_live.push_back(TraceLive{s, agent, obj});
+    return s;
+}
+
 int barrier(Stream* s, hsa_signal_t dep, hsa_signal_t done, int acq, int rel,
             uint64_t* out_idx = nullptr) {
     s->lock();
@@ -805,6 +886,8 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     p->completion_signal.handle = 0;
     constexpr uint16_t setup = 3u << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
     if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence);
+    /* After the tape took its copy: a recorded packet must not carry a trace signal. */
+    if (trace_cap() > 0) p->completion_signal = trace_take(s->agent, k->object);
     const int acq = acquire_scope(s, idx, (fence & kFenceAcquireSystem) != 0);
     const int rel = (fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
     publish(s, idx, header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel), setup);
@@ -882,6 +965,7 @@ struct PlayRun {
         std::memcpy(reinterpret_cast<char*>(p) + 4, reinterpret_cast<const char*>(&r.pkt) + 4,
                     sizeof(hsa_kernel_dispatch_packet_t) - 4);
         if (done.handle) p->completion_signal = done;
+        else if (trace_cap() > 0) p->completion_signal = trace_take(s->agent, r.pkt.kernel_object);
         const int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0);
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
         if (rel < rel_min) rel = rel_min;

@@ -1525,6 +1525,13 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct at al
 | `RADIANCE_CALIB_TOKENS` | with `RADIANCE_CALIB_DIR`, the tokens the calibration tap accumulates before it writes and switches itself off (default 65536) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
+| `RADIANCE_DISPATCH_TRACE` | `N` (default unset: off): record per-dispatch start/end timestamps of up to N kernel dispatches and write them at exit to `RADIANCE_DISPATCH_TRACE_OUT` (default `/tmp/radiance-dispatch.csv`, rocprofv3 `kernel_trace` column names). Unlike `--profile-ops` it adds no barrier and no host wait between kernels, so the gaps between dependent kernels stay visible (a decode step runs about 830 kernels: N = 20000 covers ~24 steps); the trace itself costs ~2 ms a step. Use it where rocprofv3 cannot run on the AQL backend. Not for production |
+
+**Performance switches** (opt-in; off or neutral unless set)
+
+| | |
+|---|---|
+| `RADIANCE_TAPES` | the number of recorded decode/prefill passes ("tapes") the step keeps for replay. Default 24, range 1..4096. A pass is keyed by token count, longest query and speculative width, so many concurrent sequences with varying draft lengths can push the cache over its capacity and every miss costs a live issue. `/stats` `passes` shows `played`, `recorded`, `audited`, `dispatched`, `unordered`, `evicted` and `tape_cap`: `recorded` and `evicted` climbing means thrash, `played` climbing steady replay. **Recommended:** keep the default at one or two sequences; raise it (64 is a good start) at 8 sequences. Read once at start |
 
 There is also a family of instruments for engine development — `RADIANCE_DEBUG_*` (residual probes,
 idle scrubs, routing and issue dumps), `RADIANCE_OP_ORACLE*` (named ops checked against `libref` on

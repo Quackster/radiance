@@ -2095,6 +2095,8 @@ int Engine::run_server() {
                 s.passes.issued_first   += pc.issued_first;
                 s.passes.dispatched     += pc.dispatched;
                 s.passes.unordered      += pc.unordered;
+                s.passes.evicted        += pc.evicted;
+                s.passes.tape_cap        = pc.tape_cap;
             }
 
             s.link.present        = true;
