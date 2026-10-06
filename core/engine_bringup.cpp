@@ -2621,15 +2621,31 @@ int Engine::configure_kv() {
     {
         const bool tier_asked = cfg_.prefix_cache_host_mib > 0 || cfg_.prefix_cache_disk_mib > 0;
         const std::vector<int32_t>& cg = ranks_[0]->prefix.cached_groups();
-        int64_t entry_bytes = 0;
-        for (int32_t g : cg) {
-            const KVGroupPlan* p = ranks_[0]->kv.plan(g);
-            if (p && p->paged()) entry_bytes += p->bytes_per_block;
-        }
         /* ONE SLOT HOLDS EVERY RANK'S SHARD. An entry under tensor parallelism is n_ranks
          * pieces of KV that are not interchangeable, so the unit the tiers store and budget
-         * in is the whole thing; each rank writes only its own window of it. */
-        const int64_t slot_bytes = entry_bytes * (int64_t)ranks_.size();
+         * in is the whole thing; each rank writes only its own window of it. THE SHARDS NEED
+         * NOT BE EQUAL -- a rank's block holds its own heads of a group, and a world the heads
+         * do not divide gives the ranks different shares, or none (rad_kv_group_zero) -- so a
+         * slot is the SUM of the ranks' entries and a rank's window starts where the ranks
+         * before it end. Where every rank's share is the same this is n_ranks times one entry
+         * at offsets of one entry, as it always was. The sizing below (TierExec::sizes) takes
+         * the largest rank's entry: the staging ring is a rank's own, and the ring that fits
+         * the largest fits every one. */
+        std::vector<int64_t> rank_entry(ranks_.size(), 0), rank_ck(ranks_.size(), 0);
+        std::vector<int64_t> entry_off(ranks_.size(), 0), ck_off(ranks_.size(), 0);
+        int64_t entry_bytes = 0, slot_bytes = 0, ck_slot_bytes = 0;
+        for (size_t i = 0; i < ranks_.size(); ++i) {
+            for (int32_t g : cg) {
+                const KVGroupPlan* p = ranks_[i]->kv.plan(g);
+                if (p && p->paged()) rank_entry[i] += p->bytes_per_block;
+            }
+            rank_ck[i]   = ranks_[i]->kv.checkpoint_bytes();
+            entry_off[i] = slot_bytes;
+            ck_off[i]    = ck_slot_bytes;
+            slot_bytes    += rank_entry[i];
+            ck_slot_bytes += rank_ck[i];
+            entry_bytes = std::max(entry_bytes, rank_entry[i]);
+        }
 
         /* ---- how the tier is split between the two halves of a session ----
          *
@@ -2657,7 +2673,6 @@ int Engine::configure_kv() {
          * Two thirds is the ceiling. Not because the arithmetic asks for one, but because the
          * clamp above is a property of THIS build rather than of the design, and a tier with
          * almost no room for blocks would be badly sized the day it is lifted. */
-        const int64_t ck_slot_bytes = ranks_[0]->kv.checkpoint_bytes() * (int64_t)ranks_.size();
         int64_t ck_host_cap = 0, ck_disk_slots = 0;
         if (ck_slot_bytes > 0) {
             const int64_t bs = ranks_[0]->prefix.block_size();
@@ -2795,8 +2810,8 @@ int Engine::configure_kv() {
                                            max_batch, max_copy, max_chain,
                                            /*leader=*/&r == &ranks_[0],
                                            r->device,
-                                           (int64_t)(&r - &ranks_[0]) * entry_bytes,
-                                           (int64_t)(&r - &ranks_[0]) * ranks_[0]->kv.checkpoint_bytes(),
+                                           entry_off[(size_t)(&r - &ranks_[0])],
+                                           ck_off[(size_t)(&r - &ranks_[0])],
                                            /*shared=*/r->mover.transfer_stream())
                             != RAD_OK) {
                         all = false;

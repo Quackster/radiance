@@ -534,15 +534,20 @@ int Engine::step_loop() {
          * recorded the grab and cannot do the write itself (StateClear in core/mem/kv.h); this is
          * the first moment a stream exists and the last before the ranks are released, and it is
          * off the hot path -- the list is empty on every step but a sequence's first. Every rank
-         * clears its own pool: the slot number is the scheduler's, the memory is the rank's. */
+         * clears its own pool BY ITS OWN PLAN: the slot number is the scheduler's, the memory and
+         * its size are the rank's. A state is as large as the heads this rank holds of the group,
+         * and the ranks' shares need not be equal (rad_arch.h remainder_place): a rank clearing
+         * rank 0's byte count of a larger state leaves its tail as the last sequence left it, and
+         * the recurrence reads it from the first token. */
         for (const StateClear& c : ranks_[0]->kv.state_clears()) {
-            const KVGroupPlan* gp = ranks_[0]->kv.plan(c.group);
-            if (!gp || !gp->stateful()) continue;
-            const int64_t bytes = gp->layer_bytes_per_state();
-            for (auto& rk : ranks_)
+            for (auto& rk : ranks_) {
+                const KVGroupPlan* gp = rk->kv.plan(c.group);
+                if (!gp || !gp->stateful()) continue;
+                const int64_t bytes = gp->layer_bytes_per_state();
                 for (int64_t l = 0; l < gp->n_layers; ++l)
                     if (void* p = rk->kv.state_ptr(c.group, (int32_t)l, c.slot))
                         rad_memset_async(p, 0, bytes, rk->ctx.stream());
+            }
         }
         ranks_[0]->kv.clear_state_clears();
 
