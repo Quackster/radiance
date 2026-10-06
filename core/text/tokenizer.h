@@ -247,6 +247,15 @@ public:
     bool               stopped() const { return stopped_; }
     const std::string& stop_hit() const { return stop_hit_; }
 
+    /* STOP STRINGS ARE THE ANSWER'S, NOT THE REASONING'S. A generation that starts inside an open
+     * reasoning block (the rendered prompt ends on `<think>`) is matched against its stop strings
+     * only after `marker` -- the block's closer -- has been generated, and only in the text after
+     * it. Without this a caller's stop string that the model happens to write while thinking ends
+     * the request with the reasoning cut short and no answer at all: lm-eval's GSM8K stops on
+     * "Q:", and a reasoning model restating the question writes exactly that. "" = match from the
+     * first token, the behaviour of every request that does not open a block. */
+    void defer_stops_until(std::string marker) { arm_after_ = std::move(marker); armed_ = arm_after_.empty(); }
+
     /* Everything pushed so far, stop string included. The scheduler wants this to decide whether
      * a request finished on a stop or on a length limit. */
     const std::string& text() const { return all_; }
@@ -264,6 +273,8 @@ private:
     std::string stop_hit_;
     size_t      max_stop_ = 0;
     bool        first_ = true;
+    std::string arm_after_;     /* see defer_stops_until */
+    bool        armed_ = true;
     Tokenizer   tok_;              /* over v_, set up by the first push */
     bool        tok_ready_ = false;
 

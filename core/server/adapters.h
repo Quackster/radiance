@@ -311,6 +311,7 @@ public:
     std::string push(int32_t t) override { return d_.push(t); }
     std::string flush() override { return d_.flush(); }
     bool stopped() const override { return d_.stopped(); }
+    void defer_stops_until(const std::string& m) override { d_.defer_stops_until(m); }
 private:
     Detokenizer d_;
 };

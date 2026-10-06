@@ -77,6 +77,9 @@ struct OaiRequest {
     SamplingParams  sp;
     int32_t         max_tokens = 0;
     std::vector<std::string> stop;
+    /* The reasoning block's closer when the rendered prompt leaves one open, else "": the stop
+     * strings above then apply only after it (IDetokenizer::defer_stops_until). */
+    std::string stops_after;
     /* Generate past end-of-text, to max_tokens. See Request::ignore_eos. */
     bool        ignore_eos = false;
     int             priority = 0;

@@ -299,6 +299,9 @@ public:
      * search text that can no longer contain what it is searching for, and the generation would
      * run to max_tokens. Default false, for a decoder that leaves stop handling to us. */
     virtual bool stopped() const { return false; }
+    /* Match the stop strings only after `marker` has been generated (core/text Detokenizer::
+     * defer_stops_until): the request's generation starts inside an open reasoning block. */
+    virtual void defer_stops_until(const std::string& /*marker*/) {}
 };
 
 class ITokenizer {

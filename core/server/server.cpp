@@ -330,6 +330,7 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
                 *err = err_not_implemented("the tokenizer did not supply an incremental decoder");
                 return RAD_E_UNSUPPORTED;
             }
+            if (!r.stops_after.empty()) g.detok->defer_stops_until(r.stops_after);
 
             Request rq;
             rq.prompt = r.prompts[p].tokens;
@@ -338,7 +339,9 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
              * Offsetting is enough: the sampler's stream is seeded, not chained. */
             rq.sp.seed = r.sp.seed + (uint64_t)k;
             rq.max_tokens = r.max_tokens;
-            rq.stop = r.stop;
+            /* With the stop strings deferred past the reasoning block, the scheduler -- which
+             * cannot tell reasoning from answer -- gets none; the decoder and pump() cut. */
+            rq.stop = r.stops_after.empty() ? r.stop : std::vector<std::string>{};
             rq.ignore_eos = r.ignore_eos;
             rq.priority = r.priority;
             rq.stream = r.stream;
@@ -429,8 +432,17 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
          * string straddles token boundaries and only the detokenised text can be searched, so the
          * authoritative cut is made here. Scanning restarts (maxstop-1) bytes behind the previous
          * end so a match spanning two drains is still found. */
-        if (maxstop && g.stop_cut == std::string::npos && !g.text.empty()) {
+        /* Stop strings deferred past an open reasoning block match only after its closer. */
+        size_t floor = 0;
+        bool scan = true;
+        if (!r.stops_after.empty()) {
+            const size_t m = g.text.find(r.stops_after);
+            if (m == std::string::npos) scan = false;
+            else floor = m + r.stops_after.size();
+        }
+        if (maxstop && scan && g.stop_cut == std::string::npos && !g.text.empty()) {
             size_t start = g.scanned >= maxstop ? g.scanned - maxstop + 1 : 0;
+            if (start < floor) start = floor;
             for (const auto& s : r.stop) {
                 if (s.empty()) continue;
                 size_t at = g.text.find(s, start);

@@ -1606,13 +1606,27 @@ std::string Detokenizer::push(int32_t token) {
     all_ += p;
     pending_ += p;
 
+    /* Inside an open reasoning block no stop string applies (defer_stops_until). Once the closer
+     * has been generated, matching starts in the text AFTER it -- the closer may still be in
+     * pending_, and nothing before it may count. */
+    size_t from = 0;
+    if (!armed_) {
+        if (all_.find(arm_after_) == std::string::npos) {
+            from = std::string::npos;
+        } else {
+            armed_ = true;
+            const size_t m = pending_.find(arm_after_);
+            from = m == std::string::npos ? 0 : m + arm_after_.size();
+        }
+    }
+
     /* A complete stop string inside pending_ ends the stream. Everything before it is emitted;
      * the stop string and anything after it never is. */
-    if (!stops_.empty()) {
+    if (!stops_.empty() && from != std::string::npos) {
         size_t best = std::string::npos;
         const std::string* which = nullptr;
         for (const std::string& s : stops_) {
-            const size_t m = pending_.find(s);
+            const size_t m = pending_.find(s, from);
             if (m != std::string::npos && m < best) { best = m; which = &s; }
         }
         if (which) {

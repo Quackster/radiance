@@ -1456,6 +1456,14 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
         if (std::find(out->stop.begin(), out->stop.end(), s) == out->stop.end())
             out->stop.push_back(s);
 
+    /* A prompt that ends inside an open `<think>` block: the reply starts as reasoning, and the
+     * stop strings are the answer's (Detokenizer::defer_stops_until). */
+    {
+        const std::string& gp = render.generation_prompt;
+        const size_t o = gp.rfind("<think>"), c = gp.rfind("</think>");
+        if (o != std::string::npos && (c == std::string::npos || c < o)) out->stops_after = "</think>";
+    }
+
     /* Checked HERE, where the answer is still a 400. The grammar being validated may be the
      * caller's, or one the template produced for its own tool-call syntax; either way the first
      * moment it can fail is when the automaton is built, and building it on the step path would
