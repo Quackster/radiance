@@ -706,6 +706,28 @@ from the first token. The reply is the same either way. A hit whose nearest chec
 point would give back more than two windows is kept whole. `radiance:draft_refills_total` counts
 the hits ended early and `radiance:draft_refill_tokens_total` the tokens they recomputed.
 
+**One depth for every request is a compromise; `RADIANCE_DRAFT_ADAPT=1` gives each sequence its
+own.** Acceptance depends on the text: code and JSON keep accepting deep into the window, prose and
+summaries fall off after a position or two. With the switch set, `--num-speculative-tokens` is the
+ceiling, each sequence keeps a smoothed acceptance per draft position, and it drafts into the window
+that maximises the tokens a step is expected to emit over what that step costs. The costs are
+`RADIANCE_DRAFT_COST`, the step time at each fixed depth on the same setup, in any unit:
+
+```sh
+RADIANCE_DRAFT_ADAPT=1 RADIANCE_DRAFT_COST=1:9.9,2:11.0,3:12.06,4:13.32,5:14.37,6:15.77 \
+RADIANCE_DRAFT_ADAPT_BUSY=3 radiance --model m.rad --num-speculative-tokens 6
+```
+
+The table belongs to the hardware; without one a step is priced at 1 + 0.06·d. A window moves only
+past a hysteresis and a hold, because every new window is a new pass shape and a new recording. The
+table prices a step at one sequence, and with more running a deeper window also costs every
+neighbour, so `RADIANCE_DRAFT_ADAPT_BUSY=N` caps every window at `RADIANCE_DRAFT_ADAPT_BUSY_DEPTH`
+(default 3) while more than N sequences run. The window is the serial drafter's policy: with a block
+drafter the switch is turned off at load, with a warning. At temperature 0 the text is that of a
+fixed depth wherever fixed depths agree with each other; above 0 it is distribution-exact.
+`radiance:draft_depth_adaptive` and `radiance:draft_verify_depth_total` (§6.3) show where the
+windows stand.
+
 ### 4.7 Two cards
 
 ```sh
@@ -1423,6 +1445,7 @@ under the request's own spelling of each. `server.default_max_tokens` is `null` 
 | `draft_position_reached_total`, `draft_position_acceptance_ratio` | acceptance by position, since start |
 | `draft_refills_total`, `draft_refill_tokens_total` | prefix hits ended a drafter window early, and the tokens recomputed (§4.6) |
 | `decode_rows_unspeculated_total` | rows that never drafted at all |
+| `draft_depth_adaptive`, `draft_verify_depth_total{depth}` | the adaptive window's mean over the running sequences, and verifies by the drafts they carried; only with `RADIANCE_DRAFT_ADAPT` (§4.6) |
 | `attn_cached_tokens_total`, `linear_cached_tokens_total` | prefix reuse, both halves |
 | `linear_checkpoints_written_total`, `linear_prefix_cache_hit_rate` | |
 | `prefix_cache_evictions_total`, `prefix_cache_ckpt_evictions_total` | |
@@ -1536,6 +1559,10 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct at al
 | `RADIANCE_HOME` | where `kernels/`, `architectures/` and `quantizers/` live; a `:`-separated search path, the first home winning. Same as `--radiance-home` |
 | `RADIANCE_KERNELS` | default kernel hierarchy, comma-separated. Same as `--kernels`, read by the engine *and* every tool, so a plugin validated with `rad-kbench` can be served without editing launchers |
 | `RADIANCE_LOG` | `error` \| `warn` \| `info` \| `debug` \| `trace` |
+| `RADIANCE_DRAFT_ADAPT` | `1`: a draft window per sequence, `--num-speculative-tokens` the ceiling (§4.6) |
+| `RADIANCE_DRAFT_COST` | with it, the step cost by depth, `d:cost,…` |
+| `RADIANCE_DRAFT_ADAPT_BUSY`, `_BUSY_DEPTH` | above N running sequences, every window capped at `_BUSY_DEPTH` (3) |
+| `RADIANCE_DRAFT_ADAPT_HYST`, `_HOLD`, `_HALFLIFE`, `_PRIOR`, `_MIN` | the policy's knobs: 0.02, 8 verifies, 16 verifies, 0.8, 1 |
 | `ROCM_PATH` | where ROCm lives, if not `/opt/rocm` |
 | `HF_TOKEN` | for `scripts/hfget.sh` on a gated repo |
 
