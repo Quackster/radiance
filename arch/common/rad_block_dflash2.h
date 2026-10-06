@@ -198,6 +198,7 @@ struct Dflash2 {
         rad_buf dq    = 0;  /* [srows, n_embd]  i8   the 2-bit head's quantised activation */
         rad_buf ds    = 0;  /* [srows, 1]       f32  one scale a row */
         rad_buf dsum  = 0;  /* [n_embd/128, pad] f32 GROUP-major, quant_act_i8's asum plane */
+        rad_buf ds8   = 0;  /* [srows, n_embd/128] f32  the int8 head's scale per (row, 128) */
         rad_buf dlog  = 0;  /* [srows, head_rows(g)] bf16  the coarse logits */
         rad_buf cand  = 0;  /* [srows, sel_topk] i32  candidate token ids, global */
         rad_buf unary = 0;  /* [srows, sel_topk] f32  and their logits */
@@ -422,10 +423,34 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     const int  dh_split = dh_shard ? RAD_SHARD_ROW : RAD_SHARD_NONE;
     const char* dhn = nm.f("dflash.draft_head.weight");
     RAD_ARCH_TRY(map_copy(b, dhn, ck_lm));
-    w_dh  = decl_view(b, dhn, nullptr, "codes", RAD_U2, {head_rows(g), g.n_embd},
-                      RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
-    w_dhs = decl_view(b, nm.f("dflash.draft_head.scale"), dhn, "scale,zero", RAD_F16,
-                      {head_rows(g), g.n_embd}, RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
+    /* TWO BITS OR FOUR, read off the container. The candidates every draft position keeps are this
+     * head's top K, so its precision is what the selector has to work with: a coarse head ranks
+     * the right token outside the K it hands on, and no later stage can recover it. A recipe that
+     * writes the head `codes=u4 zero=u8 group=128 scale=f16` gets libr4d's w4a8_asym GEMM over the
+     * same int8 activation and the same group sums -- twice the bytes (~660 MiB at 248k x 5120),
+     * served the same way. */
+    {
+        RadEncoding de{};
+        const bool known = weight_enc(b, dhn, &de);
+        dh4 = known && de.n_planes >= 1 && de.plane[0].dtype == RAD_U4;
+        /* EIGHT BITS: `codes=i8 group=128 scale=bf16 clamp=sym`, the int8 weight LinearFP8 serves
+         * at i8a8 -- symmetric, no zero plane, against an int8 activation with an f32 scale per
+         * (row, 128) in plain row-major order (quant_act_i8g), not the fragment-ordered one with
+         * group sums the 2- and 4-bit grids read. Twice the 4-bit head's bytes. */
+        dh8 = known && linear_is_w8(de);
+    }
+    if (dh8) {
+        w_dh  = decl_view(b, dhn, nullptr, "codes", RAD_I8, {head_rows(g), g.n_embd},
+                          RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
+        w_dhs = decl_view(b, nm.f("dflash.draft_head.scale"), dhn, "scale", RAD_BF16,
+                          {head_rows(g), g.n_embd / DF_W2_GROUP}, RAD_ACCESS_PER_TOKEN, dh_split,
+                          grp_model());
+    } else {
+        w_dh  = decl_view(b, dhn, nullptr, "codes", dh4 ? RAD_U4 : RAD_U2,
+                          {head_rows(g), g.n_embd}, RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
+        w_dhs = decl_view(b, nm.f("dflash.draft_head.scale"), dhn, "scale,zero", RAD_F16,
+                          {head_rows(g), g.n_embd}, RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
+    }
     if (!w_dh || !w_dhs) return RAD_E_INVAL;
 
     /* ---------------------------------------------------------------- per-layer weights */
@@ -829,17 +854,32 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                  RAD_STR("dtype", g.dtype)),
                       RAD_NOWEIGHTS),
                   {w.h}, {w.sel_h});
-    op_dquant = rw(b, RAD_OP(b, "quant_act_i8",
-                      RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("n", g.n_embd),
-                                 RAD_INT("group", DF_W2_GROUP), RAD_STR("dtype", g.dtype)),
-                      RAD_NOWEIGHTS),
-                  {w.sel_h}, {w.dq, w.ds, w.dsum});
-    op_dlogits = rw(b, RAD_OP(b, "gemm_nt_q",
-                       RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
-                                  RAD_INT("K", g.n_embd), RAD_INT("group", DF_W2_GROUP),
-                                  RAD_STR("dtype", "w2a8")),
-                       RAD_WEIGHTS(w_dh, w_dhs)),
-                   {w.dq, w.ds, w.dsum}, {w.dlog});
+    if (dh8) {
+        if (!w.ds8) return RAD_E_INVAL;
+        op_dquant = rw(b, RAD_OP(b, "quant_act_i8g",
+                          RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("n", g.n_embd),
+                                     RAD_INT("group", DF_W2_GROUP), RAD_STR("dtype", g.dtype)),
+                          RAD_NOWEIGHTS),
+                      {w.sel_h}, {w.dq, w.ds8});
+        op_dlogits = rw(b, RAD_OP(b, "gemm_nt_q",
+                           RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
+                                      RAD_INT("K", g.n_embd), RAD_INT("group", DF_W2_GROUP),
+                                      RAD_STR("dtype", "i8a8")),
+                           RAD_WEIGHTS(w_dh, w_dhs)),
+                       {w.dq, w.ds8}, {w.dlog});
+    } else {
+        op_dquant = rw(b, RAD_OP(b, "quant_act_i8",
+                          RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("n", g.n_embd),
+                                     RAD_INT("group", DF_W2_GROUP), RAD_STR("dtype", g.dtype)),
+                          RAD_NOWEIGHTS),
+                      {w.sel_h}, {w.dq, w.ds, w.dsum});
+        op_dlogits = rw(b, RAD_OP(b, "gemm_nt_q",
+                           RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
+                                      RAD_INT("K", g.n_embd), RAD_INT("group", DF_W2_GROUP),
+                                      RAD_STR("dtype", dh4 ? "w4a8_asym" : "w2a8")),
+                           RAD_WEIGHTS(w_dh, w_dhs)),
+                       {w.dq, w.ds, w.dsum}, {w.dlog});
+    }
     /* Sharded, the top-R runs over THIS RANK'S plane and reports global ids, and it also writes
      * the pair plane the gather moves. `vocab_off` is omitted entirely when the head is
      * replicated, so that graph is the one it always was -- an optional parameter present with
@@ -1031,11 +1071,18 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
 
     /* `dsum` is quant_act_i8's GROUP-major plane, [n_embd/group][ceil(M/16)*16], so it is passed
      * whole: there is no row slice of it that means anything. */
-    RAD_ISSUE_N(c, op_dquant, S, brows(w.sel_h, S), brows(w.dq, S), brows(w.ds, S), RAD_B(w.dsum));
     /* The trailing operand is mxfp4's optional reference and is absent here; an absent optional
      * operand is a null tensor in a full-length list, not a shorter list. */
-    RAD_ISSUE_N(c, op_dlogits, S, brows(w.dq, S), brows(w.ds, S), RAD_W(w_dh), RAD_W(w_dhs),
-                brows(w.dlog, S), RAD_B(w.dsum), RAD_NONE);
+    if (dh8) {
+        RAD_ISSUE_N(c, op_dquant, S, brows(w.sel_h, S), brows(w.dq, S), brows(w.ds8, S));
+        RAD_ISSUE_N(c, op_dlogits, S, brows(w.dq, S), brows(w.ds8, S), RAD_W(w_dh), RAD_W(w_dhs),
+                    brows(w.dlog, S), RAD_NONE, RAD_NONE);
+    } else {
+        RAD_ISSUE_N(c, op_dquant, S, brows(w.sel_h, S), brows(w.dq, S), brows(w.ds, S),
+                    RAD_B(w.dsum));
+        RAD_ISSUE_N(c, op_dlogits, S, brows(w.dq, S), brows(w.ds, S), RAD_W(w_dh), RAD_W(w_dhs),
+                    brows(w.dlog, S), RAD_B(w.dsum), RAD_NONE);
+    }
     /* RAD_NONE is the `pairs` slot: operands are POSITIONAL, so an optional one that the graph
      * does not use is still passed, absent. Omitting it is a miscount and the engine refuses the
      * op rather than guessing which of the four was left out.

@@ -512,6 +512,8 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     /* GROUP-major, [n_embd/group][ceil(M/16)*16] -- quant_act_i8's asum plane, whose first
      * dimension is the K group and not the token. */
     dw.dsum    = decl_b(b, nm.f("df_dsum"), RAD_F32, {dg.n_embd / 128, spad});
+    /* The int8 head's activation scale, one per (row, 128); unused by the 2- and 4-bit grids. */
+    dw.ds8     = decl_b(b, nm.f("df_ds8"),  RAD_F32, {sr, dg.n_embd / 128});
     /* THIS RANK'S plane. `head_rows` is the block's own answer to whether the 2-bit head is
      * vocab-sharded, asked here rather than re-derived, because a buffer that disagreed with the
      * op declared over it is a read past its end. */
