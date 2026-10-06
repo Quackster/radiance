@@ -30,6 +30,19 @@ attention computes zeros from zeros and its output projection adds exactly nothi
 Five ranks over two: attention world 4 (two replicated pairs), rank 4 attention-zero. Six: three
 pairs, no zero rank.
 
+**The zeros are written, not assumed.** A zero share has no bytes in the container, so the sweep
+over the file never reaches it; the loader hands it to the relayout workers itself, before the
+sweep, and its fill writes the slot. The pool refuses to finish with any staged weight nothing
+delivered. This matters because a card whose freed VRAM the driver wipes hands fresh allocations
+back as zeros, and a slot nothing wrote serves correctly there by luck -- until the card has been
+through a reset ("VRAM is lost") and the same slot is garbage. The test that sees it on any card:
+
+    RADIANCE_POISON_ALLOC=255 radiance --model stock.rad --tp 3 ...
+
+fills every fresh device allocation with 0xFF (NaN in every float width) before it is handed out;
+the serve must answer exactly as without it. `RADIANCE_POISON_RANGE=lo:hi` narrows the fill to a
+thread's allocation ordinals for a bisect (`core/device/dispatch.cpp`).
+
 Why the same shapes rather than no attention on that rank: the scheduler sees **one program**
 (`core/sched/batch.cpp` indexes `kv_groups[i]` by position), so every rank declares every op and
 every KV group in the same order. An attention-zero rank's KV group is as large as its peers'; the
