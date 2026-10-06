@@ -162,6 +162,8 @@ struct Plugin {
     void (*pin_nt)(int) = nullptr;
     void (*pin_qsa)(int) = nullptr;
     void (*pin_moe)(int) = nullptr;
+    void (*pin_fk)(int) = nullptr;
+    void (*pin_uw)(int) = nullptr;
     void (*pin_hc)(int) = nullptr;
     void (*pin_qsel)(int) = nullptr;
 };
@@ -192,6 +194,8 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_gemm_fp8a8_pin_nt", &pl->pin_nt);
     okall &= sym(pl->h, "r4d_qsa_score_pin_form", &pl->pin_qsa);
     okall &= sym(pl->h, "r4d_moe_gemm_pin_prefill", &pl->pin_moe);
+    okall &= sym(pl->h, "r4d_moe_gemm_pin_fk", &pl->pin_fk);
+    okall &= sym(pl->h, "r4d_moe_gemm_pin_uw", &pl->pin_uw);
     okall &= sym(pl->h, "r4d_hc_read_pin_prefill", &pl->pin_hc);
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     return okall;
@@ -5856,6 +5860,76 @@ static float st_e4m3(uint8_t b) {
  * its part and its down projection reads a shorter K. */
 struct MoeW4Shape { const char* name; int64_t N0, K0, N1, K1, parts, ne; };
 
+/* THE DECODE FORM'S BIT-IDENTICAL VARIANTS, each against the default, byte for byte: the weight from
+ * a uniform global base (R4D_MOE_UWLOAD), two 128-wide K blocks a pass (R4D_MOE_GU_FK256), and
+ * both. Every launch is DESCRIBED first: a variant that named the default's kernel would match it
+ * trivially, so two pins naming one function is a failure, not a pass. `fk2` is whether this shape
+ * can take two blocks a pass -- the token operand, a format that folds scale groups, every class's
+ * K a multiple of 256; the uniform base is open to every shape. The default here is PINNED, so an
+ * R4D_MOE_* switch in the environment cannot make the comparison one variant against itself.
+ *
+ * A row with no describe hook -- moe_gemm_fp8a8_mod4 -- is compared on its bytes alone, and says
+ * so in its label: that the variant ran is then not shown, only that what ran agrees. */
+static void moe_dec_variants(const Plugin& pl, const RadKernelInfo* row, RadArgs& a, void* d_y,
+                             size_t elems, bool fk2, const std::string& what) {
+    if (!pl.pin_fk || !pl.pin_uw || !pl.pin_moe) return;
+    const bool described = row->describe != nullptr;
+    struct Var { int uw, fk; const char* name; };
+    static const Var kVar[] = { { 1, 1, "one K block a pass" },
+                                { 2, 1, "uniform weight base" },
+                                { 1, 2, "two K blocks a pass" },
+                                { 2, 2, "uniform weight base, two K blocks a pass" } };
+    const void* fn[4] = { nullptr, nullptr, nullptr, nullptr };
+    std::vector<uint16_t> base;
+    for (int v = 0; v < 4; ++v) {
+        if (kVar[v].fk == 2 && !fk2) continue;
+        const std::string label = what + " decode form, " + kVar[v].name +
+                                  (described ? "" : " (launch not described)");
+        auto pin = [&](bool on) {
+            pl.pin_moe(on ? 2 : 0);
+            pl.pin_uw(on ? kVar[v].uw : 0);
+            pl.pin_fk(on ? kVar[v].fk : 0);
+        };
+        if (described) {
+            static RadLaunchDesc d[4];
+            int n = 0;
+            pin(true);
+            const int drc = row->describe(&a, nullptr, d, 4, &n);
+            pin(false);
+            if (drc != RAD_OK || n < 1) {
+                ok(label.c_str(), false, "describe rc=" + std::to_string(drc) + " n=" +
+                                         std::to_string(n));
+                return;
+            }
+            fn[v] = d[n - 1].func;
+            int same = -1;
+            for (int u = 0; u < v; ++u)
+                if (fn[u] && fn[u] == fn[v]) same = u;
+            if (same >= 0) {
+                ok(label.c_str(), false,
+                   std::string("named the same kernel as ") + kVar[same].name);
+                continue;
+            }
+        }
+        {
+            std::vector<uint16_t> junk(elems, 0x7f7fu);
+            st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
+        }
+        pin(true);
+        const int rc = row->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        pin(false);
+        if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); return; }
+        std::vector<uint16_t> got(elems);
+        st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
+        if (v == 0) { base = got; continue; }     /* the form loop held it to the host decode */
+        int64_t diff = 0;
+        for (size_t i = 0; i < got.size(); ++i) diff += got[i] != base[i];
+        ok(label.c_str(), diff == 0, std::to_string(diff) + " of " + std::to_string(elems) +
+                                     " elements differ from " + kVar[0].name);
+    }
+}
+
 /* EVERY FORM THE LAUNCHER HAS, each against the host decode: the run-aligned prefill form (a run
  * map in the scratch it is handed), the (tile, run) decode form, and the uniform prefill grid a
  * caller with no scratch gets. The rule picks one by the routed-row count, so a case that only
@@ -6095,6 +6169,9 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
                                     " elements off, worst " + std::to_string(worst) + first);
         two_cls[form] = got;
     }
+    /* The decode form's variants; two K blocks a pass where the switch can take this shape. */
+    const bool fk2 = g64 && sh.K0 % 256 == 0 && sh.K1 % 256 == 0;
+    moe_dec_variants(pl, r, a, d_y, (size_t)(Tr * N), fk2, what);
     if (!four) return;
 
     /* AND THE SAME EXPERTS AS FOUR CLASSES, by number mod 4 (`moe_gemm_q_mod4`). Each parity table
@@ -6158,6 +6235,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
         ok(label.c_str(), diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
                                      " elements differ from the two-class op's");
     }
+    moe_dec_variants(pl, r4, a4, d_y, (size_t)(Tr * N), fk2, what4);
 }
 
 /* THE FOUR-CLASS GROUPED GEMM, EACH CLASS AT ITS OWN GEOMETRY, AGAINST A HOST DECODE.
@@ -6419,6 +6497,10 @@ static void moe_q4_gemm(const Plugin& pl, int64_t Tr, const MoeQ4Shape& sh, cons
         ok(label.c_str(), bad == 0, std::to_string(bad) + " of " + std::to_string(Tr * N) +
                                     " elements off, worst " + std::to_string(worst) + first);
     }
+    /* The decode form's variants, each class at its own geometry; fp8a8 runs W4 0 here. */
+    bool fk2 = g64;
+    for (int q = 0; q < 4; ++q) fk2 = fk2 && sh.K[q] % 256 == 0;
+    moe_dec_variants(pl, r, a, d_y, (size_t)(Tr * N), fk2, what);
 }
 
 /* THE ARRANGED PLANE, AGAINST THE FORMAT IT STATES, AND BACK.
@@ -10239,6 +10321,9 @@ static void device_phase(const Plugin& pl) {
             { "gate/up 2:1", 256, 256, 128, 256, 2, 5 },
             { "down 2:1",    64, 256,  64, 128, 1, 5 },
             { "300 experts, gate/up 2:1", 256, 128, 128, 128, 2, 300 },
+            /* Three passes of 256 along K: the decode form's two-block pass then also runs its
+             * one-ahead prefetch, which a single pass never reaches. */
+            { "40 experts, gate/up 2:1, K 768", 256, 768, 128, 768, 2, 40 },
         };
         for (const MoeW4Shape& sh : kShapes) {
             moe_w4_gemm(pl, 24, sh);
@@ -10262,6 +10347,7 @@ static void device_phase(const Plugin& pl) {
             { "gate/up 2:1", 256, 256, 128, 256, 2, 10 },
             { "down 2:1",    64, 256,  64, 128, 1, 10 },
             { "300 experts, gate/up 2:1", 256, 128, 128, 128, 2, 300 },
+            { "40 experts, gate/up 2:1, K 768", 256, 768, 128, 768, 2, 40 },
         };
         for (const MoeW4Shape& sh : kShapes4)
             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 }) {

@@ -627,6 +627,14 @@ void r4d_qsa_score_pin_form(int form);
 // prefill form, 2 the (tile, run) decode form, 3 the uniform prefill grid. r4d_selftest --perfmoe
 // times each and compares it with form 1.
 void r4d_moe_gemm_pin_prefill(int form);
+// THE DECODE FORM'S STAGED K, pinned for a test: 0 is R4D_MOE_GU_FK256's rule, 1 one 128-wide block
+// a pass, 2 two wherever the shape allows it (the token-operand projection, every class's K a
+// multiple of 256, a format that folds scale groups). The two are bit-identical, and r4d_selftest
+// compares their bytes.
+void r4d_moe_gemm_pin_fk(int pin);
+// THE DECODE FORM'S WEIGHT ADDRESS, pinned for a test: 0 is R4D_MOE_UWLOAD's rule, 1 the generic
+// table pointer, 2 a uniform global base. Bit-identical, and r4d_selftest compares their bytes.
+void r4d_moe_gemm_pin_uw(int pin);
 // THE GATED RESIDUAL READ'S PREFILL TILE, pinned for a test: 0 is the launcher's rule, 1 the decode
 // tiles' kernels at 128 rows (hc_down_tiled, then hc_up_tiled into `ubuf` and hc_mix), 2 the wide
 // kernels (which then refuse a shape they are not built for). The two are bit-identical by

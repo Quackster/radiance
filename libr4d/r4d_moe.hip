@@ -693,6 +693,67 @@ __device__ __forceinline__ uint4 w4_load(const uint8_t* __restrict__ src, bool l
     return live ? *(const uint4*)src : make_uint4(0, 0, 0, 0);
 }
 
+/* ---- UW: THE WEIGHT STREAM FROM A UNIFORM GLOBAL ADDRESS ----------------------------------------
+ *
+ * The weight and its scales are reached through the table, so their base pointer is a value LOADED
+ * by the kernel: `e` comes out of LDS, the compiler cannot prove it uniform, and the table entry is
+ * fetched with a vector load into VGPRs and then used as a GENERIC pointer -- every weight load is
+ * a flat_load. On gfx12 that combination serialises the staging. A flat load may also reach LDS, so
+ * once one is in flight the waitcnt pass can only wait for a vector-load count of ZERO; and the
+ * base pointer's own load is never seen as retired across the exec-masked `live` branches. The
+ * disassembly of the decode form shows the result: `s_wait_loadcnt 0x0` in front of every weight
+ * load, so a pass's activation, first weight row and second weight row go to memory one after the
+ * other -- three round trips where one was written.
+ *
+ * Under UW the two table entries are made uniform (readfirstlane: `e` is block-uniform, every lane
+ * holds the same pointer) and the loads go through address_space(1), as the dense w4 kernels do:
+ * an SGPR base, global_load, and nothing for the waitcnt pass to wait on until the LDS store that
+ * consumes them. The same bytes reach the same registers: bit-identical. A table entry that points
+ * into host memory (a pooled expert) is still a global address; nothing here can be LDS. */
+typedef unsigned r4d_moe_u4v __attribute__((ext_vector_type(4)));
+typedef __attribute__((address_space(1))) const r4d_moe_u4v* r4d_moe_gu4;
+typedef __attribute__((address_space(1))) const uint32_t*    r4d_moe_gu32;
+typedef __attribute__((address_space(1))) const uint16_t*    r4d_moe_gu16;
+
+template <bool UW, typename P>
+__device__ __forceinline__ const P* uw_ptr(const P* p) {
+    if constexpr (!UW) return p;
+    const uint64_t v  = (uint64_t)(uintptr_t)p;
+    const uint32_t lo = (uint32_t)__builtin_amdgcn_readfirstlane((int)(uint32_t)v);
+    const uint32_t hi = (uint32_t)__builtin_amdgcn_readfirstlane((int)(uint32_t)(v >> 32));
+    return (const P*)(uintptr_t)(((uint64_t)hi << 32) | lo);
+}
+template <bool UW>
+__device__ __forceinline__ uint4 w4_load_w(const uint8_t* __restrict__ src, bool live) {
+    if constexpr (!UW) return w4_load(src, live);
+    if (!live) return make_uint4(0, 0, 0, 0);
+    const r4d_moe_u4v v = *(r4d_moe_gu4)src;
+    return make_uint4(v.x, v.y, v.z, v.w);
+}
+template <bool UW>
+__device__ __forceinline__ Stage8 stage8_load_w(const uint8_t* __restrict__ src, bool live) {
+    if constexpr (!UW) return stage8_load(src, live);
+    Stage8 r;
+    r.v = make_uint4(0, 0, 0, 0);
+    r.w = make_uint4(0, 0, 0, 0);
+    if (live) {
+        const r4d_moe_u4v a = *(r4d_moe_gu4)src, b = *(r4d_moe_gu4)(src + 16);
+        r.v = make_uint4(a.x, a.y, a.z, a.w);
+        r.w = make_uint4(b.x, b.y, b.z, b.w);
+    }
+    return r;
+}
+template <bool UW>
+__device__ __forceinline__ uint32_t u32_load_w(const uint32_t* p) {
+    if constexpr (!UW) return *p;
+    return *(r4d_moe_gu32)p;
+}
+template <bool UW>
+__device__ __forceinline__ uint16_t u16_load_w(const uint16_t* p) {
+    if constexpr (!UW) return *p;
+    return *(r4d_moe_gu16)p;
+}
+
 /* ================================================================== moe_gemm_q
  *
  * y[i, :] = a[row(i), :] @ w[e]^T, in SORTED order, both operands E4M3 with a scale per 128 along
@@ -853,9 +914,18 @@ static_assert(sizeof(MoeTab) == 16, "the code table is four words");
  * same at one a (row, 32 of K) (w4nl32a8h), 4 five-bit codes -- 2's magnitudes and scales, and a
  * sign bit a code from the plane after a row's nibbles (w5nl64a8h). At 2, 3 and 4 a staged
  * 128-wide tile holds two or four scale groups, each summed in its own accumulator; a tile's E4M3
- * scales are one sixteen- or thirty-two-bit load. */
+ * scales are one sixteen- or thirty-two-bit load.
+ *
+ * FK IS THE K STAGED A PASS: kFK, one 128-wide scale block, or -- at W4 2 to 4 only -- two of them.
+ * At FK 256 a pass stages two blocks' worth of weight, so a block has twice the bytes in flight
+ * behind each barrier pair and the K chain is half as many passes. Every scale group still has its
+ * own accumulator, started fresh at its first WMMA, and the fold runs the two 128-wide blocks one
+ * after the other in K order, each exactly the expression the 128 pass folds once a pass, under
+ * its own activation scale. Same products, same sums, same order: bit-identical to FK 128.
+ *
+ * UW reads the weight and its scales from a uniform global base -- see the UW note at w4_load. */
 template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
-          bool ES = false, bool AL = false, bool SK = false>
+          bool ES = false, bool AL = false, bool SK = false, uint32_t FK = kFK, bool UW = false>
 __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
     const uint8_t* __restrict__ Aq, const float* __restrict__ As,
     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
@@ -871,19 +941,25 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
     constexpr uint32_t WM = MT / WGM, WN = NTL / WGN;
     static_assert(MT % WGM == 0 && NTL % WGN == 0, "the wave grid must divide the tile");
     static_assert(kBlock % FN == 0, "a block's N rows must sit in one 128-row weight scale row");
-    /* Scale groups a staged tile: one, or at W4 2, 3 and 4 the 64- or 32-column ones. */
+    /* Scale groups a 128-wide block: one, or at W4 2, 3 and 4 the 64- or 32-column ones. */
     constexpr uint32_t kSub = W4 == 3 ? 4u : (W4 == 2 || W4 == 4) ? 2u : 1u;
-    static_assert(kFK % (kSub * r4d_fp8::kK) == 0, "a scale group is whole WMMA K steps");
+    /* 128-wide blocks a staged pass (one, or two at FK 256), and so scale groups a pass. */
+    constexpr uint32_t kBpS  = FK / kBlock;
+    constexpr uint32_t kSubT = kSub * kBpS;
+    static_assert(FK == kFK || (FK == 2 * kFK && kSub > 1),
+                  "FK is one scale block, or two where the fold already sums groups (W4 2 to 4)");
+    static_assert(FK % (kSubT * r4d_fp8::kK) == 0, "a scale group is whole WMMA K steps");
     static_assert(FM + FN <= NTHR, "a thread stages each row's and each column's scale: see "
                                    "THE SCALES RIDE WITH THE TILE");
 
-    __shared__ uint8_t s_a[FM * lds_pitch<kFK>()];
-    __shared__ uint8_t s_b[FN * lds_pitch<kFK>()];
+    __shared__ uint8_t s_a[FM * lds_pitch<FK>()];
+    __shared__ uint8_t s_b[FN * lds_pitch<FK>()];
     __shared__ int32_t s_tok[FM];
     /* The staged K block's scales: one an activation row, and one a weight column (w4) or one for
-     * the whole block (fp8). See THE SCALES RIDE WITH THE TILE, at the K loop. */
-    __shared__ float   s_as[FM];
-    __shared__ float   s_ws[kSub * FN];
+     * the whole block (fp8) -- each once a 128-wide block of the pass. See THE SCALES RIDE WITH THE
+     * TILE, at the K loop. */
+    __shared__ float   s_as[kBpS * FM];
+    __shared__ float   s_ws[kSubT * FN];
 
     const uint32_t tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
     const uint32_t wgm = wave / WGN, wgn = wave % WGN;
@@ -1003,7 +1079,7 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
     const uint32_t part = n0 / fy, j0 = n0 - part * fy;
 
     constexpr uint32_t kSeg = 32;                     /* bytes a thread stages, contiguous */
-    constexpr uint32_t kTPR = kFK / kSeg;             /* threads covering one staged row */
+    constexpr uint32_t kTPR = FK / kSeg;              /* threads covering one staged row */
     constexpr uint32_t kRPP = NTHR / kTPR;            /* rows one staging pass covers */
     constexpr uint32_t kAP  = (FM + kRPP - 1) / kRPP;
     constexpr uint32_t kBP  = (FN + kRPP - 1) / kRPP;
@@ -1052,8 +1128,8 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
         const uint32_t kb_n = wn0 / kBlock;           /* the weight scale's N row for this block */
         if constexpr (W4) (void)kb_n;                 /* w4 scales vary per ROW, not per N block */
 
-        const uint8_t*  Wp  = wtab_at(C.w, C.w_s0, e >> cshift);
-        const uint16_t* Wsp = (const uint16_t*)wtab_at(C.s, C.s_s0, e >> cshift);
+        const uint8_t*  Wp  = uw_ptr<UW>(wtab_at(C.w, C.w_s0, e >> cshift));
+        const uint16_t* Wsp = uw_ptr<UW>((const uint16_t*)wtab_at(C.s, C.s_s0, e >> cshift));
 
         /* SK: A WAVE WHOSE M TILES ARE ALL PAST THE RUN has nothing to accumulate. Under AL the
          * run is the block's rows [rs, re) from its first row, so that is a wave-uniform test;
@@ -1061,9 +1137,10 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
          * WMMA and its scale fold are skipped. */
         const bool wlive = !SK || (r0 + wgm * WM * 16 < re);
         f8v raw[WM][WN], out[WM][WN];
-        /* The other scale groups' accumulators at W4 2 and 3 (`raw` is the first's); one unused
-         * element otherwise. Each starts fresh in its group's first WMMA, so none is zeroed. */
-        f8v rx[kSub > 1 ? kSub - 1 : 1][kSub > 1 ? WM : 1][kSub > 1 ? WN : 1];
+        /* The other scale groups' accumulators at W4 2 and 3 (`raw` is the first's) -- the pass's,
+         * so both blocks' at FK 256; one unused element otherwise. Each starts fresh in its group's
+         * first WMMA, so none is zeroed. */
+        f8v rx[kSubT > 1 ? kSubT - 1 : 1][kSubT > 1 ? WM : 1][kSubT > 1 ? WN : 1];
 #pragma unroll
         for (uint32_t i = 0; i < WM; ++i)
 #pragma unroll
@@ -1110,24 +1187,70 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
         uint4  bpre4[kBP];      /* W4: packed nibbles, expanded at store time as before */
         uint32_t spre[W4 == 4 ? kBP : 1];   /* W4 4: the same 32 elements' sign bits */
         Stage8 bpre8[kBP];      /* otherwise: the fp8 bytes themselves */
-        float    pas = 0.0f;    /* thread tid < FM: its row's activation scale */
-        /* thread FM + c: column c's weight scale (w4), or the block's (fp8); at W4 3 its four */
-        std::conditional_t<W4 == 3, uint32_t, uint16_t> pws = 0;
+        /* thread tid < FM: its row's activation scale, one a 128-wide block of the pass */
+        float    pas[kBpS] = {};
+        /* thread FM + c: column c's weight scale (w4), or the block's (fp8); at W4 3 its four --
+         * again one a 128-wide block of the pass */
+        using PwsT = std::conditional_t<W4 == 3, uint32_t, uint16_t>;
+        PwsT pws[kBpS] = {};
+        /* UW: the thread's scale as loaded, and whether it is live -- the zero is selected where
+         * it is staged. Two registers, one a role, and NOT initialised: the two branches run in
+         * one wave, gfx12 retires two vector loads into one register in no promised order, and a
+         * role initialised to zero is provably zero in the other role's branch, where the
+         * compiler then writes that zero -- each a wait for the other branch's load. */
+        float pau[UW ? kBpS : 1];
+        PwsT  pwu[UW ? kBpS : 1];
+        bool  pok = false;
         auto issue = [&](uint32_t cc) {
             const uint32_t kbk = cc / kBlock;
-            if (tid < FM) {
+            if constexpr (UW) {
+                /* UNDER UW THE SCALE LOADS ARE UNCONDITIONAL -- from a row that exists when this
+                 * one is dead -- and the zero is selected at the LDS store. Selected here, the zero
+                 * is a VALU write into a register that another lane's scale load is still filling
+                 * (the two branches run in one wave), and the waitcnt pass answers that write by
+                 * waiting for the load, in front of every other load of the pass. */
+                if (tid < FM) {
+                    const int32_t tok = s_tok[tid];
+                    pok = tok >= 0 && (r0 + tid) >= rs && (r0 + tid) < re;
+                    const size_t ar = (size_t)(pok ? tok : 0) * as_ld + kbk;
+#pragma unroll
+                    for (uint32_t h = 0; h < kBpS; ++h) pau[h] = As[ar + h];
+                } else if (tid < FM + FN) {
+                    const uint32_t nn = tid - FM;
+                    pok = j0 + nn < fc;
+                    const size_t wr = (size_t)(pok ? wn0 + nn : wn0) * ws_ld + kbk;
+#pragma unroll
+                    for (uint32_t h = 0; h < kBpS; ++h) {
+                        if constexpr (W4 == 3)
+                            pwu[h] = u32_load_w<UW>((const uint32_t*)Wsp + wr + h);
+                        else if constexpr (W4)
+                            pwu[h] = u16_load_w<UW>(Wsp + wr + h);
+                        else
+                            pwu[h] = u16_load_w<UW>(Wsp + (size_t)kb_n * ws_ld + kbk + h);
+                    }
+                }
+            } else if (tid < FM) {
                 const int32_t tok = s_tok[tid];
                 const bool    ok  = tok >= 0 && (r0 + tid) >= rs && (r0 + tid) < re;
-                pas = ok ? As[(size_t)tok * as_ld + kbk] : 0.0f;
+#pragma unroll
+                for (uint32_t h = 0; h < kBpS; ++h)
+                    pas[h] = ok ? As[(size_t)tok * as_ld + kbk + h] : 0.0f;
             } else if (tid < FM + FN) {
                 const uint32_t nn = tid - FM;
-                if constexpr (W4 == 3)
-                    pws = j0 + nn < fc ? ((const uint32_t*)Wsp)[(size_t)(wn0 + nn) * ws_ld + kbk]
-                                       : 0u;
-                else if constexpr (W4)
-                    pws = j0 + nn < fc ? Wsp[(size_t)(wn0 + nn) * ws_ld + kbk] : (uint16_t)0;
-                else if (nn == 0)
-                    pws = Wsp[(size_t)kb_n * ws_ld + kbk];
+#pragma unroll
+                for (uint32_t h = 0; h < kBpS; ++h) {
+                    if constexpr (W4 == 3)
+                        pws[h] = j0 + nn < fc
+                                     ? u32_load_w<UW>((const uint32_t*)Wsp +
+                                                      (size_t)(wn0 + nn) * ws_ld + kbk + h)
+                                     : 0u;
+                    else if constexpr (W4)
+                        pws[h] = j0 + nn < fc
+                                     ? u16_load_w<UW>(Wsp + (size_t)(wn0 + nn) * ws_ld + kbk + h)
+                                     : (uint16_t)0;
+                    else if (nn == 0)
+                        pws[h] = u16_load_w<UW>(Wsp + (size_t)kb_n * ws_ld + kbk + h);
+                }
             }
 #pragma unroll
             for (uint32_t p = 0; p < kAP; ++p) {
@@ -1147,50 +1270,88 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
                  * sign plane follows its K/2 bytes of nibbles, a bit an element. */
                 if constexpr (W4) {
                     const uint8_t* wr = Wp + (size_t)(wn0 + r) * w_ld;
-                    bpre4[p] = w4_load(wr + ((cc + sk) >> 1), ok);
+                    bpre4[p] = w4_load_w<UW>(wr + ((cc + sk) >> 1), ok);
                     if constexpr (W4 == 4)
-                        spre[p] = ok ? *(const uint32_t*)(wr + (K >> 1) + ((cc + sk) >> 3)) : 0u;
+                        spre[p] = ok ? u32_load_w<UW>((const uint32_t*)(wr + (K >> 1) +
+                                                                        ((cc + sk) >> 3)))
+                                     : 0u;
                 } else
-                    bpre8[p] = stage8_load(Wp + (size_t)(wn0 + r) * w_ld + cc + sk, ok);
+                    bpre8[p] = stage8_load_w<UW>(Wp + (size_t)(wn0 + r) * w_ld + cc + sk, ok);
             }
         };
         /* `s_tok` is settled by the barrier above the run loop and no run rewrites it, so priming
          * ahead of the loop's own barrier reads nothing another thread is still writing. */
         issue(0);
 
-        for (uint32_t c0 = 0; c0 < K; c0 += kFK) {
-            __syncthreads();                       /* the previous run's reads are done */
+        /* THE K LOOP'S BARRIERS ORDER LDS AND NOTHING ELSE -- no thread reads what another wrote
+         * to global memory inside it. __syncthreads() is a workgroup fence over every address
+         * space, and on gfx12 that is `s_wait_loadcnt 0` in front of the barrier: the pass's
+         * prefetch is waited for right after it is issued, before the WMMA it was meant to hide
+         * behind. Under UW the barriers are lds_barrier(), and the loads stay in flight until the
+         * next pass's LDS store collects them.
+         *
+         * AND THAT COLLECTION IS ONE EXPLICIT WAIT, for everything, where the stores begin. Left
+         * to the waitcnt pass, the wait sits inside the exec-masked branches of the stores; a wave
+         * that skips one keeps the register "in flight" as far as the pass can tell, and it then
+         * guards the next pass's load into that register with `s_wait_loadcnt 0` -- after the
+         * load just ahead of it has been issued, so the pass's loads are serial again. Nothing is
+         * in flight at this point that the stores do not need. */
+        auto kbar = [] {
+            if constexpr (UW) lds_barrier();
+            else __syncthreads();
+        };
+        for (uint32_t c0 = 0; c0 < K; c0 += FK) {
+            kbar();                                /* the previous run's reads are done */
+            /* The wait, as a release fence on the global address space: the only spelling of
+             * `s_wait_loadcnt 0` the waitcnt pass reads as one, so it then knows every register
+             * of the pass's prefetch has landed. No invalidate -- that is the acquire half. */
+            if constexpr (UW) __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "global");
 #pragma unroll
             for (uint32_t p = 0; p < kAP; ++p) {
                 const uint32_t r = sn + p * kRPP;
                 if (r >= FM) continue;
-                stage8_store<kFK>(s_a, r, sk, apre[p]);
+                stage8_store<FK>(s_a, r, sk, apre[p]);
             }
 #pragma unroll
             for (uint32_t p = 0; p < kBP; ++p) {
                 const uint32_t r = sn + p * kRPP;
                 if (r >= FN) continue;
                 if constexpr (W4 == 4)
-                    stage8_store<kFK>(s_b, r, sk, w5_expand(bpre4[p], spre[p], tab.v));
+                    stage8_store<FK>(s_b, r, sk, w5_expand(bpre4[p], spre[p], tab.v));
                 else if constexpr (W4)
-                    stage8_store<kFK>(s_b, r, sk, w4_expand(bpre4[p], tab.v));
+                    stage8_store<FK>(s_b, r, sk, w4_expand(bpre4[p], tab.v));
                 else
-                    stage8_store<kFK>(s_b, r, sk, bpre8[p]);
+                    stage8_store<FK>(s_b, r, sk, bpre8[p]);
             }
-            if (tid < FM) s_as[tid] = pas;
-            else if (tid < FM + FN) {
-                if constexpr (kSub > 1) {
-                    /* The tile's scale groups in column order, the first in the low byte. */
+            /* The scales as issued; under UW the dead ones are zeroed here (see issue). */
+            auto pas_v = [&](uint32_t h) {
+                if constexpr (UW) return pok ? pau[h] : 0.0f;
+                else return pas[h];
+            };
+            auto pws_v = [&](uint32_t h) {
+                if constexpr (UW) return pok ? pwu[h] : (PwsT)0;
+                else return pws[h];
+            };
+            if (tid < FM) {
 #pragma unroll
-                    for (uint32_t q = 0; q < kSub; ++q)
-                        s_ws[q * FN + tid - FM] =
-                            r4d_fp8::e4m3((uint32_t)((pws >> (8 * q)) & 0xFFu)) * kW4G64Scale;
+                for (uint32_t h = 0; h < kBpS; ++h) s_as[h * FM + tid] = pas_v(h);
+            } else if (tid < FM + FN) {
+                if constexpr (kSub > 1) {
+                    /* The tile's scale groups in column order, the first in the low byte; at
+                     * FK 256 the first block's groups, then the second's. */
+#pragma unroll
+                    for (uint32_t h = 0; h < kBpS; ++h)
+#pragma unroll
+                        for (uint32_t q = 0; q < kSub; ++q)
+                            s_ws[(h * kSub + q) * FN + tid - FM] =
+                                r4d_fp8::e4m3((uint32_t)((pws_v(h) >> (8 * q)) & 0xFFu)) *
+                                kW4G64Scale;
                 } else {
-                    s_ws[tid - FM] = (W4 || tid == FM) ? bscale(pws) : 0.0f;
+                    s_ws[tid - FM] = (W4 || tid == FM) ? bscale(pws_v(0)) : 0.0f;
                 }
             }
-            if (c0 + kFK < K) issue(c0 + kFK);
-            __syncthreads();
+            if (c0 + FK < K) issue(c0 + FK);
+            kbar();
 
             if (!wlive) continue;
             /* One K step of the tile into the accumulator `acc`; `fresh` starts it from zero
@@ -1200,11 +1361,11 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
 #pragma unroll
                 for (uint32_t i = 0; i < WM; ++i) {
                     if (SK && r0 + (wgm * WM + i) * 16 >= re) continue;
-                    af[i] = frag<kFK>(s_a, (wgm * WM + i) * 16, ks, lane);
+                    af[i] = frag<FK>(s_a, (wgm * WM + i) * 16, ks, lane);
                 }
 #pragma unroll
                 for (uint32_t j = 0; j < WN; ++j)
-                    bf[j] = frag<kFK>(s_b, (wgn * WN + j) * 16, ks, lane);
+                    bf[j] = frag<FK>(s_b, (wgn * WN + j) * 16, ks, lane);
 #pragma unroll
                 for (uint32_t i = 0; i < WM; ++i) {
                     if (SK && r0 + (wgm * WM + i) * 16 >= re) continue;
@@ -1217,19 +1378,21 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
              * has its own scale: folding a group as it ends would make the next group's WMMA wait
              * on its results, and at a decode step -- a serial chain of tiles -- that wait is most
              * of what the finer groups would cost. They fold once, at the end of the tile, and
-             * each group's first step starts its accumulator, so the fold resets none. */
-            if constexpr (kSub > 1) {
-                constexpr uint32_t kG = kFK / kSub;
+             * each group's first step starts its accumulator, so the fold resets none. At FK 256
+             * that is every group of both 128-wide blocks: group g of the pass is group g % kSub
+             * of block g / kSub, in K order. */
+            if constexpr (kSubT > 1) {
+                constexpr uint32_t kG = FK / kSubT;
 #pragma unroll
                 for (uint32_t ks = 0; ks < kG; ks += r4d_fp8::kK) kstep(ks, raw, ks == 0);
 #pragma unroll
-                for (uint32_t q = 1; q < kSub; ++q)
+                for (uint32_t q = 1; q < kSubT; ++q)
 #pragma unroll
                     for (uint32_t ks = q * kG; ks < (q + 1) * kG; ks += r4d_fp8::kK)
                         kstep(ks, rx[q - 1], ks == q * kG);
             } else {
 #pragma unroll
-                for (uint32_t ks = 0; ks < kFK; ks += r4d_fp8::kK) kstep(ks, raw);
+                for (uint32_t ks = 0; ks < FK; ks += r4d_fp8::kK) kstep(ks, raw);
             }
             {
                 /* THE GRIDS DIFFER IN WHAT THE WEIGHT SCALE VARIES OVER, and that is the only
@@ -1247,16 +1410,18 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
                  * The fp8 form is written out separately rather than folded into a common
                  * expression because a * (b * c) and (a * b) * c differ in the last bit, and that
                  * kernel's output is byte-checked. */
-                float as[WM][8];
+                float as[kBpS][WM][8];
 #pragma unroll
-                for (uint32_t i = 0; i < WM; ++i)
+                for (uint32_t h = 0; h < kBpS; ++h)
 #pragma unroll
-                    for (uint32_t t = 0; t < 8; ++t)
-                        as[i][t] = s_as[(wgm * WM + i) * 16 + acc_row(lane, t)];
+                    for (uint32_t i = 0; i < WM; ++i)
+#pragma unroll
+                        for (uint32_t t = 0; t < 8; ++t)
+                            as[h][i][t] = s_as[h * FM + (wgm * WM + i) * 16 + acc_row(lane, t)];
                 if constexpr (kSub > 1) {
-                    float wq[kSub][WN];
+                    float wq[kSubT][WN];
 #pragma unroll
-                    for (uint32_t q = 0; q < kSub; ++q)
+                    for (uint32_t q = 0; q < kSubT; ++q)
 #pragma unroll
                         for (uint32_t j = 0; j < WN; ++j)
                             wq[q][j] = s_ws[q * FN + (wgn * WN + j) * 16 + frag_c(lane)];
@@ -1269,7 +1434,17 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
                                 float v = raw[i][j][t] * wq[0][j];
 #pragma unroll
                                 for (uint32_t q = 1; q < kSub; ++q) v += rx[q - 1][i][j][t] * wq[q][j];
-                                out[i][j][t] += v * as[i][t];
+                                out[i][j][t] += v * as[0][i][t];
+                                if constexpr (kBpS > 1) {
+                                    /* FK 256: the pass's second 128-wide block, folded after the
+                                     * first in the very expression the next 128 pass would fold
+                                     * it with, so `out` sees the same sequence of updates. */
+                                    float v1 = rx[kSub - 1][i][j][t] * wq[kSub][j];
+#pragma unroll
+                                    for (uint32_t q = 1; q < kSub; ++q)
+                                        v1 += rx[kSub + q - 1][i][j][t] * wq[kSub + q][j];
+                                    out[i][j][t] += v1 * as[1][i][t];
+                                }
                             }
                 } else if constexpr (W4) {
                     float wsj[WN];
@@ -1282,7 +1457,7 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
                         for (uint32_t j = 0; j < WN; ++j)
 #pragma unroll
                             for (uint32_t t = 0; t < 8; ++t) {
-                                out[i][j][t] += raw[i][j][t] * as[i][t] * wsj[j];
+                                out[i][j][t] += raw[i][j][t] * as[0][i][t] * wsj[j];
                                 raw[i][j][t] = 0.0f;
                             }
                 } else {
@@ -1290,14 +1465,14 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
 #pragma unroll
                     for (uint32_t i = 0; i < WM; ++i)
 #pragma unroll
-                        for (uint32_t t = 0; t < 8; ++t) as[i][t] *= ws;
+                        for (uint32_t t = 0; t < 8; ++t) as[0][i][t] *= ws;
 #pragma unroll
                     for (uint32_t i = 0; i < WM; ++i)
 #pragma unroll
                         for (uint32_t j = 0; j < WN; ++j)
 #pragma unroll
                             for (uint32_t t = 0; t < 8; ++t) {
-                                out[i][j][t] += raw[i][j][t] * as[i][t];
+                                out[i][j][t] += raw[i][j][t] * as[0][i][t];
                                 raw[i][j][t] = 0.0f;
                             }
                 }
@@ -2071,6 +2246,42 @@ constexpr long long kPrefillCols = 128;
 static inline bool r4d_moe_decode_band(long long T, long long n_expert) {
     return 2 * T <= 3 * n_expert;
 }
+/* R4D_MOE_GU_FK256: the decode form of the TOKEN-operand projection (gate_up) stages two 128-wide
+ * K blocks a pass instead of one -- see FK at the kernel. Unset or 0: one block, as upstream. 1:
+ * every decode-form gate_up launch that can take it; N > 1: those of at most N routed rows. It
+ * can where the weight's format already folds scale groups (W4 2 to 4) and every class's K is a
+ * multiple of 256; anything else keeps one block. Bit-identical either way. Read once, so a
+ * recorded pass and a live one take the same kernel. */
+static long long moe_gu_fk256() {
+    static const long long v = [] {
+        const char* e = std::getenv("R4D_MOE_GU_FK256");
+        const long long x = e ? std::atoll(e) : 0;
+        return x > 0 ? x : 0LL;
+    }();
+    return v;
+}
+/* THE STAGED K OF THE DECODE FORM, pinned for a test: 0 is R4D_MOE_GU_FK256's rule, 1 one 128-wide
+ * block a pass, 2 two wherever the shape allows it, whatever the switch says. r4d_selftest
+ * compares the two byte for byte. */
+static int g_moe_fk_pin = 0;
+static inline bool r4d_moe_gu_fk256(long long T, bool a_sorted) {
+    if (a_sorted || g_moe_fk_pin == 1) return false;
+    if (g_moe_fk_pin == 2) return true;
+    const long long sw = moe_gu_fk256();
+    return sw == 1 || (sw > 1 && T <= sw);
+}
+/* R4D_MOE_UWLOAD=1: the decode form -- both projections -- reads the weight and its scales from a
+ * uniform global base (see UW at w4_load). Unset or 0: the generic pointer, as upstream.
+ * Bit-identical either way; read once, like the others. A test pin over it: 0 the switch, 1 off,
+ * 2 on. */
+static int g_moe_uw_pin = 0;
+static bool r4d_moe_uwload() {
+    static const bool v = [] {
+        const char* e = std::getenv("R4D_MOE_UWLOAD");
+        return e && std::atoll(e) > 0;
+    }();
+    return g_moe_uw_pin ? g_moe_uw_pin == 2 : v;
+}
 /* THE MAP'S UPPER BOUND, stated once because the scratch hook and the launcher must agree about
  * it exactly: a hook that answers for a different shape than the launch uses is how a kernel ends
  * up writing past the arena it was given. Every expert contributes one block, plus one more for
@@ -2299,7 +2510,23 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
         /* THE DECODE GRID IS (tile, run) WIDE -- see the kernel's ES note. One tile of rows is all
          * a decode step has, so without this the whole layer runs on N/64 workgroups. */
         const unsigned tiles = (unsigned)((T + 15) / 16);
-        emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<1, 4, 1, 4, W4, true>),
+        /* Two 128-wide K blocks a pass (R4D_MOE_GU_FK256) where every class's K is whole passes
+         * of 256 and the format folds scale groups. */
+        /* WHICH INSTANTIATION: the weight from a uniform global base (R4D_MOE_UWLOAD), and two
+         * 128-wide K blocks a pass (R4D_MOE_GU_FK256) where every class's K is whole passes of
+         * 256 and the format folds scale groups. All four are bit-identical; the function moves
+         * with the choice, which a recorded pass sees as a new node. */
+        const bool uw = r4d_moe_uwload();
+        auto kern = uw ? &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, kFK, true>
+                       : &moe_gemm_q_kernel<1, 4, 1, 4, W4, true>;
+        if constexpr (W4 >= 2) {
+            bool fk2 = r4d_moe_gu_fk256(T, a_sorted);
+            for (int q = 0; q < ncls; ++q) fk2 = fk2 && Kc[q] % (2 * (long long)kBlock) == 0;
+            if (fk2)
+                kern = uw ? &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, 2 * kFK, true>
+                          : &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, 2 * kFK>;
+        }
+        emit_rc = R4D_EMIT(sk, kern,
                            dim3(tiles * 16u, ny), dim3(4 * kWave), 0,
                            (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                            (const int32_t*)sorted->data, (const int32_t*)off->data,
@@ -2394,6 +2621,8 @@ extern "C" int64_t r4d_rad_moe_gemm_q_scratch(const RadArgs* a)    { return moe_
 extern "C" int64_t r4d_rad_moe_gemm_w4a8_scratch(const RadArgs* a) { return moe_gemm_map_scratch(a); }
 
 extern "C" void r4d_moe_gemm_pin_prefill(int form) { g_moe_prefill_form = form; }
+extern "C" void r4d_moe_gemm_pin_fk(int pin) { g_moe_fk_pin = pin; }
+extern "C" void r4d_moe_gemm_pin_uw(int pin) { g_moe_uw_pin = pin; }
 
 extern "C" int r4d_rad_moe_gemm_q(const RadArgs* a, RadStream s) {
     return moe_gemm_launch<0>(a, r4d_stream_sink(s));
