@@ -5127,7 +5127,10 @@ static void hc_read_i8(const Plugin& pl, int64_t M, bool real_stream, int form) 
     static const char* const kForm[] = { "the launcher's rule", "the decode tiles' kernels",
                                          "the wide kernels", "the PF2 kernels",
                                          "the PF2 down product", "the PF2 up product",
-                                         "the PF2 kernels at 128 rows" };
+                                         "the PF2 kernels at 128 rows",
+                                         "the PF2 down and persistent up products",
+                                         "the PF2 128-row down and persistent up products",
+                                         "the PF2 persistent up product" };
     const std::string nm = fmt("hc_read_e4m3 int8 codes at M=%lld (%s, %s)", (long long)M,
                                real_stream ? "a real stream" : "the null stream", kForm[form]);
     if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q || !d_qs || !d_rq || !d_rs) {
@@ -5294,11 +5297,14 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed) {
     /* PF2 keeps its two weight planes in the band's `u` buffer, M * hc * n bf16: they need
      * ceil((lr + hc) / 16) * 16 + lr rows of it, so a smaller M is the wide form's alone. */
     const int64_t pf2_min_m = ((lr + hc + 15) / 16) * 16 + lr;
-    const int f_lo = pl.pin_hc ? 1 : 0, f_hi = pl.pin_hc ? (M >= pf2_min_m ? 6 : 2) : 0;
+    const int f_lo = pl.pin_hc ? 1 : 0, f_hi = pl.pin_hc ? (M >= pf2_min_m ? 9 : 2) : 0;
     static const char* const kForm[] = { "the launcher's rule", "the decode tiles' kernels",
                                          "the wide kernels", "the PF2 kernels",
                                          "the PF2 down product", "the PF2 up product",
-                                         "the PF2 kernels at 128 rows" };
+                                         "the PF2 kernels at 128 rows",
+                                         "the PF2 down and persistent up products",
+                                         "the PF2 128-row down and persistent up products",
+                                         "the PF2 persistent up product" };
     std::vector<Out> outs;
     for (int form = f_lo; form <= f_hi; ++form) {
         if (pl.pin_hc) pl.pin_hc(form);
@@ -10309,7 +10315,7 @@ static void device_phase(const Plugin& pl) {
             for (int64_t m : { 65, 2048 })
                 for (int form : { 1, 2 }) hc_read_i8(pl, m, true, form);
             for (int64_t m : { 700, 2048 })
-                for (int form : { 3, 4, 5, 6 }) hc_read_i8(pl, m, true, form);
+                for (int form = 3; form <= 9; ++form) hc_read_i8(pl, m, true, form);
         }
     }
 
