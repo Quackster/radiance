@@ -11222,6 +11222,23 @@ static void device_phase(const Plugin& pl) {
                     mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 13, 272, 1152, 0, false,
                                     { PI("ks", ks), PI("bk", bk), PI("nt", nt) });
                 }
+        /* THE MIXED/SHORT-PREFILL BAND, M 65..256: the tiled row at the row counts an arrival
+         * step carries (ragged against its 256-row block), and the decode kernel's WIDE form
+         * (DTM 6/8/12/16) reached through the tiled row's `dec` axis with the split partial in
+         * the op's scratch -- every split, both activation grids, N past a 128-column block. */
+        for (int mm : { 72, 96, 128, 160, 200, 256 }) {
+            mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", mm, 400, 2560, 2);
+            mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", mm, 272, 2560, 4, true);
+            mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", mm, 400, 640, 0, true, { PI("dec", 0) });
+            mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", mm, 400, 2560, 0, true, { PI("dec", 1) });
+            for (int ks : { 1, 2, 4 })
+                mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", mm, 400, 2560, 0, ks != 2,
+                                { PI("dec", 1), PI("ks", ks), PI("bk", 64), PI("nt", ks == 4 ? 0 : 1) });
+        }
+        /* the band's lower edges, a K that is 64 but not 128, and the narrowest N */
+        for (int mm : { 65, 80, 129, 193, 255 })
+            mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", mm, 1040, 576, 0, true,
+                            { PI("dec", 1), PI("ks", 2), PI("bk", 128), PI("nt", 1) });
         gemm_case(pl, "gemm_w4a8_tiled",     "w4a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K/2, 256*(K/128)*4);
         gemm_case(pl, "gemm_w8a8_tiled",     "w8a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K,   256*(K/128)*2);
         gemm_case(pl, "gemm_w4a8_prefill",   "w4a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K/2, 256*(K/128)*4);

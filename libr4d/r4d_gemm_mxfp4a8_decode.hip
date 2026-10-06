@@ -62,7 +62,8 @@
 #define R4D_MXD_GROUP   32      // K per E8M0 exponent, fixed by the OCP MX format
 #define R4D_MXD_DWN     8       // waves per block; the N tile is DWN*16 = 128 wide
 #define R4D_MXD_MTILE   16
-#define R4D_MXD_MAX_TM  4       // M <= 64
+#define R4D_MXD_MAX_TM  4       // M <= 64: the DECODE ROW's band
+#define R4D_MXD_WIDE_TM 16      // M <= 256: the wide form (see r4d_rad_gemm_mxfp4a8_decode_wide)
 #define R4D_MXD_PAD     8
 #define R4D_MXD_MAX_KS  4
 #define R4D_MXD_MAX_N   36864   // TP=1 gate_up is 34816
@@ -572,6 +573,7 @@ int mxd_split_k(int nblk, int M) {
 }  // namespace
 
 extern "C" int r4d_gemm_mxfp4a8_decode_max_m(void) { return R4D_MXD_MTILE * R4D_MXD_MAX_TM; }
+extern "C" int r4d_gemm_mxfp4a8_decode_wide_max_m(void) { return R4D_MXD_MTILE * R4D_MXD_WIDE_TM; }
 
 static void mxd_launch(long a, long ascale, long wq, long ws, long wref, long c, int M, int K, int N,
                        int KS, int BK, int NT, int as_group, int as_rs, long stream, long scratch,
@@ -598,8 +600,10 @@ extern "C" long r4d_gemm_mxfp4a8_decode_scratch(int M, int K, int N, int KS) {
 static void mxd_launch(long a, long ascale, long wq, long ws, long wref, long c, int M, int K, int N,
                        int KS, int BK, int NT, int as_group, int as_rs, long stream, long scratch,
                        long scratch_bytes, bool engine) {
-  if (M < 1 || M > R4D_MXD_MTILE * R4D_MXD_MAX_TM)
-    throw std::runtime_error("r4d gemm_mxfp4a8_decode: M must be 1..64");
+  if (M < 1 || M > R4D_MXD_MTILE * R4D_MXD_WIDE_TM)
+    throw std::runtime_error("r4d gemm_mxfp4a8_decode: M must be 1..256");
+  if (M > R4D_MXD_MTILE * R4D_MXD_MAX_TM && engine == false)
+    throw std::runtime_error("r4d gemm_mxfp4a8_decode: M above 64 only through the engine entry (op scratch)");
   if (N < 16 || N % 16) throw std::runtime_error("r4d gemm_mxfp4a8_decode: N must be a multiple of 16");
   if (K < 64 || K % 64) throw std::runtime_error("r4d gemm_mxfp4a8_decode: K must be a multiple of 64");
   if (as_group != 0 && as_group != 128)
@@ -610,8 +614,12 @@ static void mxd_launch(long a, long ascale, long wq, long ws, long wref, long c,
   const int tm = (M + R4D_MXD_MTILE - 1) / R4D_MXD_MTILE;
   int ks = KS > 0 ? KS : mxd_split_k(nblk, M);
   if (ks != 1 && ks != 2 && ks != 4) throw std::runtime_error("r4d gemm_mxfp4a8_decode: KS must be 1, 2 or 4");
-  int bk = BK > 0 ? BK : ((tm == 4 && ks == 1) ? 64 : 128);
+  // tm > 4 is the WIDE form (M 65..256, DTM 6/8/12/16): only reachable through the tiled row's `dec`
+  // axis. Its LDS is (16*DTM + 128)*(DBK + 8), so the slab is always 64 there.
+  const bool wide = tm > R4D_MXD_MAX_TM;
+  int bk = wide ? 64 : (BK > 0 ? BK : ((tm == 4 && ks == 1) ? 64 : 128));
   if (bk != 64 && bk != 128) throw std::runtime_error("r4d gemm_mxfp4a8_decode: BK must be 64 or 128");
+  if (wide) bk = 64;
   if (K % bk) { bk = 64; if (ks == 2) ks = 4; }   // a slab may not run past K
   const bool nt = NT != 0;
   hipStream_t st = (hipStream_t)stream;
@@ -620,7 +628,7 @@ static void mxd_launch(long a, long ascale, long wq, long ws, long wref, long c,
   if (N > R4D_MXD_MAX_N) throw std::runtime_error("r4d gemm_mxfp4a8_decode: N above the workspace's 36864");
   if (engine) {
     /* A scratch too short for the split runs unsplit, which is correct and slower. */
-    if (ks > 1 && scratch_bytes < (long)ks * M * N * (long)sizeof(float)) { ks = 1; bk = BK > 0 ? BK : ((tm == 4) ? 64 : 128); if (K % bk) bk = 64; }
+    if (ks > 1 && scratch_bytes < (long)ks * M * N * (long)sizeof(float)) { ks = 1; bk = wide ? 64 : (BK > 0 ? BK : ((tm == 4) ? 64 : 128)); if (K % bk) bk = 64; }
     P = (float*)scratch;
     cnt = mxd_out_ctr((const void*)c);
     if (!cnt) throw std::runtime_error("r4d gemm_mxfp4a8_decode: split counter alloc failed");
@@ -646,8 +654,12 @@ static void mxd_launch(long a, long ascale, long wq, long ws, long wref, long c,
 #define MXD_NT1(BK_, KS_) { if (nt) MXD_AB1(BK_, KS_, true) else MXD_AB1(BK_, KS_, false) }
 #define MXD_TM(BK_, KS_) { switch (tm) { case 1: MXD_NT1(BK_, KS_) break; case 2: MXD_NT(BK_, KS_, 2) break; \
                                          case 3: MXD_NT(BK_, KS_, 3) break; default: MXD_NT(BK_, KS_, 4) break; } }
-  if (bk == 64) { if (ks == 1) MXD_TM(64, 1) else if (ks == 2) MXD_TM(64, 2) else MXD_TM(64, 4) }
+#define MXD_WIDE(KS_) { switch (tm) { case 5: case 6: MXD_NT(64, KS_, 6) break; case 7: case 8: MXD_NT(64, KS_, 8) break; \
+                                      case 9: case 10: case 11: case 12: MXD_NT(64, KS_, 12) break; default: MXD_NT(64, KS_, 16) break; } }
+  if (wide)     { if (ks == 1) MXD_WIDE(1) else if (ks == 2) MXD_WIDE(2) else MXD_WIDE(4) }
+  else if (bk == 64) { if (ks == 1) MXD_TM(64, 1) else if (ks == 2) MXD_TM(64, 2) else MXD_TM(64, 4) }
   else          { if (ks == 1) MXD_TM(128, 1) else if (ks == 2) MXD_TM(128, 2) else MXD_TM(128, 4) }
+#undef MXD_WIDE
 #undef MXD_TM
 #undef MXD_NT1
 #undef MXD_AB1
@@ -657,14 +669,14 @@ static void mxd_launch(long a, long ascale, long wq, long ws, long wref, long c,
 #undef MXD_L
 }
 
-// ============================================================== the plugin ABI entry point
-extern "C" int r4d_rad_gemm_mxfp4a8_decode(const RadArgs* a, RadStream s) {
+// ============================================================== the plugin ABI entry points
+static int mxd_entry(const RadArgs* a, RadStream s, int max_m) {
     GemmOps g;
     int rc = gemm_ops(a, &g, 1);
     if (rc != RAD_OK) return rc;
     if (g.N < 16 || g.N % 16) return R4D_NO(RAD_E_SHAPE);
     if (g.K % 64) return R4D_NO(RAD_E_SHAPE);
-    if (g.M > r4d_gemm_mxfp4a8_decode_max_m() || g.N > R4D_MXD_MAX_N) return R4D_NO(RAD_E_SHAPE);
+    if (g.M > max_m || g.N > R4D_MXD_MAX_N) return R4D_NO(RAD_E_SHAPE);
     if (!g.ascale || !g.bref) return R4D_NO(RAD_E_INVAL);
     int as_group = 0, as_rs = 1;
     rc = mx_ascale_grid(g, &as_group, &as_rs);
@@ -678,12 +690,28 @@ extern "C" int r4d_rad_gemm_mxfp4a8_decode(const RadArgs* a, RadStream s) {
                    (long)(uintptr_t)s, (long)(uintptr_t)a->scratch, (long)a->scratch_bytes, true));
     return RAD_OK;
 }
+extern "C" int r4d_rad_gemm_mxfp4a8_decode(const RadArgs* a, RadStream s) {
+    return mxd_entry(a, s, r4d_gemm_mxfp4a8_decode_max_m());
+}
+/* THE WIDE FORM (M 65..256), reached only from the tiled row's `dec` axis: the same kernel at DTM
+ * 6/8/12/16, the split partial in the calling op's scratch. */
+extern "C" int r4d_rad_gemm_mxfp4a8_decode_wide(const RadArgs* a, RadStream s) {
+    return mxd_entry(a, s, r4d_gemm_mxfp4a8_decode_wide_max_m());
+}
 
 /* The core sizes the op's scratch from this, at the band's widest M and over the split rule at
  * every M of the band (a narrower M can split wider). */
 extern "C" int64_t r4d_rad_gemm_mxfp4a8_decode_scratch(const RadArgs* a) {
     const long long M = r4d_geti_or(a, "M", 0), N = r4d_geti_or(a, "N", 0), K = r4d_geti_or(a, "K", 0);
     if (M < 1 || N < 1 || K < 1 || M > r4d_gemm_mxfp4a8_decode_max_m()) return 0;
+    R4dMxDecCfg t;
+    r4d_cfg_mxfp4_decode(a, &t);
+    return (int64_t)r4d_gemm_mxfp4a8_decode_scratch((int)M, (int)K, (int)N, t.ks);
+}
+/* The wide form's: the same sizing at M up to 256. Zero when the band is wider than the kernel. */
+extern "C" int64_t r4d_rad_gemm_mxfp4a8_decode_wide_scratch(const RadArgs* a) {
+    const long long M = r4d_geti_or(a, "M", 0), N = r4d_geti_or(a, "N", 0), K = r4d_geti_or(a, "K", 0);
+    if (M < 1 || N < 1 || K < 1 || M > r4d_gemm_mxfp4a8_decode_wide_max_m() || N > R4D_MXD_MAX_N) return 0;
     R4dMxDecCfg t;
     r4d_cfg_mxfp4_decode(a, &t);
     return (int64_t)r4d_gemm_mxfp4a8_decode_scratch((int)M, (int)K, (int)N, t.ks);

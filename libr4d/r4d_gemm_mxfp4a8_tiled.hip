@@ -638,7 +638,23 @@ extern "C" void r4d_gemm_mxfp4a8_tiled(long a, long ascale, long wq, long ws, lo
 }
 
 // ============================================================== the plugin ABI entry point
+// the decode kernel's wide form (r4d_gemm_mxfp4a8_decode.hip), reached through the `dec` axis below
+extern "C" int r4d_rad_gemm_mxfp4a8_decode_wide(const RadArgs*, RadStream);
+extern "C" int64_t r4d_rad_gemm_mxfp4a8_decode_wide_scratch(const RadArgs*);
+
+/* THE `dec` AXIS. Above the decode row's M <= 64 this row is the only candidate, and it launches a
+ * 256-row block however few rows there are. `dec` = 1 serves the band with the decode kernel's WIDE
+ * form instead (DTM 6/8/12/16, split-K across workgroups, the partial in this op's scratch): it is a
+ * choice between two kernels that the tune cache can make per shape and band, because the
+ * selector itself only ranks rows by priority. 0 -- the default -- is this kernel, exactly as
+ * before. */
+extern "C" int64_t r4d_rad_gemm_mxfp4a8_tiled_scratch(const RadArgs* a) {
+    if (r4d_geti_or(a, "dec", 0) != 1) return 0;
+    return r4d_rad_gemm_mxfp4a8_decode_wide_scratch(a);
+}
+
 extern "C" int r4d_rad_gemm_mxfp4a8_tiled(const RadArgs* a, RadStream s) {
+    if (r4d_geti_or(a, "dec", 0) == 1) return r4d_rad_gemm_mxfp4a8_decode_wide(a, s);
     GemmOps g;
     int rc = gemm_ops(a, &g, 1);
     if (rc != RAD_OK) return rc;

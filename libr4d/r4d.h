@@ -583,6 +583,7 @@ void r4d_gemm_mxfp4a8_decode(long a, long ascale, long wq, long ws, long wref, l
                              int M, int K, int N, int KS, int BK, int NT,
                              int as_group, int as_rs, long stream);
 int  r4d_gemm_mxfp4a8_decode_max_m(void);
+int  r4d_gemm_mxfp4a8_decode_wide_max_m(void);   /* 256: DTM 6/8/12/16, engine entry only */
 int  r4d_gemm_mxfp4a8_tiled_k_unit(void);
 
 // ---- BLOCK-SCALED FP8: the format a checkpoint ships in ----------------------------------------

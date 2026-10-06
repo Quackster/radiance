@@ -2959,6 +2959,23 @@ static const RadConstraint cGemmW4A8Tiled[] = {
 static const RadConstraint cGemmMxfp4A8Decode[] = {
     C_LE("M", 64), C_LE("N", 36864), C_DIV("K", 64), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
 };
+/* BAND EDGES FOR gemm_nt_q, carried by a row that can never be selected.
+ * core/plugin/bands.cpp takes its bucket boundaries from the LE/GE/EQ values of EVERY row of the op,
+ * and the constraints of one row are AND-ed -- so an edge cannot ride on a real row without narrowing
+ * what that row serves (an `M <= 16` on the decode row made it serve M <= 16 only, and M 17..64 fell
+ * to the tiled kernel: 4-5x slower GEMM). The edges live here instead, beside a dtype no tensor has,
+ * so this row matches nothing and only contributes its numbers to the band table.
+ * They split (8, 64] into (8, 16], (16, 32], (32, 48], (48, 64] and (64, max] into (64, 128],
+ * (128, 256], (256, 512], (512, 1024], (1024, 2048] and the open top. Neither the decode row's nor the
+ * tiled row's default reads the band (ks / bk / tn rules run on the actual M), so a band with no tune
+ * line launches exactly as before; the `dec` axis of the tiled row is tuned per band. */
+static const RadConstraint cGemmNtQBands[] = {
+    C_IN("dtype", "__bands__"),
+    C_LE("M", 16), C_LE("M", 32), C_LE("M", 48),
+    C_LE("M", 128), C_LE("M", 256), C_LE("M", 512), C_LE("M", 1024), C_LE("M", 2048),
+};
+/* Never launched: nothing selects the row, and a caller that got here anyway is refused. */
+static int r4d_rad_bands_only(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
 static const RadConstraint cGemmMxfp4A8Tiled[] = {
     C_GE("M", 1), C_DIV("K", 64), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
 };
@@ -3084,10 +3101,7 @@ static const RadTunable tGemmPrefill[] = {
 /* The MXFP4 tiled GEMM's one axis. Both values are compiled arms of one template; 0 is the
  * measured M crossover (TN=4 from M >= 2048), which needs M and so cannot be a constant. */
 static const int64_t kMxTn[] = { 0, 2, 4 };
-static const RadTunable tGemmMxfp4Tiled[] = {
-  { "tn", kMxTn, NELEM(kMxTn), 0,
-    "16-column fragments per wave: 2 = 256x64 block, 4 = 256x128. 0 = TN 4 from M >= 2048" },
-};
+static const int64_t kMxDec[] = { 0, 1 };
 
 /* The MXFP4 decode GEMM's axes. 0 on `ks` and `bk` is the kernel's measured rule; `nt` streams
  * the weight (measured -5..-8% at M <= 48 on the fragment-order layout, ~0 at 64). */
@@ -3099,6 +3113,42 @@ static const RadTunable tGemmMxfp4Decode[] = {
   { "bk", kMxDecBk, NELEM(kMxDecBk), 0, "K slab in bytes. 0 = 128, or 64 at DTM 4 unsplit" },
   { "nt", kMxDecNt, NELEM(kMxDecNt), 1, "non-temporal weight loads" },
 };
+
+static const RadTunable tGemmMxfp4Tiled[] = {
+  { "tn", kMxTn, NELEM(kMxTn), 0,
+    "16-column fragments per wave: 2 = 256x64 block, 4 = 256x128. 0 = TN 4 from M >= 2048" },
+  { "dec", kMxDec, NELEM(kMxDec), 0,
+    "1 = serve this band with gemm_mxfp4a8_decode's wide form (M <= 256) instead of the tiled kernel. "
+    "0 = the tiled kernel. ks, bk, nt below are that kernel's axes and only read when dec = 1 (bk is "
+    "always 64 in the wide form)" },
+  { "ks", kMxDecKs, NELEM(kMxDecKs), 0, "dec=1: split-K workgroups a column block. 0 = the fill rule" },
+  { "bk", kMxDecBk, NELEM(kMxDecBk), 0, "dec=1: K slab in bytes; the wide form always uses 64" },
+  { "nt", kMxDecNt, NELEM(kMxDecNt), 1, "dec=1: non-temporal weight loads" },
+};
+
+/* dec = 1 is legal only where the wide form reaches: M <= 256 (the band's upper bound, which is what
+ * the geometry carries), N <= 36864. A band above that keeps the tiled kernel whatever the cache
+ * says.
+ *
+ * It is also refused where the A plane can be fragment-tiled (`afrag` = T, 0 = never): the producer
+ * writes q fragment-tiled from M >= T and only the atiled kernel reads that layout, the wide form
+ * reads row-major. The geometry carries the band's upper bound, so T <= M means some M of the band
+ * is tiled; a tune line with dec = 1 there is not applied, whoever wrote it. (This is what keeps
+ * RADIANCE_MXFP4_ATILED_MIN_M above 256 in practice: with T > 256 no dec = 1 band meets it.) */
+static int r4d_tune_valid_mxfp4_tiled(const RadParam* p, int n_p, const RadParam* c, int n_c) {
+    long long dec = 0, M = 0, N = 0, afrag = 0;
+    for (int i = 0; i < n_c; ++i)
+        if (c[i].kind == RAD_P_INT && !std::strcmp(c[i].key, "dec")) dec = c[i].ival;
+    if (!dec) return 1;
+    for (int i = 0; i < n_p; ++i)
+        if (p[i].kind == RAD_P_INT) {
+            if (!std::strcmp(p[i].key, "M")) M = p[i].ival;
+            else if (!std::strcmp(p[i].key, "N")) N = p[i].ival;
+            else if (!std::strcmp(p[i].key, "afrag")) afrag = p[i].ival;
+        }
+    if (afrag > 0 && afrag <= M) return 0;
+    return M > 0 && M <= 256 && N > 0 && N <= 36864;
+}
 
 /* ------------------------------------------------------------------------ split-KV attention
  * 0 is libr4d's measured split law (r4d_attn_paged_h256_gqa6.hip carries the table), which reads
@@ -4422,6 +4472,15 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_gemm_mxfp4a8_decode, r4d_rad_gemm_mxfp4a8_decode_scratch, r4d_rad_layout_mxfp4,
   r4d_rad_relayout_mxfp4 },
 
+{ "gemm_nt_q_bands", "gemm_nt_q", "gemm",
+  "not a kernel: the M band edges of gemm_nt_q (16, 32, 48, 128 ... 2048), kept off the real rows so "
+  "that they do not narrow what those serve",
+  "none: its dtype constraint matches no tensor, so selection never returns it",
+  "none",
+  RAD_DOMAIN_DEVICE, 0,
+  ROW(cGemmNtQBands), NOTUNE,
+  nullptr, nullptr, r4d_rad_bands_only, nullptr },
+
 { "gemm_mxfp4a8_tiled", "gemm_nt_q", "gemm",
   "the OCP-MXFP4 GEMM tiled for PREFILL row counts: a 256-row block stages A through LDS once per "
   "K slab and unpacks the weight once per slab, where the skinny kernel re-reads it every 64 rows",
@@ -4430,8 +4489,8 @@ static const RadKernelInfo kKernels[] = {
   "e4m3 A with an f32 per-row scale, e2m1 W with an E8M0 scale per 32 K folded into the element "
   "against a per-row reference, bf16 C, fp32 accumulate",
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_TILED,
-  ROW(cGemmMxfp4A8Tiled), ROW(tGemmMxfp4Tiled), nullptr,
-  nullptr, nullptr, r4d_rad_gemm_mxfp4a8_tiled, nullptr, r4d_rad_layout_mxfp4,
+  ROW(cGemmMxfp4A8Tiled), ROW(tGemmMxfp4Tiled), r4d_tune_valid_mxfp4_tiled,
+  nullptr, nullptr, r4d_rad_gemm_mxfp4a8_tiled, r4d_rad_gemm_mxfp4a8_tiled_scratch, r4d_rad_layout_mxfp4,
   r4d_rad_relayout_mxfp4 },
 
 /* BAND READ OFF THE ENTRY POINT'S OWN REJECTION TESTS. */
