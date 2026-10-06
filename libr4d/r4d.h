@@ -635,6 +635,9 @@ void r4d_moe_gemm_pin_fk(int pin);
 // THE DECODE FORM'S WEIGHT ADDRESS, pinned for a test: 0 is R4D_MOE_UWLOAD's rule, 1 the generic
 // table pointer, 2 a uniform global base. Bit-identical, and r4d_selftest compares their bytes.
 void r4d_moe_gemm_pin_uw(int pin);
+// THE DECODE FORM'S RUN SEARCH, pinned for a test: 0 is R4D_MOE_RUNSCAN's rule, 1 the chunked
+// search, 2 the one-pass search. Bit-identical, and r4d_selftest compares their bytes.
+void r4d_moe_gemm_pin_rs(int pin);
 // THE GATED RESIDUAL READ'S PREFILL TILE, pinned for a test: 0 is the launcher's rule, 1 the decode
 // tiles' kernels at 128 rows (hc_down_tiled, then hc_up_tiled into `ubuf` and hc_mix), 2 the wide
 // kernels (which then refuse a shape they are not built for). The two are bit-identical by

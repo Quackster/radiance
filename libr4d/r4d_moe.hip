@@ -923,9 +923,12 @@ static_assert(sizeof(MoeTab) == 16, "the code table is four words");
  * after the other in K order, each exactly the expression the 128 pass folds once a pass, under
  * its own activation scale. Same products, same sums, same order: bit-identical to FK 128.
  *
- * UW reads the weight and its scales from a uniform global base -- see the UW note at w4_load. */
+ * UW reads the weight and its scales from a uniform global base -- see the UW note at w4_load.
+ *
+ * RS finds an ES block's run in one round trip -- see the RS note at the run search. */
 template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
-          bool ES = false, bool AL = false, bool SK = false, uint32_t FK = kFK, bool UW = false>
+          bool ES = false, bool AL = false, bool SK = false, uint32_t FK = kFK, bool UW = false,
+          bool RS = false>
 __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
     const uint8_t* __restrict__ Aq, const float* __restrict__ As,
     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
@@ -986,6 +989,44 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
     }
     const uint32_t n0 = blockIdx.y * FN;
 
+    /* RS: this thread's NPT experts' offsets (and the next one's), which of them hold a run that
+     * meets the tile, and its wave's running count of those -- carried from the loads below to the
+     * run search further down. See the RS note there. */
+    constexpr uint32_t NPT = RS ? kMaxExpert / NTHR : 1;
+    static_assert(!RS || (ES && kMaxExpert % NTHR == 0 && FM <= NTHR),
+                  "RS is the decode grid's search: the offsets divide over the block's threads");
+    __shared__ uint32_t s_rc[RS ? NTHR / kWave : 1];
+    __shared__ uint32_t s_sel[RS ? 3 : 1];
+    [[maybe_unused]] uint32_t rs_ov[NPT + 1], rs_pm = 0, rs_cnt = 0, rs_inc = 0;
+
+    uint32_t live;
+    if constexpr (RS) {
+        /* EVERY LOAD THE SEARCH NEEDS, ISSUED AT ONCE: the block's sorted rows, its thread's share
+         * of the offsets and the live count. One round trip, then one barrier publishes the
+         * tokens and the waves' counts together. */
+        int32_t f = -1;
+        if (tid < FM && r0 + tid < rN) f = sorted[r0 + tid];
+#pragma unroll
+        for (uint32_t k = 0; k <= NPT; ++k) {
+            const uint32_t x = tid * NPT + k;
+            rs_ov[k] = x <= n_expert ? (uint32_t)off[x] : 0u;
+        }
+        live = (uint32_t)off[n_expert];
+        if (tid < FM)
+            s_tok[tid] = f < 0 ? -1 : (a_sorted ? (int32_t)(r0 + tid) : f / (int32_t)top_k);
+#pragma unroll
+        for (uint32_t k = 0; k < NPT; ++k) {
+            const uint32_t x = tid * NPT + k;
+            const bool p = x < n_expert && rs_ov[k] < rs_ov[k + 1] && rs_ov[k] < rN &&
+                           rs_ov[k + 1] > r0;
+            rs_pm |= (uint32_t)p << k;
+            rs_cnt += p ? 1u : 0u;
+        }
+        rs_inc = (uint32_t)wave_incl_scan_i32((int32_t)rs_cnt, lane);
+        if (lane == kWave - 1) s_rc[wave] = rs_inc;
+        /* Both of RS's barriers order LDS alone -- the tokens, the counts, the selection. */
+        lds_barrier();
+    } else {
     /* The token each of the block's sorted rows reads its activation from, resolved once. -1 marks
      * a dropped slot, whose output row is zero. */
     for (uint32_t r = tid; r < FM; r += NTHR) {
@@ -999,7 +1040,8 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
     }
     __syncthreads();
 
-    const uint32_t live = (uint32_t)off[n_expert];
+    live = (uint32_t)off[n_expert];
+    }
     /* Rows past the live count are dropped slots: zeroed here, and then the run loop below has
      * nothing left to do for them. No run owns them, so under ES exactly one of the tile's blocks
      * must -- every block writing the same zeros would be a benign race and is still a race. */
@@ -1029,8 +1071,45 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
      * stops once it has found the block's run. The same rows reach the same expert: bit-identical.
      */
     uint32_t e = 0;
+    [[maybe_unused]] uint32_t rs_first = 0, rs_end = 0;
     if constexpr (AL) {
         e = tail ? 0u : e_al;          /* the map already named it; a tail block owns no expert */
+    } else if constexpr (RS) {
+        /* RS: THE SAME SEARCH, IN ONE ROUND TRIP AND TWO BARRIERS. The pass above walks the
+         * experts a chunk of NTHR at a time, each chunk a broadcast load to skip it or two
+         * dependent loads and two barriers to scan it, after the tokens' own load and barrier and
+         * the live count's load: a block pays four to six round trips to L2 before it knows its
+         * expert, and a block past the tile's last run pays them to learn it has nothing to do.
+         *
+         * Here every thread holds NPT consecutive experts' offsets from the one batch of loads
+         * above. The hits are numbered in expert order -- a thread's own in order, then a running
+         * count over the wave (DPP) and the waves before it -- which is the order the chunked pass
+         * numbers them in, so run `jrun` is the same expert. Its owner hands the expert and the
+         * run's bounds over LDS, so neither `off[e]` nor `off[e + 1]` is loaded again. The same
+         * rows reach the same expert: bit-identical. */
+        uint32_t before = rs_inc - rs_cnt, nrun = 0;
+        for (uint32_t w = 0; w < NTHR / kWave; ++w) {
+            if (w < wave) before += s_rc[w];
+            nrun += s_rc[w];
+        }
+        if (jrun >= before && jrun < before + rs_cnt) {
+            uint32_t m = jrun - before;
+#pragma unroll
+            for (uint32_t k = 0; k < NPT; ++k) {
+                if (!((rs_pm >> k) & 1u)) continue;
+                if (m == 0) {
+                    s_sel[0] = tid * NPT + k;
+                    s_sel[1] = rs_ov[k] > r0 ? rs_ov[k] : r0;
+                    s_sel[2] = rs_ov[k + 1];
+                }
+                --m;
+            }
+        }
+        lds_barrier();
+        if (jrun >= nrun) return;       /* the tile has fewer runs than this block's index */
+        e = s_sel[0];
+        rs_first = s_sel[1];
+        rs_end = s_sel[2];
     } else if constexpr (ES) {
         __shared__ int32_t  s_run[FM];
         __shared__ uint32_t s_wc[NTHR / kWave];
@@ -1088,7 +1167,10 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
     /* Under ES the block's run was found above, so the loop starts at it: its first row in the
      * tile, and the run count already at `jrun`. */
     uint32_t rs = r0, run = 0;
-    if constexpr (ES) {
+    if constexpr (RS) {
+        rs = rs_first;
+        run = jrun;
+    } else if constexpr (ES) {
         const uint32_t a = (uint32_t)off[e];
         rs = a > r0 ? a : r0;
         run = jrun;
@@ -1096,10 +1178,13 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
     while (rs < rN && rs < live) {
         /* This run: rows [rs, re) all belong to expert `e`. The advance is at the TOP so `e` can
          * never be walked past the last expert -- `off[e + 1]` is read only for e < n_expert, and
-         * off[n_expert] is the live row count, which is the bound the loop already respects. */
-        while (e < n_expert && (uint32_t)off[e + 1] <= rs) ++e;
-        if (e >= n_expert) break;
-        const uint32_t ehi = (uint32_t)off[e + 1];
+         * off[n_expert] is the live row count, which is the bound the loop already respects.
+         * Under RS the search handed over the run's end, and its start meets it: nothing to walk. */
+        if constexpr (!RS) {
+            while (e < n_expert && (uint32_t)off[e + 1] <= rs) ++e;
+            if (e >= n_expert) break;
+        }
+        const uint32_t ehi = RS ? rs_end : (uint32_t)off[e + 1];
         const uint32_t re  = rN < live ? (rN < ehi ? rN : ehi) : (live < ehi ? live : ehi);
         if (re <= rs) break;
         /* Not this block's run: walk past it. Block-uniform, so no barrier is skipped by some
@@ -1128,8 +1213,12 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
         const uint32_t kb_n = wn0 / kBlock;           /* the weight scale's N row for this block */
         if constexpr (W4) (void)kb_n;                 /* w4 scales vary per ROW, not per N block */
 
-        const uint8_t*  Wp  = uw_ptr<UW>(wtab_at(C.w, C.w_s0, e >> cshift));
-        const uint16_t* Wsp = uw_ptr<UW>((const uint16_t*)wtab_at(C.s, C.s_s0, e >> cshift));
+        /* Both table entries are loaded before either is made uniform, so under UW the two
+         * readfirstlanes wait on one round trip and not on two. */
+        const uint8_t*  Wp0  = wtab_at(C.w, C.w_s0, e >> cshift);
+        const uint16_t* Wsp0 = (const uint16_t*)wtab_at(C.s, C.s_s0, e >> cshift);
+        const uint8_t*  Wp   = uw_ptr<UW>(Wp0);
+        const uint16_t* Wsp  = uw_ptr<UW>(Wsp0);
 
         /* SK: A WAVE WHOSE M TILES ARE ALL PAST THE RUN has nothing to accumulate. Under AL the
          * run is the block's rows [rs, re) from its first row, so that is a wave-uniform test;
@@ -2282,6 +2371,17 @@ static bool r4d_moe_uwload() {
     }();
     return g_moe_uw_pin ? g_moe_uw_pin == 2 : v;
 }
+/* R4D_MOE_RUNSCAN=1: the decode form -- both projections -- finds its block's run in one round
+ * trip (see RS at the run search). Unset or 0: the chunked search, as upstream. Bit-identical;
+ * read once. A test pin over it: 0 the switch, 1 off, 2 on. */
+static int g_moe_rs_pin = 0;
+static bool r4d_moe_runscan() {
+    static const bool v = [] {
+        const char* e = std::getenv("R4D_MOE_RUNSCAN");
+        return e && std::atoll(e) > 0;
+    }();
+    return g_moe_rs_pin ? g_moe_rs_pin == 2 : v;
+}
 /* THE MAP'S UPPER BOUND, stated once because the scratch hook and the launcher must agree about
  * it exactly: a hook that answers for a different shape than the launch uses is how a kernel ends
  * up writing past the arena it was given. Every expert contributes one block, plus one more for
@@ -2510,21 +2610,25 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
         /* THE DECODE GRID IS (tile, run) WIDE -- see the kernel's ES note. One tile of rows is all
          * a decode step has, so without this the whole layer runs on N/64 workgroups. */
         const unsigned tiles = (unsigned)((T + 15) / 16);
-        /* Two 128-wide K blocks a pass (R4D_MOE_GU_FK256) where every class's K is whole passes
-         * of 256 and the format folds scale groups. */
-        /* WHICH INSTANTIATION: the weight from a uniform global base (R4D_MOE_UWLOAD), and two
-         * 128-wide K blocks a pass (R4D_MOE_GU_FK256) where every class's K is whole passes of
-         * 256 and the format folds scale groups. All four are bit-identical; the function moves
-         * with the choice, which a recorded pass sees as a new node. */
+        /* WHICH INSTANTIATION: the weight from a uniform global base (R4D_MOE_UWLOAD), the run
+         * search in one round trip (R4D_MOE_RUNSCAN, up to kMaxExpert experts), and two 128-wide
+         * K blocks a pass (R4D_MOE_GU_FK256) where every class's K is whole passes of 256 and the
+         * format folds scale groups. All of them are bit-identical; the function moves with the
+         * choice, which a recorded pass sees as a new node. */
         const bool uw = r4d_moe_uwload();
-        auto kern = uw ? &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, kFK, true>
-                       : &moe_gemm_q_kernel<1, 4, 1, 4, W4, true>;
+        const bool rs = r4d_moe_runscan() && n_expert <= (long long)kMaxExpert;
+        auto pick = [&](auto fk) {
+            constexpr uint32_t F = decltype(fk)::value;
+            return uw ? (rs ? &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, true, true>
+                            : &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, true>)
+                      : (rs ? &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, false, true>
+                            : &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F>);
+        };
+        auto kern = pick(std::integral_constant<uint32_t, kFK>{});
         if constexpr (W4 >= 2) {
             bool fk2 = r4d_moe_gu_fk256(T, a_sorted);
             for (int q = 0; q < ncls; ++q) fk2 = fk2 && Kc[q] % (2 * (long long)kBlock) == 0;
-            if (fk2)
-                kern = uw ? &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, 2 * kFK, true>
-                          : &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, 2 * kFK>;
+            if (fk2) kern = pick(std::integral_constant<uint32_t, 2 * kFK>{});
         }
         emit_rc = R4D_EMIT(sk, kern,
                            dim3(tiles * 16u, ny), dim3(4 * kWave), 0,
@@ -2623,6 +2727,7 @@ extern "C" int64_t r4d_rad_moe_gemm_w4a8_scratch(const RadArgs* a) { return moe_
 extern "C" void r4d_moe_gemm_pin_prefill(int form) { g_moe_prefill_form = form; }
 extern "C" void r4d_moe_gemm_pin_fk(int pin) { g_moe_fk_pin = pin; }
 extern "C" void r4d_moe_gemm_pin_uw(int pin) { g_moe_uw_pin = pin; }
+extern "C" void r4d_moe_gemm_pin_rs(int pin) { g_moe_rs_pin = pin; }
 
 extern "C" int r4d_rad_moe_gemm_q(const RadArgs* a, RadStream s) {
     return moe_gemm_launch<0>(a, r4d_stream_sink(s));

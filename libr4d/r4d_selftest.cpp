@@ -164,6 +164,7 @@ struct Plugin {
     void (*pin_moe)(int) = nullptr;
     void (*pin_fk)(int) = nullptr;
     void (*pin_uw)(int) = nullptr;
+    void (*pin_rs)(int) = nullptr;
     void (*pin_hc)(int) = nullptr;
     void (*pin_qsel)(int) = nullptr;
 };
@@ -196,6 +197,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_moe_gemm_pin_prefill", &pl->pin_moe);
     okall &= sym(pl->h, "r4d_moe_gemm_pin_fk", &pl->pin_fk);
     okall &= sym(pl->h, "r4d_moe_gemm_pin_uw", &pl->pin_uw);
+    okall &= sym(pl->h, "r4d_moe_gemm_pin_rs", &pl->pin_rs);
     okall &= sym(pl->h, "r4d_hc_read_pin_prefill", &pl->pin_hc);
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     return okall;
@@ -5861,33 +5863,42 @@ static float st_e4m3(uint8_t b) {
 struct MoeW4Shape { const char* name; int64_t N0, K0, N1, K1, parts, ne; };
 
 /* THE DECODE FORM'S BIT-IDENTICAL VARIANTS, each against the default, byte for byte: the weight from
- * a uniform global base (R4D_MOE_UWLOAD), two 128-wide K blocks a pass (R4D_MOE_GU_FK256), and
- * both. Every launch is DESCRIBED first: a variant that named the default's kernel would match it
- * trivially, so two pins naming one function is a failure, not a pass. `fk2` is whether this shape
- * can take two blocks a pass -- the token operand, a format that folds scale groups, every class's
- * K a multiple of 256; the uniform base is open to every shape. The default here is PINNED, so an
- * R4D_MOE_* switch in the environment cannot make the comparison one variant against itself.
+ * a uniform global base (R4D_MOE_UWLOAD), the run search in one round trip (R4D_MOE_RUNSCAN), two
+ * 128-wide K blocks a pass (R4D_MOE_GU_FK256), and every combination. Every launch is DESCRIBED
+ * first: a variant that named the default's kernel would match it trivially, so two pins naming
+ * one function is a failure, not a pass. `fk2` is whether this shape can take two blocks a pass --
+ * the token operand, a format that folds scale groups, every class's K a multiple of 256; the
+ * other two are open to every shape. The default here is PINNED, so an R4D_MOE_* switch in the
+ * environment cannot make the comparison one variant against itself.
  *
  * A row with no describe hook -- moe_gemm_fp8a8_mod4 -- is compared on its bytes alone, and says
  * so in its label: that the variant ran is then not shown, only that what ran agrees. */
 static void moe_dec_variants(const Plugin& pl, const RadKernelInfo* row, RadArgs& a, void* d_y,
                              size_t elems, bool fk2, const std::string& what) {
-    if (!pl.pin_fk || !pl.pin_uw || !pl.pin_moe) return;
+    if (!pl.pin_fk || !pl.pin_uw || !pl.pin_rs || !pl.pin_moe) return;
     const bool described = row->describe != nullptr;
-    struct Var { int uw, fk; const char* name; };
-    static const Var kVar[] = { { 1, 1, "one K block a pass" },
-                                { 2, 1, "uniform weight base" },
-                                { 1, 2, "two K blocks a pass" },
-                                { 2, 2, "uniform weight base, two K blocks a pass" } };
-    const void* fn[4] = { nullptr, nullptr, nullptr, nullptr };
+    struct Var { int uw, rs, fk; const char* name; };
+    static const Var kVar[] = {
+        { 1, 1, 1, "as upstream" },
+        { 2, 1, 1, "uniform weight base" },
+        { 1, 2, 1, "one-pass run search" },
+        { 2, 2, 1, "uniform weight base, one-pass run search" },
+        { 1, 1, 2, "two K blocks a pass" },
+        { 2, 1, 2, "uniform weight base, two K blocks a pass" },
+        { 1, 2, 2, "one-pass run search, two K blocks a pass" },
+        { 2, 2, 2, "uniform weight base, one-pass run search, two K blocks a pass" },
+    };
+    constexpr int kN = (int)(sizeof(kVar) / sizeof(kVar[0]));
+    const void* fn[kN] = {};
     std::vector<uint16_t> base;
-    for (int v = 0; v < 4; ++v) {
+    for (int v = 0; v < kN; ++v) {
         if (kVar[v].fk == 2 && !fk2) continue;
         const std::string label = what + " decode form, " + kVar[v].name +
                                   (described ? "" : " (launch not described)");
         auto pin = [&](bool on) {
             pl.pin_moe(on ? 2 : 0);
             pl.pin_uw(on ? kVar[v].uw : 0);
+            pl.pin_rs(on ? kVar[v].rs : 0);
             pl.pin_fk(on ? kVar[v].fk : 0);
         };
         if (described) {
