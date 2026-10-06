@@ -1164,11 +1164,35 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
  */
 struct DenseFP8 {
     rad_weight w = 0, s = 0;
+    /* OR AN OCP-MXFP4 WEIGHT, when that is what the container holds for it (a recipe's `codes=
+     * fp4_e2m1 group=32 scale=e8m0`): e2m1 codes, the E8M0 plane, and that plane again as the
+     * per-row reference -- LinearFP8's mx branch, without the GEMM. A block that declares its own
+     * GEMM over a DenseFP8 asks `gemm()` for it and passes `bref()` as the op's last operand, so
+     * one block serves either format against the same E4M3 activation pair. */
+    rad_weight ref = 0;
+    bool       mx = false;
 
     int declare(RadBuilder* b, Names& nm, const char* base, int64_t N, int64_t K,
                 int access, int shard, RadWeightGroup grp,
                 std::initializer_list<const char*> src,
                 std::initializer_list<int64_t> row_parts = {});
+    /* `gemm_nt_q` over this weight, `fp8a8` or `mxfp4a8` as it was declared, ranged M 1..hi. */
+    rad_op gemm(RadBuilder* b, int64_t hi, int64_t N, int64_t K,
+                std::initializer_list<rad_buf> reads, std::initializer_list<rad_buf> writes) const {
+        if (mx)
+            return rw(b, RAD_OP(b, "gemm_nt_q",
+                          RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                     RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8")),
+                          RAD_WEIGHTS(w, s, ref)),
+                      reads, writes);
+        return rw(b, RAD_OP(b, "gemm_nt_q",
+                      RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                 RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "fp8a8")),
+                      RAD_WEIGHTS(w, s)),
+                  reads, writes);
+    }
+    /* The op's trailing `b_ref` operand: the reference view for MXFP4, absent for fp8. */
+    RadOperand bref() const { return mx ? RAD_W(ref) : RAD_NONE; }
 };
 
 inline int DenseFP8::declare(RadBuilder* b, Names& nm, const char* base, int64_t N, int64_t K,
@@ -1176,6 +1200,36 @@ inline int DenseFP8::declare(RadBuilder* b, Names& nm, const char* base, int64_t
                              std::initializer_list<const char*> src,
                              std::initializer_list<int64_t> row_parts) {
     if (N <= 0 || K <= 0 || src.size() == 0) return RAD_E_INVAL;
+
+    /* ---- OCP-MXFP4, read off the encoding the name map resolves to. The exponent grid is one row
+     * tall, so a part needs only whole 16-row tiles; K takes whole 128s because the E4M3 activation
+     * in front carries a scale per (row, 128). */
+    {
+        const char* wn = nm.f("%s.weight", base);
+        RAD_ARCH_TRY(map_linear(b, wn, src));
+        RadEncoding enc{};
+        mx = weight_enc(b, wn, &enc) && linear_is_mxfp4(enc);
+        if (mx) {
+            if (N % 16 || K % RAD_FP8_BLOCK) {
+                fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; an MXFP4 weight takes rows "
+                                "in 16s and K in whole %d-column activation scale blocks.\n",
+                        base, (long long)N, (long long)K, RAD_FP8_BLOCK);
+                return RAD_E_INVAL;
+            }
+            int64_t p[RAD_MAX_ROW_PARTS] = {0};
+            int     np = 0;
+            for (int64_t q : row_parts) {
+                if (np >= RAD_MAX_ROW_PARTS || q % 16) return RAD_E_INVAL;
+                p[np++] = q;
+            }
+            w   = decl_view(b, wn, nullptr, "codes", RAD_FP4E2M1, { N, K }, access, shard, grp, p, np);
+            s   = decl_view(b, nm.f("%s.scale", base), wn, "scale", RAD_E8M0, { N, K / RAD_MX_GROUP },
+                            access, shard, grp, p, np);
+            ref = decl_view(b, nm.f("%s.ref", base), wn, "scale", RAD_E8M0, { N, K / RAD_MX_GROUP },
+                            access, shard, grp, p, np);
+            return w && s && ref ? RAD_OK : RAD_E_INVAL;
+        }
+    }
     if (N % RAD_FP8_BLOCK || K % RAD_FP8_BLOCK) {
         fprintf(stderr, "radiance: '%s' is %lldx%lld per rank, which is not a whole number of "
                         "%dx%d scale blocks. A block-scaled fp8 weight cannot be split inside a "
@@ -1200,8 +1254,7 @@ inline int DenseFP8::declare(RadBuilder* b, Names& nm, const char* base, int64_t
     }
 
     const char* wn = nm.f("%s.weight", base);
-    const char* sn = nm.f("%s.scale",  base);
-    RAD_ARCH_TRY(map_linear(b, wn, src));
+    const char* sn = nm.f("%s.scale",  base);   /* the name map was made above */
     w = decl_view(b, wn, nullptr, "codes", RAD_F8E4M3, { N, K }, access, shard, grp, wp, np);
     s = decl_view(b, sn, wn, "scale", RAD_BF16, { fp8_blocks(N), fp8_blocks(K) }, access, shard,
                   grp, sp, np);
