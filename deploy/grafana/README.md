@@ -28,11 +28,10 @@ Window values are counter ratios with the definitions of the since-start gauges:
 | prompt from attention cache | `attn_cached_tokens` / `prompt_tokens` | `vllm:gpu_prefix_cache_hit_rate` |
 | prompt from linear checkpoint | `linear_cached_tokens` / (`linear_cached_tokens` + `prefill_tokens`) | `radiance:linear_prefix_cache_hit_rate` |
 | draft acceptance | `draft_accepted` / `draft_tokens` | `radiance:draft_acceptance_ratio` |
-| conditional acceptance at j | `draft_position_reached`(j+1) / `draft_position_reached`(j) | `radiance:draft_position_acceptance_ratio` |
+| conditional acceptance at j | `draft_position_accepted`(j) / `draft_position_reached`(j) | `radiance:draft_position_acceptance_ratio` |
 
-Position j+1 is evaluated only when j was accepted, so its reach counts j's acceptances. The last
-position's acceptances are the total accepted minus every later reach. Draft blocks per decode step is
-the reach of position 0 over `engine_steps_decode_total` (GUIDE §6.3).
+Draft blocks per decode step is the reach of position 0 over `engine_steps_decode_total` (GUIDE §6.3).
+The adaptive draft window and verifies by draft depth have data only while `RADIANCE_DRAFT_ADAPT` is on.
 
 Prometheus extrapolates `rate()` inside the window and VictoriaMetrics does not, so short windows at
 the edge of a burst differ between the two. The overview's ratios are taken over the dashboard's time
