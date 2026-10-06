@@ -1388,6 +1388,27 @@ public:
                 rad_stream_destroy(uplinks_[(size_t)d].st);
                 uplinks_[(size_t)d].st = nullptr;
             }
+        /* EVERY STAGED WEIGHT MUST HAVE BEEN DELIVERED. One nothing arrived for was never laid out
+         * and its slot holds whatever the card had there: zeros on a card whose freed memory the
+         * driver wipes, which is how such a slot serves for months unnoticed, and garbage on one
+         * that has just been through a reset. Refusing here is what makes the hole visible. */
+        if (status_ == RAD_OK && !audited_) {
+            audited_ = true;
+            int64_t undelivered = 0;
+            for (const StagedWeight& s : items_)
+                if (s.remaining > 0) {
+                    if (undelivered < 4)
+                        RAD_ERR("load: '%s' was staged and nothing delivered its %s: its slot was "
+                                "never written", s.prog->weights[s.wi].name.c_str(),
+                                humanb(s.remaining).c_str());
+                    ++undelivered;
+                }
+            if (undelivered) {
+                RAD_ERR("load: %lld staged weight(s) were never delivered; the model cannot run",
+                        (long long)undelivered);
+                status_ = RAD_E_STATE;
+            }
+        }
         return status_;
     }
 
@@ -1664,6 +1685,7 @@ private:
     std::vector<int>           out_;      /* copies outstanding out of each sweep window */
     int64_t budget_ = 0, held_ = 0, pending_ = 0, peak_ = 0;
     bool done_ = false;
+    bool audited_ = false;   /* finish() runs its delivery audit once; the destructor calls it again */
     std::atomic<bool> failed_{false};
     int status_ = RAD_OK;
 };
@@ -2425,6 +2447,16 @@ int Engine::load_weights() {
     const auto rt0 = std::chrono::steady_clock::now();
     int sw_st = RAD_OK;
     if (file_) {
+        /* A WEIGHT WITH NO BYTES IN THE FILE -- a zero share -- is one the sweep never reaches: no
+         * run of the container is its source, so nothing would ever arrive for it and its worker
+         * would never run. It is handed to the workers here, whole, and its own fill writes it
+         * (the checkpoint branch below does the same for every weight, which is why the hole was
+         * never seen there). */
+        for (size_t k = 0; k < staged.size() && !pool.failed(); ++k)
+            if (staged[k].fill) {
+                pool.reserve((int)k);
+                pool.arrived((int)k, staged[k].remaining);
+            }
         sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes);
     } else {
         /* every weight to the workers, in declaration order, as fast as the budget lets them in */
