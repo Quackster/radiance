@@ -147,6 +147,7 @@ struct AttnGatedFP8 {
     rad_op     op_attn_gq = 0;                               /* attn_paged + gate_quant_fp8 */
     rad_op     op_sig = 0, op_mul = 0;                       /* the bf16 gate, Geom::w_bf16 */
     rad_op     op_ar = 0, op_add = 0;
+    rad_op     op_fill = 0;                                  /* the attention-zero rank: see declare */
     /* ...AND WHETHER THE COLLECTIVE AT THE END OF THIS BLOCK IS THE NEXT BLOCK'S FIRST PASS.
      * `ar_in` says this block's own norm absorbs its PREDECESSOR's all-reduce; `ar_out` says the
      * block after it absorbs THIS one's, so this one must not issue it. They are the residual
@@ -195,8 +196,8 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
     /* AND UNDER A SMALLER ATTENTION WORLD (rad_arch.h Geom::attn_world: three ranks over two KV
      * heads) the even shard over `world` is the wrong cut for every projection: q|gate and the
      * output take this rank's heads [attn_rank * n_head, +n_head) as a span too, and k/v the
-     * kv_off span. An attention-zero rank declares the same spans -- the same shapes as its peers
-     * -- and then reads nothing for them (zero_share below). */
+     * kv_off span. An attention-zero rank declares none of them: its block is one `fill` of the
+     * output wire (the branch below), so the spans here are only ever cut for a rank with heads. */
     const bool    a_spanned  = g.attn_world != g.world;
     const bool    kv_spanned = g.world > g.n_head_kv_all || a_spanned;
     const int64_t kv_span_lo = kv_spanned ? g.kv_off : 0;
@@ -244,6 +245,23 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
     if (!ext_in)
         RAD_ARCH_TRY(nq_h.declare(b, g, w_norm, fold ? w.h.x : w.x, w.h, g.n_embd,
                                   fold ? w.x : 0, 0, ar_in));
+
+    /* AN ATTENTION-ZERO RANK COMPUTES NO ATTENTION AT ALL. Its share of every projection is zero,
+     * so its q, k and v are zero, its attention is zero and its output projection adds exactly
+     * nothing to the reduce -- which is what the ranks that DO hold heads need from it and all
+     * they need. Declaring the projections and running them on zero weights spent the same
+     * dispatches and bytes as a real rank and a slot for every zero (and a KV pool nothing read,
+     * see rad_kv_group_zero). Here the block's output wire is written to zero by one `fill`, and
+     * the all-reduce and the residual below see what they always saw. The norm above stays: a
+     * pre-norm block's `fold` and `ar_in` live in it. Nothing in this branch runs for a rank with
+     * heads, so a world the heads divide (every TP2 and TP4 deployment) declares as it always did. */
+    if (g.attn_zero) {
+        op_fill = rw(b, RAD_OP(b, "fill",
+                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                    RAD_STR("dtype", g.dtype)),
+                         RAD_NOWEIGHTS),
+                     {}, {w.h.x});
+    } else {
     RAD_ARCH_TRY(qg.declare(b, nm, g, nm.f("blk.%d.attn_qg", l), qg_dim, g.n_embd,
                             RAD_SHARD_ROW, grp_layer(l), { src.qg }, w.h, w.qg,
                             0, {}, qg_span_lo, qg_span_hi));
@@ -253,11 +271,6 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
     RAD_ARCH_TRY(vp.declare(b, nm, g, nm.f("blk.%d.attn_v", l), kv_dim, g.n_embd,
                             RAD_SHARD_ROW, grp_layer(l), { src.v }, w.h, w.v,
                             0, {}, kv_span_lo, kv_span_hi));
-    if (g.attn_zero) {
-        RAD_ARCH_TRY(qg.zero_share(b));
-        RAD_ARCH_TRY(kp.zero_share(b));
-        RAD_ARCH_TRY(vp.zero_share(b));
-    }
 
     /* THE FUSED PROLOGUE, AND IT IS A PROBE: the four ops below are declared either way and are
      * what runs when nothing serves this one. rad_block_attn_gated.h does not make the probe,
@@ -435,7 +448,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
     RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
                            RAD_SHARD_COL, grp_layer(l), { src.o }, w.attn, w.h.x,
                            0, {}, o_span_lo, o_span_hi));
-    if (g.attn_zero) RAD_ARCH_TRY(o.zero_share(b));
+    }   /* !g.attn_zero */
 
     if (g.world > 1)
         op_ar = rw(b, RAD_OP(b, "all_reduce",
@@ -466,6 +479,14 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch) const {
     const int64_t T = batch->n_tok;
 
     if (!ext_in) nq_h.step(c, T);
+    if (op_fill) {
+        /* The attention-zero rank: the output wire is zero, then the reduce and the residual. */
+        RAD_ISSUE_N(c, op_fill, T, brows(w.h.x, T));
+        if (op_ar && !ar_taken(g, T, ar_out, ar_out_take))
+            RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h.x, T), RAD_NONE);
+        if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
+        return;
+    }
     qg.step(c, w.h, w.qg, T);
     kp.step(c, w.h, w.k,  T);
     vp.step(c, w.h, w.v,  T);
