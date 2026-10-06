@@ -528,6 +528,14 @@ extern "C" int r4d_shape_binary(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+extern "C" int r4d_shape_fill(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, n) };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_unary(const RadParam* p, int n_p, int operand,
                                RadOpdDesc* out) {
 

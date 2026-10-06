@@ -9550,6 +9550,47 @@ static void device_phase(const Plugin& pl) {
             }
         }
     }
+    /* --- fill: the op a rank with nothing to compute writes a defined buffer with --- */
+    if (sel("fill_bf16")) {
+        const RadKernelInfo* r = find(pl, "fill_bf16");
+        if (!r) ok("fill_bf16", false, "row absent");
+        else {
+            const int64_t M = 5, n = 48, wide = 2 * n;   /* a column slice at a wide pitch */
+            void* d = dalloc((size_t)M * wide * 2);
+            if (!d) ok("fill alloc", false, "hipMalloc failed");
+            else {
+                std::vector<uint16_t> pre((size_t)(M * wide), h_to_bf16(-7.5f));
+                st_memcpy(d, pre.data(), (size_t)M * wide * 2, hipMemcpyHostToDevice);
+                RadTensor ty = T(d, RAD_BF16, { M, n });
+                ty.stride[0] = wide;
+                std::vector<RadTensor> ts = { ty };
+                /* Default value: zero. The whole point of the op is that this is exactly 0x0000. */
+                std::vector<RadParam> p0 = { PI("M", M), PI("n", n), PS("dtype", "bf16") };
+                run_case(r, ts, p0);
+                std::vector<uint16_t> got((size_t)(M * wide));
+                st_memcpy(got.data(), d, (size_t)M * wide * 2, hipMemcpyDeviceToHost);
+                bool zero = true, spilled = false;
+                for (int64_t m = 0; m < M; ++m)
+                    for (int64_t c = 0; c < wide; ++c) {
+                        const uint16_t g = got[(size_t)(m * wide + c)];
+                        if (c < n) { if (g != 0) zero = false; }
+                        else if (g != pre[0]) spilled = true;
+                    }
+                ok("fill_bf16 writes exactly zero into the slice by default", zero);
+                ok("fill_bf16 leaves the columns past the pitch alone", !spilled);
+                /* A value: rounds to nearest even once, like every store in this library. */
+                std::vector<RadParam> p1 = { PI("M", M), PI("n", n), PS("dtype", "bf16"),
+                                             PF("value", 1.37) };
+                run_case(r, ts, p1);
+                st_memcpy(got.data(), d, (size_t)M * wide * 2, hipMemcpyDeviceToHost);
+                const uint16_t want = h_to_bf16(1.37f);
+                bool val = true;
+                for (int64_t m = 0; m < M && val; ++m)
+                    for (int64_t c = 0; c < n; ++c) if (got[(size_t)(m * wide + c)] != want) { val = false; break; }
+                ok("fill_bf16 writes a given value, RNE-rounded", val);
+            }
+        }
+    }
     /* --- byte rows: the KV tier's transfer pair --- */
     /* PACK AND UNPACK A POOL, which is the only thing these two are ever asked to do. The layout
      * here is the real one in miniature: a "layer" is `rows` blocks of `n` bytes, the blocks a

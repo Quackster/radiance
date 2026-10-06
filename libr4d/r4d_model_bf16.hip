@@ -725,6 +725,32 @@ extern "C" int r4d_sigmoid_bf16(long x, long y, int M, int n, int x_ld, int y_ld
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+// ---------------------------------------------------------------------------- fill
+// y[m, i] = v for every element of an [M, n] extent with a row pitch -- the op a rank issues where
+// it has nothing to compute and a downstream reader (an all-reduce, a residual) still expects a
+// defined buffer. A memset cannot do this: the wire may have a pitch and bf16 is two bytes.
+__global__ __launch_bounds__(kThreads) void fill_kernel(uint16_t* __restrict__ y, uint32_t n,
+                                                        uint32_t y_ld, uint16_t v) {
+    uint16_t* __restrict__ yr = y + (size_t)blockIdx.x * y_ld;
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads) yr[i] = v;
+}
+
+// The host form of r4d_common.h's f32_to_bf16 (which is __device__): the same round-to-nearest-even.
+static inline uint16_t f32_to_bf16_host(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, sizeof u);
+    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
+extern "C" int r4d_fill_bf16(long y, int M, int n, int y_ld, float value, long stream) {
+    if (!y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (!y_ld) y_ld = n;
+    hipLaunchKernelGGL(fill_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
+                       (uint16_t*)y, (uint32_t)n, (uint32_t)y_ld, f32_to_bf16_host(value));
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 extern "C" int r4d_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream) {
     if (!gu || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
@@ -1256,6 +1282,23 @@ extern "C" int r4d_rad_sigmoid(const RadArgs* a, RadStream s) {
 
     return r4d_sigmoid_bf16(r4d_addr(x), r4d_addr(y), (int)M, (int)n, (int)x_ld, (int)y_ld,
                             (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* ------------------------------------------------------------------ fill */
+
+extern "C" int r4d_rad_fill(const RadArgs* a, RadStream s) {
+    const RadTensor* y = r4d_opt(a, 0);
+    if (!y) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_bf16(y));
+    const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0;
+    const long long y_ld = r4d_rows_pitch(y, n, &M);
+    if (y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0) return R4D_NO(RAD_E_SHAPE);
+    const double v = r4d_getf(a, "value", 0.0);
+    return r4d_fill_bf16(r4d_addr(y), (int)M, (int)n, (int)y_ld, (float)v,
+                         (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ silu_mul */

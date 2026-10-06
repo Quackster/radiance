@@ -1512,6 +1512,13 @@ static const RadOperandSpec oUnary[] = {
     { "x", RAD_OPD_IN,  0 },
     { "y", RAD_OPD_OUT, 0 },
 };
+/* `fill` has no input: `value` is the whole of what it writes. */
+static const RadParamSpec pFill[] = {
+    P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("value"),
+};
+static const RadOperandSpec oFill[] = {
+    { "y", RAD_OPD_OUT, 0 },
+};
 /* `cast`'s two dtype keys are STRINGS and not one `dtype`, because the whole point of the op is
  * that the two ends differ. ref's spelling, matched field for field so the two plugins agree. */
 static const RadParamSpec pCast[] = {
@@ -1796,6 +1803,10 @@ static const RadOpSchema kSchemas[] = {
            "y[.., i] = silu(gate_up[.., i]) * gate_up[.., n + i]. The GATE IS THE FIRST HALF, "
            "which is the order rad-convert fuses gate_proj and up_proj in."),
     SCHEMA("sigmoid", pMnDtype, oUnary, "y = 1 / (1 + exp(-x))."),
+    SCHEMA("fill", pFill, oFill,
+           "y = value, every element of an [M, n] extent (default 0). The op a rank issues where "
+           "it computes nothing and a reader downstream -- an all-reduce, a residual -- still "
+           "expects a defined buffer: a wire shared across layers cannot be zeroed once a step."),
     SCHEMA("cast", pCast, oUnary,
            "y = x, converted. `from` and `to` are for the selector; the bytes are described by the "
            "tensors' own dtypes and those are what the kernel reads."),
@@ -3302,6 +3313,15 @@ static const RadKernelInfo kKernels[] = {
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r4d_rad_mul, nullptr, nullptr, nullptr,
   r4d_shape_binary },
+
+{ "fill_bf16", "fill", "elem",
+  "constant fill, a row a workgroup",
+  "any M, n; a row pitch is honoured",
+  "bf16 out; the value rounds to nearest even once",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_fill, nullptr, nullptr, nullptr,
+  r4d_shape_fill },
 
 { "sigmoid_bf16", "sigmoid", "elem",
   "logistic sigmoid, grid-strided over the whole extent",

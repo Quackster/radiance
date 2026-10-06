@@ -847,6 +847,7 @@ int r4d_rmsnorm_bf16(long x, long w, long y, int M, int n, float eps, float wadd
 int r4d_binary_bf16(long a, long b, long y, int M, int n, int op,
                     int a_ld, int b_ld, int y_ld, long stream);
 int r4d_sigmoid_bf16(long x, long y, int M, int n, int x_ld, int y_ld, long stream);
+int r4d_fill_bf16(long y, int M, int n, int y_ld, float value, long stream);
 // y[.., i] = silu(gu[.., i]) * gu[.., n + i].  The GATE IS THE FIRST HALF -- the order rad-convert
 // fuses gate_proj and up_proj in.
 int r4d_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream);

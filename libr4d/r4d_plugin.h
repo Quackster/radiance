@@ -391,6 +391,7 @@ int r4d_rad_rmsnorm         (const RadArgs*, RadStream);
 int r4d_rad_add             (const RadArgs*, RadStream);
 int r4d_rad_mul             (const RadArgs*, RadStream);
 int r4d_rad_sigmoid         (const RadArgs*, RadStream);
+int r4d_rad_fill            (const RadArgs*, RadStream);
 int r4d_rad_silu_mul        (const RadArgs*, RadStream);
 int r4d_rad_rope            (const RadArgs*, RadStream);
 /* -- the vision tower's ops (r4d_vit_bf16.hip) -- */
@@ -451,6 +452,7 @@ int r4d_shape_layernorm      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_grid_embed     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gemm_nt_bias   (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_unary          (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_fill           (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_silu_mul       (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_rope           (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_kv_store       (const RadParam*, int, int operand, RadOpdDesc*);
