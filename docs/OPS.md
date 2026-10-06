@@ -1413,6 +1413,7 @@ candidates, and what enters the head from the trunk. Those two ends are what the
 | op | params | operands |
 |---|---|---|
 | `dflash_select` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `dtype` | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w → `tokens` |
+| `dflash_select_q` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `dtype` | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `pred_scale`w, `succ`w, `succ_scale`w → `tokens` |
 
 `dflash_conv` is the drafter's grouped convolution, and device-only:
 
@@ -1434,6 +1435,16 @@ argmax inside one workgroup. Written literally it is `steps` full-vocabulary [ra
 matrix products — 466 MiB a step to use seven rows — and through this operand it is 8 KiB of
 codebook gather. The only approximation is the top-K candidate set, which can cost acceptance and
 nothing else.
+
+**`dflash_select_q` is the same walk over codebooks held as E4M3 codes**: `pred` and `succ` are
+`[n_vocab, rank]` `fp8_e4m3` and `pred_scale`/`succ_scale` their f32 scales, one a row (`[n_vocab, 1]`,
+recipe `codes=fp8_e4m3 block=1x* scale=f32`) or one for the whole table (`[1, 1]`), so
+`codebook[v][r] = codes[v][r] · scale[v]`. The operand list differs from `dflash_select`'s and
+operands are positional, which is why it is an op of its own, as `embed_lookup_q` is. The two
+codebooks are 2 × 121 MiB at bf16; at E4M3 they are half that and the KV cache takes the
+difference (about 3.9k tokens at fp8 KV). The architecture chooses between the two ops from what the
+container says each codebook IS, so a container with bf16 codebooks is served as it always was.
+What the narrower codebooks can move is the drafter's acceptance, and only that: a draft is verified.
 
 ### `mtp_enter`: the MTP head's entry, when the residual stream is wide
 

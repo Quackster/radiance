@@ -1894,3 +1894,30 @@ extern "C" int r4d_shape_dflash_select(const RadParam* p, int n_p, int operand,
     };
     R4D_PICK(l);
 }
+
+/* The same walk over E4M3 codebooks. The scale is described one f32 a row; the launch also takes a
+ * single scale for the whole table, which a description has no reason to draw. */
+extern "C" int r4d_shape_dflash_select_q(const RadParam* p, int n_p, int operand,
+                                         RadOpdDesc* out) {
+    const int64_t M     = pi(p, n_p, "M");
+    const int64_t steps = pi(p, n_p, "steps");
+    const int64_t K     = pi(p, n_p, "top_k");
+    const int64_t R     = pi(p, n_p, "rank");
+    const int64_t V     = pi(p, n_p, "n_vocab");
+    const int64_t astr  = pi(p, n_p, "anchor_stride", 1);
+    const uint32_t D    = dt_act(p, n_p, "dtype");
+    if (M <= 0 || astr < 1) return RAD_E_UNSUPPORTED;
+    const int64_t rows = M * steps;
+    const RadOpdDesc l[] = {
+        opd_idx(rows, K, V),
+        opd((uint32_t)RAD_F32, rows, K),
+        opd(D, rows, R),
+        opd_idx((M - 1) * astr + 1, 0, V),
+        opd((uint32_t)RAD_F8E4M3, V, R),     /* pred codes */
+        opd((uint32_t)RAD_F32, V, 1),        /* pred scale, a row */
+        opd((uint32_t)RAD_F8E4M3, V, R),     /* succ codes */
+        opd((uint32_t)RAD_F32, V, 1),        /* succ scale, a row */
+        opd((uint32_t)RAD_I32, M, steps),
+    };
+    R4D_PICK(l);
+}

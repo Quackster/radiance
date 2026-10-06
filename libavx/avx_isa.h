@@ -114,7 +114,7 @@ int         avx_isa_force(int level);
     X(sample_penalties)     X(sample_dry)           X(sample_temp)          X(sample_topk)        \
     X(sample_topp)          X(sample_minp)          X(sample_typical)       X(sample_xtc)         \
     X(sample_merge_topk)    X(sample_mask)          X(sample_pick)          X(sample_argmax)      \
-    X(dflash_select)
+    X(dflash_select)        X(dflash_select_q)
 
 /* The table one ISA level fills. One member per op, same order as AVX_OP_LIST. A missing
  * definition is a link error against the level's own table definition in avx_table.cpp. */

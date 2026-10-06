@@ -761,11 +761,13 @@ static inline float dot_r(const float* a, const float* b, int64_t n) {
     return s;
 }
 
-AVX_KERNEL(dflash_select) {
-    if (a->n_t < 7) return RAD_E_INVAL;
-    const RadTensor *cand = &a->t[0], *un = &a->t[1], *anc = &a->t[3];
-    const RadTensor *pred = &a->t[4], *succ = &a->t[5], *out = &a->t[6];
-    const RadTensor* hp = rad_arg_in(a, 2);
+/* ONE BODY FOR BOTH SPELLINGS: `psc` / `ssc` are the f32 scales of an E4M3 codebook (one a row, or one
+ * for the table) and null for the plain one. The predecessor row's scale goes into `ax` once a step
+ * and the candidate row's onto the finished dot, which is libref's and the kernel's own order. */
+static int dflash_select_walk(const RadArgs* a, const RadTensor* cand, const RadTensor* un,
+                              const RadTensor* hp, const RadTensor* anc, const RadTensor* pred,
+                              const RadTensor* psc, const RadTensor* succ, const RadTensor* ssc,
+                              const RadTensor* out) {
     if (!cand->data || !un->data || !anc->data || !pred->data || !succ->data || !out->data)
         return RAD_E_INVAL;
 
@@ -782,6 +784,14 @@ AVX_KERNEL(dflash_select) {
     if (numel(anc) < (M - 1) * astr + 1 || numel(out) < M * steps) return RAD_E_SHAPE;
     if (numel(pred) < nv * R || numel(succ) < nv * R) return RAD_E_SHAPE;
     if (hp && numel(hp) < M * steps * R) return RAD_E_SHAPE;
+    auto scale_ok = [&](const RadTensor* t) {
+        return !t || (t->data && (numel(t) == 1 || numel(t) >= nv));
+    };
+    if (!scale_ok(psc) || !scale_ok(ssc)) return RAD_E_SHAPE;
+    auto row_scale = [&](const RadTensor* t, int64_t id) -> float {
+        if (!t) return 1.0f;
+        return ldt(t, numel(t) == 1 ? 0 : id * laststride(t));
+    };
 
     const int64_t cs = laststride(cand), us = laststride(un), os = laststride(out);
 
@@ -798,8 +808,9 @@ AVX_KERNEL(dflash_select) {
             const bool ok = pid >= 0 && pid < nv;
             const float* pv = ok ? in_row(pred, rowoff(pred, pid, R), R, rv) : nullptr;
             const float* hw = hp ? in_row(hp, rowoff(hp, r, R), R, hv) : nullptr;
+            const float pscl = ok ? row_scale(psc, pid) : 0.0f;
             for (int64_t i = 0; i < R; ++i)
-                ax[i] = (ok ? pv[i] : 0.0f) * (hp ? hw[i] : 1.0f);
+                ax[i] = (ok ? pv[i] * pscl : 0.0f) * (hp ? hw[i] : 1.0f);
 
             int64_t best_c = 0;
             float   best_s = -INFINITY;
@@ -807,7 +818,8 @@ AVX_KERNEL(dflash_select) {
                 const int64_t tok = ld_int_dt(cand->dtype, cand->data, cb + c * cs);
                 float sc = ldt(un, ub + c * us);
                 if (tok >= 0 && tok < nv)
-                    sc += dot_r(ax, in_row(succ, rowoff(succ, tok, R), R, rv), R);
+                    sc += dot_r(ax, in_row(succ, rowoff(succ, tok, R), R, rv), R) *
+                          row_scale(ssc, tok);
                 if (sc > best_s) { best_s = sc; best_c = c; }
             }
             pid = ld_int_dt(cand->dtype, cand->data, cb + best_c * cs);
@@ -815,4 +827,19 @@ AVX_KERNEL(dflash_select) {
         }
     }
     return RAD_OK;
+}
+
+AVX_KERNEL(dflash_select) {
+    if (a->n_t < 7) return RAD_E_INVAL;
+    return dflash_select_walk(a, &a->t[0], &a->t[1], rad_arg_in(a, 2), &a->t[3], &a->t[4], nullptr,
+                              &a->t[5], nullptr, &a->t[6]);
+}
+
+/* `cand`, `unary`, `hp`?, `anchor`, `pred`w, `pred_scale`w, `succ`w, `succ_scale`w -> `tokens`:
+ * the same walk over codebooks held as E4M3 codes with an f32 scale a row. */
+AVX_KERNEL(dflash_select_q) {
+    if (a->n_t < 9) return RAD_E_INVAL;
+    if (!a->t[5].data || !a->t[7].data) return RAD_E_INVAL;
+    return dflash_select_walk(a, &a->t[0], &a->t[1], rad_arg_in(a, 2), &a->t[3], &a->t[4], &a->t[5],
+                              &a->t[6], &a->t[7], &a->t[8]);
 }

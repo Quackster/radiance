@@ -190,6 +190,11 @@ static const RadParamSpec pDflashSelect[] = { P_INT("M"), P_INT("steps"), P_INT(
 static const RadOperandSpec oDflashSelect[] = { OPD("cand"), OPD("unary"), OPD_O("hp"),
                                                 OPD("anchor"), WGT("pred"), WGT("succ"),
                                                 OUT("tokens") };
+/* The E4M3 codebooks: codes and their f32 scales, so a separate op and not a dtype on the above --
+ * the operand list differs and operands are positional, the argument embed_lookup_q makes. */
+static const RadOperandSpec oDflashSelectQ[] = { OPD("cand"), OPD("unary"), OPD_O("hp"),
+                                                 OPD("anchor"), WGT("pred"), WGT("pred_scale"),
+                                                 WGT("succ"), WGT("succ_scale"), OUT("tokens") };
 
 static const RadParamSpec pRmsHadQuant[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
                                              P_STR("dtype"), P_F64O("wadd") };
@@ -873,6 +878,10 @@ static const RadOpSchema kSchemas[] = {
   "[rows][row] and y is [rows][world_size][row], so one row of y carries every rank's words for "
   "that row. The vocab-parallel candidate merge reads exactly that." },
 
+{ "dflash_select_q", ARR(pDflashSelect), ARR(oDflashSelectQ),
+  "dflash_select over codebooks held as E4M3 codes with an f32 scale a row (or one for the "
+  "table): codebook[v][r] = codes[v][r] * scale[v]. The same walk, the same guards, half the "
+  "bytes of the bf16 codebooks." },
 { "embed_lookup", ARR(pEmbed), ARR(oEmbed),
   "A gather from wte[n_vocab, n_embd]. A negative token id writes a zero row (padding); an id at "
   "or above n_vocab fails the launch." },
@@ -1021,6 +1030,9 @@ SIMPLE("ref_gemm_nt_q_gated", "gemm_nt_q_gated", "gemm",
 SIMPLE("ref_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates, bf16 codebooks, i32 tokens out", ref_dflash_select),
+SIMPLE("ref_dflash_select_q", "dflash_select_q", "draft",
+       "DFlash2's greedy walk over the candidate lattice, E4M3 codebooks",
+       "i32 candidates, E4M3 codebooks and f32 scales, i32 tokens out", ref_dflash_select_q),
 SIMPLE("ref_had_quant_act_fp8", "had_quant_act_fp8", "quant",
        "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale per group; n a multiple of group",

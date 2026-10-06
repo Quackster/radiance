@@ -625,6 +625,19 @@ static const RadOperandSpec oDflashSelect[] = {
     { "succ",   RAD_OPD_WEIGHT, 0 },
     { "tokens", RAD_OPD_OUT,    0 },
 };
+/* The E4M3 codebooks, each followed by its f32 scale. A separate op and not a dtype on the above:
+ * the operand list differs and operands are positional (embed_lookup_q's argument). */
+static const RadOperandSpec oDflashSelectQ[] = {
+    { "cand",       RAD_OPD_IN,     0 },
+    { "unary",      RAD_OPD_IN,     0 },
+    { "hp",         RAD_OPD_IN,     1 },
+    { "anchor",     RAD_OPD_IN,     0 },
+    { "pred",       RAD_OPD_WEIGHT, 0 },
+    { "pred_scale", RAD_OPD_WEIGHT, 0 },
+    { "succ",       RAD_OPD_WEIGHT, 0 },
+    { "succ_scale", RAD_OPD_WEIGHT, 0 },
+    { "tokens",     RAD_OPD_OUT,    0 },
+};
 
 /* ------------------------------------------------------------------------------ collectives */
 static const RadParamSpec pAllReduce[] = {
@@ -2004,6 +2017,10 @@ static const RadOpSchema kSchemas[] = {
            "positions, and the greedy walk that turns a block of independent top-k sets into one "
            "path. Only the K edges leaving the previous pick are scored, because the walk is "
            "serial and the other K-1 rows of the score matrix are never read."),
+    SCHEMA("dflash_select_q", pDflashSelect, oDflashSelectQ,
+           "dflash_select over codebooks held as E4M3 codes with an f32 scale a row (or one for the "
+           "table): codebook[v][r] = codes[v][r] * scale[v]. The same walk and the same guards, at "
+           "half the bytes of the bf16 codebooks."),
     SCHEMA("all_reduce", pAllReduce, oAllReduce,
            "sum over the tensor-parallel group. `exact` separates the exact sum from the "
            "quantised wire and a caller that does not declare it gets no kernel. At 4 and 8 ranks "
@@ -5091,6 +5108,17 @@ static const RadKernelInfo kKernels[] = {
   ROW(cDflashSelect), NOTUNE,
   nullptr, nullptr, r4d_rad_dflash_select, nullptr, nullptr, nullptr,
   r4d_shape_dflash_select },
+
+{ "dflash_select_q_fp8", "dflash_select_q", "dflash",
+  "DFlash2 candidate selector over E4M3 codebooks with an f32 scale a row: the same walk as "
+  "dflash_select_bf16, one workgroup a sequence, the codebook rows dequantised in registers",
+  "top_k <= 32 and rank a multiple of 32 and <= 512, both being LDS extents; the scale plane is "
+  "one f32 a row or one for the table; cand/unary/hp share one row numbering",
+  "i32 candidate ids, f32 unary logits, bf16 hp, E4M3 codebooks with f32 scales, i32 tokens out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDflashSelect), NOTUNE,
+  nullptr, nullptr, r4d_rad_dflash_select_q, nullptr, nullptr, nullptr,
+  r4d_shape_dflash_select_q },
 
 };
 

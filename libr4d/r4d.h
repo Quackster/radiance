@@ -192,6 +192,17 @@ int r4d_dflash_select_bf16(
         int M, int steps, int K, int R, int V, int cand_ld, int hp_ld, int out_ld,
         int anchor_stride, void* stream);
 
+// The same selector over codebooks held as E4M3 codes: `pred` and `succ` are [V, R] fp8_e4m3 and
+// `psc` / `ssc` their f32 scales, `*_row` the stride from one row's scale to the next (1 for a
+// scale a row, 0 for one scale across the table). The scale rides where it is cheapest -- the
+// predecessor's into the a[r] plane once a step, the candidate's onto the finished dot -- so the
+// walk is the bf16 one over the dequantised codebooks, to rounding.
+int r4d_dflash_select_q_fp8(
+        const void* cand, const void* unary, const void* hp, const void* anchor,
+        const void* pred, const void* psc, const void* succ, const void* ssc, void* out,
+        int M, int steps, int K, int R, int V, int cand_ld, int hp_ld, int out_ld,
+        int anchor_stride, int psc_row, int ssc_row, void* stream);
+
 // Everything between the qkv projection and the chunked scan, in one kernel: the depthwise causal
 // convolution (width 4, silu) with its state cache, the q/k/v split, the l2 norm on q and k, the
 // gate g = -exp(A_log).softplus(a + dt_bias) with its per-chunk cumsum, and beta = sigmoid(b).

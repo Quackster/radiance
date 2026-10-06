@@ -239,8 +239,14 @@ struct Dflash2 {
     DenseFP8   w_fc{};
     rad_weight w_hnorm = 0, w_norm = 0;
     rad_weight w_selp = 0, w_pred = 0, w_succ = 0;
+    /* ...and their f32 scales, when the container holds the two codebooks as E4M3 codes (a scale a
+     * row). Both or neither: the selector op is one or the other. */
+    rad_weight w_preds = 0, w_succs = 0;
     rad_weight w_tok = 0;                    /* the TARGET's embedding table */
+    rad_weight w_toks = 0;                   /* ...and its E4M3 scale, set before declare() */
     rad_weight w_dh = 0, w_dhs = 0;          /* the 2-bit copy of the TARGET's lm_head */
+    bool       dh4 = false;                  /* ...or a 4-bit one, when the recipe made it u4 */
+    bool       dh8 = false;                  /* ...or an int8 one (i8 codes, bf16 scale a 128) */
 
     /* per-layer weights */
     rad_weight w_anorm[MAX_LAYERS] = {}, w_fnorm[MAX_LAYERS] = {};
@@ -344,10 +350,52 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
     w_selp  = decl_w(b, nm.f("dflash.sel_proj.weight"), RAD_BF16, {cfg.sel_rank, g.n_embd},
                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
-    w_pred  = decl_w(b, nm.f("dflash.sel_pred"), RAD_BF16, {g.n_vocab_all, cfg.sel_rank},
-                     RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
-    w_succ  = decl_w(b, nm.f("dflash.sel_succ"), RAD_BF16, {g.n_vocab_all, cfg.sel_rank},
-                     RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
+    /* THE SELECTOR'S CODEBOOKS AT E4M3, when the container holds them so. Two [248320, 256] tables
+     * of bf16 are 2 x 121 MiB resident; at E4M3 codes and an f32 scale a row they are half that,
+     * and the difference goes to the KV cache (~3.9k tokens). The walk reads K candidate rows and
+     * one predecessor row a step, so the format costs no time. What it can move is acceptance, and
+     * only that: a draft is verified. Decided from what the container says each table IS (the
+     * same rule the token embedding follows), so a container with bf16 codebooks is declared and
+     * served exactly as before, and a recipe line is all it takes to opt in. A scale plane that is
+     * one for the whole table is read too (a 1 x 1 view); the shipped recipe writes one a row. */
+    {
+        RadEncoding ep{}, es{};
+        auto e4m3 = [](const RadEncoding& e) {
+            return e.n_planes == 2 && e.plane[0].dtype == RAD_F8E4M3 &&
+                   rad_enc_find(&e, "scale") == 1 && e.plane[1].dtype == RAD_F32;
+        };
+        const bool qp = weight_enc(b, nm.f("dflash.sel_pred"), &ep) && e4m3(ep);
+        const bool qs = weight_enc(b, nm.f("dflash.sel_succ"), &es) && e4m3(es);
+        if (qp != qs) {
+            fprintf(stderr, "radiance: dflash2's selector codebooks are %s for pred and %s for "
+                    "succ; the selector op takes both E4M3 or both bf16\n",
+                    qp ? "E4M3" : "not E4M3", qs ? "E4M3" : "not E4M3");
+            return RAD_E_UNSUPPORTED;
+        }
+        if (qp) {
+            auto rows_of = [&](const RadEncoding& e) -> int64_t {
+                return e.plane[1].block[0] == 1 ? g.n_vocab_all : 1;
+            };
+            w_pred  = decl_view(b, nm.f("dflash.sel_pred"), nullptr, "codes", RAD_F8E4M3,
+                                {g.n_vocab_all, cfg.sel_rank}, RAD_ACCESS_VOCAB, RAD_SHARD_NONE,
+                                grp_model());
+            w_preds = decl_view(b, nm.f("dflash.sel_pred.scale"), nm.f("dflash.sel_pred"), "scale",
+                                RAD_F32, {rows_of(ep), 1}, RAD_ACCESS_VOCAB, RAD_SHARD_NONE,
+                                grp_model());
+            w_succ  = decl_view(b, nm.f("dflash.sel_succ"), nullptr, "codes", RAD_F8E4M3,
+                                {g.n_vocab_all, cfg.sel_rank}, RAD_ACCESS_VOCAB, RAD_SHARD_NONE,
+                                grp_model());
+            w_succs = decl_view(b, nm.f("dflash.sel_succ.scale"), nm.f("dflash.sel_succ"), "scale",
+                                RAD_F32, {rows_of(es), 1}, RAD_ACCESS_VOCAB, RAD_SHARD_NONE,
+                                grp_model());
+            if (!w_pred || !w_preds || !w_succ || !w_succs) return RAD_E_INVAL;
+        } else {
+            w_pred  = decl_w(b, nm.f("dflash.sel_pred"), RAD_BF16, {g.n_vocab_all, cfg.sel_rank},
+                             RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
+            w_succ  = decl_w(b, nm.f("dflash.sel_succ"), RAD_BF16, {g.n_vocab_all, cfg.sel_rank},
+                             RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
+        }
+    }
 
     /* THE 2-BIT DRAFT HEAD. The same declaration the MTP head makes, for the same reasons, argued
      * at length in rad_block_mtp_fp8.h: `dflash.draft_head.weight` is the target's lm_head under a
@@ -554,12 +602,19 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                   {w.ck, w.cv}, {});
 
     /* ---------------------------------------------------------------- the query pass */
-    op_embed = rw(b, RAD_OP(b, "embed_lookup",
-                     RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n_embd", g.n_embd),
-                                RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
-                                RAD_INT("vocab_offset", g.vocab_off)),
-                     RAD_WEIGHTS(w_tok)),
-                 {}, {w.x});
+    op_embed = w_toks
+        ? rw(b, RAD_OP(b, "embed_lookup_q",
+                 RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n_embd", g.n_embd),
+                            RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                            RAD_INT("vocab_offset", g.vocab_off)),
+                 RAD_WEIGHTS(w_tok, w_toks)),
+             {}, {w.x})
+        : rw(b, RAD_OP(b, "embed_lookup",
+                 RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n_embd", g.n_embd),
+                            RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                            RAD_INT("vocab_offset", g.vocab_off)),
+                 RAD_WEIGHTS(w_tok)),
+             {}, {w.x});
     /* The trunk's embedding is vocab-sharded, so this gather is partial and takes the same exact
      * reduction. It is on the DRAFT path, which runs once a step ahead of the trunk: a second
      * small collective. */
@@ -826,7 +881,15 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
               {w.sel_h}, {w.hp});
     /* `anchor_stride` is `block`, because the operand is the step's own token_ids: a draft pass
      * carries `block` ids a sequence and the anchor is the first of them. */
-    op_sel = rw(b, RAD_OP(b, "dflash_select",
+    op_sel = w_preds
+        ? rw(b, RAD_OP(b, "dflash_select_q",
+                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", cfg.steps()),
+                              RAD_INT("top_k", cfg.sel_topk), RAD_INT("rank", cfg.sel_rank),
+                              RAD_INT("n_vocab", g.n_vocab_all),
+                              RAD_INT("anchor_stride", cfg.block), RAD_STR("dtype", g.dtype)),
+                   RAD_WEIGHTS(w_pred, w_preds, w_succ, w_succs)),
+               {w.cand, w.unary, w.hp}, {w.tokens})
+        : rw(b, RAD_OP(b, "dflash_select",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", cfg.steps()),
                               RAD_INT("top_k", cfg.sel_topk), RAD_INT("rank", cfg.sel_rank),
                               RAD_INT("n_vocab", g.n_vocab_all),
@@ -883,7 +946,11 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
     const int64_t NG = cfg.ng(g.n_embd);
     const int64_t half = cfg.taps * NG;      /* prepare's coefficients, then finish's */
 
-    RAD_ISSUE_N(c, op_embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(w_tok), brows(w.x, T));
+    if (w_toks)
+        RAD_ISSUE_N(c, op_embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(w_tok), RAD_W(w_toks),
+                    brows(w.x, T), RAD_NONE);
+    else
+        RAD_ISSUE_N(c, op_embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(w_tok), brows(w.x, T));
     if (op_embed_ar)
         RAD_ISSUE_N(c, op_embed_ar, (int64_t)T * g.n_embd, brows(w.x, T), RAD_NONE);
 
@@ -988,9 +1055,14 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
     }
 
     RAD_ISSUE_N(c, op_hp, S, brows(w.sel_h, S), RAD_W(w_selp), brows(w.hp, S));
-    RAD_ISSUE_N(c, op_sel, batch->n_seq, brows(w.cand, S), brows(w.unary, S), brows(w.hp, S),
-                praw(batch->token_ids, RAD_I32, T), RAD_W(w_pred), RAD_W(w_succ),
-                brows(w.tokens, batch->n_seq));
+    if (w_preds)
+        RAD_ISSUE_N(c, op_sel, batch->n_seq, brows(w.cand, S), brows(w.unary, S), brows(w.hp, S),
+                    praw(batch->token_ids, RAD_I32, T), RAD_W(w_pred), RAD_W(w_preds),
+                    RAD_W(w_succ), RAD_W(w_succs), brows(w.tokens, batch->n_seq));
+    else
+        RAD_ISSUE_N(c, op_sel, batch->n_seq, brows(w.cand, S), brows(w.unary, S), brows(w.hp, S),
+                    praw(batch->token_ids, RAD_I32, T), RAD_W(w_pred), RAD_W(w_succ),
+                    brows(w.tokens, batch->n_seq));
 }
 
 }  /* namespace arch */

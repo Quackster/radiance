@@ -152,6 +152,7 @@ int r4d_rad_gdn_conv_recurrent_update(const RadArgs*, RadStream);
 int r4d_rad_gdn_gated_rmsnorm   (const RadArgs*, RadStream);
 int r4d_rad_dflash_conv         (const RadArgs*, RadStream);
 int r4d_rad_dflash_select       (const RadArgs*, RadStream);
+int r4d_rad_dflash_select_q     (const RadArgs*, RadStream);
 
 /* -- the gated residual (r4d_hc_bf16.hip) -- */
 int     r4d_rad_hc_enter       (const RadArgs*, RadStream);
@@ -530,6 +531,7 @@ int r4d_shape_qsa_work           (const RadParam*, int, int operand, RadOpdDesc*
 
 int r4d_shape_dflash_conv    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_dflash_select  (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_dflash_select_q(const RadParam*, int, int operand, RadOpdDesc*);
 
 /* -- declared fusions (r4d_fuse.cpp, pure host) --
  *

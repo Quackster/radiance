@@ -706,10 +706,11 @@ extern "C" int r4d_rad_unrelayout_mtp_e4m3(const RadParam* p, int n_p, int opera
 /* ================================================================= embed_lookup_q's table
  *
  * The gather reads the table AS IT IS, so this hook only answers whether it can: E4M3 codes with
- * ONE bf16 scale for the whole table (`fp8_e4m3*bf16[*x*]`, the n-gram table's recipe), or the
- * table as the checkpoint ships it, plain bf16 with no scale. The same two forms libavx's host
- * gather accepts (avx_layout_ngram), checked the same way, so a model whose table one of them
- * reads is never refused by the other at declare. */
+ * ONE bf16 or f32 scale for the whole table (`fp8_e4m3*bf16[*x*]`, the n-gram table's recipe; the f32
+ * one is a token embedding a converter wrote under one scale), or the
+ * table as the checkpoint ships it, plain bf16 with no scale. Those are the forms libavx's host
+ * gather accepts (avx_layout_ngram), checked the same way, except for the f32 scale, which only
+ * this device row reads: a table that carries one is served by libr4d alone. */
 extern "C" int r4d_rad_layout_embed_q(const RadParam* p, int n_p, int operand,
                                       const RadEncoding* enc, const int* sel,
                                       const RadTensor* pl, int n, RadLayout* out) {
@@ -726,7 +727,8 @@ extern "C" int r4d_rad_layout_embed_q(const RadParam* p, int n_p, int operand,
     }
     const RadEncPlane* sc = rad_enc_plane(enc, "scale");
     if (!rad_enc_is(enc, "affine") || enc->n_planes != 2 || enc->transform[0] ||
-        enc->plane[0].dtype != RAD_F8E4M3 || !sc || sc->dtype != RAD_BF16 || sc->block[0] != 0 ||
+        enc->plane[0].dtype != RAD_F8E4M3 || !sc || (sc->dtype != RAD_BF16 && sc->dtype != RAD_F32) ||
+        sc->block[0] != 0 ||
         sc->block[1] != 0)
         return RAD_E_DTYPE;
     if (n != 1 || !pl || !sel) return RAD_E_SHAPE;

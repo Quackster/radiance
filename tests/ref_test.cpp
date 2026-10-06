@@ -263,7 +263,7 @@ TEST(op_vocabulary) {
         "quant_act_i8", "quant_act_fp8", "had_quant_act_fp8", "had_quant_act_i8", "gram_accum",
         /* The fused fp8 forms. A host run needs EVERY op covered, so these are what stands
          * between RADIANCE_HOST_DOMAIN and "site 'host' is unavailable for this band". */
-        "rmsnorm_quant_fp8", "gated_quant_fp8", "gemm_nt_q_gated", "dflash_select",
+        "rmsnorm_quant_fp8", "gated_quant_fp8", "gemm_nt_q_gated", "dflash_select", "dflash_select_q",
         "rmsnorm_had_quant_i8",
         "gated_had_quant_i8",
         "dequant",
@@ -558,6 +558,72 @@ TEST(op_embed_lookup_q) {
     A b; b.t(bad).t(wte).t(sc).t(y)
          .i("M", 1).i("n_embd", 2).i("n_vocab", 4).s("dtype", "bf16");
     CHECK(run("embed_lookup_q", b) != RAD_OK);
+}
+
+/* DFlash2's candidate walk over E4M3 codebooks, on paper. V = 4, R = 2, two steps of two candidates.
+ * The codes are the ones whose values are exact literals (0x38 = 1.0, 0x40 = 2.0, 0x3c = 1.5,
+ * 0xb8 = -1.0, 0x00 = 0), and the scales are powers of two, so every expected number below is
+ * exact.
+ *
+ *   pred rows (codes * scale):  0: [1, 2] * 1      1: [1.5, -1] * 0.5 = [0.75, -0.5]
+ *                               2: [0, 1] * 2 = [0, 2]       3: [2, 2] * 0.25 = [0.5, 0.5]
+ *   succ rows (codes * scale):  0: [1, 1] * 1      1: [2, 0] * 0.5 = [1, 0]
+ *                               2: [-1, 1] * 2 = [-2, 2]     3: [1.5, 2] * 1
+ *
+ * Case 1, anchor 0, hp absent. Step 0: ax = pred[0] = [1, 2]; candidates {1, 2} score 1 and 2, so
+ * the walk takes token 2. Step 1: ax = pred[2] = [0, 2]; candidates {0, 3} score 2 + 0 and
+ * 4 - 3 = 1, so it takes token 0 -- the unary term is what separates them. A kernel that ignored
+ * the SUCCESSOR scales would score step 0 at 2 and 1 and take token 1 instead.
+ *
+ * Case 2, anchor 3, unary {0, 1} at step 0: ax = pred[3] = [0.5, 0.5], candidates {1, 2} score 0.5
+ * and 0 + 1 = 1, so token 2. A kernel that ignored the PREDECESSOR scale (ax = [2, 2]) scores 2
+ * and 1 and takes token 1.
+ *
+ * Case 3 is the same walk over a codebook that is the same numbers at ONE scale for the table, and
+ * a candidate id outside the vocabulary, which scores its unary term alone. */
+TEST(op_dflash_select_q) {
+    T pc(RAD_F8E4M3, {4, 2});
+    pc.raw({ 0x38, 0x40,   0x3c, 0xb8,   0x00, 0x38,   0x40, 0x40 });
+    T ps(RAD_F32, {4, 1}); ps.f({ 1.0f, 0.5f, 2.0f, 0.25f });
+    T sc_(RAD_F8E4M3, {4, 2});
+    sc_.raw({ 0x38, 0x38,   0x40, 0x00,   0xb8, 0x38,   0x3c, 0x40 });
+    T ss(RAD_F32, {4, 1}); ss.f({ 1.0f, 0.5f, 2.0f, 1.0f });
+
+    auto walk = [&](int64_t anchor, std::vector<float> unary, std::vector<int64_t> cand,
+                    const T& pscale, const T& sscale, T& out) {
+        T cd(RAD_I32, {2, 2}); cd.n(cand);
+        T un(RAD_F32, {2, 2}); un.f(unary);
+        T an(RAD_I32, {1}); an.n({ anchor });
+        A a; a.t(cd).t(un).tnull().t(an).t(pc).t(pscale).t(sc_).t(sscale).t(out)
+             .i("M", 1).i("steps", 2).i("top_k", 2).i("rank", 2).i("n_vocab", 4)
+             .i("anchor_stride", 1).s("dtype", "bf16");
+        return run("dflash_select_q", a);
+    };
+
+    T out(RAD_I32, {1, 2});
+    CHECK_OK(walk(0, { 0, 0, 0, -3 }, { 1, 2, 0, 3 }, ps, ss, out));
+    CHECK_EQ(out.iat(0), 2);
+    CHECK_EQ(out.iat(1), 0);
+
+    T out2(RAD_I32, {1, 2});
+    CHECK_OK(walk(3, { 0, 1, 0, 0 }, { 1, 2, 0, 3 }, ps, ss, out2));
+    CHECK_EQ(out2.iat(0), 2);
+
+    /* One scale for the whole table. All-ones scales make it the raw codes: anchor 0, ax = [1, 2],
+     * candidates {1, 7}: token 7 is outside the vocabulary and scores its unary term (0.5) alone,
+     * token 1 scores <[1, 2], [2, 0]> = 2, so the walk takes token 1; the second step then starts
+     * from token 1's raw row [1.5, -1] against candidates {2, 3}: 1.5 * -1 + -1 * 1 = -2.5 and
+     * 1.5 * 1.5 + -1 * 2 = 0.25, token 3. */
+    T one(RAD_F32, {1}); one.f({ 1.0f });
+    T out3(RAD_I32, {1, 2});
+    CHECK_OK(walk(0, { 0, 0.5f, 0, 0 }, { 1, 7, 2, 3 }, one, one, out3));
+    CHECK_EQ(out3.iat(0), 1);
+    CHECK_EQ(out3.iat(1), 3);
+
+    /* A scale plane that is neither one element nor a row each is refused, not guessed at. */
+    T bad(RAD_F32, {2, 1}); bad.f({ 1.0f, 1.0f });
+    T out4(RAD_I32, {1, 2});
+    CHECK(walk(0, { 0, 0, 0, 0 }, { 1, 2, 0, 3 }, bad, ss, out4) != RAD_OK);
 }
 
 /* PLE's gate, on paper. n = 2 and hc = 2, which is the smallest shape where both asymmetries of

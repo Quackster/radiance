@@ -71,6 +71,7 @@ the core can tune, fuse and check against a container:
 | `dequant_w4_bf16` | `dequant_w4` |
 | `dflash_conv_t2_g16_bf16` | `dflash_conv` |
 | `dflash_select_bf16` | `dflash_select` |
+| `dflash_select_q_fp8` | `dflash_select_q` |
 | `embed_lookup_q_host` | `embed_lookup_q` |
 | `gate_quant_fp8` | `gate_quant_fp8` |
 | `gated_had_quant_fp8` | `gated_had_quant_fp8` |
@@ -136,6 +137,7 @@ the core can tune, fuse and check against a container:
 | `ref_all_reduce` | `all_reduce` |
 | `ref_attn_dense` | `attn_dense` |
 | `ref_dequant` | `dequant` |
+| `ref_dflash_select_q` | `dflash_select_q` |
 | `ref_embed_lookup_q` | `embed_lookup_q` |
 | `ref_gated_had_quant_i8` | `gated_had_quant_i8` |
 | `ref_gelu` | `gelu` |
@@ -194,6 +196,7 @@ not.
 | `dequant_w4` |   | device | - |
 | `dflash_conv` |   | device | - |
 | `dflash_select` |   | device | - |
+| `dflash_select_q` |   | device | - |
 | `embed_lookup` | yes | device | host |
 | `embed_lookup_q` |   | host | host |
 | `gate_quant_fp8` |   | device | - |

@@ -10564,6 +10564,122 @@ static void device_phase(const Plugin& pl) {
         }
     }
 
+    /* dflash_select_q_fp8: the same walk over E4M3 codebooks with an f32 scale a row. Every code is
+     * 1.0 (0x38) and the VALUE lives in the scale, a power of two times a quarter exactly as above,
+     * so the dequantised codebook is bit-for-bit the bf16 one and the f32 accumulation is exact in
+     * any order: the expected path is the bf16 case's, compared as integers. Two spellings of the
+     * predecessor scale -- a row each, then one for the whole table (every row 0.5) -- and the
+     * second one's expectation is computed with that constant, so a kernel that read a table
+     * scale at a row stride (or the other way round) walks somewhere else. */
+    if (sel("dflash_select_q_fp8")) {
+        const RadKernelInfo* r = find(pl, "dflash_select_q_fp8");
+        if (!r) ok("dflash_select_q_fp8", false, "row absent");
+        else {
+            const int64_t M = 2, steps = 3, K = 4, R = 32, V = 64, rows = M * steps;
+            auto pv   = [](int64_t t) { return t % 3 == 0 ? 0.5f : (t % 3 == 1 ? 1.0f : 2.0f); };
+            auto sv   = [](int64_t t) { return 0.25f * (float)(t % 4); };
+            auto cnd  = [&](int64_t row, int64_t c) { return (int32_t)((row * 7 + c * 10) % V); };
+            auto unf  = [&](int64_t row, int64_t c) { return 8.0f * (float)((row + c * 3) % 5); };
+            const int64_t astride = steps + 1;
+            const int32_t anchor[2] = { 2, 2 };
+            std::vector<int32_t> h_anc((size_t)(M * astride), 7);
+            for (int64_t s = 0; s < M; ++s) h_anc[(size_t)(s * astride)] = anchor[s];
+            std::vector<int32_t> h_cand((size_t)(rows * K));
+            std::vector<float>   h_un((size_t)(rows * K));
+            for (int64_t i = 0; i < rows; ++i)
+                for (int64_t c = 0; c < K; ++c) {
+                    h_cand[(size_t)(i * K + c)] = cnd(i, c);
+                    h_un[(size_t)(i * K + c)]   = unf(i, c);
+                }
+            std::vector<uint16_t> h_hp((size_t)(rows * R), h_to_bf16(1.0f));
+            std::vector<uint8_t>  h_pc((size_t)(V * R), 0x38), h_sc((size_t)(V * R), 0x38);
+            std::vector<float>    h_ps((size_t)V), h_ss((size_t)V);
+            for (int64_t t = 0; t < V; ++t) { h_ps[(size_t)t] = pv(t); h_ss[(size_t)t] = sv(t); }
+            const float one_ps[1] = { 0.5f };
+
+            auto expect = [&](bool table_pred, int32_t (&w)[2][8]) {
+                for (int64_t s = 0; s < M; ++s) {
+                    int64_t chosen = 0;
+                    for (int64_t l = 0; l < steps; ++l) {
+                        const int64_t row = s * steps + l;
+                        const int64_t pid = l == 0 ? anchor[s] : cnd(row - 1, chosen);
+                        const float   pp  = table_pred ? 0.5f : pv(pid);
+                        int64_t best = 0;
+                        float   bv   = -1e30f;
+                        for (int64_t c = 0; c < K; ++c) {
+                            const float sc = unf(row, c) + (float)R * pp * sv(cnd(row, c));
+                            if (sc > bv) { bv = sc; best = c; }
+                        }
+                        chosen = best;
+                        w[s][l] = cnd(row, best);
+                    }
+                }
+            };
+            int32_t want_row[2][8] = {}, want_tab[2][8] = {};
+            expect(false, want_row);
+            expect(true, want_tab);
+            bool differ = false;
+            for (int64_t s = 0; s < M; ++s)
+                for (int64_t l = 0; l < steps; ++l)
+                    if (want_row[s][l] != want_tab[s][l]) differ = true;
+
+            void* d_cand = dalloc((size_t)rows * K * 4);
+            void* d_un   = dalloc((size_t)rows * K * 4);
+            void* d_hp   = dalloc((size_t)rows * R * 2);
+            void* d_anc  = dalloc(h_anc.size() * 4);
+            void* d_pc   = dalloc((size_t)V * R);
+            void* d_sc   = dalloc((size_t)V * R);
+            void* d_ps   = dalloc((size_t)V * 4);
+            void* d_ss   = dalloc((size_t)V * 4);
+            void* d_ps1  = dalloc(4);
+            void* d_out  = dalloc((size_t)M * steps * 4);
+            if (!d_cand || !d_un || !d_hp || !d_anc || !d_pc || !d_sc || !d_ps || !d_ss || !d_ps1 ||
+                !d_out) {
+                ok("dflash_select_q alloc", false, "hipMalloc failed");
+            } else {
+                st_memcpy(d_cand, h_cand.data(), (size_t)rows * K * 4, hipMemcpyHostToDevice);
+                st_memcpy(d_un,   h_un.data(),   (size_t)rows * K * 4, hipMemcpyHostToDevice);
+                st_memcpy(d_hp,   h_hp.data(),   (size_t)rows * R * 2, hipMemcpyHostToDevice);
+                st_memcpy(d_anc,  h_anc.data(),  h_anc.size() * 4,     hipMemcpyHostToDevice);
+                st_memcpy(d_pc,   h_pc.data(),   (size_t)V * R,        hipMemcpyHostToDevice);
+                st_memcpy(d_sc,   h_sc.data(),   (size_t)V * R,        hipMemcpyHostToDevice);
+                st_memcpy(d_ps,   h_ps.data(),   (size_t)V * 4,        hipMemcpyHostToDevice);
+                st_memcpy(d_ss,   h_ss.data(),   (size_t)V * 4,        hipMemcpyHostToDevice);
+                st_memcpy(d_ps1,  one_ps,        4,                    hipMemcpyHostToDevice);
+
+                std::vector<RadParam> ps = {
+                    PI("M", M), PI("steps", steps), PI("top_k", K), PI("rank", R),
+                    PI("n_vocab", V), PI("anchor_stride", astride), PS("dtype", "bf16"),
+                };
+                auto go = [&](void* pscale, int64_t pscale_rows, const int32_t (&w)[2][8],
+                              bool bigram) {
+                    std::vector<RadTensor> ts = {
+                        T(d_cand, RAD_I32,  { rows, K }), T(d_un,   RAD_F32,  { rows, K }),
+                        T(d_hp,   RAD_BF16, { rows, R }), T(d_anc,  RAD_I32,  { M * astride }),
+                        T(d_pc,   RAD_F8E4M3, { V, R }),  T(pscale, RAD_F32,  { pscale_rows, 1 }),
+                        T(d_sc,   RAD_F8E4M3, { V, R }),  T(d_ss,   RAD_F32,  { V, 1 }),
+                        T(d_out,  RAD_I32,  { M, steps }),
+                    };
+                    if (bigram) absent(ts[2]);
+                    st_memcpy(d_out, h_cand.data(), (size_t)M * steps * 4, hipMemcpyHostToDevice);
+                    run_case(r, ts, ps);
+                    std::vector<int32_t> got((size_t)(M * steps));
+                    st_memcpy(got.data(), d_out, (size_t)M * steps * 4, hipMemcpyDeviceToHost);
+                    bool same = true;
+                    for (int64_t s = 0; s < M && same; ++s)
+                        for (int64_t l = 0; l < steps; ++l)
+                            if (got[(size_t)(s * steps + l)] != w[s][l]) { same = false; break; }
+                    return same;
+                };
+                ok("dflash_select_q_fp8 walks the chained path, a scale a row",
+                   go(d_ps, V, want_row, false));
+                ok("dflash_select_q_fp8 one scale for the whole table", go(d_ps1, 1, want_tab, false));
+                ok("dflash_select_q_fp8 case can tell a row scale from a table scale", differ);
+                ok("dflash_select_q_fp8 absent hp is a plane of ones", go(d_ps, V, want_row, true));
+            }
+        }
+    }
+
     /* --- GEMM --- */
     {
         const int64_t M = 16, N = 256, K = 512;

@@ -328,6 +328,11 @@ std::vector<Case> build_cases() {
                            HI("n_vocab", 300), HI("anchor_stride", 1), HS("dtype", "bf16") });
     add("dflash_select", { HI("M", 5), HI("steps", 3), HI("top_k", 12), HI("rank", 37),
                            HI("n_vocab", 97), HI("anchor_stride", 2), HS("dtype", "bf16") });
+    /* ...and over E4M3 codebooks with a scale a row, at the same two shapes. */
+    add("dflash_select_q", { HI("M", 3), HI("steps", 4), HI("top_k", 8), HI("rank", 64),
+                             HI("n_vocab", 300), HI("anchor_stride", 1), HS("dtype", "bf16") });
+    add("dflash_select_q", { HI("M", 5), HI("steps", 3), HI("top_k", 12), HI("rank", 37),
+                             HI("n_vocab", 97), HI("anchor_stride", 2), HS("dtype", "bf16") });
 
     /* ================================================================== speed-only, at model size
      *

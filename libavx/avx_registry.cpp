@@ -412,6 +412,9 @@ static const RadParamSpec pDflashSelect[]    = { P_INT("M"), P_INT("steps"), P_I
 static const RadOperandSpec oDflashSelect[]  = { OPD("cand"), OPD("unary"), OPD_O("hp"),
                                                  OPD("anchor"), WGT("pred"), WGT("succ"),
                                                  OUT("tokens") };
+static const RadOperandSpec oDflashSelectQ[] = { OPD("cand"), OPD("unary"), OPD_O("hp"),
+                                                 OPD("anchor"), WGT("pred"), WGT("pred_scale"),
+                                                 WGT("succ"), WGT("succ_scale"), OUT("tokens") };
 
 /* ================================================================== the schema table
  * The doc strings are libavx's own and say what this plugin does with the op -- which of the two
@@ -567,6 +570,9 @@ static const RadOpSchema kSchemas[] = {
   "a greedy walk over a candidate lattice: score[l, c] = unary[l, c] + sum_r pred[pid(l)][r] * "
   "hp[l][r] * succ[cand[l, c]][r], pid(0) the anchor and pid(l) the walk's own previous pick. "
   "`hp` absent is a plane of ones." },
+{ "dflash_select_q", ARR(pDflashSelect), ARR(oDflashSelectQ),
+  "dflash_select over codebooks held as E4M3 codes with an f32 scale a row (or one for the table): "
+  "codebook[v][r] = codes[v][r] * scale[v]." },
 };
 
 /* ================================================================== the kernel table
@@ -787,6 +793,10 @@ SIMPLE("avx_sample_argmax", "sample_argmax", "sample", "greedy pick", DT_FLOAT, 
 SIMPLE("avx_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates and tokens, float unary and codebooks", L(dflash_select)),
+SIMPLE("avx_dflash_select_q", "dflash_select_q", "draft",
+       "DFlash2's greedy walk over the candidate lattice, E4M3 codebooks",
+       "i32 candidates and tokens, float unary, E4M3 codebooks with f32 scales",
+       L(dflash_select_q)),
 };
 
 /* ================================================================== plugin exports */

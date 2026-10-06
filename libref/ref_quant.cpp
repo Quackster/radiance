@@ -699,11 +699,14 @@ int ref_gemm_nt_q_gated(const RadArgs* a, RadStream) {
  * THE WALK IS SERIAL IN l, which is why it is an op and not a GEMM and an argmax: scoring the full
  * [steps, K, K] edge tensor computes K times the edges that are ever read, because the predecessor
  * is not known until the previous step has been decided. The parallelism here is over sequences. */
-int ref_dflash_select(const RadArgs* a, RadStream) {
-    if (a->n_t < 7) return RAD_E_INVAL;
-    const RadTensor *cand = &a->t[0], *un = &a->t[1], *anc = &a->t[3];
-    const RadTensor *pred = &a->t[4], *succ = &a->t[5], *out = &a->t[6];
-    const RadTensor* hp = t_in(a, 2);
+/* ONE BODY FOR BOTH SPELLINGS. `psc` and `ssc` are the per-row (or one-for-all) f32 scales of an
+ * E4M3 codebook and are null for the plain one, where every factor below is 1. A scale is applied
+ * where the kernel applies it: the predecessor row's into `ax` once a step, the candidate row's
+ * onto the finished dot -- so the two spellings agree on a codebook that is the same numbers either way. */
+static int dflash_select_body(const RadArgs* a, const RadTensor* cand, const RadTensor* un,
+                              const RadTensor* hp, const RadTensor* anc, const RadTensor* pred,
+                              const RadTensor* psc, const RadTensor* succ, const RadTensor* ssc,
+                              const RadTensor* out) {
     if (!cand->data || !un->data || !anc->data || !pred->data || !succ->data || !out->data)
         return RAD_E_INVAL;
 
@@ -720,6 +723,15 @@ int ref_dflash_select(const RadArgs* a, RadStream) {
     if (numel(anc) < (M - 1) * astr + 1 || numel(out) < M * steps) return RAD_E_SHAPE;
     if (numel(pred) < nv * R || numel(succ) < nv * R) return RAD_E_SHAPE;
     if (hp && numel(hp) < M * steps * R) return RAD_E_SHAPE;
+    /* A scale plane is one element for the whole codebook or one a row, and nothing in between. */
+    auto scale_ok = [&](const RadTensor* t) {
+        return !t || (t->data && (numel(t) == 1 || numel(t) >= nv));
+    };
+    if (!scale_ok(psc) || !scale_ok(ssc)) return RAD_E_SHAPE;
+    auto row_scale = [&](const RadTensor* t, int64_t id) -> float {
+        if (!t) return 1.0f;
+        return ldt(t, numel(t) == 1 ? 0 : id * laststride(t));
+    };
 
     const int64_t cs = laststride(cand), us = laststride(un), os = laststride(out);
     const int64_t ps = laststride(pred), sxs = laststride(succ);
@@ -738,8 +750,9 @@ int ref_dflash_select(const RadArgs* a, RadStream) {
              * the vocabulary contributes nothing rather than reading past the codebook: at step 0
              * it is whatever the target committed, and a padding row's is not a token. */
             const bool ok = pid >= 0 && pid < nv;
+            const float pscl = ok ? row_scale(psc, pid) : 0.0f;
             for (int64_t i = 0; i < R; ++i)
-                ax[(size_t)i] = (ok ? ldt(pred, rowoff(pred, pid, R) + i * ps) : 0.0f) *
+                ax[(size_t)i] = (ok ? ldt(pred, rowoff(pred, pid, R) + i * ps) * pscl : 0.0f) *
                                 (hp ? ldt(hp, hb + i * hs) : 1.0f);
 
             int64_t best_c = 0;
@@ -749,7 +762,9 @@ int ref_dflash_select(const RadArgs* a, RadStream) {
                 float sc = ldt(un, ub + c * us);
                 if (tok >= 0 && tok < nv) {
                     const int64_t sb = rowoff(succ, tok, R);
-                    for (int64_t i = 0; i < R; ++i) sc += ax[(size_t)i] * ldt(succ, sb + i * sxs);
+                    float dot = 0.0f;
+                    for (int64_t i = 0; i < R; ++i) dot += ax[(size_t)i] * ldt(succ, sb + i * sxs);
+                    sc += dot * row_scale(ssc, tok);
                 }
                 if (sc > best_s) { best_s = sc; best_c = c; }
             }
@@ -758,4 +773,31 @@ int ref_dflash_select(const RadArgs* a, RadStream) {
         }
     }
     return RAD_OK;
+}
+
+int ref_dflash_select(const RadArgs* a, RadStream) {
+    if (a->n_t < 7) return RAD_E_INVAL;
+    const RadTensor *cand = &a->t[0], *un = &a->t[1], *anc = &a->t[3];
+    const RadTensor *pred = &a->t[4], *succ = &a->t[5], *out = &a->t[6];
+    if (!cand->data || !un->data || !anc->data || !pred->data || !succ->data || !out->data)
+        return RAD_E_INVAL;
+    return dflash_select_body(a, cand, un, t_in(a, 2), anc, pred, nullptr, succ, nullptr, out);
+}
+
+/* `cand`, `unary`, `hp`?, `anchor`, `pred`w, `pred_scale`w, `succ`w, `succ_scale`w -> `tokens`
+ *
+ * dflash_select over codebooks held as E4M3 codes: codebook[v][r] = codes[v][r] * scale[v], one f32
+ * scale a row (or one for the whole table). A SEPARATE OP and not a dtype on the plain one, for the
+ * reason embed_lookup_q is: the operand list differs and operands are positional. The two
+ * codebooks are 2 x 121 MiB at bf16 on the shipped checkpoint; this halves them, and the KV cache
+ * takes the difference. */
+int ref_dflash_select_q(const RadArgs* a, RadStream) {
+    if (a->n_t < 9) return RAD_E_INVAL;
+    const RadTensor *cand = &a->t[0], *un = &a->t[1], *anc = &a->t[3];
+    const RadTensor *pred = &a->t[4], *psc = &a->t[5], *succ = &a->t[6], *ssc = &a->t[7];
+    const RadTensor* out = &a->t[8];
+    if (!cand->data || !un->data || !anc->data || !pred->data || !succ->data || !out->data ||
+        !psc->data || !ssc->data)
+        return RAD_E_INVAL;
+    return dflash_select_body(a, cand, un, t_in(a, 2), anc, pred, psc, succ, ssc, out);
 }

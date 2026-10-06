@@ -175,6 +175,9 @@ struct Model {
     rad_op   op_tap = 0;
 
     rad_weight w_tok = 0, w_out_norm = 0, w_lm_head = 0;
+    /* The embedding's single f32 scale when the container holds the table as E4M3 (a recipe's
+     * `codes=fp8_e4m3 block=*x* scale=f32`), else 0 and the table is bf16. */
+    rad_weight w_toks = 0;
     rad_op op_embed = 0, op_embed_ar = 0, op_final_norm = 0, op_gather = 0, op_logits = 0;
     rad_op op_rope_cs = 0;   /* rope_table, if the fused prologue is reachable */
 
@@ -525,6 +528,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
      * the selector and never through the sampler's token buffer. */
     dw.tokens  = decl_b(b, nm.f("dflash_tokens"), RAD_I32, {dg.max_seqs, dc.steps()});
 
+    m.df.w_toks = m.w_toks;
     RAD_ARCH_TRY(m.df.declare(b, nm, dg, dc, base_layer, m.kv_draft, m.w_tok, "draft",
                               nm.ckpt("lm_head.weight"), dw));
     m.have_df = true;
@@ -934,8 +938,25 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(map_copy_alt(b, nm.f("output.weight"), nm.ckpt("lm_head.weight"),
                               nm.ckpt("model.language_model.embed_tokens.weight")));
 
-    m.w_tok = decl_w(b, nm.f("token_embd.weight"), RAD_BF16, {g.n_vocab, g.n_embd},
-                     RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+    /* THE EMBEDDING AT E4M3, when the container holds it so: one scale for the whole table, which
+     * is what an embedding's narrow per-row range allows (docs/OPS.md, embed_lookup_q), half the
+     * bytes of the bf16 table -- 1.18 GiB at 248k x 5120 -- and all of it handed to the KV cache.
+     * A gather reads a handful of rows a step, so the format costs no time. */
+    {
+        RadEncoding e{};
+        const bool q = weight_enc(b, nm.f("token_embd.weight"), &e) && e.n_planes == 2 &&
+                       e.plane[0].dtype == RAD_F8E4M3;
+        if (q) {
+            m.w_tok  = decl_view(b, nm.f("token_embd.weight"), nullptr, "codes", RAD_F8E4M3,
+                                 {g.n_vocab, g.n_embd}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+            m.w_toks = decl_view(b, nm.f("token_embd.scale"), nm.f("token_embd.weight"), "scale",
+                                 RAD_F32, {1, 1}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
+            if (!m.w_tok || !m.w_toks) return RAD_E_INVAL;
+        } else {
+            m.w_tok = decl_w(b, nm.f("token_embd.weight"), RAD_BF16, {g.n_vocab, g.n_embd},
+                             RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+        }
+    }
     m.w_out_norm = decl_w(b, nm.f("output_norm.weight"), RAD_F32, {g.n_embd},
                           RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
     /* ROW-SHARDED with the vocabulary: g.n_vocab is THIS RANK'S share and rad_arch.h says what
@@ -944,12 +965,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          weight_codes_dtype(b, nm.f("output.weight"), RAD_BF16),
                          {g.n_vocab, g.n_embd}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
 
-    m.op_embed = rw(b, RAD_OP(b, "embed_lookup",
-                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", g.n_embd),
-                                   RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
-                                   RAD_INT("vocab_offset", g.vocab_off)),
-                        RAD_WEIGHTS(m.w_tok)),
-                    {}, {m.b_x});
+    m.op_embed = m.w_toks
+        ? rw(b, RAD_OP(b, "embed_lookup_q",
+                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", g.n_embd),
+                            RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                            RAD_INT("vocab_offset", g.vocab_off)),
+                 RAD_WEIGHTS(m.w_tok, m.w_toks)),
+             {}, {m.b_x})
+        : rw(b, RAD_OP(b, "embed_lookup",
+                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", g.n_embd),
+                            RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                            RAD_INT("vocab_offset", g.vocab_off)),
+                 RAD_WEIGHTS(m.w_tok)),
+             {}, {m.b_x});
     /* THE ENCODER'S ROWS, over the lookup and before its reduction -- which layer 0's norm folds
      * in at two ranks, so there is no other place to put them (MediaRows says why). */
     m.media = VisionTower::present(meta) && ctx->max_enc_patches > 0;
@@ -1354,9 +1382,14 @@ static void step(RadCtx* c, const RadBatch* batch) {
         return;
     }
 
-    RAD_ISSUE(c, m.op_embed,
-              praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.w_tok),
-              brows(m.b_x, batch->n_tok));
+    if (m.w_toks)
+        RAD_ISSUE(c, m.op_embed,
+                  praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.w_tok), RAD_W(m.w_toks),
+                  brows(m.b_x, batch->n_tok), RAD_NONE);
+    else
+        RAD_ISSUE(c, m.op_embed,
+                  praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.w_tok),
+                  brows(m.b_x, batch->n_tok));
     m.mrows.step(c, batch, m.b_x, batch->n_tok);
     /* The vocab shard's reduction -- ONLY WHERE LAYER 0'S NORM WILL NOT DO IT, which is the same
      * sentence every block in this model already carries about its own collective. At tp1 there
