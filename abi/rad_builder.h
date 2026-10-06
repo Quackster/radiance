@@ -381,6 +381,14 @@ int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo, 
  * projection contributes exactly nothing to the reduce. Additive export. */
 int rad_weight_shard_zero(RadBuilder* b, rad_weight w);
 
+/* THIS RANK KEEPS NO CACHE FOR THE GROUP. The group is declared as on every other rank -- the
+ * scheduler indexes groups by position and one block table serves every rank, so it must exist
+ * here with the same block size and layers -- and nothing is carved for it: it costs this rank no
+ * pool. It is for a rank the geometry gives no attention heads (rad_arch.h Geom::attn_zero),
+ * whose attention is a `fill` of zeros and never reads a key. No op on this rank may name the
+ * group as a RAD_KV operand after this; the engine refuses one at issue. Additive export. */
+int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g);
+
 #define RAD_BUFS(...)  ((const rad_buf[]){ __VA_ARGS__ }), \
                        (int)(sizeof((const rad_buf[]){ __VA_ARGS__ }) / sizeof(rad_buf))
 

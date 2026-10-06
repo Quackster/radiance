@@ -926,6 +926,13 @@ int Builder::weight_shard_span_parts(rad_weight h, const int64_t* lo, const int6
     return RAD_OK;
 }
 
+int Builder::kv_group_zero(rad_kvgroup h) {
+    if (finished_) { err(RAD_E_STATE, "kv_group_zero after declare finished"); return RAD_E_STATE; }
+    if (h == 0 || h >= prog_.kv_groups.size()) return RAD_E_INVAL;
+    prog_.kv_groups[h].zero = true;
+    return RAD_OK;
+}
+
 int Builder::weight_shard_zero(rad_weight h) {
     if (finished_) { err(RAD_E_STATE, "weight_shard_zero after declare finished"); return RAD_E_STATE; }
     if (h == 0 || h >= prog_.weights.size()) return RAD_E_INVAL;
@@ -1671,6 +1678,11 @@ int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo, 
 int rad_weight_shard_zero(RadBuilder* b, rad_weight w) {
     if (!b) return RAD_E_INVAL;
     return B(b)->weight_shard_zero(w);
+}
+
+int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->kv_group_zero(g);
 }
 
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m) {

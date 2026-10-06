@@ -66,7 +66,7 @@ struct RecMap {
     std::vector<std::string> src;
     int                      concat_dim = 0;
 };
-struct RecKV    { std::string name; RadKVGroupDecl d{}; };
+struct RecKV    { std::string name; RadKVGroupDecl d{}; bool zero = false; };
 struct RecIssue {
     rad_op                  op = 0;
     std::vector<RadOperand> opd;
@@ -173,7 +173,7 @@ extern "C" int rad_op_resolved(RadBuilder* b, rad_op h) {
 
 extern "C" rad_kvgroup rad_decl_kv_group(RadBuilder* b, const char* name,
                                          const RadKVGroupDecl* d) {
-    b->kv_groups.push_back({name, *d});
+    b->kv_groups.push_back({name, *d, false});
     return (rad_kvgroup)b->kv_groups.size();
 }
 
@@ -243,6 +243,11 @@ extern "C" int rad_weight_shard_zero(RadBuilder* b, rad_weight w) {
     RecWeight& rw = b->weights[w - 1];
     if (rw.d.shard != RAD_SHARD_ROW && rw.d.shard != RAD_SHARD_COL) return RAD_E_INVAL;
     rw.zero = true;
+    return RAD_OK;
+}
+extern "C" int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g) {
+    if (!b || g == 0 || g > b->kv_groups.size()) return RAD_E_INVAL;
+    b->kv_groups[g - 1].zero = true;
     return RAD_OK;
 }
 extern "C" int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {
@@ -2509,29 +2514,51 @@ TEST(flashnext_tp3_zeroes_the_third_ranks_attention_and_splits_gdn_heads_unevenl
         REQUIRE_EQ(qwen4exp_fp8::declare(&b[r], &meta, &c[r]), RAD_OK);
     }
 
-    /* The three programs declare the same ops in the same order and the same KV groups: the
-     * scheduler sees one program. */
+    /* EVERY RANK DECLARES THE SAME KV GROUPS IN THE SAME ORDER: the scheduler indexes groups by
+     * position and one block table serves every rank. The OPS are each rank's own -- issue walks
+     * a rank's program -- and the attention ranks declare the same ops as each other. */
     for (int r = 1; r < world; ++r) {
-        REQUIRE_EQ(b[r].ops.size(), b[0].ops.size());
         REQUIRE_EQ(b[r].kv_groups.size(), b[0].kv_groups.size());
-        for (size_t i = 0; i < b[0].ops.size(); ++i) CHECK_EQ(b[r].ops[i].op, b[0].ops[i].op);
         for (size_t g = 0; g < b[0].kv_groups.size(); ++g) {
             CHECK_EQ(b[r].kv_groups[g].name, b[0].kv_groups[g].name);
             CHECK_EQ(b[r].kv_groups[g].d.kind, b[0].kv_groups[g].d.kind);
+        }
+        if (r < attn_world) {
+            REQUIRE_EQ(b[r].ops.size(), b[0].ops.size());
+            for (size_t i = 0; i < b[0].ops.size(); ++i) CHECK_EQ(b[r].ops[i].op, b[0].ops[i].op);
         }
     }
 
     for (int r = 0; r < world; ++r) {
         const bool zero = r >= attn_world;
-        /* (1) ATTENTION: every rank the two-rank geometry -- 12 heads, one KV head, gqa 12. */
-        const RecOp* at = find_op(b[r], "attn_paged");
-        REQUIRE(at != nullptr);
-        CHECK_EQ(pint(at, "n_head"), n_head / attn_world);
-        CHECK_EQ(pint(at, "gqa"), n_head / attn_world);
         CHECK_EQ(b[r].kv_groups[0].d.n_head_kv, 1);
-        /* (2) THE PROJECTIONS: the span of this rank's heads in the container on every rank --
-         * rank 2 the last attention rank's, so its shapes match -- and zeros on rank 2. */
+        /* THE ATTENTION-ZERO RANK COMPUTES NO ATTENTION: no attention op, no projection weight,
+         * a `fill` of its output wire, and no cache carved for the attention group. */
+        if (zero) {
+            CHECK(find_op(b[r], "attn_paged") == nullptr);
+            CHECK(find_op(b[r], "kv_store") == nullptr);
+            CHECK(find_op(b[r], "fill") != nullptr);
+            CHECK(find_w(b[r], kq) == nullptr);
+            CHECK(find_w(b[r], qg) == nullptr);
+            CHECK(find_w(b[r], oo) == nullptr);
+            CHECK(b[r].kv_groups[0].zero);
+            /* The all-reduce it still joins, and the indexer it still runs. */
+            CHECK(find_op(b[r], "qsa_select") != nullptr);
+        } else {
+            CHECK(!b[r].kv_groups[0].zero);
+            CHECK(find_op(b[r], "fill") == nullptr);
+        }
+        /* (1) ATTENTION: every attention rank the two-rank geometry -- 12 heads, one KV head,
+         * gqa 12. */
+        const RecOp* at = find_op(b[r], "attn_paged");
+        if (!zero) {
+            REQUIRE(at != nullptr);
+            CHECK_EQ(pint(at, "n_head"), n_head / attn_world);
+            CHECK_EQ(pint(at, "gqa"), n_head / attn_world);
+        }
+        /* (2) THE PROJECTIONS: the span of this rank's heads in the container. */
         for (const std::string& wn : {kq, kv}) {
+            if (zero) break;
             const RecWeight* w = find_w(b[r], wn);
             REQUIRE(w != nullptr);
             CHECK_EQ(w->d.shape[0], head_dim);
@@ -2541,7 +2568,7 @@ TEST(flashnext_tp3_zeroes_the_third_ranks_attention_and_splits_gdn_heads_unevenl
             CHECK_EQ(w->span_hi, w->span_lo + head_dim);
             CHECK_EQ(w->zero, zero);
         }
-        {
+        if (!zero) {
             const RecWeight* w = find_w(b[r], qg);
             REQUIRE(w != nullptr);
             const int ar = zero ? attn_world - 1 : r;

@@ -295,6 +295,7 @@ struct KVGroupInfo {
     int64_t         bytes_per_block = 0;
     int64_t         bytes_per_state = 0;   /* linear/conv: per sequence */
     std::vector<int> layers;
+    bool            zero = false;       /* rad_kv_group_zero: declared for position, nothing carved */
 };
 
 /* A RAD_KV_CONV GROUP'S WINDOW, IN ENTRIES: conv_width - 1 of history and one more for every

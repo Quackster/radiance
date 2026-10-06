@@ -256,6 +256,14 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
             RAD_ERR("KV group '%s': unknown kind %d", p.name.c_str(), p.kind);
             return RAD_E_INVAL;
         }
+        /* A ZERO GROUP COSTS THIS RANK NOTHING: declared for its position and its block count,
+         * never carved, never read. The validation above still ran on the real sizes, so a zero
+         * group is a real group on every other rank. */
+        if (g.zero) {
+            p.zero = true;
+            p.bytes_per_block = 0;
+            p.bytes_per_state = 0;
+        }
         plans_.push_back(std::move(p));
     }
     bundling_ = compare_bundling(bundles);
@@ -453,6 +461,15 @@ int KVManager::carve_into(Pool& kv_pool) {
         int64_t bytes = p.paged() ? p.n_blocks * p.bytes_per_block
                                   : p.n_states * p.bytes_per_state;
         if (p.paged()) paged_taken += bytes;
+        if (p.zero) {
+            p.base = nullptr;
+            p.pool_offset = 0;
+            p.pool_bytes = 0;
+            RAD_INFO("KV group '%s': this rank keeps no cache for it (rad_kv_group_zero) -- %lld "
+                     "blocks of the shared table, nothing carved", p.name.c_str(),
+                     (long long)p.n_blocks);
+            continue;
+        }
         int64_t off = 0;
         void* ptr = kv_pool.reserve(p.name, bytes, RAD_ALIGN_UNIT, &off);
         if (!ptr && !kv_pool.accounting_only()) {

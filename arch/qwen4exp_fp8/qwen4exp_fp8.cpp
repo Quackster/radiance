@@ -1130,6 +1130,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 lay.attn.qsa_exact_to = m.qsacfg.budget + m.qsacfg.ratio - 1;
             }
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_full));
+            /* AN ATTENTION-ZERO RANK KEEPS NO ATTENTION CACHE. Its block is a fill of zeros
+             * (rad_block_attn_gated_fp8.h) and never stores or reads a key; the indexer below
+             * reads only the group's block table, which every rank shares. Once per model: the
+             * group is one and the call is idempotent, but the first layer is the honest place. */
+            if (g.attn_zero && m.kv_full) RAD_ARCH_TRY(rad_kv_group_zero(b, m.kv_full));
             lay.attn.ar_out_take = lay.hc_mix.ar_take();
             RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv_full, m.n_rot, aw, as,
                                           false, false, kArNone, lay.hc_mix.op_ar_write != 0));

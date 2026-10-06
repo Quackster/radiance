@@ -760,10 +760,12 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             const uint32_t g = o.handle;
             if ((size_t)g >= kv_.size() || !kv_[g].base)
                 return abort_step_msg(h, RAD_E_STATE,
-                                      fmt("operand %d names KV group %u, which has no pool bound. "
-                                          "The block manager allocates it at load and binds it "
-                                          "into the Ctx; a group with none is a startup bug, not "
-                                          "a runtime condition", i, g));
+                                      fmt("operand %d names KV group %u, which has no pool bound on "
+                                          "this rank. The block manager allocates it at load and "
+                                          "binds it into the Ctx; a group with none is a startup "
+                                          "bug -- or a group this rank declared with "
+                                          "rad_kv_group_zero and then issued against, which the "
+                                          "plugin must not do", i, g));
             const KVPoolBinding& b = kv_[g];
             /* A POSITION LOOKUP, not `o.offset - first_layer`. The subtraction is right only for a
              * group whose layers are contiguous, and they need not be: with 15 attention layers

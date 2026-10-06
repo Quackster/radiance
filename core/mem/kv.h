@@ -74,6 +74,10 @@ struct KVGroupPlan {
     int64_t     window_blocks = 0;     /* WINDOW: the per-sequence block cap */
 
     int64_t     n_blocks = 0;          /* paged groups: blocks carved from the pool */
+    /* rad_kv_group_zero: this rank keeps no cache for the group. The plan exists for its position
+     * and its block count (one block table serves every rank), its costs are zero and nothing is
+     * carved; no op on this rank names it (issue refuses a group with no pool bound). */
+    bool        zero = false;
     int64_t     n_states = 0;          /* LINEAR/CONV: n_seq_states * state_copies */
     /* HOW MANY PHYSICAL SLOTS ONE LOGICAL STATE COSTS. One, normally: a sequence owns a state.
      * Under speculation a linear kernel needs somewhere to put what it cannot commit yet -- it

@@ -152,6 +152,7 @@ public:
     int weight_shard_span_parts(rad_weight w, const int64_t* lo, const int64_t* hi,
                                 const int64_t* total, int n);
     int weight_shard_zero(rad_weight w);
+    int kv_group_zero(rad_kvgroup g);
 
     /* Finalise: weight first/last use, KV group geometry, buffer liveness and packing. Returns
      * RAD_OK, or the first structural error class. Resolution MISSES are not an error here -- an
