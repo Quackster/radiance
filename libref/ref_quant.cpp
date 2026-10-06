@@ -507,6 +507,41 @@ static inline void fp8_row(const float* v, int64_t n, int64_t g, const RadTensor
     }
 }
 
+/* `afrag`: the op's M >= afrag asks for the E4M3 codes in the fragment-tiled layout (afrag_off in
+ * ref_gemm.h) instead of row-major. The rows are quantised row-major into a scratch plane and
+ * scattered into `q` at the end, so the pad rows of the last tile are never touched. A `q` that is
+ * not an E4M3 plane over a row width that is a multiple of 16 cannot hold the layout. */
+struct AfragOut {
+    const RadTensor* use;
+    const RadTensor* q;
+    std::vector<uint8_t> buf;
+    RadTensor tmp;
+    int64_t rows, n;
+    bool on;
+    int rc;
+    AfragOut(const RadArgs* a, const RadTensor* q_, int64_t rows_, int64_t n_)
+        : use(q_), q(q_), rows(rows_), n(n_), on(false), rc(RAD_OK) {
+        const int64_t afrag = p_int(a, "afrag", 0);
+        if (afrag <= 0 || rows < afrag) return;
+        if (q->dtype != RAD_F8E4M3 || n % 16 != 0) { rc = RAD_E_DTYPE; return; }
+        on = true;
+        buf.assign((size_t)(rows * n), 0);
+        tmp = *q;
+        tmp.data = buf.data();
+        tmp.rank = 2;
+        tmp.shape[0] = rows;  tmp.shape[1] = n;
+        tmp.stride[0] = n;    tmp.stride[1] = 1;
+        use = &tmp;
+    }
+    int finish() const {
+        if (rc != RAD_OK || !on) return rc;
+        uint8_t* d = (uint8_t*)q->data;
+        for (int64_t r = 0; r < rows; ++r)
+            for (int64_t c = 0; c < n; ++c) d[afrag_off(r, c, n)] = buf[(size_t)(r * n + c)];
+        return RAD_OK;
+    }
+};
+
 /* ------------------------------------------------------------- rmsnorm_quant_fp8 */
 /* `x`, `residual`:inout?, `w`w -> `q`, `scale`, `out_bf16`?
  *
@@ -535,6 +570,8 @@ int ref_rmsnorm_quant_fp8(const RadArgs* a, RadStream) {
     if (res && numel(res) < rows * n) return RAD_E_SHAPE;
     if (ob  && numel(ob)  < rows * n) return RAD_E_SHAPE;
 
+    AfragOut qo(a, q, rows, n);
+    if (qo.rc != RAD_OK) return qo.rc;
     #pragma omp parallel for schedule(static)
     for (int64_t r = 0; r < rows; ++r) {
         std::vector<float> v((size_t)n);
@@ -559,9 +596,9 @@ int ref_rmsnorm_quant_fp8(const RadArgs* a, RadStream) {
             if (ob) stt(ob, obb + i * obs, bf16_to_f32(h));
             v[(size_t)i] = bf16_to_f32(h);
         }
-        fp8_row(v.data(), n, g, q, s, r);
+        fp8_row(v.data(), n, g, qo.use, s, r);
     }
-    return RAD_OK;
+    return qo.finish();
 }
 
 /* ------------------------------------------------------------- gated_quant_fp8 */
@@ -586,6 +623,8 @@ int ref_gated_quant_fp8(const RadArgs* a, RadStream) {
     if (rows <= 0 || numel(q) < rows * n || numel(s) < rows * ngrp) return RAD_E_SHAPE;
     if (ob && numel(ob) < rows * n) return RAD_E_SHAPE;
 
+    AfragOut qo(a, q, rows, n);
+    if (qo.rc != RAD_OK) return qo.rc;
     #pragma omp parallel for schedule(static)
     for (int64_t r = 0; r < rows; ++r) {
         std::vector<float> v((size_t)n);
@@ -600,9 +639,9 @@ int ref_gated_quant_fp8(const RadArgs* a, RadStream) {
             if (ob) stt(ob, obb + i * obs, bf16_to_f32(h));
             v[(size_t)i] = bf16_to_f32(h);
         }
-        fp8_row(v.data(), n, g, q, s, r);
+        fp8_row(v.data(), n, g, qo.use, s, r);
     }
-    return RAD_OK;
+    return qo.finish();
 }
 
 /* ------------------------------------------------------------- gemm_nt_q_gated */

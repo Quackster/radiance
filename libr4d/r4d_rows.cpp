@@ -715,6 +715,7 @@ static const RadParamSpec pGemmNtQ[] = {
     { "K",     RAD_P_INT, RAD_REQUIRED },
     { "group", RAD_P_INT, RAD_REQUIRED },
     { "dtype", RAD_P_STR, RAD_REQUIRED },
+    P_INTO("afrag"),   /* mxfp4a8 only: A is fragment-tiled when M >= afrag; see docs/OPS.md */
 };
 /* docs/OPS.md's `gemm_nt_q` is `a`, `a_scale`, `b`w, `b_scale`w -> `y`. Two of libr4d's six
  * quantised GEMMs need a seventh operand each and neither is expressible as a weight aux stream,
@@ -1277,6 +1278,7 @@ static const RadParamSpec pRmsNormQuantFp8[] = {
     { "group", RAD_P_INT, RAD_REQUIRED },
     { "dtype", RAD_P_STR, RAD_REQUIRED },
     P_F64O("wadd"),
+    P_INTO("afrag"),   /* q is fragment-tiled when M >= afrag; see docs/OPS.md */
 };
 static const RadOperandSpec oRmsNormQuantFp8[] = {
     { "x",        RAD_OPD_IN,     0 },
@@ -1314,6 +1316,15 @@ static const RadOperandSpec oArRmsNormQuantFp8[] = {
 };
 
 static const RadParamSpec pGatedQuantFp8[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "group", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    P_STRO("act"),
+    P_INTO("afrag"),   /* q is fragment-tiled when M >= afrag (gated_quant_fp8 only) */
+};
+/* gated_had_quant_fp8 has no fragment-tiled form: the same list without `afrag`. */
+static const RadParamSpec pGatedHadQuantFp8[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
     { "group", RAD_P_INT, RAD_REQUIRED },
@@ -2124,7 +2135,7 @@ static const RadOpSchema kSchemas[] = {
            "output the unfused pair wrote is still written, and the codes are taken over it."),
     SCHEMA("gated_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
            "silu(a)*b or sigmoid(a)*b, then the same quantiser, in one pass."),
-    SCHEMA("gated_had_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
+    SCHEMA("gated_had_quant_fp8", pGatedHadQuantFp8, oGatedQuantFp8,
            "the same, with a `group`-wide Hadamard between the product and the absmax. `out_bf16` "
            "still receives the UNROTATED product -- it exists for a bf16 consumer of the gate, and "
            "the rotation is a property of the quantised pair alone. Pairs with a weight stored at "

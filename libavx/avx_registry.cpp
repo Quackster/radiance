@@ -147,11 +147,12 @@ static const RadOperandSpec oQuantFp8[] = { OPD("x"), OUT("q"), OUT("scale") };
 /* The fp8 fusions: the unfused pair's operands minus the tensor between them, and `out_bf16` to
  * put even that back. */
 static const RadParamSpec pRmsQuantFp8[]     = { P_INT("M"), P_INT("n"), P_F64("eps"),
-                                                 P_INT("group"), P_STR("dtype"), P_F64O("wadd") };
+                                                 P_INT("group"), P_STR("dtype"), P_F64O("wadd"),
+                                                 P_INTO("afrag") };
 static const RadOperandSpec oRmsQuantFp8[]   = { OPD("x"), INOUT_O("residual"), WGT("w"),
                                                  OUT("q"), OUT("scale"), OUT_O("out_bf16") };
 static const RadParamSpec pGatedQuantFp8[]   = { P_INT("M"), P_INT("n"), P_INT("group"),
-                                                 P_STR("dtype"), P_STRO("act") };
+                                                 P_STR("dtype"), P_STRO("act"), P_INTO("afrag") };
 static const RadOperandSpec oGatedQuantFp8[] = { OPD("gate_up"), OUT("q"), OUT("scale"),
                                                  OUT_O("out_bf16") };
 
@@ -181,6 +182,9 @@ static const RadOperandSpec oGemmBias[] = { OPD("a"), WGT("b"), WGT("bias"), OPD
 
 static const RadParamSpec pGemmQ[]        = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
                                               P_STR("dtype") };
+/* gemm_nt_q alone carries `afrag` (libref's schema does the same; gemm_nt_q_bias has none). */
+static const RadParamSpec pGemmQA[]       = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
+                                              P_STR("dtype"), P_INTO("afrag") };
 static const RadOperandSpec oGemmQ[]      = { OPD("a"), OPD_O("a_scale"), WGT("b"), WGT("b_scale"),
                                               OUT("y"), OPD_O("a_sum"), WGT_O("b_ref") };
 static const RadOperandSpec oGemmQBias[]  = { OPD("a"), OPD("a_scale"), WGT("b"), WGT("b_scale"),
@@ -496,7 +500,7 @@ static const RadOpSchema kSchemas[] = {
   "gemm_nt (8e-3) is what that costs." },
 { "gemm_nt_bias", ARR(pGemmBias), ARR(oGemmBias),
   "C = act(A B^T + bias) + res, each step rounded to C's dtype." },
-{ "gemm_nt_q", ARR(pGemmQ), ARR(oGemmQ),
+{ "gemm_nt_q", ARR(pGemmQA), ARR(oGemmQ),
   "C = A B^T with group-scaled quantised operands. `a_sum` and `b_ref` are libr4d's asymmetric and "
   "mxfp4 forms and are ignored here, as they are in libref." },
 { "gemm_nt_q_bias", ARR(pGemmQ), ARR(oGemmQBias), "quantised C = A B^T + bias." },

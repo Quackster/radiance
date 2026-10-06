@@ -169,11 +169,12 @@ static const RadOperandSpec oQuantFp8[]  = { OPD("x"), OUT("q"), OUT("scale") };
  * puts even that back: the codes are taken over its value, so a caller that wants to compare
  * the fused form against the pair has to be able to ask for it. */
 static const RadParamSpec pRmsQuantFp8[] = { P_INT("M"), P_INT("n"), P_F64("eps"),
-                                             P_INT("group"), P_STR("dtype"), P_F64O("wadd") };
+                                             P_INT("group"), P_STR("dtype"), P_F64O("wadd"),
+                                             P_INTO("afrag") };
 static const RadOperandSpec oRmsQuantFp8[] = { OPD("x"), INOUT_O("residual"), WGT("w"),
                                                OUT("q"), OUT("scale"), OUT_O("out_bf16") };
 static const RadParamSpec pGatedQuantFp8[] = { P_INT("M"), P_INT("n"), P_INT("group"),
-                                               P_STR("dtype"), P_STRO("act") };
+                                               P_STR("dtype"), P_STRO("act"), P_INTO("afrag") };
 static const RadOperandSpec oGatedQuantFp8[] = { OPD("gate_up"), OUT("q"), OUT("scale"),
                                                  OUT_O("out_bf16") };
 /* `act` is REQUIRED here and optional on the quantiser, for the reason docs/OPS.md gives: an
@@ -230,8 +231,10 @@ static const RadParamSpec pGemmBias[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_
 static const RadOperandSpec oGemmBias[] = { OPD("a"), WGT("b"), WGT("bias"), OPD_O("res"),
                                             OUT("y") };
 
+static const RadParamSpec pGemmQBias[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
+                                           P_STR("dtype") };
 static const RadParamSpec pGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
-                                       P_STR("dtype") };
+                                       P_STR("dtype"), P_INTO("afrag") };
 /* `a_sum` and `b_ref` are libr4d's, appended AFTER `y` so docs/OPS.md's list stays a positional
  * prefix: the asymmetric 4-bit and 2-bit grids subtract the activation's per-group code sums, and
  * mxfp4 folds a per-output-row reference exponent. Neither is expressible as a weight aux stream,
@@ -735,7 +738,7 @@ static const RadOpSchema kSchemas[] = {
   "gemm_nt with quantised operands. The group sub-sum is accumulated from the raw codes and "
   "scaled once per group, which is what an int8 or fp8 WMMA kernel does. Scale streams are "
   "[rows, groups] or [rows]; an mxfp4 weight's u8 scale stream is read as OCP e8m0." },
-{ "gemm_nt_q_bias", ARR(pGemmQ), ARR(oGemmQBias), "gemm_nt_q with a per-column bias." },
+{ "gemm_nt_q_bias", ARR(pGemmQBias), ARR(oGemmQBias), "gemm_nt_q with a per-column bias." },
 
 { "attn_paged", ARR(pAttnPaged), ARR(oAttnPaged),
   "Paged attention over kv_cache[num_blocks, kv_heads, block_size, 2*head_dim] (K then V per "

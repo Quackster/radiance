@@ -89,6 +89,18 @@ struct ActFP8 {
      * the model when it declares the pair, before the wires copy it. */
     bool    q8_fed = false;
 
+    /* THE E4M3 CODES ARE FRAGMENT-TILED WHEN THE STEP IS AT LEAST THIS MANY ROWS (0 = never, the
+     * row-major plane every other model has). Set by the model on the one input whose producers
+     * are NormQuantFP8 / GateQuantFP8 and whose every consumer is an MXFP4 LinearFP8, BEFORE
+     * declare_qs and before the wires copy it. The producer and each consumer carry the same value
+     * as an `afrag` parameter on their op, and decide the layout from the issue's own row count:
+     * M >= afrag, and no state travels between them. A consumer that cannot read the layout
+     * (an fp8 weight, the int8 path) refuses a flagged input at declare time rather than read
+     * the codes as row-major. A copy with frag = 0 (the MTP head's) shares the buffers and declares
+     * row-major ops; the two never run in the same step window. See r4d_gemm_mxfp4a8_tiled.hip
+     * for the layout and docs/OPS.md for the parameter. */
+    int64_t frag = 0;
+
     /* The code pair the producer writes: int8 when the model fed it, E4M3 otherwise. */
     rad_buf cq() const { return q8_fed ? q8 : q; }
     rad_buf cs() const { return q8_fed ? s8 : s; }
@@ -110,7 +122,10 @@ struct ActFP8 {
          * to declare: an arena plane nothing writes is a plane the planner still charges. */
         if (g.w_bf16) { q = s = q8 = s8 = 0; return RAD_OK; }
         const int64_t m = rows > 0 ? rows : g.max_tok;
-        q = decl_b(b, nm.f("%s.q", name), RAD_F8E4M3, { m, n });
+        /* Fragment tiles are whole 16-row tiles: the consumer reads the pad rows of the last one,
+         * so the plane is allocated to a multiple of 16 rows (the extra rows are never written). */
+        const int64_t mq = frag ? (m + 15) / 16 * 16 : m;
+        q = decl_b(b, nm.f("%s.q", name), RAD_F8E4M3, { mq, n });
         s = decl_b(b, nm.f("%s.s", name), RAD_F32,    { m, fp8_blocks(n) });
         if (i8) {
             q8 = decl_b(b, nm.f("%s.q8", name), RAD_I8,  { m, n });
@@ -497,12 +512,20 @@ inline int NormQuantFP8::declare(RadBuilder* b, const Geom& g, rad_weight gain, 
         return RAD_E_UNSUPPORTED;
     }
     if (!src || !a.x || !a.q || !a.s || !w || n <= 0) return RAD_E_INVAL;
-    op = RAD_OP(b, "rmsnorm_quant_fp8",
-                RAD_PARAMS(RAD_RANGE("M", 1, max_rows > 0 ? max_rows : g.max_tok),
-                           RAD_INT("n", n), RAD_F64("eps", g.eps),
-                           RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype),
-                           RAD_F64("wadd", g.wadd)),
-                RAD_WEIGHTS(w));
+    /* A FRAGMENT-TILED OUTPUT is the single-rank, unfused op's: the fused all-reduce forms below
+     * write row-major codes. */
+    if (act.frag && (fuse_ar || n % 16)) {
+        fprintf(stderr, "radiance: rmsnorm_quant_fp8 cannot write fragment-tiled codes with a fused "
+                        "all-reduce or a row width that is not a multiple of 16\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    {
+        const RadParam ps[] = { RAD_RANGE("M", 1, max_rows > 0 ? max_rows : g.max_tok),
+                                RAD_INT("n", n), RAD_F64("eps", g.eps),
+                                RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype),
+                                RAD_F64("wadd", g.wadd), RAD_INT("afrag", act.frag) };
+        op = rad_decl_op(b, "rmsnorm_quant_fp8", ps, act.frag ? 7 : 6, RAD_WEIGHTS(w));
+    }
     if (!op) return RAD_E_INVAL;
     /* Not rw()'s two initializer_lists, because the sets are conditional and a braced list in a
      * ternary has no lifetime extension. `residual` is read AND written, so it is in both: the
@@ -630,18 +653,21 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
     /* The rotated codes are a four-bit expert's operand, which reads E4M3 only. */
     if (rot && a.q8_fed) return RAD_E_INVAL;
     const char* opname = rot ? "gated_had_quant_fp8" : "gated_quant_fp8";
+    /* The fragment-tiled output is the plain E4M3 gated quantiser's alone. */
+    if (a.frag && (rot || a.q8_fed || n % 16)) {
+        fprintf(stderr, "radiance: gated_quant_fp8 writes fragment-tiled codes only unrotated, at "
+                        "E4M3, over a row width that is a multiple of 16\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    const RadParam ps[] = { RAD_RANGE("M", 1, max_rows > 0 ? max_rows : g.max_tok),
+                            RAD_INT("n", n), RAD_INT("group", RAD_FP8_BLOCK),
+                            RAD_STR("dtype", g.dtype), RAD_STR("act", act_name),
+                            RAD_INT("afrag", a.frag) };
+    const int nps = a.frag ? 6 : 5;
     op = want_x
-        ? rw(b, RAD_OP(b, opname,
-                RAD_PARAMS(RAD_RANGE("M", 1, max_rows > 0 ? max_rows : g.max_tok),
-                           RAD_INT("n", n), RAD_INT("group", RAD_FP8_BLOCK),
-                           RAD_STR("dtype", g.dtype), RAD_STR("act", act_name)),
-                RAD_NOWEIGHTS),
+        ? rw(b, rad_decl_op(b, opname, ps, nps, RAD_NOWEIGHTS),
             { gate_up }, { a.cq(), a.cs(), a.x })
-        : rw(b, RAD_OP(b, opname,
-                RAD_PARAMS(RAD_RANGE("M", 1, max_rows > 0 ? max_rows : g.max_tok),
-                           RAD_INT("n", n), RAD_INT("group", RAD_FP8_BLOCK),
-                           RAD_STR("dtype", g.dtype), RAD_STR("act", act_name)),
-                RAD_NOWEIGHTS),
+        : rw(b, rad_decl_op(b, opname, ps, nps, RAD_NOWEIGHTS),
             { gate_up }, { a.cq(), a.cs() });
     return op ? RAD_OK : RAD_E_INVAL;
 }
@@ -991,12 +1017,22 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
             RAD_ARCH_TRY(rad_weight_shard_span(b, wref, lo, hi));
         }
         const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
-        op = rw(b, RAD_OP(b, "gemm_nt_q",
-                   RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
-                              RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8")),
-                   RAD_WEIGHTS(w, ws, wref)),
+        /* `afrag`: the producer in front writes this GEMM's A fragment-tiled when M >= afrag, and
+         * libr4d's mxfp4a8 row then reads it with gemm_mxfp4a8_atiled (ActFP8::frag). */
+        const RadParam ps[] = { RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8"),
+                                RAD_INT("afrag", a.frag) };
+        op = rw(b, rad_decl_op(b, "gemm_nt_q", ps, a.frag ? 6 : 5, RAD_WEIGHTS(w, ws, wref)),
                { a.q, a.s }, { y });
         return op ? RAD_OK : RAD_E_INVAL;
+    }
+
+    /* A block-fp8 weight reads the E4M3 plane row-major; handed a fragment-tiled one it would read
+     * garbage that runs and answers. Refused by name. */
+    if (a.frag) {
+        fprintf(stderr, "radiance: '%s' is not an MXFP4 weight, and its input carries "
+                        "fragment-tiled E4M3 codes (ActFP8::frag); give it a row-major input\n", wn);
+        return RAD_E_DTYPE;
     }
 
     /* The one geometric precondition, checked here so it is reported once per weight with the

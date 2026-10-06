@@ -418,6 +418,7 @@ AVX_KERNEL(quant_act_fp8) {
  * rmsnorm_add, which takes its variance from the unrounded sum. The normalised row is then narrowed
  * to bf16 and the codes taken over it (avx_had.h). */
 AVX_KERNEL(rmsnorm_quant_fp8) {
+    if (p_int(a, "afrag", 0) > 0 && p_int(a, "M", 0) >= p_int(a, "afrag", 0)) return RAD_E_INVAL; /* afrag is a libr4d layout; this kernel is row-major */
     if (a->n_t < 5) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *w = &a->t[2], *q = &a->t[3], *s = &a->t[4];
     const RadTensor* res = rad_arg_in(a, 1);
@@ -484,6 +485,7 @@ AVX_KERNEL(rmsnorm_quant_fp8) {
  * bf16-narrowed product. `act` is silu or sigmoid, `mode` libr4d's integer spelling of the same
  * choice, silu when neither is given. */
 AVX_KERNEL(gated_quant_fp8) {
+    if (p_int(a, "afrag", 0) > 0 && p_int(a, "M", 0) >= p_int(a, "afrag", 0)) return RAD_E_INVAL; /* afrag is a libr4d layout; this kernel is row-major */
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *gu = &a->t[0], *q = &a->t[1], *s = &a->t[2];
     const RadTensor* ob = rad_arg_in(a, 3);

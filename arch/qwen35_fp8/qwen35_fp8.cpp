@@ -98,6 +98,33 @@ namespace QWEN35_NS {
 
 using namespace rad::arch;
 
+/* RADIANCE_MXFP4_ATILED_MIN_M = T (default 0, off): at M >= T the two producers whose every consumer
+ * is an MXFP4 GEMM -- the block norm (`h`) and the SwiGLU product (`ffn`) -- write the E4M3 plane
+ * fragment-tiled and those GEMMs read it straight into the WMMA registers (libr4d
+ * gemm_mxfp4a8_atiled; credit: SlyBase/vllm-sly-radiance, radiance_mxfp4_fp8_gemm_atiled).
+ * It changes the declared ops (an `afrag` parameter), so it is read at declare time and a
+ * recorded tape is bound to it. Single rank, dense MXFP4 trunk only; T must exceed the skinny and
+ * decode bands (64) -- 513 is the vLLM value. Anything else is refused loudly rather than ignored. */
+static int64_t mxfp4_atiled_min_m(const Geom& g) {
+#if QWEN35_MXFP4 && !QWEN35_MOE
+    const char* e = std::getenv("RADIANCE_MXFP4_ATILED_MIN_M");
+    if (!e || !*e) return 0;
+    const long long t = std::atoll(e);
+    if (t <= 0) return 0;
+    if (t <= 64 || g.world != 1 || g.max_tok < t) {
+        std::fprintf(stderr, "radiance: RADIANCE_MXFP4_ATILED_MIN_M=%s ignored (needs 64 < T <= "
+                             "max_tok and one rank; max_tok=%lld world=%d)\n", e,
+                     (long long)g.max_tok, (int)g.world);
+        return 0;
+    }
+    std::fprintf(stderr, "radiance: MXFP4 fragment-tiled prefill activations from M >= %lld\n", t);
+    return t;
+#else
+    (void)g;
+    return 0;
+#endif
+}
+
 /* The feed-forward this build declares, and the ONE name the rest of the file uses for it. Both
  * blocks take the same declare() arity over their own Wire and Src -- the routed one carries its
  * geometry inside its Src for exactly that reason -- so every site below is spelled once. */
@@ -802,6 +829,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * is 143 MiB against the 285 MiB the bf16 buffer it shadows already costs. */
     m.b_x       = decl_b(b, nm.f("x"),        g.act_dtype, {g.max_tok, g.n_embd});
     m.a_h.x     = decl_b(b, nm.f("h"),        g.act_dtype, {g.max_tok, g.n_embd});
+    const int64_t atiled_t = mxfp4_atiled_min_m(g);
+    m.a_h.frag  = atiled_t;
     RAD_ARCH_TRY(m.a_h.declare_qs(b, nm, g, "h", g.n_embd));
 
     m.b_qg      = decl_b(b, nm.f("attn_qg"),  g.act_dtype, {g.max_tok, g.n_head, 2 * g.head_dim});
@@ -934,6 +963,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 #else
     m.b_gate_up = decl_b(b, nm.f("gate_up"),  g.act_dtype, {g.max_tok, 2 * g.n_ff});
     m.a_ffn.x   = decl_b(b, nm.f("ffn"),      g.act_dtype, {g.max_tok, g.n_ff});
+    m.a_ffn.frag = atiled_t;
     RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "ffn", g.n_ff));
 #endif
 
@@ -1243,6 +1273,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * `x`, which the next step's prefill still needs. */
         AttnGatedFP8::Wire tw_attn = aw; tw_attn.x = m.b_mtp_x;
         Ffn::Wire          tw_mlp  = mw; tw_mlp.x  = m.b_mtp_x;
+        /* THE HEAD'S OWN LINEARS ARE NOT THE TRUNK'S (block fp8 in the shipped recipe) and read
+         * the E4M3 plane row-major, so its copies of the wire declare row-major ops over the same
+         * buffers: the trunk and a draft round never share a step window. */
+        tw_attn.h.frag = 0; tw_mlp.h.frag = 0;
+#if !QWEN35_MOE
+        tw_mlp.ffn.frag = 0;   /* the routed block has no `ffn` plane and no afrag */
+#endif
 
         MtpHead::Wire tw{};
         tw.src = m.a_h.x;   tw.hout = m.b_mtp_h; tw.logits = m.b_logits;

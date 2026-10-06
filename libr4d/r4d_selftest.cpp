@@ -3308,6 +3308,98 @@ static void w8a16_numeric(const Plugin& pl, const char* row, int64_t M, int64_t 
 }
 
 
+
+/* THE FRAGMENT-TILED ACTIVATION (`afrag`), producer side. rmsnorm_quant_fp8 and gated_quant_fp8
+ * with afrag = T and M >= T write the E4M3 codes as 16 x 16 fragments (r4d_fused_quant_fp8.hip,
+ * quant_group); the scales and the bf16 plane are unchanged. Checked against the same op without
+ * `afrag`: every code of the tiled plane must be the row-major run's code at the position the
+ * layout names, the pad rows of the last tile must be left as they were (a canary is written there
+ * first), and an issue BELOW T must be byte-identical to the row-major run. */
+static int launch_row(const RadKernelInfo* r, std::vector<RadTensor> ts, std::vector<RadParam> ps);
+static void mxfp4_afrag_producers_numeric(const Plugin& pl) {
+    const RadKernelInfo* rq = find(pl, "rmsnorm_quant_fp8");
+    const RadKernelInfo* gq = find(pl, "gated_quant_fp8");
+    if (!rq || !gq) { ok("fp8 fusions afrag", false, "rows absent"); return; }
+    const int64_t K = 640, nkb = K / 128, AF = 65;
+    auto off = [&](int64_t r, int64_t c) {
+        return ((r >> 4) * (K >> 4) + (c >> 4)) * 256 + (((c >> 3) & 1) * 16 + (r & 15)) * 8 + (c & 7);
+    };
+    for (const int64_t M : { (int64_t)75, (int64_t)130, (int64_t)40 }) {
+        const bool tiled = M >= AF;
+        const int64_t Mp = (M + 15) / 16 * 16;
+        std::vector<uint16_t> hx((size_t)M * K), hgu((size_t)M * 2 * K);
+        std::vector<float> hw((size_t)K);
+        for (int64_t r = 0; r < M; ++r)
+            for (int64_t c = 0; c < K; ++c) {
+                const float m = std::ldexp(1.0f, (int)(c / 128) - 2);
+                const float v = m * (0.037f * (float)((r * 29 + c * 13) % 71) - 1.3f);
+                hx[(size_t)(r * K + c)] = h_to_bf16(c == (r * 37) % K ? v * 19.0f : v);
+                hgu[(size_t)(r * 2 * K + c)] = h_to_bf16(v * 0.75f);
+                hgu[(size_t)(r * 2 * K + K + c)] = h_to_bf16(m * (0.011f * (float)((r + c * 7) % 43) - 0.2f));
+            }
+        for (int64_t c = 0; c < K; ++c) hw[(size_t)c] = 0.004f * (float)((c * 19) % 51) - 0.1f;
+        void* d_x = dalloc(hx.size() * 2);
+        void* d_gu = dalloc(hgu.size() * 2);
+        void* d_w = dalloc(hw.size() * 4);
+        void* d_y[2] = { dalloc((size_t)M * K * 2), dalloc((size_t)M * K * 2) };
+        void* d_q[2] = { dalloc((size_t)Mp * K), dalloc((size_t)Mp * K) };
+        void* d_s[2] = { dalloc((size_t)M * nkb * 4), dalloc((size_t)M * nkb * 4) };
+        if (!d_x || !d_gu || !d_w || !d_y[1] || !d_q[1] || !d_s[1]) { ok("afrag alloc", false, "hipMalloc"); return; }
+        st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_gu, hgu.data(), hgu.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_w, hw.data(), hw.size() * 4, hipMemcpyHostToDevice);
+        const std::vector<uint8_t> canary((size_t)Mp * K, 0x5A);
+        for (int k = 0; k < 2; ++k) st_memcpy(d_q[k], canary.data(), canary.size(), hipMemcpyHostToDevice);
+
+        for (int which = 0; which < 2; ++which) {
+            char nm[128];
+            std::snprintf(nm, sizeof nm, "%s afrag=%lld M=%lld K=%lld%s",
+                          which ? "gated_quant_fp8" : "rmsnorm_quant_fp8", (long long)AF,
+                          (long long)M, (long long)K, tiled ? "" : " (below T: row-major)");
+            int rc = RAD_OK;
+            for (int k = 0; k < 2 && rc == RAD_OK; ++k) {
+                std::vector<RadParam> ps;
+                if (which == 0) {
+                    ps = { PI("M", M), PI("n", K), PF("eps", 1e-6), PI("group", 128),
+                           PS("dtype", "bf16"), PF("wadd", 1.0) };
+                    if (k) ps.push_back(PI("afrag", AF));
+                    rc = launch_row(rq, { T(d_x, RAD_BF16, { M, K }), T(nullptr, RAD_BF16, {}),
+                                          T(d_w, RAD_F32, { K }), T(d_q[k], RAD_F8E4M3, { M, K }),
+                                          T(d_s[k], RAD_F32, { M, nkb }), T(d_y[k], RAD_BF16, { M, K }) }, ps);
+                } else {
+                    ps = { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16"),
+                           PS("act", "silu") };
+                    if (k) ps.push_back(PI("afrag", AF));
+                    rc = launch_row(gq, { T(d_gu, RAD_BF16, { M, 2 * K }), T(d_q[k], RAD_F8E4M3, { M, K }),
+                                          T(d_s[k], RAD_F32, { M, nkb }), T(d_y[k], RAD_BF16, { M, K }) }, ps);
+                }
+            }
+            if (rc != RAD_OK) { ok(nm, false, "rc=" + std::to_string(rc)); continue; }
+            std::vector<uint8_t> q0((size_t)Mp * K), q1((size_t)Mp * K);
+            std::vector<float> s0((size_t)M * nkb), s1((size_t)M * nkb);
+            std::vector<uint16_t> y0((size_t)M * K), y1((size_t)M * K);
+            st_memcpy(q0.data(), d_q[0], q0.size(), hipMemcpyDeviceToHost);
+            st_memcpy(q1.data(), d_q[1], q1.size(), hipMemcpyDeviceToHost);
+            st_memcpy(s0.data(), d_s[0], s0.size() * 4, hipMemcpyDeviceToHost);
+            st_memcpy(s1.data(), d_s[1], s1.size() * 4, hipMemcpyDeviceToHost);
+            st_memcpy(y0.data(), d_y[0], y0.size() * 2, hipMemcpyDeviceToHost);
+            st_memcpy(y1.data(), d_y[1], y1.size() * 2, hipMemcpyDeviceToHost);
+            int nq = 0, ns = 0, ny = 0, npad = 0;
+            for (int64_t r = 0; r < M; ++r)
+                for (int64_t c = 0; c < K; ++c)
+                    nq += q1[(size_t)(tiled ? off(r, c) : r * K + c)] != q0[(size_t)(r * K + c)];
+            if (tiled)   /* the pad rows of the last tile: only fragment bytes of rows >= M */
+                for (int64_t r = M; r < Mp; ++r)
+                    for (int64_t c = 0; c < K; ++c) npad += q1[(size_t)off(r, c)] != 0x5A;
+            for (size_t i = 0; i < s0.size(); ++i) ns += std::memcmp(&s0[i], &s1[i], 4) != 0;
+            for (size_t i = 0; i < y0.size(); ++i) ny += y0[i] != y1[i];
+            ok(nm, nq == 0 && ns == 0 && ny == 0 && npad == 0,
+               "codes differ " + std::to_string(nq) + ", scales " + std::to_string(ns) +
+               ", bf16 " + std::to_string(ny) + ", pad bytes touched " + std::to_string(npad));
+        }
+    }
+}
+
 /* THE MXFP4 GEMMS AGAINST WHAT THE PLANES MEAN. The weight is an OCP-MXFP4 plane pair -- e2m1
  * codes and an E8M0 exponent per 32 K -- stored through the row's own hooks, so the fragment
  * order, the [K/32][N] exponents and the per-row reference all come from r4d_layout.cpp and the
@@ -3381,14 +3473,31 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
         }
     }
     std::vector<uint16_t> hy((size_t)(M * N), 0);
-    void* d_a = dalloc(ha.size());
+    /* `afrag` (the A-fragment-tiled kernel, gemm_mxfp4a8_atiled): when M >= afrag the activation is
+     * uploaded in the fragment-tiled layout -- whole 16-row tiles, the pad rows filled with the
+     * e4m3 NaN 0x7F to show that rows past M never reach a kept output -- and the same row is then
+     * launched again WITHOUT afrag on the row-major plane; the two bf16 outputs must be bit-identical
+     * (the atiled kernel is a re-arrangement of where A is read from, not of the arithmetic). */
+    int64_t afrag = 0;
+    for (const RadParam& p : extra) if (!std::strcmp(p.key, "afrag")) afrag = p.ival;
+    const bool frag = afrag > 0 && M >= afrag;
+    std::vector<uint8_t> hat;
+    if (frag) {
+        hat.assign((size_t)((M + 15) / 16 * 16 * K), 0x7F);
+        for (int64_t r = 0; r < M; ++r)
+            for (int64_t c = 0; c < K; ++c)
+                hat[(size_t)(((r >> 4) * (K >> 4) + (c >> 4)) * 256 + (((c >> 3) & 1) * 16 + (r & 15)) * 8 + (c & 7))] =
+                    ha[(size_t)(r * K + c)];
+    }
+    const std::vector<uint8_t>& up = frag ? hat : ha;
+    void* d_a = dalloc(up.size());
     void* d_s = dalloc(as.size() * 4);
     void* d_w = dalloc(wq.size());
     void* d_e = dalloc(ws.size());
     void* d_r = dalloc(wr.size());
     void* d_y = dalloc(hy.size() * 2);
     if (!d_a || !d_s || !d_w || !d_e || !d_r || !d_y) { ok(nm, false, "hipMalloc failed"); return; }
-    st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_a, up.data(), up.size(), hipMemcpyHostToDevice);
     st_memcpy(d_s, as.data(), as.size() * 4, hipMemcpyHostToDevice);
     st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
     st_memcpy(d_e, ws.data(), ws.size(), hipMemcpyHostToDevice);
@@ -3446,9 +3555,38 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
             worst = std::max(worst, std::fabs(d) / (std::fabs(acc) + 1e-3));
         }
     const double rel = den > 0 ? std::sqrt(num / den) : std::sqrt(num);
-    char d[96];
+    char d[128];
     std::snprintf(d, sizeof d, "rel_l2 %.3e, worst %.3e", rel, worst);
-    ok(nm, rel < 1e-2, d);
+    bool good = rel < 1e-2;
+    std::string note = d;
+    if (frag) {
+        void* d_a2 = dalloc(ha.size());
+        void* d_y2 = dalloc(hy.size() * 2);
+        if (!d_a2 || !d_y2) { ok(nm, false, "hipMalloc failed"); return; }
+        st_memcpy(d_a2, ha.data(), ha.size(), hipMemcpyHostToDevice);
+        std::vector<RadTensor> ts2 = ts;
+        ts2[0] = T(d_a2, RAD_F8E4M3, { M, K });
+        ts2[4] = T(d_y2, RAD_BF16, { M, N });
+        std::vector<RadParam> ps2;
+        for (const RadParam& p : ps) if (std::strcmp(p.key, "afrag")) ps2.push_back(p);
+        RadArgs a2;
+        std::memset(&a2, 0, sizeof(a2));
+        a2.t = ts2.data(); a2.n_t = (int)ts2.size();
+        a2.p = ps2.data(); a2.n_p = (int)ps2.size();
+        a2.world_size = 1;
+        const int rc2 = r->launch(&a2, (RadStream) nullptr);
+        if (rc2 != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+            ok(nm, false, "staged-kernel run rc=" + std::to_string(rc2));
+            return;
+        }
+        std::vector<uint16_t> hy2(hy.size());
+        st_memcpy(hy2.data(), d_y2, hy2.size() * 2, hipMemcpyDeviceToHost);
+        size_t nd = 0;
+        for (size_t i = 0; i < hy.size(); ++i) nd += hy[i] != hy2[i];
+        good = good && nd == 0;
+        note += ", vs staged tiled: " + std::to_string(nd) + " bf16 differ";
+    }
+    ok(nm, good, note);
 }
 
 
@@ -11040,6 +11178,19 @@ static void device_phase(const Plugin& pl) {
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 640, 2);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 400, 640, 4);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 2100, 512, 2560, 0);
+        /* THE A-FRAGMENT-TILED KERNEL (afrag = T; gemm_mxfp4a8_atiled), each case also launched on
+         * the row-major plane without afrag and required bit-identical: TN 2 at K = 576 (64-deep
+         * slab, K % 128 != 0) and at 640 / 2560 (128-deep slab), TN 4, ragged M and N, the per-row and
+         * the (row, 128) activation grids, and an issue below T that must take the staged kernel. */
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 576, 2, false, { PI("afrag", 65) });
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 640, 2, false, { PI("afrag", 65) });
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 40, 272, 640, 2, false, { PI("afrag", 65) });
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 400, 640, 4, false, { PI("afrag", 65) });
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 2100, 512, 2560, 0, false, { PI("afrag", 513) });
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 640, 2, true, { PI("afrag", 65) });
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 2560, 2, true, { PI("afrag", 65) });
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 2100, 512, 2560, 0, true, { PI("afrag", 513) });
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 400, 640, 4, true, { PI("afrag", 513) });
         /* ...and against the fp8 family's (row, 128) activation grid, which is what an architecture
          * feeds them. K = 640 is five blocks and 2560 twenty, so every split-K segment of the
          * skinny row and every slab pair of the tiled one crosses block boundaries. */
@@ -11556,6 +11707,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("rmsnorm_quant_fp8") || sel("gated_quant_fp8") || sel("gate_quant_fp8")) {
         if (!g_case) std::printf("\nthe fp8 fusions, against the pair each one replaces\n");
         fused_quant_fp8_numeric(pl);
+        mxfp4_afrag_producers_numeric(pl);
     }
 
     /* The MTP head's fc is K=10240; the DFlash2 drafter's is 25600, the largest K any shape in

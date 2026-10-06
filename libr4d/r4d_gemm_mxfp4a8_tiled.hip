@@ -315,6 +315,295 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
       }
 }
 
+// ================================================================= the A-FRAGMENT-TILED variant
+// r4d_gemm_mxfp4a8_atiled_kernel: the same tile, W staging, fold and epilogue as the kernel above,
+// but the activation arrives in WMMA-FRAGMENT-TILED layout and goes straight from global memory
+// into the registers the WMMA reads.  There is no sA, no A staging and no A fragment ds_read: only
+// W goes through LDS (9 KB at TN=4), so three blocks fit a CU where the staged kernel fits two.
+//
+// Ported from SlyBase/vllm-sly-radiance (radiance_mxfp4_fp8_gemm_atiled, which is built on the
+// ggz14 / StillDeadcode fragment-tiled kernel), where it measured +11-16 % prefill over the folded
+// kernel this file's staged one is the sibling of.  What changed on the way in:
+//   - only the fragment-order weight is kept (as in the staged kernel), no E6 arm, no merged-linear
+//     partition select;
+//   - the folded-magnitude table is THIS FILE's kMxtMag, copied into LDS once per block;
+//   - the (row, 128 of K) activation grid (ABLK) is carried exactly as in the staged kernel: the
+//     per-row ratio is computed into LDS at each 128 boundary and applied to the accumulators, so
+//     the two kernels agree bit for bit.  vLLM's kernel had no such grid (per-row scale only).
+//
+// A LAYOUT, produced by r4d_rmsnorm_quant_fp8 / r4d_gated_quant_fp8 when the op carries `afrag`
+// and M >= afrag.  Each 16 (m) x 16 (k) fp8 fragment is 256 contiguous bytes in lane order:
+//     byte  ((mt * (K/16) + ks) * 256) + lane * 8 + j  =  A[mt*16 + lane%16][ks*16 + (lane/16)*8 + j]
+// so one global_load_b64 per lane per fragment lands in the register the WMMA reads.  The storage
+// is whole 16-row tiles; the rows past M in the last tile are never written and only reach
+// accumulators the epilogue drops (WMMA rows are independent), so a NaN there is harmless.
+//
+// Codegen notes carried over from the source (all measured there, bit-identical each):
+//   - the fragment bases are SGPRs (readfirstlane on the tile offset) with an UNSIGNED 32-bit lane
+//     offset, so the loads take the SADDR form and issue as one s_clause;
+//   - the magnitude table is read from LDS: a global load for it is a dependent load issued behind
+//     the A fragments, and loadcnt is in order;
+//   - the barriers fence LDS only.  __syncthreads() is a workgroup-scope acquire/release on every
+//     address space (a global_inv and a full loadcnt drain, twice per slab), and nothing in global
+//     memory is shared between waves here.
+// LBK, K per slab: with no A tile a 128-deep W slab is affordable at TN=2 and halves the barriers
+// there (measured +2-4 %); at TN=4 it costs registers (occupancy 5) and loses, so TN=4 stays at 64.
+static __device__ __forceinline__ void mxt_lds_barrier() {
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+  __builtin_amdgcn_s_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
+template <int TN, bool ABLK, int LBK>
+__global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_atiled_kernel(
+    const unsigned char* __restrict__ AT, const float* __restrict__ As,
+    const unsigned char* __restrict__ W, const unsigned char* __restrict__ Ws,
+    const unsigned char* __restrict__ Wref, __hip_bfloat16* __restrict__ C,
+    int M, int K, int N, int as_rs) {
+  constexpr int TM = R4D_MXT_TM, WN = R4D_MXT_WN, BK = R4D_MXT_BK;
+  constexpr int NTHREADS = R4D_MXT_NTHR, BMF = R4D_MXT_BMF;
+  constexpr int NS = LBK / 16;
+  constexpr int LWSTR = LBK + R4D_MXT_PAD;
+  constexpr int BNF = WN * TN * 16;
+  static_assert(LBK % BK == 0, "slab is a multiple of the K unit");
+  static_assert(!ABLK || BMF == NTHREADS, "ABLK: one ratio row per thread");
+  __shared__ unsigned char sW[BNF * LWSTR];
+  __shared__ unsigned int sMag[32];             // kMxtMag, 128 B: a ds_load keeps it off loadcnt
+  __shared__ float sR[ABLK ? BMF : 1];
+
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int wm = wave / WN, wn = wave % WN;
+  const int col = lane & 15, kb8 = (lane >> 4) * 8;
+  const int m0 = blockIdx.y * BMF, n0 = blockIdx.x * BNF;
+  const int ksteps_g = K / 16;
+  const int Mt = (M + 15) >> 4;
+
+  if (tid < 32) sMag[tid] = ((const unsigned int*)kMxtMag)[tid];
+  mxt_lds_barrier();
+
+  // One A tile base per M fragment: wave-uniform, forced into SGPRs.  Tile-granular clamp, never
+  // predicate: rows of a clamped tile only reach accumulators the epilogue drops.
+  const unsigned char* abase[TM];
+#pragma unroll
+  for (int i = 0; i < TM; ++i) {
+    int mt = (m0 >> 4) + wm * TM + i;
+    mt = mt < Mt - 1 ? mt : Mt - 1;
+    abase[i] = AT + (size_t)__builtin_amdgcn_readfirstlane(mt * ksteps_g * 256);
+  }
+  const unsigned int aoff = lane * 8;
+
+  // W staging geometry, hoisted: see the staged kernel for the slot arithmetic.
+  constexpr int KSTEPS_T = LBK / 16, NTILES_T = BNF / 16;
+  constexpr int TOT_SLOTS = NTILES_T * KSTEPS_T * 32;
+  constexpr int WSLOTS = (TOT_SLOTS >= NTHREADS * 4) ? 4 : 2;
+  constexpr int NW = TOT_SLOTS / (NTHREADS * WSLOTS);
+  static_assert(NW * NTHREADS * WSLOTS == TOT_SLOTS, "W slot groups must tile the block");
+  int wrow[NW], wcol[NW], wrc[NW], wkst[NW], wlanec[NW];
+#pragma unroll
+  for (int it = 0; it < NW; ++it) {
+    const int sl = it * NTHREADS * WSLOTS + tid * WSLOTS;
+    const int lane_ = sl & 31, rest = sl >> 5;
+    const int kst = rest % KSTEPS_T, ntl = rest / KSTEPS_T;
+    wrow[it] = ntl * 16 + (lane_ & 15);
+    wcol[it] = kst * 16 + (lane_ >> 4) * 8;
+    const int gn = n0 + wrow[it];
+    wrc[it] = gn < N - WSLOTS ? gn : N - WSLOTS;
+    wlanec[it] = (lane_ & 16) | (wrc[it] & 15);
+    wkst[it] = kst;
+  }
+  unsigned int wref[NW];   // WSLOTS per-row reference exponents, packed
+#pragma unroll
+  for (int it = 0; it < NW; ++it) {
+    if constexpr (WSLOTS == 4) wref[it] = *(const unsigned int*)(Wref + wrc[it]);
+    else                       wref[it] = *(const unsigned short*)(Wref + wrc[it]);
+  }
+
+  v8f acc[TM][TN];
+#pragma unroll
+  for (int i = 0; i < TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j) acc[i][j] = (v8f)(0.f);
+
+  // ABLK: the scale row m's accumulator is carried in after block kb (see the staged kernel).
+  auto carried = [&](int m, int kb) -> float {
+    const float* __restrict__ row = As + (size_t)m * as_rs;
+    for (int j = kb; j >= 0; --j) {
+      const float s = row[j];
+      if (s > 0.f) return s;
+    }
+    return 1.f;
+  };
+
+  const unsigned int* __restrict__ Wp = (const unsigned int*)W;
+  for (int k0 = 0; k0 < K; k0 += LBK) {
+    if constexpr (ABLK) {
+      // LBK divides 128 or is 128, so a 128 boundary is always a slab start.
+      if (k0 && (k0 & 127) == 0) {
+        const int kb = k0 >> 7;
+        const int m = m0 + tid < M ? m0 + tid : M - 1;
+        const float s = As[(size_t)m * as_rs + kb];
+        sR[tid] = s > 0.f ? carried(m, kb - 1) / s : 1.f;
+      }
+    }
+    // A fragments straight from global: one SADDR clause, consumed only at the WMMAs.
+    mxt_v2i af[TM][NS];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+      for (int st = 0; st < NS; ++st)
+        af[i][st] = *(const mxt_v2i*)(abase[i] + (aoff + (unsigned int)(k0 * 16) + (unsigned int)(st * 256)));
+
+    // ---- W tile -> LDS, folded to e4m3 (kMxtMag[d] through v_perm, as the staged kernel does)
+    mxt_u4 pk[NW];
+    unsigned int wsv[NW];
+    const int kstep0 = k0 / 16;
+#pragma unroll
+    for (int it = 0; it < NW; ++it) {
+      const unsigned int* src = &Wp[((size_t)(wrc[it] >> 4) * ksteps_g + kstep0 + wkst[it]) * 32 + wlanec[it]];
+      if constexpr (WSLOTS == 4) pk[it] = *(const mxt_u4*)src;
+      else { const mxt_u2 v = *(const mxt_u2*)src; pk[it] = mxt_u4{v[0], v[1], 0u, 0u}; }
+      const int blk = (k0 + wkst[it] * 16) / R4D_MXT_GROUP;
+      if constexpr (WSLOTS == 4) wsv[it] = *(const unsigned int*)(Ws + (size_t)blk * N + wrc[it]);
+      else                       wsv[it] = *(const unsigned short*)(Ws + (size_t)blk * N + wrc[it]);
+    }
+#pragma unroll
+    for (int it = 0; it < NW; ++it)
+#pragma unroll
+      for (int q = 0; q < WSLOTS; ++q) {
+        int d = (int)((wref[it] >> (8 * q)) & 0xFF) - (int)((wsv[it] >> (8 * q)) & 0xFF);
+        d = d < 0 ? 0 : (d > 15 ? 15 : d);
+        const mxt_u2 t = *(const mxt_u2*)&sMag[d * 2];
+        const unsigned int wq = pk[it][q];
+        const unsigned int ev = wq & 0x0F0F0F0Fu;
+        const unsigned int od = (wq >> 4) & 0x0F0F0F0Fu;
+        const unsigned int be = __builtin_amdgcn_perm(t[1], t[0], ev & 0x07070707u)
+                              | ((ev & 0x08080808u) << 4);
+        const unsigned int bo = __builtin_amdgcn_perm(t[1], t[0], od & 0x07070707u)
+                              | ((od & 0x08080808u) << 4);
+        *(mxt_u2*)(&sW[(wrow[it] + q) * LWSTR + wcol[it]]) =
+            mxt_u2{__builtin_amdgcn_perm(bo, be, 0x05010400u),
+                   __builtin_amdgcn_perm(bo, be, 0x07030602u)};
+      }
+    mxt_lds_barrier();
+
+    if constexpr (ABLK) {
+      if (k0 && (k0 & 127) == 0) {
+#pragma unroll
+        for (int i = 0; i < TM; ++i) {
+          float r[8];
+#pragma unroll
+          for (int e = 0; e < 8; ++e) r[e] = sR[wm * TM * 16 + i * 16 + kb8 + e];
+#pragma unroll
+          for (int j = 0; j < TN; ++j)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc[i][j][e] *= r[e];
+          __builtin_amdgcn_sched_barrier(0);
+        }
+      }
+    }
+
+#pragma unroll
+    for (int step = 0; step < NS; ++step) {
+      const int kk = step * 16 + kb8;
+      mxt_v2i wf[TN];
+#pragma unroll
+      for (int j = 0; j < TN; ++j) {
+        const unsigned char* p = &sW[(wn * TN * 16 + j * 16 + col) * LWSTR + kk];
+        wf[j][0] = *(const int*)p; wf[j][1] = *(const int*)(p + 4);
+      }
+      __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+      for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+          acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i][step], wf[j], acc[i][j]);
+    }
+    mxt_lds_barrier();
+  }
+
+  if constexpr (ABLK) {
+    const int m = m0 + tid < M ? m0 + tid : M - 1;
+    sR[tid] = carried(m, (K - 1) >> 7);
+    mxt_lds_barrier();
+  }
+  // Epilogue: identical to the staged kernel's (bit-identical by construction).
+  float rf[TN];
+#pragma unroll
+  for (int j = 0; j < TN; ++j) {
+    const int n = n0 + wn * TN * 16 + j * 16 + col;
+    rf[j] = (n < N) ? __int_as_float((int)Wref[n] << 23) : 0.f;
+  }
+  {
+    __hip_bfloat16* __restrict__ Cb = C + (size_t)(m0 + wm * TM * 16) * N;
+    const float* __restrict__ Asb = As + m0 + wm * TM * 16;
+    const bool full = (m0 + wm * TM * 16 + (TM - 1) * 16 + kb8 + 7 < M) &&
+                      (n0 + wn * TN * 16 + (TN - 1) * 16 + col < N);
+    if (full) {
+#pragma unroll
+      for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            const int r = i * 16 + kb8 + e;
+            const int n = n0 + wn * TN * 16 + j * 16 + col;
+            Cb[r * N + n] = (__hip_bfloat16)(acc[i][j][e] * rf[j] *
+                                             (ABLK ? sR[wm * TM * 16 + r] : Asb[r]));
+          }
+      return;
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int m = m0 + wm * TM * 16 + i * 16 + kb8 + e;
+        const int n = n0 + wn * TN * 16 + j * 16 + col;
+        if (m < M && n < N)
+          C[(size_t)m * N + n] =
+              (__hip_bfloat16)(acc[i][j][e] * rf[j] *
+                               (ABLK ? sR[wm * TM * 16 + i * 16 + kb8 + e] : As[m]));
+      }
+}
+
+// Same operands and checks as r4d_gemm_mxfp4a8_tiled, with `a` in the fragment-tiled layout above
+// (whole 16-row tiles; a pointer 16-byte aligned).  TN 0 = the same M rule as the staged kernel.
+extern "C" void r4d_gemm_mxfp4a8_atiled(long a, long ascale, long wq, long ws, long wref, long c,
+                                        int M, int K, int N, int TN, int as_group, int as_rs,
+                                        long stream) {
+  if (M < 1) throw std::runtime_error("r4d gemm_mxfp4a8_atiled: M must be >= 1");
+  if (N < 16 || N % 16) throw std::runtime_error("r4d gemm_mxfp4a8_atiled: N must be a multiple of 16");
+  if (K < R4D_MXT_BK || K % R4D_MXT_BK)
+    throw std::runtime_error("r4d gemm_mxfp4a8_atiled: K must be a multiple of 64");
+  if (TN == 0) TN = M >= R4D_MXT_TN4_MIN_M ? 4 : 2;
+  if (TN != 2 && TN != 4) throw std::runtime_error("r4d gemm_mxfp4a8_atiled: TN must be 2 or 4");
+  if (as_group != 0 && as_group != 128)
+    throw std::runtime_error("r4d gemm_mxfp4a8_atiled: the activation scale is per row or per 128 of K");
+  const bool ablk = as_group == 128;
+  if (ablk && as_rs < (K + 127) / 128)
+    throw std::runtime_error("r4d gemm_mxfp4a8_atiled: activation scale rows shorter than ceil(K/128)");
+  const int bnf = R4D_MXT_WN * TN * 16;
+  dim3 grid((N + bnf - 1) / bnf, (M + R4D_MXT_BMF - 1) / R4D_MXT_BMF), block(R4D_MXT_NTHR);
+  auto Ap = (const unsigned char*)a;
+  auto Sp = (const float*)ascale;
+  auto Wp = (const unsigned char*)wq;
+  auto Zp = (const unsigned char*)ws;
+  auto Rp = (const unsigned char*)wref;
+  auto Cp = (__hip_bfloat16*)c;
+  hipStream_t st = (hipStream_t)stream;
+  // TN=2 takes a 128-deep slab when K allows; TN=4 stays at 64 (see the note above the kernel).
+  const bool l128 = TN == 2 && K % 128 == 0;
+#define MXT_ALAUNCH(TNv, ABv, LBv) hipLaunchKernelGGL((r4d_gemm_mxfp4a8_atiled_kernel<TNv, ABv, LBv>), \
+                                        grid, block, 0, st, Ap, Sp, Wp, Zp, Rp, Cp, M, K, N, as_rs)
+  if (TN == 4) { if (ablk) MXT_ALAUNCH(4, true, 64); else MXT_ALAUNCH(4, false, 64); }
+  else if (l128) { if (ablk) MXT_ALAUNCH(2, true, 128); else MXT_ALAUNCH(2, false, 128); }
+  else           { if (ablk) MXT_ALAUNCH(2, true, 64);  else MXT_ALAUNCH(2, false, 64); }
+#undef MXT_ALAUNCH
+}
+
+
 extern "C" int r4d_gemm_mxfp4a8_tiled_group(void) { return R4D_MXT_GROUP; }
 extern "C" int r4d_gemm_mxfp4a8_tiled_k_unit(void) { return R4D_MXT_BK; }
 
@@ -364,6 +653,20 @@ extern "C" int r4d_rad_gemm_mxfp4a8_tiled(const RadArgs* a, RadStream s) {
     if (rc != RAD_OK) return rc;
     R4dMxTileCfg t;
     r4d_cfg_mxfp4_tiled(a, &t);
+    /* `afrag` = T > 0 is the ARCHITECTURE'S statement that its producers write this op's A in the
+     * fragment-tiled layout whenever M >= T (rad_fp8.h ActFP8::frag), the same T they carry. The
+     * decision is a function of the issue's M alone, so a producer and its consumers agree without
+     * any state between them. Absent (every op today) it is the row-major kernel below. */
+    const long long afrag = r4d_geti_or(a, "afrag", 0);
+    if (afrag > 0 && g.M >= afrag) {
+        if (afrag <= 64) return R4D_NO(RAD_E_INVAL);   /* the skinny/decode rows own M <= 64 */
+        R4D_TRY("gemm_mxfp4a8_atiled",
+            r4d_gemm_mxfp4a8_atiled(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b),
+                                    r4d_addr(g.bscale), r4d_addr(g.bref), r4d_addr(g.y),
+                                    (int)g.M, (int)g.K, (int)g.N, t.tn, as_group, as_rs,
+                                    (long)(uintptr_t)s));
+        return RAD_OK;
+    }
     R4D_TRY("gemm_mxfp4a8_tiled",
         r4d_gemm_mxfp4a8_tiled(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b),
                                r4d_addr(g.bscale), r4d_addr(g.bref), r4d_addr(g.y),

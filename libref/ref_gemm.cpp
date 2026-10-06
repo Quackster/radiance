@@ -262,7 +262,25 @@ static int gemm_ntq_impl(const RadArgs* a, bool bias_operand) {
     const int64_t gp = p_int(a, "group", 0);
     if (gp > 0 && SB.p && SB.group != gp) return RAD_E_SHAPE;
 
-    const Mat ma = as_mat(A, M, K), mb = as_mat(B, N, K);
+    /* A FRAGMENT-TILED A (see afrag_off): gathered back to row-major, so the arithmetic below is
+     * the one every other layout gets. */
+    const int64_t afrag = p_int(a, "afrag", 0);
+    std::vector<uint8_t> a_rm;
+    RadTensor A_rm;
+    const RadTensor* Au = A;
+    if (afrag > 0 && M >= afrag && A->dtype == RAD_F8E4M3 && K % 16 == 0) {
+        const uint8_t* src = (const uint8_t*)A->data;
+        a_rm.resize((size_t)(M * K));
+        for (int64_t r = 0; r < M; ++r)
+            for (int64_t c = 0; c < K; ++c) a_rm[(size_t)(r * K + c)] = src[afrag_off(r, c, K)];
+        A_rm = *A;
+        A_rm.data = a_rm.data();
+        A_rm.rank = 2;
+        A_rm.shape[0] = M;  A_rm.shape[1] = K;
+        A_rm.stride[0] = K; A_rm.stride[1] = 1;
+        Au = &A_rm;
+    }
+    const Mat ma = as_mat(Au, M, K), mb = as_mat(B, N, K);
     QuantFn fn = pick_quant(A->dtype, B->dtype);
     if (fn) fn(ma, mb, SA, SB, Y, bias, M, N, K, 1.0f);
     else    gemm_quant_generic(ma, mb, SA, SB, Y, bias, M, N, K, 1.0f);

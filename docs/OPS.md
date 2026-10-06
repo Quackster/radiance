@@ -305,9 +305,21 @@ spelling of `act`, not the vocabulary's.
 |---|---|---|
 | `quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
 | `had_quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
-| `rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
-| `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
+| `rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt `afrag`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
+| `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt `afrag`/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gemm_nt_q_gated` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `out_bf16`? |
+
+`afrag` (optional int, default 0 = off) is a LAYOUT statement about the E4M3 activation plane `q`, carried
+by the two producers above and by the `mxfp4a8` `gemm_nt_q` that reads it: when the issue's own `M` is
+at least `afrag`, `q` is stored as 16 (row) x 16 (k) WMMA fragments of 256 contiguous bytes instead of
+row-major, whole 16-row tiles, so the GEMM loads each fragment straight into its registers with no
+LDS staging of A (`gemm_mxfp4a8_atiled`, libr4d). Byte `((r/16)*(K/16) + c/16)*256 +
+(((c/8)%2)*16 + r%16)*8 + c%8` holds `q[r][c]`; the pad rows of the last tile are unwritten. The values
+are identical in both layouts, the `scale` plane is unchanged, and libref implements the permutation
+so the oracle compares like with like. Producer and consumer decide from the same `M` and the same
+`afrag`, so nothing travels between them; `afrag` must exceed 64 (the skinny and decode rows own
+`M <= 64`). An architecture sets it only on an activation whose every reader is an MXFP4 linear
+(`ActFP8::frag`, enabled by `RADIANCE_MXFP4_ATILED_MIN_M`); absent, every op is what it was.
 
 ### The int8 and gated fp8 fusions — device-only
 
@@ -353,7 +365,7 @@ waiting on the mover's event — a read of weight bytes that may not have arrive
 |---|---|---|
 | `gemm_nt` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
-| `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
+| `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `afrag`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
 
 `nt` is A row-major `[M,K]` times B **transposed** `[N,K]`, giving `[M,N]` — the layout every

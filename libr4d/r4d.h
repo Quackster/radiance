@@ -571,6 +571,12 @@ int  r4d_gemm_mxfp4a8_nt_m64_group(void);
 void r4d_gemm_mxfp4a8_tiled(long a, long ascale, long wq, long ws, long wref, long c,
                             int M, int K, int N, int TN, int as_group, int as_rs, long stream);
 int  r4d_gemm_mxfp4a8_tiled_group(void);
+// The same GEMM with A in WMMA-FRAGMENT-TILED layout (a global_load_b64 a fragment straight into the
+// WMMA register, no A staging through LDS): byte ((mt*(K/16) + ks)*256) + lane*8 + j holds
+// A[mt*16 + lane%16][ks*16 + (lane/16)*8 + j]; storage is whole 16-row tiles. Ported from
+// SlyBase/vllm-sly-radiance's radiance_mxfp4_fp8_gemm_atiled. Bit-identical to the staged kernel.
+void r4d_gemm_mxfp4a8_atiled(long a, long ascale, long wq, long ws, long wref, long c,
+                             int M, int K, int N, int TN, int as_group, int as_rs, long stream);
 // The same operands for the DECODE band (M <= 64): split-K across workgroups with a fused
 // last-arriver reduction and a persistent partial a (device, stream). KS/BK 0 = the measured rule.
 void r4d_gemm_mxfp4a8_decode(long a, long ascale, long wq, long ws, long wref, long c,
@@ -733,6 +739,14 @@ int  r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, long s, int
                            int q_ld, int s_ld, long stream);
 int  r4d_gated_quant_fp8(long gu, long y, long q, long s, int M, int n, int mode,
                          int gu_ld, int y_ld, int q_ld, int s_ld, long stream);
+// The two producers with `tiled` != 0 write q in the FRAGMENT-TILED layout r4d_gemm_mxfp4a8_atiled
+// reads (see r4d_gemm_mxfp4a8_tiled.hip): q is the whole buffer, whole 16-row tiles, n % 16 == 0,
+// q_ld ignored, the pad rows of the last tile unwritten. 0 is exactly the calls above.
+int  r4d_rmsnorm_quant_fp8_t(long x, long res, long w, long y, long q, long s, int M, int n,
+                             float eps, float wadd, int w_f32, int x_ld, int r_ld, int y_ld,
+                             int q_ld, int s_ld, long stream, int tiled);
+int  r4d_gated_quant_fp8_t(long gu, long y, long q, long s, int M, int n, int mode,
+                           int gu_ld, int y_ld, int q_ld, int s_ld, long stream, int tiled);
 // The activation is rounded to bf16 before the product: the unfused pair is `sigmoid` then `mul`,
 // two kernels with a bf16 buffer between them, and that round trip is part of what is replaced.
 // The same epilogue with the gate in a DIFFERENT buffer from the thing it scales, which is the

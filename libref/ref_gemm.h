@@ -47,6 +47,16 @@ static inline int64_t row_stride(const RadTensor* t, int64_t cols) {
     return t->stride[t->rank - 2];      /* the shapes disagree; fall back to the row axis */
 }
 
+/* THE FRAGMENT-TILED E4M3 ACTIVATION (`afrag` on rmsnorm_quant_fp8, gated_quant_fp8 and, for
+ * mxfp4a8, gemm_nt_q): when the op's M >= afrag the codes are stored as 16 (row) x 16 (k) fragments
+ * of 256 contiguous bytes, lane l = (k half) * 16 + row, byte j of a lane = k offset j:
+ *     off(r, c) = ((r / 16) * (K / 16) + c / 16) * 256 + (((c / 8) % 2) * 16 + r % 16) * 8 + c % 8
+ * The arithmetic is unchanged; only where a code lives is. libr4d's writers and its
+ * gemm_mxfp4a8_atiled reader agree on this formula (r4d_fused_quant_fp8.hip, quant_group). */
+static inline int64_t afrag_off(int64_t r, int64_t c, int64_t K) {
+    return ((r >> 4) * (K >> 4) + (c >> 4)) * 256 + (((c >> 3) & 1) * 16 + (r & 15)) * 8 + (c & 7);
+}
+
 /* The element offset of row `r` of a [rows, cols] operand, and the stride along cols. Weights
  * arrive contiguous from the mapper; activations may be a slice of a wider arena buffer, so both
  * are read through their strides. */

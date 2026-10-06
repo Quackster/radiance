@@ -102,10 +102,19 @@ __device__ __forceinline__ float block_sum(float v, float* lds) {
 //
 // I8 writes int8 codes at amax / 127 instead (r4d_q8.h), the codes quant_act_i8g would take over
 // the same bf16 values: an int8 linear reads them where an fp8 one reads the E4M3 pair.
+//
+// QT (`qt` at run time, uniform per launch) selects the FRAGMENT-TILED store gemm_mxfp4a8_atiled
+// reads (r4d_gemm_mxfp4a8_tiled.hip): `q` is then the buffer BASE rather than the row's, and the
+// lane's four codes land at
+//     ((row/16) * (n/16) + c0/16) * 256 + ((c0/8)%2 * 16 + row%16) * 8 + c0%8
+// -- 16-row x 16-column fragments of 256 contiguous bytes, lane l = (k half) * 16 + row. n is a
+// multiple of 16 (the launchers refuse it otherwise) so a lane's four columns share a fragment, and
+// c0 is a multiple of 4 so the dword store stays aligned. Pad rows of the last tile are not written.
 template <bool I8 = false>
 __device__ __forceinline__ void quant_group(const float v[4], float* __restrict__ s,
                                             uint8_t* __restrict__ q, size_t s_at, uint32_t c0,
-                                            uint32_t n, uint32_t lane) {
+                                            uint32_t n, uint32_t lane, uint32_t qt = 0,
+                                            uint32_t row = 0) {
     float m = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
     m = wave_max(m);
     const float sc = m > 0.0f ? m * (1.0f / q8_top<I8>()) : 1.0f;
@@ -114,7 +123,15 @@ __device__ __forceinline__ void quant_group(const float v[4], float* __restrict_
     const uint32_t pk = q8_pack4<I8>(v[0], v[1], v[2], v[3], inv);
     // A ragged last group is written zero-padded rather than partially, exactly as
     // r4d_quant_act_fp8 does, and the caller owns `n` rounded up to 4 bytes of `q`.
-    if (c0 < n) *(uint32_t*)(q + c0) = pk;
+    if (c0 < n) {
+        if (qt) {
+            const uint32_t off = ((row >> 4) * (n >> 4) + (c0 >> 4)) * 256u +
+                                 (((c0 >> 3) & 1u) * 16u + (row & 15u)) * 8u + (c0 & 7u);
+            *(uint32_t*)(q + off) = pk;
+        } else {
+            *(uint32_t*)(q + c0) = pk;
+        }
+    }
 }
 
 // Pass two, shared by every kernel in this file that ends in a block-scaled fp8 activation: give
@@ -127,7 +144,7 @@ template <bool WF32, uint32_t THR>
 __device__ __forceinline__ void norm_quant_row(
     const uint16_t* __restrict__ nr, const void* __restrict__ w, uint16_t* __restrict__ yr,
     uint8_t* __restrict__ qr, float* __restrict__ s, size_t s_row, uint32_t n, uint32_t nkb,
-    float rs, float wadd) {
+    float rs, float wadd, uint32_t qt = 0, uint32_t row = 0) {
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
     for (uint32_t kb = wave; kb < nkb; kb += THR / kWave) {
         const uint32_t c0 = kb * kGroup + lane * 4u;
@@ -153,7 +170,7 @@ __device__ __forceinline__ void norm_quant_row(
                 v[j] = bf2f(h);
             }
         }
-        quant_group(v, s, qr, s_row + kb, c0, n, lane);
+        quant_group(v, s, qr, s_row + kb, c0, n, lane, qt, row);
     }
 }
 
@@ -166,7 +183,7 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     uint16_t* __restrict__ y, uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n,
     uint32_t nkb, float eps, float wadd, uint32_t x_ld, uint32_t r_ld, uint32_t y_ld,
-    uint32_t q_ld, uint32_t s_ld) {
+    uint32_t q_ld, uint32_t s_ld, uint32_t qt) {
     __shared__ float lds[THR / kWave];
     const uint32_t row = blockIdx.x;
     const uint16_t* __restrict__ xr = x + (size_t)row * x_ld;
@@ -207,8 +224,9 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
     }
     const float rs = rsqrtf(block_sum<THR / kWave>(ss, lds) / (float)n + eps);
 
-    norm_quant_row<WF32, THR>(nr, w, y ? y + (size_t)row * y_ld : nullptr, q + (size_t)row * q_ld,
-                              s, (size_t)row * s_ld, n, nkb, rs, wadd);
+    norm_quant_row<WF32, THR>(nr, w, y ? y + (size_t)row * y_ld : nullptr,
+                              qt ? q : q + (size_t)row * q_ld,
+                              s, (size_t)row * s_ld, n, nkb, rs, wadd, qt, row);
 }
 
 // ---------------------------------------------------------------------------- gate -> quant
@@ -233,12 +251,12 @@ template <int ACT, bool ROT = false, bool I8 = false>
 __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
     const uint16_t* __restrict__ gu, uint16_t* __restrict__ y, uint8_t* __restrict__ q,
     float* __restrict__ s, uint32_t n, uint32_t nkb, uint32_t gu_ld, uint32_t y_ld,
-    uint32_t q_ld, uint32_t s_ld) {
+    uint32_t q_ld, uint32_t s_ld, uint32_t qt = 0) {
     const uint32_t row = blockIdx.x;
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
     const uint16_t* __restrict__ gr = gu + (size_t)row * gu_ld;
     uint16_t* __restrict__ yr = y ? y + (size_t)row * y_ld : nullptr;
-    uint8_t*  __restrict__ qr = q + (size_t)row * q_ld;
+    uint8_t*  __restrict__ qr = qt ? q : q + (size_t)row * q_ld;
 
     for (uint32_t kb = wave; kb < nkb; kb += blockDim.x / kWave) {
         const uint32_t c0 = kb * kGroup + lane * 4u;
@@ -264,7 +282,7 @@ __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
         // The rotated launcher refuses an n that is not a multiple of the group, so no block that
         // reaches this line mixes real values with the padding zeros above.
         if constexpr (ROT) r4d_fwht_wave<(int)kGroup>(v, (int)lane);
-        quant_group<I8>(v, s, qr, (size_t)row * s_ld + kb, c0, n, lane);
+        quant_group<I8>(v, s, qr, (size_t)row * s_ld + kb, c0, n, lane, qt, row);
     }
 }
 
@@ -660,12 +678,17 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
 //   y    [M][n]              bf16, `y_ld` elements a row (0 = n), optional
 //   q    [M][n]              E4M3, `q_ld` bytes a row (0 = n), rounded up to 4
 //   s    [M][ceil(n/128)]    f32,  `s_ld` elements a row (0 = ceil(n/128))
-extern "C" int r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, long s, int M, int n,
-                                     float eps, float wadd, int w_f32, int x_ld, int r_ld,
-                                     int y_ld, int q_ld, int s_ld, long stream) {
+//
+// `tiled` writes q in the FRAGMENT-TILED layout of gemm_mxfp4a8_atiled (see quant_group): q is the
+// buffer base, whole 16-row tiles, so n % 16 == 0 and q_ld is ignored; the pad rows of the last
+// tile are left unwritten. 0 is the row-major store every caller had before.
+extern "C" int r4d_rmsnorm_quant_fp8_t(long x, long res, long w, long y, long q, long s, int M, int n,
+                                       float eps, float wadd, int w_f32, int x_ld, int r_ld,
+                                       int y_ld, int q_ld, int s_ld, long stream, int tiled) {
     if (!x || !w || !q || !s) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (n % 4) return -3;              // a lane owns four columns; see the kernel
+    if (tiled && (n % 16 || (q & 15))) return -3;
     if (!x_ld) x_ld = n;
     if (!r_ld) r_ld = n;
     if (!y_ld) y_ld = n;
@@ -689,7 +712,7 @@ extern "C" int r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, l
                        (hipStream_t)stream, (const uint16_t*)x, (uint16_t*)res, (const void*)w,  \
                        (uint16_t*)y, (uint8_t*)q, (float*)s, (uint32_t)n, (uint32_t)nkb, eps,    \
                        wadd, (uint32_t)x_ld, (uint32_t)r_ld, (uint32_t)y_ld, (uint32_t)q_ld,     \
-                       (uint32_t)s_ld)
+                       (uint32_t)s_ld, (uint32_t)(tiled ? 1 : 0))
 #define R4D_RQ(wf, rs)                                                                          \
     do { if (thr == 1024)     R4D_RQ_T(wf, rs, 1024);                                           \
          else if (thr == 512) R4D_RQ_T(wf, rs, 512);                                            \
@@ -699,6 +722,13 @@ extern "C" int r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, l
 #undef R4D_RQ
 #undef R4D_RQ_T
     return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, long s, int M, int n,
+                                     float eps, float wadd, int w_f32, int x_ld, int r_ld,
+                                     int y_ld, int q_ld, int s_ld, long stream) {
+    return r4d_rmsnorm_quant_fp8_t(x, res, w, y, q, s, M, n, eps, wadd, w_f32, x_ld, r_ld, y_ld,
+                                   q_ld, s_ld, stream, 0);
 }
 
 // `mode` is 0 for silu (down_proj's input) and 1 for sigmoid (a gated attention o_proj's), the same
@@ -715,7 +745,7 @@ extern "C" int r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, l
 // weight block on the other side.
 static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n, int mode,
                                   int gu_ld, int y_ld, int q_ld, int s_ld, const R4dSink& sk,
-                                  bool rot, bool i8 = false) {
+                                  bool rot, bool i8 = false, bool tiled = false) {
     int emit_rc = RAD_OK;
     if (!gu || !q || !s) return -1;
     if (M <= 0 || n <= 0) return -2;
@@ -724,6 +754,8 @@ static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n,
     if (rot && (n % (int)kGroup)) return -6;
     // The rotated codes pair with a rotated four-bit expert, which reads E4M3 only.
     if (rot && i8) return -7;
+    // The fragment-tiled store is the E4M3 mxfp4 GEMM's operand; no rotated or int8 consumer reads it.
+    if (tiled && (rot || i8 || n % 16 || (q & 15))) return -8;
     if (!gu_ld) gu_ld = 2 * n;
     if (!y_ld) y_ld = n;
     if (!q_ld) q_ld = n;
@@ -737,7 +769,7 @@ static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n,
     emit_rc = R4D_EMIT(sk, (gated_quant_fp8_kernel<a, R, I>), dim3((uint32_t)M), dim3(thr), 0,  \
                        (const uint16_t*)gu, (uint16_t*)y, (uint8_t*)q,                         \
                        (float*)s, (uint32_t)n, (uint32_t)nkb, (uint32_t)gu_ld, (uint32_t)y_ld,  \
-                       (uint32_t)q_ld, (uint32_t)s_ld)
+                       (uint32_t)q_ld, (uint32_t)s_ld, (uint32_t)(tiled ? 1 : 0))
 #define R4D_GQ(a)                                                                               \
     do { if (rot) R4D_GQ_R(a, true, false);                                                     \
          else if (i8) R4D_GQ_R(a, false, true);                                                 \
@@ -754,6 +786,14 @@ extern "C" int r4d_gated_quant_fp8(long gu, long y, long q, long s, int M, int n
                                    int gu_ld, int y_ld, int q_ld, int s_ld, long stream) {
     return gated_quant_fp8_launch(gu, y, q, s, M, n, mode, gu_ld, y_ld, q_ld, s_ld,
                                   r4d_stream_sink((RadStream)(uintptr_t)stream), false);
+}
+
+extern "C" int r4d_gated_quant_fp8_t(long gu, long y, long q, long s, int M, int n, int mode,
+                                     int gu_ld, int y_ld, int q_ld, int s_ld, long stream,
+                                     int tiled) {
+    return gated_quant_fp8_launch(gu, y, q, s, M, n, mode, gu_ld, y_ld, q_ld, s_ld,
+                                  r4d_stream_sink((RadStream)(uintptr_t)stream), false, false,
+                                  tiled != 0);
 }
 
 extern "C" int r4d_gated_had_quant_fp8(long gu, long y, long q, long s, int M, int n, int mode,
@@ -920,12 +960,18 @@ extern "C" int r4d_rad_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     const long long xp = r4d_row_pitch(x), qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc);
     const long long yp = y ? r4d_row_pitch(y) : 0, rp = rs ? r4d_row_pitch(rs) : 0;
     if (xp < 0 || qp < 0 || sp < 0 || yp < 0 || rp < 0) return R4D_NO(RAD_E_STRIDE);
-    const int e = r4d_rmsnorm_quant_fp8(r4d_addr(x), rs ? r4d_addr(rs) : 0, r4d_addr(w),
+    /* `afrag` = T: the architecture's statement that this op's consumers are mxfp4 GEMMs that read
+     * A fragment-tiled whenever M >= T (see r4d_gemm_mxfp4a8_tiled.hip). M here is the issue's, the
+     * same M those GEMMs see. The tiled store needs q to be the whole [M, n] buffer, row pitch n. */
+    const long long afrag = r4d_geti_or(a, "afrag", 0);
+    const bool tiled = afrag > 0 && M >= afrag;
+    if (tiled && (afrag <= 64 || qp != K || K % 16)) return R4D_NO(RAD_E_STRIDE);
+    const int e = r4d_rmsnorm_quant_fp8_t(r4d_addr(x), rs ? r4d_addr(rs) : 0, r4d_addr(w),
                                         y ? r4d_addr(y) : 0, r4d_addr(q), r4d_addr(sc),
                                         (int)M, (int)K,
                                         (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0),
                                         w->dtype == RAD_F32, (int)xp, (int)rp, (int)yp, (int)qp,
-                                        (int)sp, (long)(uintptr_t)s);
+                                        (int)sp, (long)(uintptr_t)s, tiled ? 1 : 0);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
@@ -962,9 +1008,13 @@ static int rad_gated_quant_fp8(const RadArgs* a, const R4dSink& sk, bool rot) {
         else if (!std::strcmp(act, "sigmoid")) mode = 1;
         else return R4D_NO(RAD_E_UNSUPPORTED);
     }
+    /* `afrag`: see r4d_rad_rmsnorm_quant_fp8. */
+    const long long afrag = r4d_geti_or(a, "afrag", 0);
+    const bool tiled = afrag > 0 && M >= afrag;
+    if (tiled && (afrag <= 64 || rot || qp != K || K % 16)) return R4D_NO(RAD_E_STRIDE);
     const int e = gated_quant_fp8_launch(r4d_addr(gu), y ? r4d_addr(y) : 0, r4d_addr(q),
                                          r4d_addr(sc), (int)M, (int)K, mode, (int)gp, (int)yp,
-                                         (int)qp, (int)sp, sk, rot, q->dtype == RAD_I8);
+                                         (int)qp, (int)sp, sk, rot, q->dtype == RAD_I8, tiled);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 

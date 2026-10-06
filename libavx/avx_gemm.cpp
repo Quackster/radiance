@@ -416,6 +416,7 @@ static int gemm_nt_impl(const RadArgs* a, bool bias_operand, const char* nkey, c
 }
 
 static int gemm_ntq_impl(const RadArgs* a, bool bias_operand) {
+    if (p_int(a, "afrag", 0) > 0 && p_int(a, "M", 0) >= p_int(a, "afrag", 0)) return RAD_E_INVAL; /* afrag is a libr4d layout; this kernel is row-major */
     const int nt = bias_operand ? 6 : 5;
     if (a->n_t < nt || !a->t[0].data || !a->t[2].data || !a->t[nt - 1].data) return RAD_E_INVAL;
     const RadTensor *A = &a->t[0], *B = &a->t[2], *Y = &a->t[nt - 1];

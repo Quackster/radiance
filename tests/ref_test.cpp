@@ -1653,6 +1653,82 @@ TEST(op_gemm_nt_q_gated_is_the_pair) {
     CHECK(differs > M * nout / 4);
 }
 
+/* THE FRAGMENT-TILED E4M3 ACTIVATION (`afrag`, docs/OPS.md): the two producers write the codes as 16 x
+ * 16 fragments when M >= afrag, and gemm_nt_q reads them back. The plane is the row-major one
+ * permuted, so (a) every code sits where the formula names it and (b) the GEMM over the tiled plane
+ * is byte-identical to the GEMM over the row-major plane. M = 20 leaves four pad rows in the last
+ * tile, which the producer must not write. */
+TEST(op_afrag_layout_round_trips) {
+    const int64_t M = 20, Mp = 32, K = 128, N = 16;
+    auto off = [&](int64_t r, int64_t c) {
+        return ((r >> 4) * (K >> 4) + (c >> 4)) * 256 + (((c >> 3) & 1) * 16 + (r & 15)) * 8 + (c & 7);
+    };
+    uint32_t rs = 0x1234567u;
+    auto rnd = [&]() {
+        rs = rs * 1664525u + 1013904223u;
+        return (float)((int32_t)((rs >> 13) & 0xffu) - 128) / 32.0f;
+    };
+    T x(RAD_BF16, {M, K});
+    for (int64_t i = 0; i < M * K; ++i) st_dt(RAD_BF16, x.t.data, i, rnd());
+    T w(RAD_F32, {K});
+    for (int64_t i = 0; i < K; ++i) st_dt(RAD_F32, w.t.data, i, 0.5f + 0.01f * (float)i);
+
+    for (int which = 0; which < 2; ++which) {
+        T qr(RAD_F8E4M3, {M, K}), sr(RAD_F32, {M, 1});
+        T qt(RAD_F8E4M3, {Mp, K}), st(RAD_F32, {M, 1});
+        for (size_t i = 0; i < qt.mem.size(); ++i) qt.mem[i] = 0x5a;      /* canary */
+        if (which == 0) {
+            A a; a.t(x).tnull().t(w).t(qr).t(sr).i("M", M).i("n", K).d("eps", 1e-6).i("group", 128)
+                  .s("dtype", "bf16");
+            CHECK_OK(run("rmsnorm_quant_fp8", a));
+            A b; b.t(x).tnull().t(w).t(qt).t(st).i("M", M).i("n", K).d("eps", 1e-6).i("group", 128)
+                  .s("dtype", "bf16").i("afrag", 16);
+            CHECK_OK(run("rmsnorm_quant_fp8", b));
+        } else {
+            T gu(RAD_BF16, {M, 2 * K});
+            for (int64_t i = 0; i < M * 2 * K; ++i) st_dt(RAD_BF16, gu.t.data, i, rnd());
+            A a; a.t(gu).t(qr).t(sr).i("M", M).i("n", K).i("group", 128).s("dtype", "bf16")
+                  .s("act", "silu");
+            CHECK_OK(run("gated_quant_fp8", a));
+            A b; b.t(gu).t(qt).t(st).i("M", M).i("n", K).i("group", 128).s("dtype", "bf16")
+                  .s("act", "silu").i("afrag", 16);
+            CHECK_OK(run("gated_quant_fp8", b));
+        }
+        int64_t bad = 0, pad = 0, nz = 0;
+        for (int64_t r = 0; r < M; ++r)
+            for (int64_t c = 0; c < K; ++c) {
+                bad += qt.mem[(size_t)off(r, c)] != qr.mem[(size_t)(r * K + c)];
+                nz += qr.mem[(size_t)(r * K + c)] != 0;
+            }
+        for (int64_t r = M; r < Mp; ++r)
+            for (int64_t c = 0; c < K; ++c) pad += qt.mem[(size_t)off(r, c)] != 0x5a;
+        REQUIRE(nz > M * K / 2);
+        CHECK_EQ(bad, (int64_t)0);
+        CHECK_EQ(pad, (int64_t)0);
+    }
+
+    /* The consumer: the same GEMM over the row-major plane and over its tiled twin. */
+    T qr(RAD_F8E4M3, {M, K}), qt(RAD_F8E4M3, {Mp, K}), as(RAD_F32, {M, 1});
+    for (int64_t i = 0; i < M * K; ++i) st_dt(RAD_F8E4M3, qr.t.data, i, rnd());
+    for (size_t i = 0; i < qt.mem.size(); ++i) qt.mem[i] = 0x7f;
+    for (int64_t r = 0; r < M; ++r)
+        for (int64_t c = 0; c < K; ++c) qt.mem[(size_t)off(r, c)] = qr.mem[(size_t)(r * K + c)];
+    for (int64_t i = 0; i < M; ++i) st_dt(RAD_F32, as.t.data, i, 0.25f + 0.0625f * (float)i);
+    T b_(RAD_F8E4M3, {N, K}), bs(RAD_BF16, {1, 1});
+    for (int64_t i = 0; i < N * K; ++i) st_dt(RAD_F8E4M3, b_.t.data, i, rnd());
+    st_dt(RAD_BF16, bs.t.data, 0, 0.5f);
+    T y1(RAD_BF16, {M, N}), y2(RAD_BF16, {M, N});
+    A g1; g1.t(qr).t(as).t(b_).t(bs).t(y1).i("M", M).i("N", N).i("K", K).i("group", 128)
+            .s("dtype", "fp8a8");
+    CHECK_OK(run("gemm_nt_q", g1));
+    A g2; g2.t(qt).t(as).t(b_).t(bs).t(y2).i("M", M).i("N", N).i("K", K).i("group", 128)
+            .s("dtype", "fp8a8").i("afrag", 16);
+    CHECK_OK(run("gemm_nt_q", g2));
+    int64_t diff = 0;
+    for (size_t i = 0; i < y1.mem.size(); ++i) diff += y1.mem[i] != y2.mem[i];
+    CHECK_EQ(diff, (int64_t)0);
+}
+
 TEST(op_vocab_edges) {
     T wte(RAD_F32, {3, 2}); wte.f({1, 2, 3, 4, 5, 6});
     T tok(RAD_I32, {3});    tok.n({2, 0, -1});
