@@ -76,6 +76,10 @@ private:
      * shared BY POINTER rather than broadcast (spec §1). */
     struct Rank;
     std::vector<std::unique_ptr<Rank>> ranks_;
+    /* Each rank's pool budgets: cfg_'s, except where a rank's cache costs less than its peers'
+     * and its KV pool is sized for the same tokens with the difference in its weights (see the
+     * resolve in Engine::plan). */
+    std::vector<Config> rank_cfg_;
     /* THE DISK HALF OF THE IDLE TIERS. One store for the engine, not one per rank: it is
      * keyed by a chained hash of TOKENS, which every rank computes identically, and a
      * per-rank store would write the same key several times over. Off unless
