@@ -1,0 +1,40 @@
+# q38-27b-mxfp4.recipe -- a Qwen3.8-27B OCP-MXFP4 release (compressed-tensors `mxfp4-pack-quantized`,
+# e.g. llm-compressor GPTQ) as the q38-27b-mxfp4.rad container serves it through qwen35_mxfp4.
+#
+#   rad-convert <Swift-1.5-Qwen3.8-27b-heretic MXFP4A16 checkpoint, see q38-27b-mxfp4.recipe> --recipe data/recipes/q38-27b-mxfp4.recipe -o q38-27b-mxfp4.rad
+#
+# SOURCES. Trunk: akumaburn/Swift-1.5-Qwen3.8-27b-heretic (Hugging Face), quantised with llm-compressor
+# to OCP MXFP4 weights, 16-bit activations (scheme MXFP4A16, served here at W4A8):
+#
+#   GPTQModifier(targets="Linear", scheme="MXFP4A16", actorder="static",
+#                ignore=["lm_head", "re:.*visual.*", "re:.*mtp.*"])
+#   89 calibration samples, sequence length 2048
+#
+# DFlash2 drafter (the recipes with a --draft-model line): incoai/Qwen3.8-27B-DFlash2.
+# The finished container of the recommended recipe (q38-27b-mxfp4-df2h4l4ames) is published as
+# slybase/Swift-1.5-Qwen3.8-27b-heretic-MXFP4-DFlash2-radiance (Hugging Face; private for now).
+#
+# Every trunk linear the release quantised is COPIED: its e2m1 codes and E8M0 exponents are already
+# the planes of fp4_e2m1*e8m0[1x32] (core/format/checkpoint.cpp), so no rule names them -- a rule
+# that matched one would quantise it a second time. What the release left bf16, and how it is served:
+#
+#   - the lm_head, block fp8: the widest GEMM in the model at half the bytes, as in the fp8 recipes
+#   - the MTP block (blk.64 -- one past the 64 trunk layers), block fp8: a draft is verified, so its
+#     precision can move acceptance and never an emitted token
+#
+# And one the release DID quantise that this graph reads at bf16: the delta net's a/b projection
+# (`ssm_ab`, in_proj_a and in_proj_b joined), 96 rows the gated delta net consumes as gate inputs.
+# It is widened, which is EXACT -- every e2m1 value times a power of two is a bf16 -- so the plane
+# holds precisely what the release meant.
+#
+# The vision tower, every norm, the embedding, conv1d, A and dt stay as the release holds them.
+
+output.weight                 rtn   codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ssm_ab.weight           cast  dtype=bf16
+
+blk.64.attn_qg.weight         rtn   codes=fp8_e4m3 block=128x128 scale=bf16
+blk.64.attn_k.weight          rtn   codes=fp8_e4m3 block=128x128 scale=bf16
+blk.64.attn_v.weight          rtn   codes=fp8_e4m3 block=128x128 scale=bf16
+blk.64.attn_output.weight     rtn   codes=fp8_e4m3 block=128x128 scale=bf16
+blk.64.ffn_gate_up.weight     rtn   codes=fp8_e4m3 block=128x128 scale=bf16
+blk.64.ffn_down.weight        rtn   codes=fp8_e4m3 block=128x128 scale=bf16

@@ -1,0 +1,28 @@
+# q38-27b-mxfp4-df2h4.recipe -- q38-27b-mxfp4-df2.recipe with the drafter's head at FOUR bits
+# (u4, a u8 zero and an f16 scale a 128, read by w4a8_asym) instead of two.
+#
+#   rad-convert <Swift-1.5-Qwen3.8-27b-heretic MXFP4A16 checkpoint, see q38-27b-mxfp4.recipe> --draft-model <incoai/Qwen3.8-27B-DFlash2> \
+#       --recipe data/recipes/q38-27b-mxfp4-df2h4.recipe -o q38-27b-mxfp4-df2h4.rad
+#
+# The target's rules are q38-27b-mxfp4.recipe's and say why: the MXFP4 trunk is copied (no rule
+# names it), the lm_head goes block fp8, and the delta net's a/b projection is widened exactly to
+# the bf16 this graph reads it at. There is no MTP rule: with a DFlash2 drafter merged the graph
+# declares no MTP block, so blk.64 is not a weight of this container.
+#
+# THE DFLASH2 DRAFTER (merged under `draft.` by --draft-model) is handled exactly as
+# q38-27b-fp8-df2.recipe handles it: its linears block fp8 from the bf16 release -- it is read whole
+# on every decode step, and a draft is verified, so its precision can move acceptance and never an
+# emitted token -- and a 2-bit copy of the target's head for its draft rounds. The selector
+# projection, codebooks and convolution weights stay bf16.
+
+output.weight                 rtn   codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ssm_ab.weight           cast  dtype=bf16
+
+dflash.draft_head.weight             rtn  codes=u4 zero=u8 group=128 scale=f16
+dflash.fc.weight                     rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_q.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_k.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_v.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_output.weight      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_gate_up.weight      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_down.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16

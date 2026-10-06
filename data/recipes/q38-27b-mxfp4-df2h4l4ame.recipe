@@ -1,0 +1,30 @@
+# q38-27b-mxfp4-df2h4l4ame.recipe -- q38-27b-mxfp4-df2h4l4am.recipe with the token embedding at E4M3
+# under ONE f32 scale (embed_lookup_q): 1.18 GiB instead of 2.37, all of it given to the KV cache.
+# Converted with the fuse_qkv arch, so q/k/v are one projection.
+#
+#   rad-convert <Swift-1.5-Qwen3.8-27b-heretic MXFP4A16 checkpoint, see q38-27b-mxfp4.recipe> --draft-model <incoai/Qwen3.8-27B-DFlash2> \
+#       --recipe data/recipes/q38-27b-mxfp4-df2h4l4ame.recipe -o q38-27b-mxfp4-df2h4l4ame.rad
+#
+# The target's rules are q38-27b-mxfp4.recipe's and say why: the MXFP4 trunk is copied (no rule
+# names it), the lm_head goes block fp8, and the delta net's a/b projection is widened exactly to
+# the bf16 this graph reads it at. There is no MTP rule: with a DFlash2 drafter merged the graph
+# declares no MTP block, so blk.64 is not a weight of this container.
+#
+# THE DFLASH2 DRAFTER (merged under `draft.` by --draft-model) is handled exactly as
+# q38-27b-fp8-df2.recipe handles it: its linears block fp8 from the bf16 release -- it is read whole
+# on every decode step, and a draft is verified, so its precision can move acceptance and never an
+# emitted token -- and a 2-bit copy of the target's head for its draft rounds. The selector
+# projection, codebooks and convolution weights stay bf16.
+
+token_embd.weight             rtn   codes=fp8_e4m3 block=*x* scale=f32 rule=search
+output.weight                 rtn   codes=u4 zero=u8 group=64 scale=bf16 rule=search
+blk.*.ssm_ab.weight           cast  dtype=bf16
+
+dflash.draft_head.weight             rtn  codes=u4 zero=u8 group=128 scale=f16
+dflash.fc.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_q.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_k.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_v.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_output.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_gate_up.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_down.weight         rtn  codes=fp4_e2m1 group=32 scale=e8m0
