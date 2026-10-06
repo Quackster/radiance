@@ -605,9 +605,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                  * the ranks to fit inside the two parities' blocks together. */
                 const int64_t base = nb / g.world, extra = nb % g.world;
                 for (int q = 0; q < 2; ++q) {
-                    /* This rank's place in expert parity q's split: the ranks without attention
-                     * first, then first for its own parity (rad_arch.h remainder_place). */
-                    const int64_t p = remainder_place(g, g.rank, q);
+                    /* This rank's place in expert parity q's split: first for its own parity.
+                     * THE EXPERTS DO NOT GO REMAINDER-FIRST (rad_arch.h remainder_place): an
+                     * expert block is a whole GEMM of every routed token, and a rank taking the
+                     * extra block of every class became the step's slowest rank -- measured at
+                     * three ranks, Flash-Next: 50/25/25 cost 25% a step single-stream, and even
+                     * one class's extra block (37/25/37) swung 16-19 ms between boots. The delta
+                     * net's remainder is a head's worth of work and goes to the rank without
+                     * attention; the experts stay on the rotation every world has always had. */
+                    const int64_t p = (g.rank - q + g.world) % g.world;
                     const int64_t b0 = p * base + std::min<int64_t>(p, extra);
                     const int64_t b1 = b0 + base + (p < extra ? 1 : 0);
                     mc.ff_lo[q] = b0 * RAD_FP8_BLOCK;
@@ -621,7 +627,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                  * rank already takes of some parity. */
                 if (g.world == 4) {
                     for (int q = 0; q < 4; ++q) {
-                        const int64_t p = remainder_place(g, g.rank, q);
+                        const int64_t p = (g.rank - q + 4) % 4;
                         const int64_t b0 = p * base + std::min<int64_t>(p, extra);
                         const int64_t b1 = b0 + base + (p < extra ? 1 : 0);
                         mc.ff_lo4[q] = b0 * RAD_FP8_BLOCK;
@@ -639,10 +645,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 } else {
                     rad_note(b, "routed experts: rank %d computes columns [%lld, %lld) of each "
                                 "even expert and [%lld, %lld) of each odd one, of %lld. The width "
-                                "is %lld blocks of %d, which %lld ranks split unevenly: the extra block "
-                                "goes to a rank without attention where there is one, else to the "
-                                "rank the expert's parity picks; the block's all-reduce sums the "
-                                "partials.",
+                                "is %lld blocks of %d, which %lld ranks split unevenly, so the rank "
+                                "taking the extra block alternates with the expert's parity; the "
+                                "block's all-reduce sums the partials.",
                              g.rank, (long long)mc.ff_lo[0], (long long)mc.ff_hi[0],
                              (long long)mc.ff_lo[1], (long long)mc.ff_hi[1],
                              (long long)g.n_ff_all, (long long)nb, RAD_FP8_BLOCK,
