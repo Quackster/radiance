@@ -144,6 +144,7 @@ private:
      * answers "how much between these two scrapes", and only the second survives a comparison
      * between two runs that settled into different mixes. */
     Counter c_prefill_tokens_, c_decode_tokens_, c_draft_tokens_, c_draft_accepted_;
+    Counter c_refill_tokens_, c_refills_;
     Counter c_lookup_taken_, c_lookup_steps_, c_lookup_drafted_, c_lookup_accepted_;
     Counter c_attn_cached_, c_linear_cached_, c_checkpoints_;
     Counter c_prefix_evict_, c_prefix_ckpt_evict_;

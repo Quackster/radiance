@@ -150,6 +150,18 @@ struct IPrefixCache {
 
     virtual CacheHit lookup(const Request& r,
                             std::vector<std::vector<int32_t>>* blocks_out) const = 0;
+    /* The same lookup with the hit ended no later than `cap_tokens` (a checkpoint at or below it
+     * for a hybrid model). The default declines the hit when it is longer than the cap, which is
+     * always safe; the real cache answers with the shorter hit. */
+    virtual CacheHit lookup_capped(const Request& r, std::vector<std::vector<int32_t>>* blocks_out,
+                                   int64_t cap_tokens) const {
+        CacheHit h = lookup(r, blocks_out);
+        if (h.n_attn_tokens > cap_tokens) {
+            if (blocks_out) for (auto& v : *blocks_out) v.clear();
+            return CacheHit{};
+        }
+        return h;
+    }
     virtual const std::vector<int32_t>& cached_groups() const = 0;
 
     /* PUBLISH what this sequence computed, so the next request sharing the prefix can adopt it.
@@ -339,6 +351,11 @@ struct PCBinding final : IPrefixCache {
                     std::vector<std::vector<int32_t>>* out) const override {
         media_keys(r, &mm_);
         return m->lookup(r.prompt, mm_, out);
+    }
+    CacheHit lookup_capped(const Request& r, std::vector<std::vector<int32_t>>* out,
+                           int64_t cap) const override {
+        media_keys(r, &mm_);
+        return m->lookup(r.prompt, mm_, out, cap);
     }
 
     /* Installed by the engine when the idle tiers are on; empty otherwise. */

@@ -161,6 +161,8 @@ void Metrics::sample(const SchedMetrics& m) {
     c_draft_tokens_.inc(std::max(0.0, (double)m.draft_tokens - c_draft_tokens_.get()));
     c_draft_accepted_.inc(std::max(0.0, (double)m.draft_accepted - c_draft_accepted_.get()));
     c_lookup_taken_.inc(std::max(0.0, (double)m.lookup_taken - c_lookup_taken_.get()));
+    c_refill_tokens_.inc(std::max(0.0, (double)m.draft_refill_tokens - c_refill_tokens_.get()));
+    c_refills_.inc(std::max(0.0, (double)m.draft_refills - c_refills_.get()));
     c_lookup_steps_.inc(std::max(0.0, (double)m.lookup_steps - c_lookup_steps_.get()));
     c_lookup_drafted_.inc(std::max(0.0, (double)m.lookup_drafted - c_lookup_drafted_.get()));
     c_lookup_accepted_.inc(std::max(0.0, (double)m.lookup_accepted - c_lookup_accepted_.get()));
@@ -352,6 +354,11 @@ std::string Metrics::render() const {
     w.counter("radiance:lookup_draft_taken_total",
               "Proposals the whole-context lookup draft replaced the drafter's with (RADIANCE_LOOKUP_DRAFT).",
               L, c_lookup_taken_.get());
+    w.counter("radiance:draft_refill_tokens_total",
+              "Prefix-hit tokens recomputed so the block drafter has context (RADIANCE_DRAFT_REFILL).",
+              L, c_refill_tokens_.get());
+    w.counter("radiance:draft_refills_total",
+              "Admissions whose prefix hit was shortened for the block drafter.", L, c_refills_.get());
     w.counter("radiance:lookup_draft_steps_total",
               "Verify steps that carried a lookup-draft proposal.", L, c_lookup_steps_.get());
     w.counter("radiance:lookup_draft_tokens_total",

@@ -184,7 +184,8 @@ public:
      * should have to know. */
     CacheHit lookup(const std::vector<int32_t>& tokens,
                     const std::vector<MMContentKey>& mm,
-                    std::vector<std::vector<int32_t>>* blocks_out = nullptr) const;
+                    std::vector<std::vector<int32_t>>* blocks_out = nullptr,
+                    int64_t cap_tokens = -1) const;
 
     /* Publish the whole blocks a sequence just filled. `blocks[i]` is the block table of
      * cached_groups()[i]. Takes a KV reference on every newly indexed block. */

@@ -454,6 +454,14 @@ public:
      * block drafter only; `window` is the drafter's attention window in tokens (0: unknown, 2048 is
      * used) -- sources closer than that are the drafter's own to copy. A no-op when !p.enabled. */
     int                  set_lookup_draft(const LookupParams& p, int window);
+    /* DRAFT REFILL. A prefix-cache hit leaves a windowed block drafter without K/V for the cached tokens
+     * (hit_holes_draft_), and it stays silent until its window has slid past the hole. With `refill` > 0 a hit
+     * is ended `refill` tokens before the end of the prompt (down to a block, and for a hybrid model down to a
+     * linear-state checkpoint), so the trunk recomputes those tokens, the drafter's context pass sees them, and
+     * the sequence drafts from its first decode step. `refill` is clamped to the drafter's window: more would
+     * buy nothing. 0 = off. A hit that would have to give back more than 2 * refill extra tokens (no checkpoint
+     * near enough) is kept whole and the drafter waits as before. */
+    int                  set_draft_refill(int window, int64_t refill);
     const LookupParams&  lookup_draft() const { return lk_p_; }
     SchedMetrics         metrics() const;
 
@@ -499,6 +507,8 @@ private:
      * also skips on a block-size mismatch. A bound like this lives in exactly one place; a second
      * copy is free to drift out of step with the first. */
     bool          hit_holes_draft_ = true;
+    int64_t       draft_refill_ = 0;
+    int64_t       refill_tokens_ = 0, refill_n_ = 0;
     BatchBuilder  builder_;
     DraftController draft_;
     AdaptiveK       ak_;

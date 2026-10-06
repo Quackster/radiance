@@ -368,6 +368,18 @@ struct FakePC : IPrefixCache {
         }
         return CacheHit{ attn, lin, src };
     }
+    /* The cap: attention ends at a block, the linear state at the newest checkpoint at or below it that exists
+     * (checkpoints at multiples of `interval`, none below `ckpt_lo`), else there is none. */
+    int64_t ckpt_lo = 0;
+    CacheHit lookup_capped(const Request& r, std::vector<std::vector<int32_t>>* out,
+                           int64_t cap) const override {
+        CacheHit h = lookup(r, out);
+        if (h.n_attn_tokens > cap) h.n_attn_tokens = (int32_t)(cap / 16 * 16);
+        int64_t l = std::min<int64_t>(h.n_linear_tokens, cap) / interval * interval;
+        if (l < ckpt_lo || l <= 0) { h.n_linear_tokens = 0; h.checkpoint_slot = -1; }
+        else h.n_linear_tokens = (int32_t)l;
+        return h;
+    }
     const std::vector<int32_t>& cached_groups() const override { return groups; }
 
     /* What the scheduler published, and what it asked to be evicted. Recorded rather than acted
@@ -1216,6 +1228,94 @@ TEST(a_prefix_hit_does_not_stop_a_full_attention_drafter) {
     Scheduler::BlockRow rows[4];
     CHECK_EQ(f.sch.block_begin(/*block=*/8, /*depth=*/7, /*window=*/0, /*mask=*/99, rows, 4), 1);
     CHECK_EQ((int)rows[0].seq, (int)a);
+}
+
+/* ============================ a prefix hit and the windowed block drafter (RADIANCE_DRAFT_REFILL)
+ * The drafter's own windowed KV group is not prefix-cached, so a hit leaves it without K and V for the cached
+ * tokens and block_begin's `reach` gate declines until the window has slid past the hole. set_draft_refill ends the
+ * hit `refill` tokens before the end of the prompt (at a checkpoint) so the recompute covers the window. */
+namespace {
+struct DfRun {
+    int64_t n_after_first = 0;     /* n_computed after the first (admitting) step */
+    int rows = -1;                 /* drafting rows block_begin offers at the first decode step */
+    SchedMetrics m;
+};
+DfRun df_run(int64_t refill, int n_prompt, int32_t seeded, int64_t ckpt_lo = 0) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192);
+    f.cfg.n_spec = 7;
+    /* the drafter's own windowed group: paged, not indexed by the prefix cache */
+    KVGroupInfo w;
+    w.name = "draft";
+    w.decl.kind = RAD_KV_WINDOW;
+    w.decl.window = 512;
+    w.block_size = 16;
+    f.prog.kv_groups.push_back(w);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.pc.groups = { 0 };
+    f.pc.ckpt_lo = ckpt_lo;
+    CHECK_OK(f.start());
+    CHECK_OK(f.sch.set_draft_refill(512, refill));
+    if (seeded > 0) { f.pc.seed(seeded); f.pc.lin = seeded; f.pc.src = 3; }
+    DfRun r;
+    const uint64_t a = f.submit(n_prompt, 64);
+    Scheduler::BlockRow rows[4];
+    for (int st = 0; st < 40; ++st) {
+        CHECK(f.sch.step() != nullptr);
+        if (st == 0) r.n_after_first = f.sch.find(a)->n_computed;
+        f.commit_plain(11);
+        const int n = f.sch.block_begin(8, 7, 512, 99, rows, 4);
+        f.sch.block_end();
+        if (!f.sch.find(a)->output.empty()) { r.rows = n; break; }
+    }
+    r.m = f.sch.metrics();
+    return r;
+}
+}  /* namespace */
+
+TEST(a_prefix_hit_leaves_a_windowed_drafter_silent_without_refill) {
+    DfRun r = df_run(/*refill=*/0, /*prompt=*/1100, /*seeded=*/1024);
+    CHECK_EQ(r.n_after_first, 1024 + 0);       /* the whole hit was taken */
+    CHECK_EQ(r.rows, 0);                       /* reach: 1100 - 511 < 1024 */
+    CHECK_EQ(r.m.draft_refills, (int64_t)0);
+}
+
+TEST(draft_refill_ends_the_hit_a_window_before_the_prompt_and_the_drafter_drafts_at_once) {
+    DfRun r = df_run(/*refill=*/512, 1100, 1024);
+    /* cap = 1100 - 512 = 588 -> attention 576, linear checkpoint 512: n_computed starts there. */
+    CHECK_EQ(r.n_after_first, 512);
+    CHECK_EQ(r.rows, 1);
+    CHECK_EQ(r.m.draft_refills, (int64_t)1);
+    CHECK_EQ(r.m.draft_refill_tokens, (int64_t)512);      /* 1024 -> 512 */
+    CHECK_EQ(r.m.linear_cached_tokens, (int64_t)512);     /* what was actually skipped */
+}
+
+TEST(draft_refill_is_clamped_to_the_window) {
+    DfRun r = df_run(/*refill=*/100000, 1100, 1024);
+    CHECK_EQ(r.n_after_first, 512);
+    CHECK_EQ(r.rows, 1);
+}
+
+TEST(draft_refill_leaves_a_hit_that_is_already_far_enough_back) {
+    /* the prompt is long, the hit short: 5000 - 512 > 1024, nothing to give back */
+    DfRun r = df_run(512, 5000, 1024);
+    CHECK_EQ(r.n_after_first, 512 + 512);      /* first chunk: max_tok 512 from 1024? hit kept */
+    CHECK_EQ(r.m.draft_refills, (int64_t)0);
+    CHECK_EQ(r.rows, 1);                       /* 5000 - 511 >= 1024 */
+}
+
+TEST(draft_refill_keeps_the_hit_when_no_checkpoint_is_near_enough) {
+    /* checkpoints only at >= 2048: the capped lookup finds none, giving back 2048 > 2 * 512, so the whole hit stays */
+    DfRun r = df_run(512, 2200, 2048, /*ckpt_lo=*/2048);
+    CHECK_EQ(r.m.draft_refills, (int64_t)0);
+    CHECK_EQ(r.m.linear_cached_tokens, (int64_t)2048);
+    CHECK_EQ(r.rows, 0);                       /* the drafter waits, as before */
+}
+
+TEST(draft_refill_with_no_hit_changes_nothing) {
+    DfRun r = df_run(512, 1100, 0);
+    CHECK_EQ(r.m.draft_refills, (int64_t)0);
+    CHECK_EQ(r.rows, 1);
 }
 
 /* ================================================================== speculation */

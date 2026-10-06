@@ -233,6 +233,16 @@ int Scheduler::set_lookup_draft(const LookupParams& p, int window) {
     return RAD_OK;
 }
 
+int Scheduler::set_draft_refill(int window, int64_t refill) {
+    std::lock_guard<std::mutex> lk(mu_);
+    draft_refill_ = 0;
+    if (refill <= 0 || window <= 0 || !hit_holes_draft_) return RAD_OK;
+    draft_refill_ = refill < window ? refill : window;
+    RAD_INFO("draft refill ON: a prefix hit ends %lld tokens before the prompt's end (window %d)",
+             (long long)draft_refill_, window);
+    return RAD_OK;
+}
+
 /* A block drafter's proposal, replaced by the longest match of the sequence's suffix further back than the
  * drafter can see (lookup_draft.h). The tokens are the target's to verify like any other: lossless. */
 int Scheduler::lookup_override(SchedReq& s, int n) {
@@ -840,6 +850,29 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget) {
          * costs a prefill. */
         if (pc_->restore(r) == IPrefixCache::Restore::Wait) return kAdmitWait;
         CacheHit h = pc_->lookup(r, &hit_blocks_);
+        /* DRAFT REFILL (set_draft_refill): the drafter's own K/V for a cached prefix does not exist, so end the
+         * hit early enough for the trunk's recompute (and the drafter's context pass over it) to cover the
+         * drafter's window. The capped lookup lands on a checkpoint at or below the cap. */
+        {
+            const auto eff = [&](const CacheHit& c) -> int64_t {
+                int64_t u = c.n_attn_tokens;
+                if (geo_.checkpoints() && c.n_linear_tokens < u) u = c.n_linear_tokens;
+                if (has_linear_state_ && c.checkpoint_slot < 0) u = 0;
+                return u;
+            };
+            const int64_t cap = (int64_t)r.prompt.size() - draft_refill_;
+            if (draft_refill_ > 0 && h.n_attn_tokens > 0 && eff(h) > cap) {
+                std::vector<std::vector<int32_t>> cb;
+                const CacheHit c = pc_->lookup_capped(r, &cb, cap < 0 ? 0 : cap);
+                const int64_t lost = eff(h) - eff(c);
+                if (lost <= 2 * draft_refill_) {
+                    h = c;
+                    hit_blocks_ = std::move(cb);
+                    refill_tokens_ += lost;
+                    ++refill_n_;
+                }
+            }
+        }
         int32_t reuse = h.n_attn_tokens;
         if (geo_.checkpoints() && h.n_linear_tokens < reuse) {
             /* A hit landing between checkpoints reuses the attention blocks and must replay the
@@ -2373,6 +2406,8 @@ SchedMetrics Scheduler::metrics_locked() const {
     m.lookup_considered = lk_considered_;
     m.lookup_taken = lk_taken_;
     m.lookup_steps = lk_steps_;
+    m.draft_refill_tokens = refill_tokens_;
+    m.draft_refills = refill_n_;
     m.lookup_drafted = lk_drafted_;
     m.lookup_accepted = lk_accepted_;
     m.adaptive_k_steps = ak_steps_;

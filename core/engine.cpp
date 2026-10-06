@@ -419,6 +419,13 @@ int Engine::step_loop() {
          * (sched/lookup_draft.h). */
         const LookupParams lkp = LookupParams::from_env();
         if (lkp.enabled) (void)sched_.set_lookup_draft(lkp, (int)drafter_.window);
+        /* RADIANCE_DRAFT_REFILL=<tokens>: on a prefix-cache hit recompute this many cached tokens (clamped to the
+         * drafter window) so the windowed drafter has context at once. Default = the window; 0 = off. */
+        {
+            const char* v = std::getenv("RADIANCE_DRAFT_REFILL");
+            const int64_t n = (v && *v) ? std::atoll(v) : (int64_t)drafter_.window;
+            (void)sched_.set_draft_refill((int)drafter_.window, n);
+        }
     }
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* Read once. See the block in the idle branch below for what it is for. */

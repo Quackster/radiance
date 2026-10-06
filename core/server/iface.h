@@ -103,6 +103,7 @@ struct SchedMetrics {
     int64_t draft_tokens = 0;
     int64_t draft_accepted = 0;
     /* Whole-context lookup draft (sched/lookup_draft.h); 0 when it is off. */
+    int64_t draft_refill_tokens = 0, draft_refills = 0;
     int64_t lookup_taken = 0, lookup_steps = 0, lookup_drafted = 0, lookup_accepted = 0;
     /* THE PER-POSITION DRAFT HAZARD. `draft_acceptance` above is pooled over the whole window and
      * cannot distinguish a drafter that decays with depth from one whose later rounds are broken:

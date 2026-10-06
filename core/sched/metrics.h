@@ -133,6 +133,10 @@ struct SchedMetrics {
     int64_t lookup_considered = 0;
     int64_t lookup_taken = 0;
     int64_t lookup_steps = 0;
+    /* Prefix-hit tokens given back to be recomputed so a block drafter has context (RADIANCE_DRAFT_REFILL), and the
+     * admissions it applied to. */
+    int64_t draft_refill_tokens = 0;
+    int64_t draft_refills = 0;
     int64_t lookup_drafted = 0;
     int64_t lookup_accepted = 0;
     int     draft_depth = 0;          /* what the controller would choose right now */

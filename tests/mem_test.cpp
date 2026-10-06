@@ -1141,6 +1141,39 @@ TEST(split_lookup_reuses_attention_between_checkpoints) {
     CHECK_EQ(f.pc.lookup(other, {}).n_linear_tokens, 0);
 }
 
+/* A capped lookup (RADIANCE_DRAFT_REFILL) ends the hit at a block and the linear state at a checkpoint at or
+ * below the cap, never past it. */
+TEST(capped_lookup_lands_on_a_checkpoint_at_or_below_the_cap) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+    auto prompt = tok_run(7000, 336);
+    publish(f, 1, prompt, 320);
+    BlockHash parent;
+    std::vector<BlockHash> hs;
+    for (int b = 0; b < 21; ++b) {
+        parent = chain_block_hash(parent, prompt.data() + b * 16, 16, nullptr, 0, b * 16);
+        hs.push_back(parent);
+    }
+    int32_t s128 = -1, s256 = -1;
+    CHECK_OK(f.pc.reserve_checkpoint(1, 128, hs[128 / 16 - 1], &s128));
+    f.pc.commit_checkpoint(hs[128 / 16 - 1]);
+    CHECK_OK(f.pc.reserve_checkpoint(1, 256, hs[256 / 16 - 1], &s256));
+    f.pc.commit_checkpoint(hs[256 / 16 - 1]);
+
+    CacheHit u = f.pc.lookup(prompt, {});
+    CHECK_EQ(u.n_attn_tokens, 320);
+    CHECK_EQ(u.n_linear_tokens, 256);
+    CacheHit c = f.pc.lookup(prompt, {}, nullptr, 250);
+    CHECK_EQ(c.n_attn_tokens, 240);
+    CHECK_EQ(c.n_linear_tokens, 128);
+    CHECK_EQ(c.checkpoint_slot, s128);
+    CacheHit z = f.pc.lookup(prompt, {}, nullptr, 100);
+    CHECK_EQ(z.n_attn_tokens, 96);
+    CHECK_EQ(z.n_linear_tokens, 0);
+    CHECK_EQ(z.checkpoint_slot, -1);
+    CHECK_EQ(f.pc.lookup(prompt, {}, nullptr, 100000).n_attn_tokens, 320);   /* a cap above the hit changes nothing */
+}
+
 /* The chained block hashes of `tokens`, one a block, as the cache computes them. */
 static std::vector<BlockHash> chain_of(const std::vector<int32_t>& tokens, int bs) {
     std::vector<BlockHash> hs;

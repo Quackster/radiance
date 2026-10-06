@@ -224,7 +224,8 @@ void PrefixCache::touch(const BlockHash& h) const {
 
 CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
                              const std::vector<MMContentKey>& mm,
-                             std::vector<std::vector<int32_t>>* blocks_out) const {
+                             std::vector<std::vector<int32_t>>* blocks_out,
+                             int64_t cap_tokens) const {
     CacheHit hit;
     if (blocks_out) { blocks_out->assign(groups_.size(), {}); }
     if (!enabled_ || tokens.empty()) return hit;
@@ -255,6 +256,11 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
             std::memcmp(it->second.tokens.data(), src, (size_t)block_size_ * sizeof(int32_t)) != 0)
             break;
     }
+
+    /* `cap_tokens` >= 0 ends the hit no later than that many tokens (rounded down to a block). The
+     * checkpoint walk below starts from what is left, so a capped hit lands on a checkpoint at or
+     * below the cap and the recurrent state stays exact. See Scheduler::set_draft_refill. */
+    if (cap_tokens >= 0 && matched > cap_tokens / block_size_) matched = cap_tokens / block_size_;
 
     /* At least one token must remain for the step to compute a logit from. A full hit is backed
      * off by one block rather than being handed to a caller that would then schedule a zero-token
