@@ -1177,41 +1177,6 @@ int Engine::plan() {
         VramBudget vb;
         RAD_TRY(vram_budget_resolve(cfg_, facts, &vb));
         if (!vb.report.empty()) RAD_INFO("%s", vb.report.c_str());
-
-        /* A RANK WHOSE CACHE COSTS LESS PER TOKEN THAN ITS PEERS' -- an attention-zero rank keeps
-         * no attention cache (rad_kv_group_zero) -- gets a KV pool that backs the SAME token
-         * count as the dearest rank's, and what that saves goes to its expert pool. One block
-         * table serves every rank, so the extra tokens the common pool would buy it are tokens
-         * configure_kv caps away; the bytes are better spent where that rank's larger share of
-         * the experts lives. Only a DERIVED split is re-split: an operator who stated the pools
-         * has decided. A hair over the exact share, so rounding never makes this rank the least.
-         * Where every rank costs the same -- every world the heads divide -- nothing changes. */
-        rank_cfg_.assign(ranks_.size(), cfg_);
-        if (vb.derived_kv && vb.derived_weights && facts.size() == ranks_.size()) {
-            size_t dear = 0;
-            for (size_t i = 1; i < facts.size(); ++i)
-                if (facts[i].kv_ceiling > facts[dear].kv_ceiling) dear = i;
-            const int64_t kv = cfg_.vram_kv_mib * (1024 * 1024);
-            const int64_t span_d = facts[dear].kv_ceiling - facts[dear].kv_fixed;
-            const double  frac   = span_d > 0
-                ? std::min(1.0, (double)std::max<int64_t>(kv - facts[dear].kv_fixed, 0) / (double)span_d)
-                : 1.0;
-            for (size_t i = 0; i < facts.size(); ++i) {
-                if (facts[i].kv_ceiling >= facts[dear].kv_ceiling) continue;
-                const int64_t span_i = facts[i].kv_ceiling - facts[i].kv_fixed;
-                int64_t need = facts[i].kv_fixed + (int64_t)(frac * (double)span_i * 1.01);
-                need = std::min(need, kv);
-                const int64_t kv_mib = (need + (1024 * 1024) - 1) / (1024 * 1024);
-                if (kv_mib >= cfg_.vram_kv_mib) continue;
-                rank_cfg_[i].vram_kv_mib      = kv_mib;
-                rank_cfg_[i].vram_weights_mib = cfg_.vram_weights_mib + (cfg_.vram_kv_mib - kv_mib);
-                RAD_INFO("kv: rank %d's cache costs %s at the worst case where rank %d's costs %s; "
-                         "its KV pool is %lld MiB for the same tokens, and the %lld MiB saved go to "
-                         "its weights", ranks_[i]->index, humanb(facts[i].kv_ceiling).c_str(),
-                         ranks_[dear]->index, humanb(facts[dear].kv_ceiling).c_str(),
-                         (long long)kv_mib, (long long)(cfg_.vram_kv_mib - kv_mib));
-            }
-        }
         /* The staging region the budget took out of the experts, above everything the buffer plan
          * placed -- so it is at the top of the arena, the part the smaller levels lend. */
         if (vb.stage > 0)
@@ -1238,9 +1203,7 @@ int Engine::plan() {
         /* Every pool is budgeted explicitly. No profiling pass, no utilisation fraction, no
          * inference about what the workload will be (spec §6). Pools refuses by name and by how
          * much rather than shrinking anything. */
-        const size_t ri = (size_t)(&r - ranks_.data());
-        const Config& rc = rank_cfg_.size() == ranks_.size() ? rank_cfg_[ri] : cfg_;
-        int s = r->pools.configure(rc, props.vram_bytes);
+        int s = r->pools.configure(cfg_, props.vram_bytes);
         RAD_INFO("pools:\n%s", r->pools.fit_report().c_str());
         if (s < 0) {
             report_pool_refusal(r->index, r->device, r->pools, cfg_);
