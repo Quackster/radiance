@@ -173,6 +173,7 @@ adding a kernel plugin; "refused at load" names one op and leaves you to find th
 | `softmax` | `M`(range) `n` `dtype` | `x` → `y` |
 | `sigmoid` | `M`(range) `n` `dtype` | `x` → `y` |
 | `silu` | `M` `n` `dtype` | `x` → `y` |
+| `fill` | `M`(range) `n` `dtype` `value`:f64/opt | → `y` |
 
 `gelu` and `silu` are two ops with one schema, and `silu` carries a row of its own because a row
 names one op.
@@ -216,6 +217,12 @@ it. Every other elementwise op keeps the strict same-shape rule.
 
 `sigmoid`, with a broadcast-capable `mul`, is what a gated shared expert needs
 (`ffn_gate_inp_shexp`). Without it the shared expert runs ungated, which is a different model.
+
+`fill` has no input: `y = value` over the extent, `value` 0 when absent. It is the op a rank issues
+where it computes nothing and a reader downstream still expects a defined buffer -- an
+attention-zero rank's block (`docs/TP3.md`) is one `fill` of its output wire before the all-reduce.
+A wire shared across layers cannot be zeroed once a step, and a memset knows neither the row pitch
+nor the dtype; this does.
 
 ## Quantisation and rotation
 
