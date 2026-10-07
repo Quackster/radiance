@@ -1157,6 +1157,7 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     c.created = started_at_;
     c.max_model_len = opt_.max_ctx;
     c.root = opt_.model_path;
+    c.capabilities = capabilities().dump();
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, id.empty() ? models_body(c) : model_body(c));
 }

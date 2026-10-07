@@ -262,6 +262,30 @@ HttpResponse Server::handle_tokenizer_info(const HttpRequest& req) {
     return HttpResponse::json_body(200, json_dump(o));
 }
 
+/* ================================================================== capabilities */
+json Server::capabilities() const {
+    json caps;
+    caps["chat"]      = deps_.chat != nullptr;
+    caps["tools"]     = deps_.chat && deps_.chat->supports_tools();
+    caps["reasoning"] = deps_.chat && deps_.chat->supports_reasoning();
+    caps["grammar"]   = deps_.grammar != nullptr;
+    caps["embedding"] = deps_.embed != nullptr;
+    caps["image"]     = deps_.mm && deps_.mm->accepts(MediaKind::Image);
+    caps["video"]     = deps_.mm && deps_.mm->accepts(MediaKind::Video);
+    caps["audio"]     = deps_.mm && deps_.mm->accepts(MediaKind::Audio);
+    caps["logprobs"]  = opt_.supports_logprobs;
+    /* THE EFFORTS A CHAT REQUEST MAY SEND, as probed from the template at startup: null when it
+     * takes any word. "none" and "minimal" are this server's, and turn thinking off. */
+    if (lim_.reasoning_efforts.empty()) {
+        caps["reasoning_efforts"] = nullptr;
+    } else {
+        std::vector<std::string> e = { "none", "minimal" };
+        e.insert(e.end(), lim_.reasoning_efforts.begin(), lim_.reasoning_efforts.end());
+        caps["reasoning_efforts"] = e;
+    }
+    return caps;
+}
+
 /* ================================================================== /server_info */
 /* vLLM returns the repr() of its config object, which is a Python string a client can only print.
  * This returns the same information as JSON, in two halves: what the SERVER decided, which is
@@ -288,25 +312,7 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
     srv["uptime_s"]           = unix_now() - started_at_;
     srv["in_flight"]          = in_flight_.load(std::memory_order_relaxed);
 
-    json caps;
-    caps["chat"]      = deps_.chat != nullptr;
-    caps["tools"]     = deps_.chat && deps_.chat->supports_tools();
-    caps["reasoning"] = deps_.chat && deps_.chat->supports_reasoning();
-    caps["grammar"]   = deps_.grammar != nullptr;
-    caps["embedding"] = deps_.embed != nullptr;
-    caps["image"]     = deps_.mm && deps_.mm->accepts(MediaKind::Image);
-    caps["video"]     = deps_.mm && deps_.mm->accepts(MediaKind::Video);
-    caps["audio"]     = deps_.mm && deps_.mm->accepts(MediaKind::Audio);
-    caps["logprobs"]  = opt_.supports_logprobs;
-    /* THE EFFORTS A CHAT REQUEST MAY SEND, as probed from the template at startup: null when it
-     * takes any word. "none" and "minimal" are this server's, and turn thinking off. */
-    if (lim_.reasoning_efforts.empty()) {
-        caps["reasoning_efforts"] = nullptr;
-    } else {
-        std::vector<std::string> e = { "none", "minimal" };
-        e.insert(e.end(), lim_.reasoning_efforts.begin(), lim_.reasoning_efforts.end());
-        caps["reasoning_efforts"] = e;
-    }
+    json caps = capabilities();
 
     /* WHAT A REQUEST THAT LEAVES A FIELD OUT GETS, under the request's own spelling of each
      * field, so a client can read off exactly what leaving one out means on this deployment. */

@@ -426,6 +426,15 @@ TEST(the_model_list_is_a_list_of_one_with_the_fields_clients_read) {
      * trusting a made-up one. */
     CHECK(!o["data"][0].contains("max_model_len"));
     CHECK(!o["data"][0].contains("root"));
+    CHECK(!o["data"][0].contains("capabilities"));
+}
+
+TEST(the_model_entry_carries_the_capabilities_it_was_given) {
+    ModelCard c = card("q38-flashnext", 1700000000);
+    c.capabilities = R"({"tools":true,"image":false})";
+    const json m = parsed(model_body(c));
+    CHECK(m["capabilities"].value("tools", false));
+    CHECK(!m["capabilities"].value("image", true));
 }
 
 TEST(the_model_entry_names_the_file_behind_the_served_name) {

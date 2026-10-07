@@ -200,6 +200,10 @@ private:
     HttpResponse handle_detokenize(const HttpRequest& req);
     HttpResponse handle_tokenizer_info(const HttpRequest& req);
     HttpResponse handle_server_info(const HttpRequest& req);
+    /* What this deployment can do -- chat, tools, reasoning, grammar, media, logprobs, the
+     * reasoning efforts it takes -- as /server_info's `capabilities` and the model entry both
+     * report it, built in one place so the two cannot disagree. */
+    json capabilities() const;
     HttpResponse handle_sessions(const HttpRequest& req);
     HttpResponse handle_reset_prefix_cache(const HttpRequest& req);
 

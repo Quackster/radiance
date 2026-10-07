@@ -2542,6 +2542,20 @@ TEST(the_model_entry_carries_the_context_length_the_server_was_started_with) {
     CHECK(!json::parse(unknown.get("/v1/models").body)["data"][0].contains("max_model_len"));
 }
 
+TEST(the_model_entry_and_server_info_report_the_same_capabilities) {
+    Fixture f;
+    const json info = json::parse(f.get("/server_info").body)["capabilities"];
+    const json list = json::parse(f.get("/v1/models").body)["data"][0]["capabilities"];
+    const json one  = json::parse(f.get("/v1/models/test-model").body)["capabilities"];
+    CHECK(info.is_object());
+    CHECK(list == info);
+    CHECK(one == info);
+    /* Read per request, not frozen at startup: a template that takes no tools says so. */
+    CHECK(info.value("tools", false));
+    f.tmpl.tools_ok = false;
+    CHECK(!json::parse(f.get("/v1/models").body)["data"][0]["capabilities"].value("tools", true));
+}
+
 TEST(embeddings_without_an_embedder_is_501_not_an_empty_200) {
     Fixture f;
     HttpResponse r = f.post("/v1/embeddings", R"({"input":"hi"})");

@@ -331,6 +331,11 @@ struct ModelCard {
     int64_t     max_model_len = 0;
     /* What the server loaded (ServerOptions::model_path), vLLM's `root`. Empty leaves it out. */
     std::string root;
+    /* What the model can be asked for -- tools, reasoning, images -- as /server_info reports it.
+     * There is no field for it in OpenAI's model object, so a client today learns it by sending a
+     * request and reading the refusal; the entry it already fetches can say so up front. A JSON
+     * object as text, spliced in as it is; empty leaves it out. */
+    std::string capabilities;
 };
 /* The list, for GET /v1/models. */
 std::string models_body(const ModelCard& m);

@@ -2213,6 +2213,10 @@ static json model_card(const ModelCard& c) {
     m["owned_by"] = "radiance";
     if (c.max_model_len > 0) m["max_model_len"] = c.max_model_len;
     if (!c.root.empty()) m["root"] = c.root;
+    if (!c.capabilities.empty()) {
+        json caps = json::parse(c.capabilities, nullptr, false);
+        if (!caps.is_discarded() && caps.is_object()) m["capabilities"] = std::move(caps);
+    }
     return m;
 }
 
