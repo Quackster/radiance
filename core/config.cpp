@@ -39,7 +39,7 @@ static const std::string g_draft_window_help =
     draft_window_name(kDraftWindowDefault);
 
 static const Flag g_flags[] = {
-    { "--model",              "PATH",   "the .rad container, or a checkpoint served as it stands" },
+    { "--model",              "PATH|REPO", "the .rad container, a checkpoint served as it stands, or an HF repo id (owner/name) fetched to the cache" },
     { "--radiance-home",      "DIRS",   "where kernels/, architectures/ and quantizers/ live; several\n"
                                         "homes separated by ':' are searched in order, the first winning" },
     { "--kernels",            "LIST",   "kernel plugin hierarchy, comma-separated, first wins" },
