@@ -8,6 +8,8 @@
 #include "ref_common.h"
 #include "ref_ops.h"
 
+#include <algorithm>
+
 using namespace ref;
 
 /* Rows of a tensor read as [rows, n]. `n` is a declared parameter and the row count is whatever
@@ -30,6 +32,8 @@ int ref_rmsnorm(const RadArgs* a, RadStream) {
     const int64_t n = p_int(a, "n", w->rank ? w->shape[w->rank - 1] : 0);
     const float eps = p_f32(a, "eps", 1e-6f);
     const float wadd = p_f32(a, "wadd", 0.0f);
+    const int64_t round_before_weight = p_int(a, "round_before_weight", 0);
+    if (round_before_weight != 0 && round_before_weight != 1) return RAD_E_INVAL;
     if (n <= 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(x, n);
     if (rows <= 0 || numel(y) < rows * n || numel(w) < n) return RAD_E_SHAPE;
@@ -41,8 +45,15 @@ int ref_rmsnorm(const RadArgs* a, RadStream) {
         float ss = 0.0f;
         for (int64_t i = 0; i < n; ++i) { float v = ldt(x, xb + i * xs); ss += v * v; }
         const float s = 1.0f / std::sqrt(ss / (float)n + eps);
-        for (int64_t i = 0; i < n; ++i)
-            stt(y, yb + i * ys, ldt(x, xb + i * xs) * s * (ldt(w, i * ws) + wadd));
+        for (int64_t i = 0; i < n; ++i) {
+            float value = ldt(x, xb + i * xs) * s;
+            if (round_before_weight) {
+                alignas(8) unsigned char narrowed[8] = {};
+                st_dt(x->dtype, narrowed, 0, value);
+                value = ld_dt(x->dtype, narrowed, 0);
+            }
+            stt(y, yb + i * ys, value * (ldt(w, i * ws) + wadd));
+        }
     }
     return RAD_OK;
 }
@@ -140,6 +151,9 @@ int ref_grid_embed(const RadArgs* a, RadStream) {
     const RadTensor *x = &a->t[0], *tab = &a->t[1], *crd = &a->t[2];
     const int64_t n = p_int(a, "n", tab->rank ? tab->shape[tab->rank - 1] : 0);
     const int64_t side = p_int(a, "side", 0);
+    const char* mode = p_str(a, "mode", "bilinear");
+    const bool antialias = std::strcmp(mode, "bilinear_antialias") == 0;
+    if (!antialias && std::strcmp(mode, "bilinear") != 0) return RAD_E_INVAL;
     if (n <= 0 || side <= 0 || numel(tab) < side * side * n) return RAD_E_SHAPE;
     const int64_t rows = rows_of(x, n);
     if (rows <= 0 || crd->rank != 2 || crd->shape[0] < 4 || crd->shape[1] < rows)
@@ -153,6 +167,60 @@ int ref_grid_embed(const RadArgs* a, RadStream) {
         const int64_t gc = ld_int(crd->dtype, crd->data, 1 * cs + r * ms);
         const int64_t gh = ld_int(crd->dtype, crd->data, 2 * cs + r * ms);
         const int64_t gw = ld_int(crd->dtype, crd->data, 3 * cs + r * ms);
+        if (antialias) {
+            // Separable half-pixel triangle filtering. Widen the footprint when reducing, then
+            // normalize only surviving taps at an edge. The table dtype determines rounding of
+            // raw/normalized weights and the horizontal intermediate, as in GPU interpolate.
+            auto narrow = [&](float v) {
+                if (tab->dtype == RAD_BF16) return rad_bf16_to_f32(rad_f32_to_bf16(v));
+                if (tab->dtype == RAD_F16) return rad_f16_to_f32(rad_f32_to_f16(v));
+                return v;
+            };
+            std::vector<float> weights((size_t)(2 * side));
+            float* wh = weights.data();
+            float* ww = wh + side;
+            auto weights_axis = [&](int64_t at, int64_t size, float* w) {
+                size = size > 0 ? size : 1;
+                at = at < 0 ? 0 : (at >= size ? size - 1 : at);
+                const float scale = (float)side / (float)size;
+                const float support = scale > 1.0f ? scale : 1.0f;
+                const float inv = 1.0f / support;
+                const float center = scale * ((float)at + 0.5f);
+                const int64_t first = std::max<int64_t>(0, (int64_t)(center - support + 0.5f));
+                const int64_t end = std::min<int64_t>(side, (int64_t)(center + support + 0.5f));
+                float total = 0.0f;
+                for (int64_t j = 0; j < side; ++j) w[j] = 0.0f;
+                for (int64_t j = first; j < end; ++j) {
+                    const float distance = std::fabs(((float)(j - first) +
+                        ((float)first - center) + 0.5f) * inv);
+                    const float value = distance < 1.0f ? 1.0f - distance : 0.0f;
+                    w[j] = narrow(value);
+                    total += value;
+                }
+                for (int64_t j = first; j < end; ++j) w[j] = narrow(w[j] / total);
+            };
+            const int64_t grid[4] = { gr, gc, gh, gw };
+            weights_axis(grid[0], grid[2], wh);
+            weights_axis(grid[1], grid[3], ww);
+            const int64_t xb = rowoff(x, r, n), xs = laststride(x);
+            for (int64_t i = 0; i < n; ++i) {
+                float value = 0.0f;
+                for (int64_t y = 0; y < side; ++y) {
+                    if (wh[y] == 0.0f) continue;
+                    float horizontal = 0.0f;
+                    for (int64_t col = 0; col < side; ++col) {
+                        if (ww[col] == 0.0f) continue;
+                        horizontal += ldt(tab, rowoff(tab, y * side + col, n) + i * ts) * ww[col];
+                    }
+                    value += narrow(horizontal) * wh[y];
+                }
+                float pe = narrow(value);
+                if (x->dtype == RAD_BF16) pe = rad_bf16_to_f32(rad_f32_to_bf16(pe));
+                if (x->dtype == RAD_F16) pe = rad_f16_to_f32(rad_f32_to_f16(pe));
+                stt(x, xb + i * xs, ldt(x, xb + i * xs) + pe);
+            }
+            continue;
+        }
         int64_t th[2], tw[2];
         float wh[2], ww[2];
         auto axis = [&](int64_t idx, int64_t size, int64_t* t, float* w) {

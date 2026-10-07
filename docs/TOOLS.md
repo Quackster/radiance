@@ -232,6 +232,10 @@ pre-tokeniser *name*, which is a guess; a safetensors checkpoint's `tokenizer.js
 it. Also make sure a `chat_template.jinja` sits beside `tokenizer_config.json` in the checkpoint —
 newer repos moved the template out of the JSON, and the symptom of missing it is `chat is 501`.
 
+BPE's `model.ignore_merges` is preserved: when true, a pre-token already present in the vocabulary
+is emitted whole; otherwise ordinary merge ranks apply. Containers using this flag require a
+runtime with `ignore_merges` support. Older runtimes read that field as reserved and ignore it.
+
 **`--set K=V` is how a convert-time choice that must also hold at serve time is stated once.** The
 key is handed to declare *and* written into the container. What a weight is stored as is not such a
 choice: the encoding is in the container, and the plugin reads it from there.

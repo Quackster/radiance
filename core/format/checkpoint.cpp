@@ -146,11 +146,14 @@ int meta_merge_generation_config(const std::string& dir, MetaOwn* out) {
  * reads the pixel bands, the normalisation and the frame rate from here; the geometry the encoder
  * itself needs is already in config.json's vision_config. Flattened under their own prefixes --
  * `size.shortest_edge` means two different things in the two files. Absent is not an error: a
- * text model has neither. */
+ * text model has neither. Newer processors put the image configuration under `image_processor`
+ * in processor_config.json instead. Carry it under the same prefix, filling only keys absent
+ * from preprocessor_config.json so a separately saved image processor remains authoritative. */
 int meta_merge_preprocessor_configs(const std::string& dir, MetaOwn* out) {
-    static const struct { const char* file; const char* prefix; } kFiles[] = {
-        { "preprocessor_config.json", "preprocessor" },
-        { "video_preprocessor_config.json", "video_preprocessor" },
+    static const struct { const char* file; const char* prefix; const char* member; } kFiles[] = {
+        { "preprocessor_config.json", "preprocessor", nullptr },
+        { "video_preprocessor_config.json", "video_preprocessor", nullptr },
+        { "processor_config.json", "preprocessor", "image_processor" },
     };
     for (const auto& f : kFiles) {
         const std::string path = dir + "/" + f.file;
@@ -162,7 +165,14 @@ int meta_merge_preprocessor_configs(const std::string& dir, MetaOwn* out) {
             RAD_WARN("%s: %s; it is not carried", path.c_str(), e.what());
             continue;
         }
-        if (j.is_object()) flatten_json(j, f.prefix, out);
+        if (!j.is_object()) continue;
+        if (!f.member) flatten_json(j, f.prefix, out);
+        else if (j.contains(f.member) && j[f.member].is_object()) {
+            MetaOwn nested;
+            flatten_json(j[f.member], f.prefix, &nested);
+            for (size_t i = 0; i < nested.keys.size(); ++i)
+                if (!out->has(nested.keys[i])) out->kv(nested.keys[i], nested.vals[i]);
+        }
     }
     return RAD_OK;
 }
@@ -228,6 +238,10 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
     if (const char* mt = gs("model_type")) {
         out->arch.clear();
         for (const char* p = mt; *p; ++p) if (*p != '_') out->arch += *p;
+        /* LFM2-VL embeds the same text backbone as LFM2. Keep model_type and vision_config
+         * in the free-form metadata; the plugin uses them to select the checkpoint namespace
+         * and declare the optional SigLIP2 image encoder. */
+        if (std::strcmp(mt, "lfm2_vl") == 0) out->arch = "lfm2";
     }
     if (const char* nm = gs("_name_or_path")) out->name = nm;
 
@@ -251,7 +265,7 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
     m.n_expert        = gi("num_experts", gi("num_local_experts", 0));
     m.n_expert_used   = gi("num_experts_per_tok", 0);
     m.n_expert_shared = gi("shared_expert_intermediate_size", 0) ? 1 : 0;
-    m.rms_eps     = (float)gf("rms_norm_eps", 1e-6);
+    m.rms_eps     = (float)gf("rms_norm_eps", gf("norm_eps", gf("block_norm_eps", 1e-6)));
     m.rope_theta  = (float)gf("rope_parameters.rope_theta", gf("rope_theta", 10000.0));
     /* The rotary's scaling stays in the free-form keys with its type beside it; the architecture
      * reads both (arch/common/rad_arch.h, yarn_from). A factor copied here without its type would

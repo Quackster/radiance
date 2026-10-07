@@ -81,6 +81,7 @@ enum {
 extern "C" {
 
 /* -- attention (r4d_attn_*.hip) -- */
+int     r4d_rad_attn_h64_gqa4_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_prefill_h256_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_prefill_h256_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h256_fp8  (const RadArgs*, RadStream);
@@ -397,6 +398,8 @@ int r4d_rad_ngram_ids       (const RadArgs*, RadStream);
 int r4d_rad_ngram_ids_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_ple_gate        (const RadArgs*, RadStream);
 int r4d_rad_ple_conv        (const RadArgs*, RadStream);
+int r4d_rad_causal_conv1d   (const RadArgs*, RadStream);
+int r4d_rad_causal_conv1d_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_cast            (const RadArgs*, RadStream);
 int r4d_rad_gather_rows     (const RadArgs*, RadStream);
 int r4d_rad_gather_rows_u8  (const RadArgs*, RadStream);
@@ -410,6 +413,7 @@ int r4d_rad_rmsnorm         (const RadArgs*, RadStream);
 int r4d_rad_add             (const RadArgs*, RadStream);
 int r4d_rad_mul             (const RadArgs*, RadStream);
 int r4d_rad_sigmoid         (const RadArgs*, RadStream);
+int r4d_rad_silu            (const RadArgs*, RadStream);
 int r4d_rad_fill            (const RadArgs*, RadStream);
 int r4d_rad_silu_mul        (const RadArgs*, RadStream);
 int r4d_rad_rope            (const RadArgs*, RadStream);
@@ -424,6 +428,9 @@ int r4d_rad_kv_store        (const RadArgs*, RadStream);
 int r4d_rad_kv_store_fp8    (const RadArgs*, RadStream);
 int r4d_rad_kv_store_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_logits_gemm     (const RadArgs*, RadStream);
+int r4d_rad_logits_select(const RadArgs*, RadStream);
+int r4d_rad_logits_select_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+int r4d_shape_logits_select(const RadParam*, int, int, RadOpdDesc*);
 
 /* -- the decomposed sampler chain (r4d_sample_stages_f32.hip) --
  *

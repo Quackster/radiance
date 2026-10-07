@@ -1131,6 +1131,7 @@ for a model that takes no images or video.
 | `POST /v1/chat/completions` | chat, with tools, reasoning and streaming |
 | `POST /v1/completions` | raw text completion |
 | `POST /v1/embeddings` | needs a model with an embedding head, else 501 |
+| `POST /v1/systemone` | typed d1 decisions from candidate logits; [setup and contract](SYSTEMONE.md) |
 | `GET /v1/models`, `/v1/models/:id` | what is loaded |
 | `GET /health`, `/ping`, `POST /ping` | liveness |
 | `GET /load` | current load |

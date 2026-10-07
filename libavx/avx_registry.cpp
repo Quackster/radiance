@@ -76,6 +76,8 @@
 
 /* ---- elementwise and norms ---------------------------------------------------------------- */
 static const RadParamSpec pRmsnorm[]   = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
+                                           P_F64O("wadd"), P_INTO("round_before_weight") };
+static const RadParamSpec pRmsnormAdd[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
                                            P_F64O("wadd") };
 static const RadOperandSpec oRmsnorm[] = { OPD("x"), WGT("w"), OUT("y") };
 
@@ -104,7 +106,11 @@ static const RadParamSpec pPleConv[]   = { P_INT("M"), P_INT("n"), P_INT("width"
                                            P_INT("dilation"), P_STR("dtype") };
 static const RadOperandSpec oPleConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
                                            OPD_O("resid"), OPD_O("cache_idx"), OPD_O("has_init"),
-                                           OPD_O("num_accepted"), OUT("y") };
+                                          OPD_O("num_accepted"), OUT("y") };
+
+static const RadParamSpec pCausalConv[] = { P_INT("M"), P_INT("n"), P_INT("width"), P_STR("dtype") };
+static const RadOperandSpec oCausalConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
+    OPD_O("cache_idx"), OPD_O("has_init"), OPD_O("num_accepted"), OUT("y") };
 
 static const RadParamSpec pHcWrite[]   = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
@@ -122,7 +128,8 @@ static const RadOperandSpec oRmsnormAdd[] = { OPD("x"), OPD("residual"), WGT("w"
 static const RadParamSpec pLayernorm[]   = { P_INT("M"), P_INT("n"), P_F64("eps"),
                                              P_STR("dtype") };
 static const RadOperandSpec oLayernorm[] = { OPD("x"), WGT("w"), WGT_O("b"), OUT("y") };
-static const RadParamSpec pGridEmbed[]   = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype") };
+static const RadParamSpec pGridEmbed[]   = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"),
+    P_STRO("mode") };
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
 
 static const RadParamSpec pMnD[]      = { P_INT("M"), P_INT("n"), P_STR("dtype") };
@@ -398,6 +405,10 @@ static const RadOperandSpec oEmbedQ[] = { OPD("tokens"), WGT("wte"), WGT_O("scal
 static const RadParamSpec pLogits[]   = { P_INT("M"), P_INT("n_vocab"), P_INT("n_embd"),
                                           P_STR("dtype") };
 static const RadOperandSpec oLogits[] = { OPD("x"), WGT("lm_head"), OUT("logits") };
+static const RadParamSpec pLogitsSelect[] = { P_INT("M"), P_INT("n_rows"), P_INT("n_vocab"),
+    P_INT("n_embd"), P_STR("dtype"), P_INTO("round_bf16") };
+static const RadOperandSpec oLogitsSelect[] = {
+    OPD("x"), WGT("lm_head"), OPD("rows"), OPD("tokens"), OUT("values") };
 
 /* ---- sampling ----------------------------------------------------------------------------- */
 static const RadParamSpec pMVocab[] = { P_INT("M"), P_INT("n_vocab") };
@@ -437,8 +448,9 @@ static const RadOperandSpec oDflashSelect[]  = { OPD("cand"), OPD("unary"), OPD_
 static const RadOpSchema kSchemas[] = {
 { "rmsnorm", ARR(pRmsnorm), ARR(oRmsnorm),
   "y = x * rsqrt(mean(x^2) + eps) * (w + wadd). The sum of squares is a four-accumulator vector "
-  "reduction, so it does not sum in libref's order and does not claim to." },
-{ "rmsnorm_add", ARR(pRmsnorm), ARR(oRmsnormAdd),
+  "reduction, so it does not sum in libref's order and does not claim to. Optional "
+  "round_before_weight=1 narrows x * rsqrt(...) to x's dtype before multiplying the gain." },
+{ "rmsnorm_add", ARR(pRmsnormAdd), ARR(oRmsnormAdd),
   "residual_out = x + residual, then y = rmsnorm(residual_out) * w. The variance is taken from the "
   "unrounded f32 sum and the multiply reads residual_out back AFTER narrowing -- both are libref's "
   "rule and both are observable, so both are reproduced exactly." },
@@ -456,7 +468,9 @@ static const RadOpSchema kSchemas[] = {
   "matrices' stored format; a host kernel reads them as the dense tensors it is handed." },
 { "layernorm", ARR(pLayernorm), ARR(oLayernorm), "layer norm with gain and optional bias." },
 { "grid_embed", ARR(pGridEmbed), ARR(oGridEmbed),
-  "x += a side x side position table resampled bilinearly to the row's grid." },
+  "x += a side x side position table resampled bilinearly to the row's grid. Optional "
+  "mode=bilinear_antialias uses half-pixel centers, normalized triangular filtering, "
+  "and table-dtype rounding of weights and separable passes." },
 { "add", ARR(pMnD), ARR(oBinary), "elementwise sum." },
 { "mul", ARR(pMnD), ARR(oBinary),
   "elementwise product; `b` may have extent 1 on any axis `a` does not and is broadcast along it." },
@@ -468,6 +482,10 @@ static const RadOpSchema kSchemas[] = {
 { "fill", ARR(pFill), ARR(oFill), "y = value over [M, n], rounded once to y's dtype (default 0)." },
 { "ple_gate", ARR(pPleGate), ARR(oPleGate),
   "PLE gate: three grouped norms, a dot, a signed sqrt." },
+{ "causal_conv1d", ARR(pCausalConv), ARR(oCausalConv),
+  "Depthwise causal convolution without an activation. Packed rolling state holds width-1 "
+  "history values per channel. A cold sequence reads zeros; num_accepted selects a prior verify "
+  "offset and preserves candidate inputs for the next verify. Without it, all inputs commit." },
 { "ple_conv", ARR(pPleConv), ARR(oPleConv),
   "PLE's dilated depthwise conv, silu and residual add." },
 { "ngram_ids", ARR(pNgramIds), ARR(oNgramIds), "hashed n-gram row ids for PLE." },
@@ -566,6 +584,8 @@ static const RadOpSchema kSchemas[] = {
 { "embed_lookup_q", ARR(pEmbed), ARR(oEmbedQ),
   "embedding gather, one scale for the table; without a scale the table is read as it is." },
 { "logits_gemm", ARR(pLogits), ARR(oLogits), "the lm_head projection." },
+{ "logits_select", ARR(pLogitsSelect), ARR(oLogitsSelect),
+  "selected (hidden row, vocabulary token) projections, optionally rounded through bf16." },
 { "sample_penalties", ARR(pPenal), ARR(oPenalties),
   "repetition, frequency and presence penalties." },
 { "sample_dry", ARR(pPenal), ARR(oDry), "DRY repetition-suffix penalty, once per token." },
@@ -653,6 +673,8 @@ SIMPLE("avx_ngram_ids", "ngram_ids", "vocab", "hashed n-gram row ids for PLE", D
        L(ngram_ids)),
 SIMPLE("avx_ple_gate", "ple_gate", "norm", "PLE gate: three grouped norms, a dot, a signed sqrt",
        DT_FLOAT, L(ple_gate)),
+SIMPLE("avx_causal_conv1d", "causal_conv1d", "conv", "depthwise causal convolution with rolling state",
+       DT_FLOAT, L(causal_conv1d)),
 SIMPLE("avx_ple_conv", "ple_conv", "norm", "PLE's dilated depthwise conv, silu and residual add",
        DT_FLOAT, L(ple_conv)),
 SIMPLE("avx_cast", "cast", "elem", "dtype conversion", DT_ANY, L(cast)),
@@ -783,6 +805,8 @@ SIMPLE("avx_embed_lookup", "embed_lookup", "vocab", "embedding gather", DT_FLOAT
   nullptr, nullptr },
 SIMPLE("avx_logits_gemm", "logits_gemm", "vocab", "the lm_head projection", DT_FLOAT,
        L(logits_gemm)),
+SIMPLE("avx_logits_select", "logits_select", "vocab", "selected vocabulary projection", DT_FLOAT,
+       L(logits_select)),
 
 SIMPLE("avx_sample_penalties", "sample_penalties", "sample",
        "repetition, frequency and presence penalties", DT_FLOAT, L(sample_penalties)),

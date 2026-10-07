@@ -4450,3 +4450,108 @@ TEST(kv_bytes_in_use_count_a_speculating_state_once_per_sequence) {
     f.kv.free_sequence(1);
     CHECK_EQ(f.kv.pool_bytes_used(G_GDN), 0ll);
 }
+
+TEST(request_local_partial_prefix_copies_all_layers_without_global_cache_ownership) {
+    if (!device_is_host()) return;
+    Fixture f;
+    CHECK_OK(f.build());
+    RadStream stream = nullptr;
+    REQUIRE_EQ(rad_stream_create(&stream, 0), RAD_OK);
+    struct Cleanup { RadStream stream; ~Cleanup() { rad_stream_destroy(stream); } } cleanup{stream};
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 7));
+    const auto prefix = f.kv.block_table(1, G_FULL);
+    REQUIRE_EQ(prefix.size(), 1u);
+    const KVGroupPlan* plan = f.kv.plan(G_FULL);
+    const int64_t bytes = plan->layer_bytes_per_block();
+    for (int64_t layer = 0; layer < plan->n_layers; ++layer) {
+        auto* row = (unsigned char*)plan->base + layer * plan->layer_stride() + prefix[0] * bytes;
+        for (int64_t i = 0; i < bytes; ++i) row[i] = (unsigned char)(i * 31 + layer * 53);
+    }
+    CHECK_OK(f.kv.retain_prefix_block(G_FULL, prefix[0]));
+    f.kv.free_sequence(1);
+    CHECK_EQ(f.kv.cache_only_blocks(G_FULL), 0);
+    CHECK_EQ(f.kv.block_refcount(G_FULL, prefix[0]), 1);
+    for (uint64_t id : {2, 3}) {
+        CHECK_OK(f.kv.add_sequence(id));
+        CHECK_EQ(f.kv.adopt_prefix(id, G_FULL, {-1}, 7), RAD_E_INVAL);
+        CHECK(f.kv.block_table(id, G_FULL).empty());
+        CHECK_OK(f.kv.adopt_prefix(id, G_FULL, prefix, 7));
+        CHECK_EQ(f.kv.seq_tokens(id), 7);
+        CHECK_OK(f.kv.ensure(id, 12));
+        const auto blocks = f.kv.block_table(id, G_FULL);
+        REQUIRE_EQ(blocks.size(), 1u);
+        CHECK(blocks[0] != prefix[0]);
+        const auto copies = f.kv.take_pending_copies();
+        REQUIRE_EQ(copies.size(), 1u);
+        CHECK_OK(f.kv.copy_blocks(copies, stream));
+        CHECK_OK(rad_stream_sync(stream));
+        for (int64_t layer = 0; layer < plan->n_layers; ++layer) {
+            auto* row = (unsigned char*)plan->base + layer * plan->layer_stride() + blocks[0] * bytes;
+            for (int64_t i = 0; i < bytes; ++i)
+                CHECK_EQ(row[i], (unsigned char)(i * 31 + layer * 53));
+            std::memset(row, 0xdd, (size_t)bytes); // writing one branch must not alter the trunk
+        }
+        f.kv.free_sequence(id);
+    }
+    CHECK_EQ(f.kv.cache_only_blocks(G_FULL), 0);
+    f.kv.release_prefix_block(G_FULL, prefix[0]);
+    CHECK_EQ(f.kv.free_blocks(G_FULL), f.kv.total_blocks(G_FULL));
+}
+
+TEST(private_snapshot_restores_every_convolution_layer_into_independent_branch_slots) {
+    if (!device_is_host()) return;
+    Fixture f;
+    f.cfg.prefix_cache = false;
+    f.cfg.checkpoint_slots = 2;
+    f.cfg.n_spec = 0;
+    auto groups = hybrid_groups();
+    KVGroupInfo conv;
+    conv.name = "conv"; conv.decl.kind = RAD_KV_CONV; conv.decl.dtype = RAD_BF16;
+    conv.decl.n_head_kv = 2; conv.decl.head_dim = 8; conv.decl.conv_width = 4;
+    conv.layers = {6, 7, 8};
+    groups.push_back(conv);
+    REQUIRE_EQ(f.build_groups(groups), RAD_OK);
+    RadStream stream = nullptr;
+    REQUIRE_EQ(rad_stream_create(&stream, 0), RAD_OK);
+    struct Cleanup { RadStream stream; ~Cleanup() { rad_stream_destroy(stream); } } cleanup{stream};
+    CHECK_OK(f.kv.add_sequence(1)); CHECK_OK(f.kv.ensure(1, 7));
+    std::vector<int32_t> slots(groups.size(), -1);
+    for (size_t g = 0; g < groups.size(); ++g) {
+        const auto* plan = f.kv.plan((int32_t)g);
+        if (!plan->stateful()) continue;
+        slots[g] = f.kv.state_slot(1, (int32_t)g);
+        for (int layer = 0; layer < plan->n_layers; ++layer) {
+            auto* row = (unsigned char*)f.kv.state_ptr((int32_t)g, layer, slots[g]);
+            for (int64_t i = 0; i < plan->layer_bytes_per_state(); ++i)
+                row[i] = (unsigned char)(g * 29 + layer * 41 + i * 7);
+        }
+    }
+    int32_t snapshot = -1;
+    CHECK_OK(f.kv.alloc_checkpoint(&snapshot));
+    CHECK_OK(f.kv.checkpoint_save(slots.data(), (int)slots.size(), snapshot, stream));
+    CHECK_OK(rad_stream_sync(stream));
+    f.kv.free_sequence(1); // snapshot owns its contents, not the old sequence's state slots
+    std::vector<int32_t> first_slots;
+    for (uint64_t id : {2, 3}) {
+        CHECK_OK(f.kv.add_sequence(id)); CHECK_OK(f.kv.ensure(id, 12));
+        for (size_t g = 0; g < groups.size(); ++g) slots[g] = f.kv.state_slot(id, (int32_t)g);
+        CHECK_OK(f.kv.checkpoint_restore(slots.data(), (int)slots.size(), snapshot, stream));
+        CHECK_OK(rad_stream_sync(stream));
+        for (size_t g = 0; g < groups.size(); ++g) {
+            const auto* plan = f.kv.plan((int32_t)g);
+            if (!plan->stateful()) continue;
+            if (id == 3) CHECK(slots[g] != first_slots[g]);
+            for (int layer = 0; layer < plan->n_layers; ++layer) {
+                auto* row = (unsigned char*)f.kv.state_ptr((int32_t)g, layer, slots[g]);
+                for (int64_t i = 0; i < plan->layer_bytes_per_state(); ++i)
+                    CHECK_EQ(row[i], (unsigned char)(g * 29 + layer * 41 + i * 7));
+                std::memset(row, 0xcc, (size_t)plan->layer_bytes_per_state());
+            }
+        }
+        first_slots = slots;
+    }
+    f.kv.free_sequence(2); f.kv.free_sequence(3);
+    f.kv.free_checkpoint(snapshot);
+    CHECK_EQ(f.kv.free_checkpoint_slots(), 2);
+}

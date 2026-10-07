@@ -379,6 +379,7 @@ struct TokEncoder {
     uint32_t kind = RAD_TOK_BPE;
     bool     bytelevel = false;              /* the chain has a ByteLevel pre-tokeniser */
     bool     byte_fallback = false;
+    bool     ignore_merges = false;
     /* The ByteLevel step at this index is the last step that rewrites text, so the mapping is
      * never materialised: the BPE merges raw bytes against `raw` instead. -1 when that does not
      * hold (no ByteLevel, or a step after it that reads the mapped text). */
@@ -407,6 +408,7 @@ struct TokEncoder {
 
 int TokEncoder::build(const VocabBuild& b, const std::vector<int32_t>& special) {
     kind = b.kind;
+    ignore_merges = b.ignore_merges;
     types = b.types;
     unk = b.unk;
 
@@ -1029,15 +1031,14 @@ void bpe_word(const TokEncoder& e, std::string_view w, std::vector<int32_t>& out
      * the vocabulary promises to round-trip; decomposing one into codepoints and merging back
      * can land on a different sequence, because the merge table was never fitted over them.
      *
-     * ORDINARY VOCABULARY ENTRIES STILL GO THROUGH THE MERGE LOOP, which is HuggingFace's
-     * behaviour at `ignore_merges: false` and is what every checkpoint in scope declares. A
-     * vocabulary setting it TRUE wants the same short-circuit for any word that is already a
-     * token, and this engine does not honour the flag: core/text/tokenizer_json.cpp only warns
-     * when it is set, and the vocabulary has nowhere to carry it. Such a model would tokenise
-     * differently here than it does in transformers, mostly on rare words. Supporting it is a
-     * vocabulary field, not a change to this loop. */
+     * `ignore_merges` extends this rule to ordinary vocabulary entries. It applies to each
+     * pre-token after the declared normalizer and pre-tokenizer, not to the unsplit input.
+     * The deferred ByteLevel path looks up the same token through its raw-byte spelling. */
     const int32_t whole = table.find(w);
-    if (whole >= 0 && e.types[whole] == RAD_TT_USER_DEFINED) {
+    /* Control tokens are consumed by the special-token splitter when enabled. A control entry
+     * reaching this path is ordinary user text; ignore_merges must not re-enable that marker. */
+    if (whole >= 0 && ((e.ignore_merges && e.types[whole] != RAD_TT_CONTROL) ||
+                      e.types[whole] == RAD_TT_USER_DEFINED)) {
         out.push_back(whole);
         return;
     }

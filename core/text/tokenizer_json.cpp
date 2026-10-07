@@ -335,17 +335,7 @@ int read_model(const json& m, VocabBuild& out, const char* origin, uint64_t id_l
 
     if (type == "BPE") {
         out.kind = RAD_TOK_BPE;
-        /* `ignore_merges` SHORT-CIRCUITS THE MERGE LOOP for any word that is already a token, and
-         * this reader does not carry it: the vocabulary has no field for it and tokenizer.cpp
-         * applies the short-circuit only to added tokens. A vocabulary that sets it would tokenise
-         * differently here than in transformers, on rare words, with nothing in the output to say
-         * so -- so it is said here instead of being discovered from a quality regression. */
-        if (const json* im = get(m, "ignore_merges"))
-            if (im->is_boolean() && im->get<bool>())
-                RAD_WARN("%s: the vocabulary sets ignore_merges, which this tokeniser does not "
-                         "implement. Words that are already tokens will be re-split through the "
-                         "merge table and may tokenise differently than they do in transformers.",
-                         origin);
+        out.ignore_merges = bool_or(m, "ignore_merges", false);
         RAD_TRY(read_text_to_id("BPE"));
     } else if (type == "Unigram") {
         out.kind = RAD_TOK_UNIGRAM;
@@ -922,6 +912,7 @@ int vocab_serialize(const VocabBuild& in, StringSink& strings, uint64_t off,
     h.add_bos = in.add_bos ? 1u : 0u;
     h.add_eos = in.add_eos ? 1u : 0u;
     h.chat_template = tmpl;
+    h.model_flags = in.ignore_merges ? RAD_VOCAB_F_IGNORE_MERGES : 0;
     out.resize(sizeof(RadVocabHeader), 0);
 
     /* Each array is aligned to its own element so a mapped reader can point a typed pointer at
@@ -984,6 +975,7 @@ int vocab_deserialize(const void* file_base, uint64_t file_bytes, const RadVocab
     out.pad = h->pad_id; out.unk = h->unk; out.sep = h->sep;
     out.add_bos = h->add_bos != 0;
     out.add_eos = h->add_eos != 0;
+    out.ignore_merges = (h->model_flags & RAD_VOCAB_F_IGNORE_MERGES) != 0;
     out.chat_template = S(h->chat_template);
 
     if (!in_file(h->tok_text_off, (uint64_t)h->n_tokens * sizeof(rad_stroff)))

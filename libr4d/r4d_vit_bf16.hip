@@ -120,6 +120,60 @@ __global__ __launch_bounds__(kThr) void grid_embed_kernel(
     }
 }
 
+// Half-pixel antialiased bilinear interpolation, used by SigLIP2. A table is a tensor in
+// its own dtype: both filter-weight stages and each separable pass narrow to that dtype.
+// This matters for BF16 even when upsampling, where the footprint is only two samples.
+template <bool TF32>
+__device__ __forceinline__ float grid_narrow(float v) {
+    return TF32 ? v : bf2f(f32_to_bf16(v));
+}
+template <bool TF32>
+__global__ __launch_bounds__(kThr) void grid_embed_antialias_kernel(
+    unsigned short* __restrict__ x, const void* __restrict__ tab, const int32_t* __restrict__ crd,
+    uint32_t n, int side, uint32_t x_ld, uint32_t plane) {
+    extern __shared__ float weights[];
+    float* wh = weights;
+    float* ww = weights + side;
+    const uint32_t m = blockIdx.x;
+    if (threadIdx.x == 0) {
+        for (int axis = 0; axis < 2; ++axis) {
+            const int size = max(1, crd[(axis + 2) * plane + m]);
+            const int at = max(0, min(size - 1, crd[axis * plane + m]));
+            const float scale = (float)side / (float)size;
+            const float support = fmaxf(scale, 1.0f), inv = 1.0f / support;
+            const float center = scale * ((float)at + 0.5f);
+            const int first = max(0, (int)(center - support + 0.5f));
+            const int end = min(side, (int)(center + support + 0.5f));
+            float* w = weights + axis * side;
+            float total = 0.0f;
+            for (int j = 0; j < side; ++j) w[j] = 0.0f;
+            for (int j = first; j < end; ++j) {
+                const float d = fabsf(((float)(j - first) + ((float)first - center) + 0.5f) * inv);
+                const float value = fmaxf(0.0f, 1.0f - d);
+                w[j] = grid_narrow<TF32>(value);
+                total += value;
+            }
+            for (int j = first; j < end; ++j) w[j] = grid_narrow<TF32>(w[j] / total);
+        }
+    }
+    __syncthreads();
+    unsigned short* xr = x + (size_t)m * x_ld;
+    for (uint32_t i = threadIdx.x; i < n; i += kThr) {
+        float value = 0.0f;
+        for (int y = 0; y < side; ++y) {
+            if (wh[y] == 0.0f) continue;
+            float horizontal = 0.0f;
+            for (int col = 0; col < side; ++col) {
+                if (ww[col] == 0.0f) continue;
+                horizontal += ldw<TF32>(tab, (uint32_t)(y * side + col) * n + i) * ww[col];
+            }
+            value += grid_narrow<TF32>(horizontal) * wh[y];
+        }
+        const float pe = bf2f(f32_to_bf16(grid_narrow<TF32>(value)));
+        xr[i] = f32_to_bf16(bf2f(xr[i]) + pe);
+    }
+}
+
 // ---------------------------------------------------------------------------- gemm_nt_bias
 #define VB_BK 64
 #define VB_PITCH (VB_BK + 8)      // 144-byte LDS rows: gemm_bf16_nt_tiled's bank argument
@@ -288,6 +342,9 @@ static int rad_grid_embed_body(const RadArgs* a, const R4dSink& sk) {
     if (!r4d_contig(tab)) return R4D_NO(RAD_E_STRIDE);
     const long long n = r4d_geti_or(a, "n", r4d_dim(tab, (int)tab->rank - 1));
     const long long side = r4d_geti_or(a, "side", 0);
+    const char* mode = r4d_gets(a, "mode");
+    const bool antialias = mode && std::strcmp(mode, "bilinear_antialias") == 0;
+    if (mode && !antialias && std::strcmp(mode, "bilinear") != 0) return R4D_NO(RAD_E_INVAL);
     if (n <= 0 || side <= 0 || r4d_numel(tab) < side * side * n) return R4D_NO(RAD_E_SHAPE);
     long long M = 0;
     const long long x_ld = r4d_rows_pitch(x, n, &M);
@@ -297,6 +354,18 @@ static int rad_grid_embed_body(const RadArgs* a, const R4dSink& sk) {
         return R4D_NO(RAD_E_SHAPE);
     if (M <= 0) return R4D_NO(RAD_E_SHAPE);
     const uint32_t plane = (uint32_t)crd->shape[1];
+    if (antialias) {
+        // Only two side-long weight vectors are shared, independent of the patch count.
+        if (side > 4096) return R4D_NO(RAD_E_SHAPE);
+        const uint32_t shared = (uint32_t)(2 * side * sizeof(float));
+        if (tab->dtype == RAD_F32)
+            return R4D_EMIT(sk, grid_embed_antialias_kernel<true>, dim3((uint32_t)M), dim3(kThr), shared,
+                            (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
+                            (uint32_t)n, (int)side, (uint32_t)x_ld, plane);
+        return R4D_EMIT(sk, grid_embed_antialias_kernel<false>, dim3((uint32_t)M), dim3(kThr), shared,
+                        (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
+                        (uint32_t)n, (int)side, (uint32_t)x_ld, plane);
+    }
     if (tab->dtype == RAD_F32)
         return R4D_EMIT(sk, grid_embed_kernel<true>, dim3((uint32_t)M), dim3(kThr), 0,
                         (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),

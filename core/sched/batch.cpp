@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
+#include <mutex>
 
 namespace rad {
 
@@ -376,7 +377,13 @@ int64_t BatchBuilder::device_bytes(Program& prog, const Config& cfg, const KVGeo
     if (b.layout(prog, cfg) < 0) return -1;
     b.size_set(b.set_, prog.kv_groups);
     const MediaBytes m = b.mm_on_ ? b.media_bytes() : MediaBytes{};
-    return b.set_.dev_bytes + m.mm + m.pix + m.crd + m.cu;
+    /* Compact projection owns two int32 indices and one float result per
+     * candidate. TokenScoreReadback allocates lazily within this declared bound. */
+    const int64_t scores = prog.token_scores ?
+        cfg.max_seqs * RAD_MAX_SCORE_CANDIDATES * 3 * (int64_t)sizeof(int32_t) : 0;
+    /* media_bytes() charges the optional retained feature pool only on rank zero,
+     * matching alloc_media(); every rank still owns its ordinary step staging. */
+    return b.set_.dev_bytes + m.mm + m.pix + m.crd + m.cu + m.retained + scores;
 }
 
 int BatchBuilder::layout(Program& prog, const Config& cfg) {
@@ -500,6 +507,65 @@ int BatchBuilder::layout(Program& prog, const Config& cfg) {
 }
 
 /* ------------------------------------------------------------------ media staging */
+struct BatchBuilder::MediaPool : std::enable_shared_from_this<MediaPool> {
+    struct Range { int64_t row, count; };
+    void* base = nullptr;
+    int device = 0;
+    int64_t width = 0, available = 0;
+    std::vector<Range> free;
+    std::mutex mutex;
+
+    ~MediaPool() {
+        if (base) {
+            (void)rad_dev_set(device);
+            rad_dev_free(base, RAD_MEM_DEVICE);
+        }
+    }
+
+    std::shared_ptr<mm::DeviceRows> reserve(int64_t rows) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (rows <= 0 || rows > available) return {};
+        auto result = std::make_shared<mm::DeviceRows>();
+        result->device = device;
+        result->rows = rows;
+        result->width = width;
+        std::vector<Range> owned;
+        int64_t at = 0;
+        while (at < rows) {
+            Range& front = free.front();
+            const int64_t take = std::min(rows - at, front.count);
+            owned.push_back({front.row, take});
+            result->spans.push_back({at, take,
+                static_cast<char*>(base) + front.row * width * (int64_t)sizeof(uint16_t)});
+            front.row += take;
+            front.count -= take;
+            if (!front.count) free.erase(free.begin());
+            at += take;
+        }
+        available -= rows;
+        /* The allocation outlives the builder if an HTTP request still owns its
+         * media at shutdown. Sources used by asynchronous staging have an extra
+         * lease in the builder until the upload event completes. */
+        result->release = [owner = shared_from_this(), owned = std::move(owned)] {
+            std::lock_guard<std::mutex> lock(owner->mutex);
+            for (const auto& range : owned) {
+                owner->free.push_back(range);
+                owner->available += range.count;
+            }
+            std::sort(owner->free.begin(), owner->free.end(),
+                      [](const Range& a, const Range& b) { return a.row < b.row; });
+            size_t n = 0;
+            for (const auto& range : owner->free) {
+                if (n && owner->free[n - 1].row + owner->free[n - 1].count == range.row)
+                    owner->free[n - 1].count += range.count;
+                else owner->free[n++] = range;
+            }
+            owner->free.resize(n);
+        };
+        return result;
+    }
+};
+
 BatchBuilder::MediaBytes BatchBuilder::media_bytes() {
     const RadEncoderDecl& e = prog_->encoder;
     n_embd_ = e.n_embd;
@@ -512,7 +578,30 @@ BatchBuilder::MediaBytes BatchBuilder::media_bytes() {
     m.pix = enc_patches_ * enc_dim_ * (int64_t)sizeof(uint16_t);
     m.crd = 4 * enc_patches_ * (int64_t)sizeof(int32_t);
     m.cu  = (enc_segs_ + 1) * (int64_t)sizeof(int32_t);
+    /* Retaining features is an opt-in for compact-scoring architectures, so an
+     * existing encoder-enabled generation model keeps its original memory budget.
+     * Rank zero owns at most one context of rows and at most 128 MiB, regardless
+     * of context length or queue depth. Overflow keeps the host representation. */
+    constexpr int64_t kRetainedMediaBytes = 128 * 1024 * 1024;
+    if (prog_->token_scores && prog_->ctx.rank == 0 && !device_is_host() &&
+        n_embd_ > 0 && n_embd_ <= kRetainedMediaBytes / (int64_t)sizeof(uint16_t)) {
+        const int64_t row_bytes = n_embd_ * (int64_t)sizeof(uint16_t);
+        m.retained = std::min(max_ctx_, kRetainedMediaBytes / row_bytes) * row_bytes;
+    }
     return m;
+}
+
+int BatchBuilder::reserve_media_rows(mm::Item& item) {
+    if (!mm_pool_ || item.device_rows) return RAD_OK;
+    /* Reap the last batch's source leases even if no later media-bearing batch
+     * arrived. Encoder passes run between model steps. */
+    if (mm_ev_live_) {
+        RAD_TRY(rad_event_sync(mm_ev_));
+        mm_ev_live_ = false;
+        mm_sources_.clear();
+    }
+    item.device_rows = mm_pool_->reserve(item.n_rows());
+    return RAD_OK;
 }
 
 int BatchBuilder::alloc_media() {
@@ -535,6 +624,20 @@ int BatchBuilder::alloc_media() {
         }
     }
     RAD_TRY(rad_dev_set(ranks_[0].device));
+    if (m.retained > 0) {
+        mm_pool_ = std::make_shared<MediaPool>();
+        mm_pool_->device = ranks_[0].device;
+        mm_pool_->width = n_embd_;
+        mm_pool_->available = m.retained / (n_embd_ * (int64_t)sizeof(uint16_t));
+        mm_pool_->free.reserve((size_t)mm_pool_->available + 1);
+        mm_pool_->free.push_back({0, mm_pool_->available});
+        mm_pool_->base = rad_dev_alloc(m.retained, RAD_MEM_DEVICE);
+        if (!mm_pool_->base) {
+            RAD_ERR("media features: could not reserve the planned %s on rank zero",
+                    humanb(m.retained).c_str());
+            return RAD_E_NOMEM;
+        }
+    }
     mm_host_        = static_cast<uint16_t*>(rad_dev_alloc(mm_bytes, RAD_MEM_HOST_PINNED));
     enc_pix_host_   = static_cast<uint16_t*>(rad_dev_alloc(pix_bytes, RAD_MEM_HOST_PINNED));
     enc_coord_host_ = static_cast<int32_t*>(rad_dev_alloc(crd_bytes, RAD_MEM_HOST_PINNED));
@@ -545,13 +648,24 @@ int BatchBuilder::alloc_media() {
         return RAD_E_NOMEM;
     }
     if (rad_event_create_as(&mm_ev_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT) < 0) return RAD_E_DEVICE;
+    mm_sources_.reserve((size_t)max_tok_);
+    mm_host_ranges_.reserve((size_t)max_tok_);
+    mm_device_copies_.reserve((size_t)max_tok_);
     RAD_INFO("media staging: %s a rank for a step's encoder rows and %s for an encoder pass of "
              "%lld patches", humanb(mm_bytes).c_str(),
              humanb(pix_bytes + crd_bytes + cu_bytes).c_str(), (long long)enc_patches_);
+    if (m.retained > 0)
+        RAD_INFO("media features: %s retained on rank zero; overflow uses host staging",
+                 humanb(m.retained).c_str());
     return RAD_OK;
 }
 
 void BatchBuilder::free_media() {
+    if (mm_ev_live_) (void)rad_event_sync(mm_ev_);
+    mm_sources_.clear();
+    mm_host_ranges_.clear();
+    mm_device_copies_.clear();
+    mm_pool_.reset();
     for (size_t r = 0; r < mm_dev_.size(); ++r) {
         if (r < ranks_.size()) rad_dev_set(ranks_[r].device);
         if (mm_dev_[r])        rad_dev_free(mm_dev_[r], RAD_MEM_DEVICE);
@@ -585,7 +699,11 @@ int64_t BatchBuilder::stage_mm_rows(const StepEntry& e, int64_t k, int64_t shift
         const mm::RopeLayout::Run* run = pm.rope.run_at(ti);
         if (!run) { ++j; continue; }
         const mm::Item& it = *pm.items[(size_t)run->item].item;
-        if (!it.encoded || (int64_t)it.embd.size() < it.n_rows() * n_embd_) {
+        const bool on_device = it.device_rows != nullptr;
+        if (!it.encoded || (on_device ?
+            (it.device_rows->device != ranks_[0].device || it.device_rows->width != n_embd_ ||
+             it.device_rows->rows < it.n_rows()) :
+            ((int64_t)it.embd.size() < it.n_rows() * n_embd_))) {
             RAD_ERR("step batch: request %llu reaches a media item that has not been encoded",
                     (unsigned long long)e.seq);
             return RAD_E_STATE;
@@ -594,8 +712,34 @@ int64_t BatchBuilder::stage_mm_rows(const StepEntry& e, int64_t k, int64_t shift
         int64_t take = std::min<int64_t>((int64_t)run->tok + run->n - ti, e.n_tokens - j);
         take = std::min<int64_t>(take, prompt - ti);
         const int64_t row = (int64_t)run->row0 + (ti - run->tok);
-        std::memcpy(mm_host_ + (n_rows + added) * n_embd_, it.embd.data() + row * n_embd_,
-                    (size_t)(take * n_embd_) * sizeof(uint16_t));
+        const int64_t row_bytes = n_embd_ * (int64_t)sizeof(uint16_t);
+        if (on_device) {
+            int64_t copied = 0;
+            for (const auto& span : it.device_rows->spans) {
+                const int64_t lo = std::max(row, span.row);
+                const int64_t hi = std::min(row + take, span.row + span.count);
+                if (lo >= hi) continue;
+                const char* src = static_cast<const char*>(span.data) + (lo - span.row) * row_bytes;
+                const int64_t dst = (n_rows + added + lo - row) * row_bytes;
+                const int64_t bytes = (hi - lo) * row_bytes;
+                if (!mm_device_copies_.empty() &&
+                    mm_device_copies_.back().dst + mm_device_copies_.back().bytes == dst &&
+                    static_cast<const char*>(mm_device_copies_.back().src) + mm_device_copies_.back().bytes == src)
+                    mm_device_copies_.back().bytes += bytes;
+                else mm_device_copies_.push_back({src, dst, bytes});
+                copied += hi - lo;
+            }
+            if (copied != take) return RAD_E_STATE;
+            mm_sources_.push_back(it.device_rows);
+        } else {
+            const int64_t off = (n_rows + added) * row_bytes;
+            const int64_t bytes = take * row_bytes;
+            std::memcpy(mm_host_ + (n_rows + added) * n_embd_, it.embd.data() + row * n_embd_,
+                        (size_t)bytes);
+            if (!mm_host_ranges_.empty() && mm_host_ranges_.back().dst + mm_host_ranges_.back().bytes == off)
+                mm_host_ranges_.back().bytes += bytes;
+            else mm_host_ranges_.push_back({off, off, bytes});
+        }
         for (int64_t q = 0; q < take; ++q) rows[n_rows + added + q] = (int32_t)(k + j + q);
         added += take;
         j += (int32_t)take;
@@ -932,6 +1076,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     int64_t n_out = 0, n_dout = 0;
     int32_t rope_mixed = 0;
     int64_t n_mm = 0;
+    mm_host_ranges_.clear();
+    mm_device_copies_.clear();
     s.h_cu[0] = 0;
     for (int64_t i = 0; i < n_seq; ++i) {
         const StepEntry& e = plan.e[(size_t)i];
@@ -980,6 +1126,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 if (mm_ev_live_) {
                     if (rad_event_sync(mm_ev_) < 0) return nullptr;
                     mm_ev_live_ = false;
+                    mm_sources_.clear();
                 }
                 const int64_t got = stage_mm_rows(e, k, shift, n_mm, s.h_mmrow);
                 if (got < 0) return nullptr;
@@ -1041,6 +1188,16 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         RAD_ERR("step plan token count %lld does not match its entries (%lld)",
                 (long long)n_tok, (long long)k);
         return nullptr;
+    }
+
+    /* Score-only requests read one final-prompt row. Keeping these after all sampled rows means
+     * the sampler's dense row indexing and speculative acceptance never include a scoring row. */
+    if (plan.draft_pass == 0 && plan.tok_shift == 0) {
+        int64_t at = 0;
+        for (const StepEntry& e : plan.e) {
+            if (e.produces_score) s.h_out[n_out++] = (int32_t)(at + e.n_tokens - 1);
+            at += e.n_tokens;
+        }
     }
 
     /* THE SCORED ROWS (Request::score), after every row the sampler reads: a row at each token of
@@ -1150,8 +1307,23 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     if (n_mm > 0) {
         const int64_t bytes = n_mm * n_embd_ * (int64_t)sizeof(uint16_t);
         for (size_t r = 0; r < ranks_.size(); ++r) {
-            const int st = r == 0 ? rad_memcpy_async(mm_dev_[r], mm_host_, bytes, ranks_[r].stream)
-                                  : rad_memset_async(mm_dev_[r], 0, bytes, ranks_[r].stream);
+            int st = RAD_OK;
+            if (r == 0) {
+                /* Adjacent tiles in one allocation coalesce even when prompt
+                 * markers separate their feature runs. Keep host and device spans
+                 * disjoint so stale host rows cannot overwrite retained features. */
+                for (const auto& copy : mm_device_copies_) {
+                    st = rad_memcpy_async(static_cast<char*>(mm_dev_[r]) + copy.dst,
+                                          copy.src, copy.bytes, ranks_[r].stream);
+                    if (st < 0) break;
+                }
+                if (st < 0) return nullptr;
+                for (const auto& range : mm_host_ranges_) {
+                    st = rad_memcpy_async(static_cast<char*>(mm_dev_[r]) + range.dst,
+                        reinterpret_cast<const char*>(mm_host_) + range.src, range.bytes, ranks_[r].stream);
+                    if (st < 0) break;
+                }
+            } else st = rad_memset_async(mm_dev_[r], 0, bytes, ranks_[r].stream);
             if (st < 0) {
                 RAD_ERR("step batch: rank %zu's encoder rows -> %s", r, rad_strerror(st));
                 return nullptr;
@@ -1277,9 +1449,13 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
     int64_t n_patch = 0, n_seg = 0, max_seg = 0;
     enc_cu_host_[0] = 0;
     for (const EncoderPart& p : parts) {
+        if (!p.item || p.seg0 < 0 || p.n_seg <= 0 || p.n_seg > p.item->n_seg ||
+            p.seg0 > p.item->n_seg - p.n_seg) {
+            RAD_ERR("encoder pass: invalid item segment range");
+            return nullptr;
+        }
         const mm::Item& it = *p.item;
-        const int64_t seg_p = (int64_t)it.grid_h * it.grid_w;
-        const int64_t np = seg_p * p.n_seg;
+        const int64_t np = it.patch_at(p.seg0 + p.n_seg) - it.patch_at(p.seg0);
         if (it.patch_dim != enc_dim_ || n_patch + np > enc_patches_ ||
             n_seg + p.n_seg > enc_segs_ || p.seg0 + p.n_seg > it.n_seg) {
             RAD_ERR("encoder pass: %lld patches in %lld segments do not fit the declared pass of "
@@ -1288,14 +1464,15 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
             return nullptr;
         }
         std::memcpy(enc_pix_host_ + n_patch * enc_dim_,
-                    it.pixels.data() + (int64_t)p.seg0 * seg_p * enc_dim_,
+                    it.pixels.data() + it.patch_at(p.seg0) * enc_dim_,
                     (size_t)(np * enc_dim_) * sizeof(uint16_t));
         n_patch += np;
         for (int32_t q = 0; q < p.n_seg; ++q) {
+            const int64_t seg_p = it.segment_patches(p.seg0 + q);
+            max_seg = std::max(max_seg, seg_p);
             enc_cu_host_[n_seg + 1] = enc_cu_host_[n_seg] + (int32_t)seg_p;
             ++n_seg;
         }
-        if (seg_p > max_seg) max_seg = seg_p;
     }
     /* Coordinates in planes of n_patch, which is what makes planes 0 and 1 a dense [2, n_patch]. */
     {
@@ -1303,10 +1480,9 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
         int64_t at = 0;
         for (const EncoderPart& p : parts) {
             const mm::Item& it = *p.item;
-            const int64_t seg_p = (int64_t)it.grid_h * it.grid_w;
-            const int64_t np = seg_p * p.n_seg;
+            const int64_t np = it.patch_at(p.seg0 + p.n_seg) - it.patch_at(p.seg0);
             tmp.resize((size_t)(4 * np));
-            it.coords((int64_t)p.seg0 * seg_p, np, tmp.data());
+            it.coords(it.patch_at(p.seg0), np, tmp.data());
             for (int c = 0; c < 4; ++c)
                 std::memcpy(enc_coord_host_ + c * n_patch + at, tmp.data() + c * np,
                             (size_t)np * sizeof(int32_t));

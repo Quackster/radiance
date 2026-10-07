@@ -44,6 +44,10 @@ std::vector<Case> build_cases() {
                              HF("wadd", 0) }, EB(7, 640, w, 2));
         add("rmsnorm",     { HI("M", 3), HI("n", 645), HF("eps", 1e-5), HS("dtype", dt),
                              HF("wadd", 1) }, EB(3, 645, w, 2));
+        add("rmsnorm",     { HI("M", 7), HI("n", 640), HF("eps", 1e-6), HS("dtype", dt),
+                             HF("wadd", 0), HI("round_before_weight", 1) }, EB(7, 640, w, 2));
+        add("rmsnorm",     { HI("M", 3), HI("n", 645), HF("eps", 1e-5), HS("dtype", dt),
+                             HF("wadd", 1), HI("round_before_weight", 1) }, EB(3, 645, w, 2));
         add("rmsnorm_add", { HI("M", 5), HI("n", 640), HF("eps", 1e-6), HS("dtype", dt),
                              HF("wadd", 0) }, EB(5, 640, w, 4));
         add("layernorm",   { HI("M", 5), HI("n", 645), HF("eps", 1e-5), HS("dtype", dt) },
@@ -93,6 +97,9 @@ std::vector<Case> build_cases() {
                            HF("wadd", 1), HF("gate_eps", 1e-6) });
         add("ple_conv",  { HI("M", 9), HI("n", 128), HI("width", 4), HI("dilation", 2),
                            HS("dtype", dt) });
+        add("causal_conv1d", { HI("M", 1), HI("n", 128), HI("width", 3), HS("dtype", dt) });
+        add("causal_conv1d", { HI("M", 5), HI("n", 131), HI("width", 3), HS("dtype", dt) });
+        add("causal_conv1d", { HI("M", 3), HI("n", 17), HI("width", 65), HS("dtype", dt) });
     }
     add("ngram_ids", { HI("M", 9), HI("heads", 3), HI("ngram", 4), HI("eos", 2) });
 
@@ -145,6 +152,10 @@ std::vector<Case> build_cases() {
                                       HS("act", act) }, 0, fl);
             add("logits_gemm",  { HI("M", M), HI("n_vocab", 96), HI("n_embd", 259),
                                   HS("dtype", dt) }, 0, fl);
+            for (int rounding : { 0, 1 })
+                add("logits_select", { HI("M", M), HI("n_rows", 11), HI("n_vocab", 96),
+                                         HI("n_embd", 259), HS("dtype", dt),
+                                         HI("round_bf16", rounding) }, 0, 2.0 * M * 259);
         }
     /* fp8a8 and fp8a16 ARE THE ONLY TWO libref CAN DESCRIBE, and that is a real limit rather than
      * a gap in this table: `gemm_nt_q` is one op over six weight formats and the SCALE GRID is
@@ -246,6 +257,8 @@ std::vector<Case> build_cases() {
                       HF("theta", 10000.0), HF("scale", 1.0), HS("mode", "axial"),
                       HI("rotary_dim", 72), HS("sections", "18 18"), HS("dtype", dt) });
         add("grid_embed", { HI("M", 20), HI("n", 72), HI("side", 6), HS("dtype", dt) });
+        add("grid_embed", { HI("M", 20), HI("n", 72), HI("side", 6), HS("dtype", dt),
+                            HS("mode", "bilinear_antialias") });
     }
 
     /* MoE. `a_order` exists because the two grouped GEMMs of one routed block disagree about it,

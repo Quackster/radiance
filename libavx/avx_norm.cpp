@@ -31,6 +31,8 @@
 #include "avx_vec.h"
 #include "avx_common.h"
 
+#include <algorithm>
+
 using namespace avx;
 
 /* The gain row, widened once per LAUNCH rather than once per row.
@@ -66,6 +68,8 @@ AVX_KERNEL(rmsnorm) {
     const int64_t n = p_int(a, "n", w->rank ? w->shape[w->rank - 1] : 0);
     const float eps  = p_f32(a, "eps", 1e-6f);
     const float wadd = p_f32(a, "wadd", 0.0f);
+    const int64_t round_before_weight = p_int(a, "round_before_weight", 0);
+    if (round_before_weight != 0 && round_before_weight != 1) return RAD_E_INVAL;
     if (n <= 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(x, n);
     if (rows <= 0 || numel(y) < rows * n || numel(w) < n) return RAD_E_SHAPE;
@@ -82,9 +86,23 @@ AVX_KERNEL(rmsnorm) {
         const float s = 1.0f / std::sqrt(ss / (float)n + eps);
         const vf vs = vf_set1(s);
         int64_t i = 0;
-        for (; i + VF_N <= n; i += VF_N)
-            vf_storeu(sy + i, vf_mul(vf_mul(vf_loadu(v + i), vs), vf_loadu(gain + i)));
-        for (; i < n; ++i) sy[i] = v[i] * s * gain[i];
+        if (round_before_weight && x->dtype != RAD_F32) {
+            for (; i + VF_N <= n; i += VF_N)
+                vf_storeu(sy + i, vf_mul(vf_loadu(v + i), vs));
+            for (; i < n; ++i) sy[i] = v[i] * s;
+            /* LFM2 narrows the normalized row before applying its gain. The input has been
+             * consumed now, so sx can hold the packed row without another scratch allocation. */
+            row_from_f32(x->dtype, sy, sx, n);
+            row_to_f32(x->dtype, sx, sy, n);
+            i = 0;
+            for (; i + VF_N <= n; i += VF_N)
+                vf_storeu(sy + i, vf_mul(vf_loadu(sy + i), vf_loadu(gain + i)));
+            for (; i < n; ++i) sy[i] *= gain[i];
+        } else {
+            for (; i + VF_N <= n; i += VF_N)
+                vf_storeu(sy + i, vf_mul(vf_mul(vf_loadu(v + i), vs), vf_loadu(gain + i)));
+            for (; i < n; ++i) sy[i] = v[i] * s * gain[i];
+        }
         out_row(y, rowoff(y, r, n), n, sy);
     }
     return RAD_OK;
@@ -237,6 +255,9 @@ AVX_KERNEL(grid_embed) {
     const RadTensor *x = &a->t[0], *tab = &a->t[1], *crd = &a->t[2];
     const int64_t n = p_int(a, "n", tab->rank ? tab->shape[tab->rank - 1] : 0);
     const int64_t side = p_int(a, "side", 0);
+    const char* mode = p_str(a, "mode", "bilinear");
+    const bool antialias = std::strcmp(mode, "bilinear_antialias") == 0;
+    if (!antialias && std::strcmp(mode, "bilinear") != 0) return RAD_E_INVAL;
     if (n <= 0 || side <= 0 || numel(tab) < side * side * n) return RAD_E_SHAPE;
     const int64_t rows = rows_of(x, n);
     if (rows <= 0 || crd->rank != 2 || crd->shape[0] < 4 || crd->shape[1] < rows)
@@ -248,6 +269,59 @@ AVX_KERNEL(grid_embed) {
     for (int64_t r = 0; r < rows; ++r) {
         int64_t g[4];
         for (int c = 0; c < 4; ++c) g[c] = ldi(crd, c * cs + r * ms);
+        if (antialias) {
+            // Separable half-pixel triangle filtering. Widen the footprint when reducing, then
+            // normalize only surviving taps at an edge. The table dtype determines rounding of
+            // raw/normalized weights and the horizontal intermediate, as in GPU interpolate.
+            auto narrow = [&](float v) {
+                if (tab->dtype == RAD_BF16) return rad_bf16_to_f32(rad_f32_to_bf16(v));
+                if (tab->dtype == RAD_F16) return rad_f16_to_f32(rad_f32_to_f16(v));
+                return v;
+            };
+            float* wh = scratch_f32((size_t)(2 * side));
+            float* ww = wh + side;
+            auto weights_axis = [&](int64_t at, int64_t size, float* w) {
+                size = size > 0 ? size : 1;
+                at = at < 0 ? 0 : (at >= size ? size - 1 : at);
+                const float scale = (float)side / (float)size;
+                const float support = scale > 1.0f ? scale : 1.0f;
+                const float inv = 1.0f / support;
+                const float center = scale * ((float)at + 0.5f);
+                const int64_t first = std::max<int64_t>(0, (int64_t)(center - support + 0.5f));
+                const int64_t end = std::min<int64_t>(side, (int64_t)(center + support + 0.5f));
+                float total = 0.0f;
+                for (int64_t j = 0; j < side; ++j) w[j] = 0.0f;
+                for (int64_t j = first; j < end; ++j) {
+                    const float distance = std::fabs(((float)(j - first) +
+                        ((float)first - center) + 0.5f) * inv);
+                    const float value = distance < 1.0f ? 1.0f - distance : 0.0f;
+                    w[j] = narrow(value);
+                    total += value;
+                }
+                for (int64_t j = first; j < end; ++j) w[j] = narrow(w[j] / total);
+            };
+            const int64_t grid[4] = { g[0], g[1], g[2], g[3] };
+            weights_axis(grid[0], grid[2], wh);
+            weights_axis(grid[1], grid[3], ww);
+            const int64_t xb = rowoff(x, r, n), xs = laststride(x);
+            for (int64_t i = 0; i < n; ++i) {
+                float value = 0.0f;
+                for (int64_t y = 0; y < side; ++y) {
+                    if (wh[y] == 0.0f) continue;
+                    float horizontal = 0.0f;
+                    for (int64_t col = 0; col < side; ++col) {
+                        if (ww[col] == 0.0f) continue;
+                        horizontal += ldt(tab, rowoff(tab, y * side + col, n) + i * ts) * ww[col];
+                    }
+                    value += narrow(horizontal) * wh[y];
+                }
+                float pe = narrow(value);
+                if (x->dtype == RAD_BF16) pe = rad_bf16_to_f32(rad_f32_to_bf16(pe));
+                if (x->dtype == RAD_F16) pe = rad_f16_to_f32(rad_f32_to_f16(pe));
+                stt(x, xb + i * xs, ldt(x, xb + i * xs) + pe);
+            }
+            continue;
+        }
         int64_t th[2], tw[2];
         float wh[2], ww[2];
         auto axis = [&](int64_t idx, int64_t size, int64_t* t, float* w) {

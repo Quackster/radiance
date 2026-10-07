@@ -700,9 +700,10 @@ struct TestStrings : StringSink {
 TEST(vocab_section_round_trip) {
     VocabBuild in;
     in.kind   = RAD_TOK_BPE;
-    in.tokens = { "<unk>", "a", "b", "ab", "\xc4\xa0" };
-    in.types  = { RAD_TT_UNKNOWN, RAD_TT_NORMAL, RAD_TT_NORMAL, RAD_TT_NORMAL, RAD_TT_NORMAL };
+    in.tokens = { "<unk>", "a", "b", "ab", "\xc4\xa0", "aba" };
+    in.types  = { RAD_TT_UNKNOWN, RAD_TT_NORMAL, RAD_TT_NORMAL, RAD_TT_NORMAL, RAD_TT_NORMAL, RAD_TT_NORMAL };
     in.merges = { { 1, 2 } };
+    in.ignore_merges = true;
     in.bos = -1; in.eos = 2; in.eot = 2; in.unk = 0; in.pad = -1; in.sep = -1;
     in.add_bos = false;
     in.add_eos = true;
@@ -743,6 +744,8 @@ TEST(vocab_section_round_trip) {
                                out));
 
     CHECK_EQ(out.kind, in.kind);
+    CHECK_EQ(sizeof(RadVocabHeader), (size_t)128);  /* consumes a reserved word, no layout growth */
+    CHECK_EQ(out.ignore_merges, in.ignore_merges);
     CHECK(out.tokens == in.tokens);
     CHECK(out.types == in.types);
     CHECK(out.merges == in.merges);
@@ -766,7 +769,22 @@ TEST(vocab_section_round_trip) {
     std::vector<int32_t> ids;
     CHECK_OK(t.encode("ab", ids, false, false));
     CHECK_EQ(ids.size(), (size_t)1);
-    CHECK_EQ(ids[0], 3);      /* the merge fired */
+    CHECK_EQ(ids[0], 3);
+    ids.clear();
+    CHECK_OK(t.encode("aba", ids, false, false));
+    CHECK(ids == (std::vector<int32_t>{5}));  /* stored flag bypasses the incomplete merge path */
+
+    /* Older containers left this reserved word zero: retain ordinary BPE for those files. */
+    auto* old = reinterpret_cast<RadVocabHeader*>(file.data() + sec_off);
+    old->model_flags = 0;
+    CHECK_OK(vocab_deserialize(file.data(), file.size(), old, out));
+    CHECK(!out.ignore_merges);
+    auto legacy = std::make_shared<Vocab>();
+    CHECK_OK(legacy->load(std::move(out)));
+    CHECK_OK(t.init(legacy));
+    ids.clear();
+    CHECK_OK(t.encode("aba", ids, false, false));
+    CHECK(ids == (std::vector<int32_t>{3, 1}));
 }
 
 /* ================================================================== tokenizer.json */

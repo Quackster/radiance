@@ -424,14 +424,9 @@ void bpe(const Vocab& v, const std::vector<std::string>& words, std::vector<int3
          * merging back can land on a different sequence, because the merge table was never
          * fitted over them.
          *
-         * ORDINARY VOCABULARY ENTRIES STILL GO THROUGH THE MERGE LOOP, which is HuggingFace's
-         * behaviour at `ignore_merges: false` and is what every checkpoint in scope declares.
-         * A vocabulary setting it TRUE wants the same short-circuit for any word that is already
-         * a token, and this engine does not read the flag: core/text/tokenizer_json.cpp does not
-         * parse it and the vocabulary has nowhere to carry it. Such a model would tokenise
-         * differently here than it does in transformers -- silently, and mostly on rare words.
-         * Supporting it is a vocabulary field, not a change to this loop. */
-        if (v.find(word) >= 0 && v.type(v.find(word)) == RAD_TT_USER_DEFINED) {
+         * `ignore_merges` also takes ordinary vocabulary entries whole, after pre-tokenization. */
+        if (v.find(word) >= 0 && ((v.build().ignore_merges && v.type(v.find(word)) != RAD_TT_CONTROL) ||
+                                 v.type(v.find(word)) == RAD_TT_USER_DEFINED)) {
             symbols.push_back({ -1, -1, word.c_str(), word.size() });
             offset = word.size();
         }

@@ -66,6 +66,7 @@ struct ServerOptions {
     int         retry_after_s = 1;
 
     int64_t     max_ctx = 0;
+    int64_t     max_batch_tokens = 0;       /* 0: automatic shared-prefill grouping disabled */
     int64_t     default_max_tokens = 0;     /* 0: what the context leaves (OaiLimits) */
     int64_t     max_tokens_cap = 0;         /* 0: none */
     int         max_n = 8;
@@ -73,6 +74,9 @@ struct ServerOptions {
     int64_t     max_stop_bytes = 4096;
 
     bool        supports_logprobs = false;
+    /* Model metadata, not inferred from its name. Only a declared d1 profile currently has a
+     * System One prompt/readout adapter. Empty means the model has no decision capability. */
+    std::string decision_type;
     /* The deployment default for `reasoning_effort`, empty for the template's own. See
      * OaiLimits::default_reasoning_effort for why a server-side default is needed at all. */
     std::string default_reasoning_effort;
@@ -177,6 +181,7 @@ private:
     HttpResponse handle_chat(const HttpRequest& req);
     HttpResponse handle_completion(const HttpRequest& req);
     HttpResponse handle_embeddings(const HttpRequest& req);
+    HttpResponse handle_systemone(const HttpRequest& req);
     HttpResponse handle_models(const HttpRequest& req);
     HttpResponse handle_metrics(const HttpRequest& req);
 

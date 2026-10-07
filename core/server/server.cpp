@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include "json_partial.h"
+#include "systemone.h"
 #include "rad_internal.h"
 
 #include <nlohmann/json.hpp>
@@ -127,6 +128,7 @@ void Server::register_routes() {
     router_.post("/v1/chat/completions", [this](const HttpRequest& q) { return handle_chat(q); });
     router_.post("/v1/completions",      [this](const HttpRequest& q) { return handle_completion(q); });
     router_.post("/v1/embeddings",       [this](const HttpRequest& q) { return handle_embeddings(q); });
+    router_.post("/v1/systemone",        [this](const HttpRequest& q) { return handle_systemone(q); });
     router_.get ("/v1/models",           [this](const HttpRequest& q) { return handle_models(q); });
     router_.get ("/v1/models/:id",       [this](const HttpRequest& q) { return handle_models(q); });
 
@@ -1027,6 +1029,131 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
     }
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, embeddings_body(r, vecs, u));
+}
+
+HttpResponse Server::handle_systemone(const HttpRequest& req) {
+    if (!deps_.sched || !deps_.tok)
+        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+    if (opt_.decision_type != "d1")
+        return error_response(err_not_implemented(
+            "/v1/systemone requires a supported decision profile; this model is not declared as d1"), req.peer);
+    if (!deps_.sched->supports_token_scores())
+        return error_response(err_not_implemented("the engine does not support decision token scoring"), req.peer);
+
+    DecisionRequest r;
+    ApiError err;
+    if (parse_d1_request(req.body, *deps_.tok, opt_.model_id, opt_.max_ctx, queue_depth_, &r, &err,
+                         opt_.allow_image ? deps_.mm : nullptr) < 0)
+        return error_response(err, req.peer);
+    if (stopping_.load()) return error_response(err_overloaded("the server is shutting down"), req.peer);
+
+    sweep_abandoned();
+    const int64_t count = (int64_t)r.questions.size();
+    if (!admit(count)) {
+        metrics_.observe_rejected();
+        return error_response(err_overloaded("the admission queue is full; retry the decision request later"), req.peer);
+    }
+
+    std::vector<Generation> gens;
+    std::vector<Request> requests;
+    std::vector<std::shared_ptr<TokenScores>> scores;
+    std::shared_ptr<SharedPrefix> shared_prefix;
+    // Keep short requests in one ordinary batch. A larger batch budget should not
+    // disable reuse of a substantial trunk when all branches still cannot fit together.
+    if (r.questions.size() > 1 && opt_.max_batch_tokens > 0 &&
+        r.questions[0].shared_prefix_tokens >= std::min<int64_t>(opt_.max_batch_tokens, 256) &&
+        r.input_tokens > opt_.max_batch_tokens) {
+        shared_prefix = std::make_shared<SharedPrefix>();
+        shared_prefix->n_tokens = r.questions[0].shared_prefix_tokens;
+    }
+    for (const auto& question : r.questions) {
+        Generation g;
+        g.sink = std::make_shared<Sink>();
+        auto result = std::make_shared<TokenScores>();
+        result->tokens = question.candidates;
+        Request rq;
+        rq.prompt = question.tokens;
+        rq.max_tokens = 0;
+        rq.token_scores = result;
+        rq.shared_prefix = shared_prefix;
+        rq.media = r.media;
+        rq.sink = g.sink.get();
+        gens.push_back(std::move(g));
+        requests.push_back(std::move(rq));
+        scores.push_back(std::move(result));
+    }
+    std::vector<uint64_t> ids;
+    deps_.sched->submit_all(requests, &ids);
+    for (size_t i = 0; i < gens.size(); ++i) {
+        gens[i].id = ids[i];
+        gens[i].sink->id = ids[i];
+    }
+    RAD_INFO("systemone admitted%s model=%s questions=%lld prompt=%lld tok",
+             from_peer(req.peer).c_str(), opt_.model_id.c_str(), (long long)count,
+             (long long)r.input_tokens);
+
+    /* Use the same sinks, cancellation and retirement as generation. A finished score request
+     * produces no tokens, so no decoder or sampler is needed on this path. */
+    auto retire_all = [&] {
+        retire(gens);
+        release(count);
+    };
+    for (;;) {
+        bool done = true;
+        for (const auto& g : gens) {
+            if (!g.sink->done()) { done = false; continue; }
+            if (g.sink->finish_reason() == Finish::Error || g.sink->finish_reason() == Finish::Cancelled) {
+                err.status = 500;
+                err.type = "internal_server_error";
+                err.message = g.sink->finish_reason() == Finish::Error ? engine_failure(*g.sink)
+                    : "the engine cancelled this decision request";
+                cancel_all(gens, false);
+                retire_all();
+                return error_response(err, req.peer);
+            }
+        }
+        if (done) break;
+        if (req.peer_gone()) {
+            cancel_all(gens, true);
+            retire_all();
+            metrics_.observe_http(499);
+            return HttpResponse::text(499, "client closed request\n");
+        }
+        if (stopping_.load()) {
+            cancel_all(gens, false);
+            retire_all();
+            return error_response(err_overloaded("the server is shutting down"), req.peer);
+        }
+        for (const auto& g : gens) if (!g.sink->done()) { g.sink->wait(); break; }
+    }
+
+    json answers = json::object();
+    double elapsed = 0.0;
+    for (size_t i = 0; i < r.questions.size(); ++i) {
+        json answer;
+        if (gens[i].sink->n_produced() != 0) {
+            err.status = 500;
+            err.type = "internal_server_error";
+            err.message = "the engine generated tokens for a score-only decision request";
+            retire_all();
+            return error_response(err, req.peer);
+        }
+        if (d1_answer(r.questions[i], scores[i]->logits, &answer, &err) < 0) {
+            retire_all();
+            return error_response(err, req.peer);
+        }
+        answers[r.questions[i].name] = std::move(answer);
+        elapsed = std::max(elapsed, (double)gens[i].sink->age_ns() * 1e-9);
+    }
+    retire_all();
+    metrics_.observe_request(r.input_tokens, 0, -1.0, -1.0, elapsed, -1.0, 1, 0, SuccessReason::Stop);
+    metrics_.observe_http(200);
+    RAD_INFO("systemone done%s questions=%lld prompt=%lld gen=0 %.2fs",
+             from_peer(req.peer).c_str(), (long long)count, (long long)r.input_tokens, elapsed);
+    return HttpResponse::json_body(200, json_dump(json{
+        {"answers", std::move(answers)},
+        {"usage", {{"input_tokens", r.input_tokens}, {"output_tokens", 0}}}
+    }));
 }
 
 HttpResponse Server::handle_models(const HttpRequest& req) {

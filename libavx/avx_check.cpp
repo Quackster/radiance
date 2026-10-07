@@ -44,6 +44,8 @@
  *      execute is reported as NOT EXECUTABLE and counted nowhere: claiming a pass for a path that
  *      never ran is the one result worse than a failure.
  */
+#include "../tests/grid_embed_golden.h"
+
 #include "avx_harness.h"
 #include "avx_isa.h"
 
@@ -89,6 +91,7 @@ static const Tol kTol[] = {
     { "gemm_nt",      "*",        3e-2 },
     { "logits_gemm",  "bf16",     8e-3 },
     { "logits_gemm",  "f32",      2e-5 },
+    { "logits_select", "*",      2e-5 },
     { "moe_gemm",     "*",        3e-2 },
     { "attn_",        "bf16",     2e-2 },
     { "attn_",        "f32",      1e-4 },
@@ -181,7 +184,13 @@ static void run_case(const Lib& ref, const Lib& avx, const Case& c, bool verbose
 
     bool ok = true;
     double worst = 0;
-    const double tol = tol_override >= 0 ? tol_override : tolerance_for(c.op, case_dtype(c));
+    // The selected head's optional final narrowing is BF16 even with F32 input operands.
+    // A reduction-order difference can cross that rounding boundary; exact seam cases below
+    // use dyadic products whose sum is independent of the SIMD width.
+    const bool selected_bf16 = std::strcmp(c.op, "logits_select") == 0 &&
+        case_geti(c, "round_bf16", 0) == 1;
+    const double tol = tol_override >= 0 ? tol_override :
+        selected_bf16 ? 8e-3 : tolerance_for(c.op, case_dtype(c));
     for (size_t i = 0; i < pr.opd.size(); ++i) {
         const Opd& o = pr.opd[i];
         if (o.absent || o.n <= 0) continue;
@@ -465,6 +474,240 @@ static std::function<float(int64_t)> hfill(uint64_t s, float sigma = 1.0f) {
         x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 29;
         return ((float)(x % 2001) / 1000.0f - 1.0f) * sigma;
     };
+}
+
+/* Independent PyTorch GPU outputs cover the low-precision filter weights and intermediate
+ * rounding, while the full-buffer oracle also checks strided inputs and untouched padding. */
+static bool grid_embed_antialias_cases(const Lib& ref, const Lib& avx, bool verbose) {
+    namespace g = grid_embed_golden;
+    bool passed = true;
+    for (uint32_t table_dt : {RAD_BF16, RAD_F32}) {
+        const int n = 35, pitch = 2 * n + 3;
+        Hand h("GPU antialias golden, pitched x/table", "grid_embed", 1e-7);
+        h.view(RAD_BF16, {g::rows, n}, {pitch, 2}, g::rows * pitch,
+               [=](int64_t i) { const int c = i % pitch;
+                   return c < 2 * n && c % 2 == 0 ? g::patch(i / pitch, (c / 2) % g::n) : 19.0f;
+               }, true)
+         .view(table_dt, {g::side * g::side, n}, {pitch, 2}, g::side * g::side * pitch,
+               [=](int64_t i) { const int c = i % pitch;
+                   return c < 2 * n && c % 2 == 0 ? g::table(i / pitch, (c / 2) % g::n) : -29.0f;
+               })
+         .dense(RAD_I32, {4, g::rows}, [](int64_t i) { return (float)g::coord[i % g::rows][i / g::rows]; })
+         .pi("M", g::rows).pi("n", n).pi("side", g::side).ps("dtype", "bf16")
+         .ps("mode", "bilinear_antialias");
+        if (!h.run(ref, avx, verbose)) passed = false;
+        const uint16_t* expected = table_dt == RAD_BF16 ? g::bf16 : g::f32;
+        const Hand::Buf& x = h.bufs[0];
+        bool exact = true;
+        for (int r = 0; r < g::rows; ++r) for (int c = 0; c < n; ++c) {
+            const float want = rad_bf16_to_f32(expected[r * g::n + c % g::n]);
+            const int i = r * pitch + c * 2;
+            if (rad_load_f32(x.a.data(), RAD_BF16, i) != want ||
+                rad_load_f32(x.b.data(), RAD_BF16, i) != want) exact = false;
+        }
+        if (!exact) {
+            std::printf("  FAIL grid_embed antialias differs from GPU golden (table %s)\n",
+                        table_dt == RAD_BF16 ? "bf16" : "f32");
+            passed = false;
+        }
+    }
+    return passed;
+}
+
+/* Integer input squares sum exactly in every reduction order, so these cases can require exact
+ * agreement on the extra rounding instead of hiding it inside the usual norm tolerance. The
+ * varying gains make narrowing before their multiply observably different from narrowing after. */
+static bool rmsnorm_rounding_cases(const Lib& ref, const Lib& avx, bool verbose) {
+    bool ok = true;
+    for (const char* dtype : { "bf16", "f16" }) {
+        const uint32_t dt = rad_dtype_parse(dtype);
+        for (int64_t n : { 64, 65 }) {
+            for (int rounding : { 0, 1 }) {
+                const std::string name = std::string(dtype) + " n=" + std::to_string(n) +
+                    " round_before_weight=" + std::to_string(rounding);
+                Hand h(name.c_str(), "rmsnorm", 0.0);
+                const int64_t stride = n == 65 ? 2 : 1;
+                h.view(dt, { 2, n }, { n * stride, stride }, 2 * n * stride,
+                       [stride, n](int64_t i) { return (float)(1 + (i / stride % n) % 4); })
+                 .dense(dt, { n }, [](int64_t i) { return 1.0f + (float)(i % 17) * 0.03125f; })
+                 .dense(dt, { 2, n }, [](int64_t) { return 0.0f; }, true)
+                 .pi("M", 2).pi("n", n).pf("eps", 1e-6).ps("dtype", dtype)
+                 .pi("round_before_weight", rounding);
+                if (!h.run(ref, avx, verbose)) ok = false;
+            }
+        }
+    }
+    std::printf("  rmsnorm rounding: 8 exact cases %s\n", ok ? "passed" : "FAILED");
+    return ok;
+}
+
+/* Every product here is dyadic and the sums are exactly representable in F32, so the SIMD
+ * reduction order cannot obscure an index/stride bug or a missing BF16 rounding seam. Padding
+ * holds unrelated values, and the whole output allocation is checked for stray writes. */
+static bool logits_select_cases(const Lib& ref, const Lib& avx, bool verbose) {
+    bool ok = true;
+    int checked = 0;
+    constexpr int64_t R = 6, V = 7, K = 35, M = 7;
+    constexpr int64_t xp = 2 * K + 3, xb = 3 * xp + 5, wp = 3 * K + 2;
+    const int row_ids[M] = {0, 5, 2, 0, 4, 1, 5};
+    const int token_ids[M] = {0, 6, 2, 0, 1, 3, 6};
+    for (const char* dtype : { "f32", "bf16", "f16" }) {
+        for (int rounding : { -1, 0, 1 }) {
+            const uint32_t dt = rad_dtype_parse(dtype);
+            const std::string name = std::string(dtype) + " strided pairs, rounding=" +
+                (rounding < 0 ? "default" : std::to_string(rounding));
+            Hand h(name.c_str(), "logits_select", 0.0);
+            h.view(dt, {2, 3, K}, {xb, xp, 2}, 2 * xb,
+                   [](int64_t i) {
+                       for (int64_t r = 0; r < R; ++r) {
+                           const int64_t k2 = i - (r / 3 * xb + r % 3 * xp);
+                           if (k2 >= 0 && k2 < 2 * K && !(k2 & 1))
+                               return r == 0 ? (k2 == 0 ? 1.0078125f : 0.0f) :
+                                   (float)(r + (k2 / 2) % 5) * 0.125f;
+                       }
+                       return 99.0f;
+                   })
+             .view(dt, {V, K}, {wp, 3}, V * wp,
+                   [](int64_t i) {
+                       const int64_t v = i / wp, k3 = i % wp;
+                       if (k3 < 3 * K && k3 % 3 == 0)
+                           return v == 0 ? (k3 == 0 ? 1.0078125f : 0.0f) :
+                               (float)(v - (k3 / 3) % 3) * 0.25f;
+                       return -99.0f;
+                   })
+             .view(RAD_I32, {M}, {2}, 2 * M,
+                   [&row_ids](int64_t i) { return (float)(i % 2 ? 999 : row_ids[i / 2]); })
+             .view(RAD_I32, {M}, {2}, 2 * M,
+                   [&token_ids](int64_t i) { return (float)(i % 2 ? 999 : token_ids[i / 2]); })
+             .view(RAD_F32, {M}, {3}, 3 * M, [](int64_t) { return -17.0f; }, true)
+             .pi("M", 4096).pi("n_rows", 64).pi("n_vocab", V).pi("n_embd", K).ps("dtype", dtype);
+            if (rounding >= 0) h.pi("round_bf16", rounding);
+            ++checked;
+            if (!h.run(ref, avx, verbose)) ok = false;
+
+            const float expected = rounding == 1 ? 1.015625f : 1.01568603515625f;
+            for (const auto* tensors : { &h.ta, &h.tb })
+                if (rad_load_f32((*tensors)[4].data, RAD_F32, 0) != expected ||
+                    rad_load_f32((*tensors)[4].data, RAD_F32, 9) != expected) {
+                    std::printf("  FAIL logits_select %s: duplicate pair or rounding seam\n", name.c_str());
+                    ok = false;
+                }
+
+            // Rejections must agree with the oracle and leave every output byte unchanged.
+            auto refuse = [&](const char* why, int expected_rc) {
+                ++checked;
+                bool pass = true;
+                for (int side = 0; side < 2; ++side) {
+                    auto& tensors = side ? h.tb : h.ta;
+                    const Lib& lib = side ? avx : ref;
+                    const auto* kernel = lib.row("logits_select");
+                    const auto& output = side ? h.bufs.back().b : h.bufs.back().a;
+                    const auto before = output;
+                    RadArgs args{};
+                    args.t = tensors.data(); args.n_t = (int)tensors.size();
+                    args.p = h.p.data(); args.n_p = (int)h.p.size(); args.world_size = 1;
+                    if (!kernel || kernel->launch(&args, nullptr) != expected_rc || output != before)
+                        pass = false;
+                }
+                if (!pass) {
+                    std::printf("  FAIL logits_select %s: %s rejection changed output or status\n",
+                                name.c_str(), why);
+                    ok = false;
+                }
+            };
+            auto set_last = [&](int operand, int value) {
+                auto& b = h.bufs[(size_t)h.buf_of[(size_t)operand]];
+                rad_store_f32(b.a.data(), RAD_I32, 2 * (M - 1), (float)value);
+                rad_store_f32(b.b.data(), RAD_I32, 2 * (M - 1), (float)value);
+            };
+            for (int invalid : { -1, (int)R }) {
+                set_last(2, invalid);
+                refuse("hidden row out of range", RAD_E_INVAL);
+            }
+            set_last(2, row_ids[M - 1]);
+            for (int invalid : { -1, (int)V }) {
+                set_last(3, invalid);
+                refuse("vocabulary token out of range", RAD_E_INVAL);
+            }
+            set_last(3, token_ids[M - 1]);
+            h.ta[4].shape[0] = h.tb[4].shape[0] = M - 1;
+            refuse("short output", RAD_E_SHAPE);
+            h.ta[4].shape[0] = h.tb[4].shape[0] = M;
+            h.ta[2].dtype = h.tb[2].dtype = RAD_F32;
+            refuse("noninteger row indices", RAD_E_DTYPE);
+            h.ta[2].dtype = h.tb[2].dtype = RAD_I32;
+            if (rounding < 0) h.pi("round_bf16", 2);
+            else h.p.back().ival = 2;
+            refuse("invalid rounding flag", RAD_E_INVAL);
+        }
+    }
+    std::printf("  selected logits: %d exact/contract cases %s\n", checked, ok ? "passed" : "FAILED");
+    return ok;
+}
+
+/* Successive calls keep each plugin's own state, so a cold prefill, warm short chunk and rejected
+ * verify cannot accidentally pass by starting from a fresh identical fixture every time. */
+static bool causal_conv_cases(const Lib& ref, const Lib& avx, bool verbose) {
+    bool ok = true;
+    int checked = 0;
+    for (const char* dtype : { "f32", "bf16", "f16" }) {
+        const uint32_t dt = rad_dtype_parse(dtype);
+        constexpr int64_t T = 4, N = 35, W = 3, DEPTH = 4;
+        Hand h("cold pitched prefill", "causal_conv1d", 1e-5);
+        // Powers of two keep the short multiply-add exact even on an ISA that contracts FMA.
+        h.view(dt, {T, N}, {2 * N + 3, 2}, T * (2 * N + 3),
+               [](int64_t i) { return (float)(i % 13 - 6) * 0.125f; })
+         .view(dt, {N, W}, {2 * W + 1, 2}, N * (2 * W + 1),
+               [](int64_t i) { return (float)(i % 7 - 3) * 0.25f; })
+         .dense(dt, {2, N, DEPTH}, [](int64_t i) { return 7.0f + (float)(i % 5); }, true)
+         .idx({0, 2, 4}).idx({1, 0}).idx({0, 0}).none()
+         .view(dt, {T, N}, {3 * N + 5, 3}, T * (3 * N + 5),
+               [](int64_t) { return -17.0f; }, true)
+         .pi("M", 64).pi("n", N).pi("width", W).ps("dtype", dtype);
+        auto set_ids = [&](int operand, std::initializer_list<int> values) {
+            Hand::Buf& b = h.bufs[(size_t)h.buf_of[(size_t)operand]];
+            size_t i = 0;
+            for (int value : values) {
+                rad_store_f32(b.a.data(), b.dt, i, (float)value);
+                rad_store_f32(b.b.data(), b.dt, i++, (float)value);
+            }
+        };
+        auto run = [&](const char* name) {
+            h.name = std::string(dtype) + " " + name;
+            ++checked;
+            if (!h.run(ref, avx, verbose)) ok = false;
+        };
+        run("cold pitched prefill");
+        set_ids(3, {0, 1, 2});
+        set_ids(5, {1, 1});
+        run("warm chunks shorter than history");
+
+        // Reuse the optional operand's slot with an i32 buffer, without replacing either state.
+        const size_t appended = h.ta.size();
+        h.idx({1, 1});
+        h.ta[6] = h.ta[appended]; h.tb[6] = h.tb[appended];
+        h.buf_of[6] = h.buf_of[appended];
+        h.ta.pop_back(); h.tb.pop_back(); h.buf_of.pop_back();
+        set_ids(3, {0, 2, 4});
+        run("two-token verify retains candidates");
+        set_ids(6, {1, 2});
+        run("next verify rejects one prefix and accepts another");
+        set_ids(3, {1, 2, 4});
+        set_ids(4, {1, -1});
+        run("global cu offset leaves inactive rows and slot untouched");
+
+        Hand defaults("implicit slots and initialized history", "causal_conv1d", 1e-5);
+        defaults.dense(dt, {T, N}, [](int64_t i) { return (float)(i % 5) * 0.125f; })
+         .dense(dt, {N, W}, [](int64_t i) { return (float)(i % 3 - 1) * 0.25f; })
+         .dense(dt, {2, N, DEPTH}, [](int64_t i) { return (float)(i % 7) * 0.25f; }, true)
+         .idx({0, 2, 4}).none().none().none()
+         .dense(dt, {T, N}, [](int64_t) { return 0.0f; }, true)
+         .pi("M", 64).pi("n", N).pi("width", W).ps("dtype", dtype);
+        ++checked;
+        if (!defaults.run(ref, avx, verbose)) ok = false;
+    }
+    std::printf("  causal convolution: %d stateful cases %s\n", checked, ok ? "passed" : "FAILED");
+    return ok;
 }
 
 static bool hand_cases(const Lib& ref, const Lib& avx, bool verbose, int* n_checked) {
@@ -933,6 +1176,14 @@ int main(int argc, char** argv) {
         if (!st.worst_where.empty()) std::printf("\n  worst case: %s", st.worst_where.c_str());
         std::printf("\n");
         if (st.failed || st.declined || st.missing) rc = 1;
+        if ((only_op.empty() || only_op == "grid_embed") &&
+            !grid_embed_antialias_cases(ref, avx, verbose)) rc = 1;
+        if ((only_op.empty() || only_op == "rmsnorm") &&
+            !rmsnorm_rounding_cases(ref, avx, verbose)) rc = 1;
+        if ((only_op.empty() || only_op == "causal_conv1d") &&
+            !causal_conv_cases(ref, avx, verbose)) rc = 1;
+        if ((only_op.empty() || only_op == "logits_select") &&
+            !logits_select_cases(ref, avx, verbose)) rc = 1;
         if (only_op.empty()) {
             int hand_checked = 0;
             if (!hand_cases(ref, avx, verbose, &hand_checked)) rc = 1;

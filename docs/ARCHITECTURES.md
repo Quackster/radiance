@@ -13,6 +13,7 @@ into the id an architecture plugin claims.
 | `arch/qwen35_fp8` | `qwen35` | `fp8_e4m3` | the same, block-scaled FP8 weights and activations |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert |
+| `arch/lfm2_bf16` | `lfm2` | *(empty)* | LFM2 and LFM2-VL from safetensors, served bf16 on one rank; optional SigLIP2 vision and [d1 decisions](SYSTEMONE.md) |
 
 This document is the geometry of each, and the handful of readings that are **arithmetically
 silent** — wrong in a way that produces fluent output and no error anywhere.

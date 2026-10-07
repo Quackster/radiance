@@ -70,6 +70,7 @@ inline bool step_is_dec (uint32_t k) { return k >= 64 && k < 96; }
  * milliseconds at load, against a model measured in gigabytes -- which is not a cost. */
 struct VocabBuild {
     uint32_t kind = RAD_TOK_BPE;
+    bool ignore_merges = false;              /* BPE: take a whole pre-token already in vocab */
 
     std::vector<std::string> tokens;          /* id -> text, in the vocab's own encoding */
     std::vector<float>       scores;          /* unigram only; empty otherwise */

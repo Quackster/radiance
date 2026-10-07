@@ -1,4 +1,4 @@
-/* avx_misc.cpp -- the PLE pair, the hashed n-gram ids, and the two collectives.
+/* avx_misc.cpp -- the PLE pair, causal convolution, hashed n-gram ids, and two collectives.
  *
  * Grouped because none of them is a vector kernel and the reason differs in each case, which is
  * worth saying rather than leaving as an absence:
@@ -155,6 +155,106 @@ AVX_KERNEL(ple_gate) {
         }
         if (gnls == 1) out_row(gvn, nb, hn, qv);
         else for (int64_t j = 0; j < hn; ++j) stt(gvn, nb + j * gnls, qv[j]);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ causal_conv1d */
+/* LFM2's short depthwise convolution has no activation or residual. Like PLE, its useful CPU
+ * parallelism is over channels: each worker widens the taps and the old history once, then
+ * walks that channel's tokens. Every sequence is validated before any worker changes state. */
+AVX_KERNEL(causal_conv1d) {
+    if (!a || a->n_t < 8) return RAD_E_INVAL;
+    const RadTensor* x = rad_arg_in(a, 0);
+    const RadTensor* w = rad_arg_in(a, 1);
+    const RadTensor* state = rad_arg_in(a, 2);
+    const RadTensor* cu = rad_arg_in(a, 3);
+    const RadTensor* indices = rad_arg_in(a, 4);
+    const RadTensor* initialized = rad_arg_in(a, 5);
+    const RadTensor* accepted = rad_arg_in(a, 6);
+    const RadTensor* y = rad_arg_in(a, 7);
+    if (!x || !w || !state || !cu || !y) return RAD_E_INVAL;
+    const int64_t n = p_int(a, "n", 0), width = p_int(a, "width", 0);
+    const int64_t rows = n > 0 ? band_rows(numel(x) / n, p_int(a, "M", 0)) : 0;
+    if (n <= 0 || width <= 0 || rows <= 0 || state->rank != 3) return RAD_E_SHAPE;
+    const int64_t history = width - 1;
+    constexpr int64_t kHistoryMax = 64;
+    if (history > kHistoryMax) return RAD_E_UNSUPPORTED;
+    int64_t packed_stride = 1;
+    for (int i = 2; i >= 0; --i) {
+        if (state->shape[i] != 1 && state->stride[i] != packed_stride) return RAD_E_SHAPE;
+        packed_stride *= state->shape[i];
+    }
+    const int64_t depth = state->shape[2], count = numel(cu) - 1;
+    if (count <= 0 || state->shape[1] != n || depth < history ||
+        numel(w) < n * width || numel(y) < rows * n ||
+        (indices && numel(indices) < count) ||
+        (initialized && numel(initialized) < count) ||
+        (accepted && numel(accepted) < count)) return RAD_E_SHAPE;
+    auto integer = [](const RadTensor* t, int64_t i) { return ldi(t, offlin(t, i)); };
+    if (integer(cu, 0) < 0 || integer(cu, count) > rows) return RAD_E_SHAPE;
+
+    for (int64_t s = 0; s < count; ++s) {
+        const int64_t begin = integer(cu, s), end = integer(cu, s + 1);
+        const int64_t slot = indices ? integer(indices, s) : s;
+        const int64_t offset = accepted ? integer(accepted, s) - 1 : 0;
+        if (begin < 0 || end < begin || end > rows || slot < -1 || slot >= state->shape[0] ||
+            offset < 0) return RAD_E_INVAL;
+        if (offset > depth - history ||
+            (accepted && history && end > begin && end - begin > depth - history + 1))
+            return RAD_E_SHAPE;
+        if (slot >= 0 && end > begin) {
+            for (int64_t earlier = 0; earlier < s; ++earlier) {
+                const int64_t other_slot = indices ? integer(indices, earlier) : earlier;
+                if (other_slot == slot && integer(cu, earlier + 1) > integer(cu, earlier))
+                    return RAD_E_INVAL;
+            }
+        }
+    }
+
+    const int64_t xr = rowoff(x, 1, n), xc = laststride(x);
+    const int64_t yr = rowoff(y, 1, n), yc = laststride(y);
+    const int64_t wr = rowoff(w, 1, width), wc = laststride(w);
+    AVX_PARALLEL_FOR_IF(count * n >= 64)
+    for (int64_t worker = 0; worker < count * n; ++worker) {
+        const int64_t s = worker / n, channel = worker % n;
+        const int64_t begin = integer(cu, s), length = integer(cu, s + 1) - begin;
+        const int64_t slot = indices ? integer(indices, s) : s;
+        if (slot < 0 || length == 0) continue;
+        const int64_t offset = accepted ? integer(accepted, s) - 1 : 0;
+        const bool warm = !initialized || integer(initialized, s) != 0;
+        const int64_t base = (slot * n + channel) * depth;
+        float prior[kHistoryMax], taps[kHistoryMax + 1];
+        for (int64_t j = 0; j < history; ++j)
+            prior[j] = warm ? ldt(state, base + offset + j) : 0.0f;
+        for (int64_t j = 0; j < width; ++j)
+            taps[j] = ldt(w, channel * wr + j * wc);
+        for (int64_t token = 0; token < length; ++token) {
+            float value = 0.0f;
+            for (int64_t tap = 0; tap < width; ++tap) {
+                const int64_t source = token - history + tap;
+                const float input = source < 0 ? prior[source + history]
+                    : ldt(x, (begin + source) * xr + channel * xc);
+                value += input * taps[tap];
+            }
+            stt(y, (begin + token) * yr + channel * yc, value);
+        }
+        if (!history) continue;
+        if (accepted) {
+            /* A verify stores one shifted history followed by all candidates. The next step
+             * picks the accepted prefix by reading at num_accepted - 1. */
+            for (int64_t j = 0; j + 1 < history; ++j) stt(state, base + j, prior[j + 1]);
+            for (int64_t token = 0; token < length; ++token)
+                stt(state, base + history - 1 + token,
+                    ldt(x, (begin + token) * xr + channel * xc));
+        } else {
+            /* A prefill commits every input, including a chunk shorter than its history. */
+            for (int64_t j = 0; j < history; ++j) {
+                const int64_t source = length - history + j;
+                stt(state, base + j, source < 0 ? prior[source + history]
+                    : ldt(x, (begin + source) * xr + channel * xc));
+            }
+        }
     }
     return RAD_OK;
 }

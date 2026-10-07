@@ -19,7 +19,7 @@ extern "C" {
  * name, with both versions printed. An OPTIONAL export added beside the existing ones
  * (rad_plugin_reference, say) is not a change of shape: a plugin without it is read as answering
  * the default. */
-#define RAD_ABI_VERSION 15u
+#define RAD_ABI_VERSION 16u
 
 /* ================================================================== plugin identity */
 /* RAD_PLUGIN_QUANT is a quantiser plugin: rad_quant.h is its whole contract. */

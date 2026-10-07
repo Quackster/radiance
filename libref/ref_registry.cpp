@@ -74,6 +74,8 @@
 
 /* ---- elementwise and norms ---------------------------------------------------------------- */
 static const RadParamSpec pRmsnorm[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
+                                          P_F64O("wadd"), P_INTO("round_before_weight") };
+static const RadParamSpec pRmsnormAdd[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
                                           P_F64O("wadd") };
 static const RadOperandSpec oRmsnorm[] = { OPD("x"), WGT("w"), OUT("y") };
 
@@ -119,6 +121,10 @@ static const RadOperandSpec oPleConv[] = { OPD("x"), WGT("w"), INOUT("conv_state
                                           OPD_O("resid"), OPD_O("cache_idx"), OPD_O("has_init"),
                                           OPD_O("num_accepted"), OUT("y") };
 
+static const RadParamSpec pCausalConv[] = { P_INT("M"), P_INT("n"), P_INT("width"), P_STR("dtype") };
+static const RadOperandSpec oCausalConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
+    OPD_O("cache_idx"), OPD_O("has_init"), OPD_O("num_accepted"), OUT("y") };
+
 static const RadParamSpec pHcWrite[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
 static const RadOperandSpec oHcWrite[] = { OPD("y"), OPD("inj"), INOUT("h") };
@@ -137,7 +143,8 @@ static const RadOperandSpec oRmsnormAdd[] = { OPD("x"), OPD("residual"), WGT("w"
 static const RadParamSpec pLayernorm[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype") };
 static const RadOperandSpec oLayernorm[] = { OPD("x"), WGT("w"), WGT_O("b"), OUT("y") };
 /* A learned position table resampled to each row's grid and added in (a vision tower's). */
-static const RadParamSpec pGridEmbed[] = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype") };
+static const RadParamSpec pGridEmbed[] = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"),
+    P_STRO("mode") };
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
 
 static const RadParamSpec pMnD[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
@@ -515,6 +522,10 @@ static const RadOperandSpec oEmbedQ[] = { OPD("tokens"), WGT("wte"), WGT_O("scal
 static const RadParamSpec pLogits[] = { P_INT("M"), P_INT("n_vocab"), P_INT("n_embd"),
                                         P_STR("dtype") };
 static const RadOperandSpec oLogits[] = { OPD("x"), WGT("lm_head"), OUT("logits") };
+static const RadParamSpec pLogitsSelect[] = { P_INT("M"), P_INT("n_rows"), P_INT("n_vocab"),
+    P_INT("n_embd"), P_STR("dtype"), P_INTO("round_bf16") };
+static const RadOperandSpec oLogitsSelect[] = {
+    OPD("x"), WGT("lm_head"), OPD("rows"), OPD("tokens"), OUT("values") };
 
 /* ---- sampling -------------------------------------------------------------------------------
  *
@@ -569,8 +580,9 @@ static const RadOpSchema kSchemas[] = {
   "y = x * rsqrt(mean(x^2) + eps) * (w + wadd). `wadd` is not in docs/OPS.md's elementwise table: "
   "it is GemmaRMSNorm's `1 +`, which Qwen3.5, Qwen3-Next and Gemma all need, and it defaults to 0. "
   "Spelled `wadd` and not `w_add` because that is what libr4d's fused norms call it and one "
-  "vocabulary cannot have two spellings of one parameter." },
-{ "rmsnorm_add", ARR(pRmsnorm), ARR(oRmsnormAdd),
+  "vocabulary cannot have two spellings of one parameter. Optional round_before_weight=1 "
+  "narrows x * rsqrt to x's dtype before multiplying by the gain; the default is 0." },
+{ "rmsnorm_add", ARR(pRmsnormAdd), ARR(oRmsnormAdd),
   "residual_out = x + residual, then y = rmsnorm(residual_out) * w. The variance is taken from "
   "the unrounded f32 sum; the multiply reads residual_out back AFTER it has been narrowed, which "
   "is what every fused implementation does." },
@@ -601,7 +613,9 @@ static const RadOpSchema kSchemas[] = {
   "x[m] += table resampled at row m's grid position: `table` is a side x side grid of rows, "
   "`coord` is [4, M] -- row, column, grid height, grid width -- and the position is sampled "
   "bilinearly with the grid's corners on the table's corners (align_corners), edge taps clamped. "
-  "The taps are summed in f32 and rounded to x's dtype, then added to x and rounded again." },
+  "The taps are summed in f32 and rounded to x's dtype, then added to x and rounded again. "
+  "Optional mode=bilinear_antialias uses half-pixel centers and a widened triangular filter, "
+  "normalizes edge weights, and rounds weights and each separable pass to the table dtype." },
 { "add", ARR(pMnD), ARR(oBinary),
   "y = a + b. An operand carrying exactly n elements against a taller output broadcasts along "
   "rows; nothing else broadcasts." },
@@ -625,6 +639,11 @@ static const RadOpSchema kSchemas[] = {
   "row gated differently per stream. `gvn` is grouped_rmsnorm(gv) * (w_conv + wadd), taken over "
   "the bytes gv was narrowed to. BOTH outputs leave: the convolution that follows reads the normed "
   "copy and the residual add reads the un-normed one." },
+{ "causal_conv1d", ARR(pCausalConv), ARR(oCausalConv),
+  "Depthwise causal convolution, no activation. The packed rolling state has width-1 history "
+  "values per channel. has_init zero supplies a cold zero history. Absent num_accepted commits "
+  "every input and saves the tail; present num_accepted reads at accepted-1 and saves all "
+  "candidate inputs in the rolling verification window, as ple_conv does. Live slots are unique." },
 { "ple_conv", ARR(pPleConv), ARR(oPleConv),
   "y[t] = resid[t] + silu(sum_j w[c][j] * x[t - (width-1-j)*dilation]), a DEPTHWISE CAUSAL "
   "convolution whose taps are `dilation` apart -- at width 4 and dilation 3 they are 9, 6, 3 and 0 "
@@ -906,6 +925,9 @@ static const RadOpSchema kSchemas[] = {
 { "logits_gemm", ARR(pLogits), ARR(oLogits),
   "logits[M, n_vocab] = x[M, n_embd] @ lm_head[n_vocab, n_embd]^T. Separate from gemm_nt because "
   "lm_head is its own access class and the sampler wants to fuse against it." },
+{ "logits_select", ARR(pLogitsSelect), ARR(oLogitsSelect),
+  "Project M selected (hidden row, vocabulary token) pairs to compact f32 values. n_rows bounds "
+  "the hidden rows. round_bf16 optionally narrows each dot to bf16 before widening to f32." },
 
 { "sample_penalties", ARR(pPenal), ARR(oPenalties),
   "Repetition (multiplicative, sign-dependent), frequency and presence penalties over the row's "
@@ -1015,6 +1037,8 @@ SIMPLE("ref_ngram_ids", "ngram_ids", "vocab", "hashed n-gram row ids for PLE", D
        ref_ngram_ids),
 SIMPLE("ref_ple_gate", "ple_gate", "norm", "PLE gate: three grouped norms, a dot, a signed sqrt",
        DT_FLOAT, ref_ple_gate),
+SIMPLE("ref_causal_conv1d", "causal_conv1d", "conv", "depthwise causal convolution with rolling state",
+       DT_FLOAT, ref_causal_conv1d),
 SIMPLE("ref_ple_conv", "ple_conv", "norm", "PLE's dilated depthwise conv, silu and residual add",
        DT_FLOAT, ref_ple_conv),
 SIMPLE("ref_gather_rows", "gather_rows", "elem", "y[i,:] = x[idx[i],:]", DT_ANY, ref_gather_rows),
@@ -1137,6 +1161,8 @@ SIMPLE("ref_embed_lookup_q", "embed_lookup_q", "vocab", "embedding gather, one s
        DT_ANY, ref_embed_lookup_q),
 SIMPLE("ref_logits_gemm", "logits_gemm", "vocab", "the lm_head projection", DT_FLOAT,
        ref_logits_gemm),
+SIMPLE("ref_logits_select", "logits_select", "vocab", "selected vocabulary projection", DT_FLOAT,
+       ref_logits_select),
 
 SIMPLE("ref_sample_penalties", "sample_penalties", "sample",
        "repetition, frequency and presence penalties", DT_FLOAT, ref_sample_penalties),

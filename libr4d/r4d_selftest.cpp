@@ -46,6 +46,7 @@
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_args.h"
+#include "../tests/grid_embed_golden.h"
 #include "r4d_hc_fp8.h"
 #include "r4d_fp8_frag.h"
 #include "r4d_fp8_lm.h"
@@ -815,6 +816,448 @@ static uint16_t h_to_bf16(float f) {
     uint32_t u; std::memcpy(&u, &f, 4);
     return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
+
+// The expected bits come from PyTorch GPU interpolation, independently of libref and this
+// kernel. Every row has its own grid; x is pitched and the coord planes are longer than M.
+static void grid_embed_case(const Plugin& pl) {
+    namespace g = grid_embed_golden;
+    const char* name = "grid_embed_bf16";
+    if (!sel(name)) return;
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    for (int n : {5, 1152}) for (bool tf32 : {false, true}) {
+        const int pitch = n + 7, plane = g::rows + 3;
+        std::vector<uint16_t> input(g::rows * pitch, h_to_bf16(19.0f));
+        std::vector<uint16_t> tab16(g::side * g::side * n);
+        std::vector<float> tab32(tab16.size());
+        std::vector<int32_t> coord(4 * plane, -1);
+        for (int r = 0; r < g::rows; ++r) {
+            for (int c = 0; c < n; ++c) input[r * pitch + c] = h_to_bf16(g::patch(r, c % g::n));
+            for (int k = 0; k < 4; ++k) coord[k * plane + r] = g::coord[r][k];
+        }
+        for (int r = 0; r < g::side * g::side; ++r) for (int c = 0; c < n; ++c) {
+            tab32[r * n + c] = g::table(r, c % g::n);
+            tab16[r * n + c] = h_to_bf16(tab32[r * n + c]);
+        }
+        void* dx = dalloc(input.size() * 2);
+        void* dt = dalloc(tab32.size() * (tf32 ? 4 : 2));
+        void* dc = dalloc(coord.size() * 4);
+        if (!dx || !dt || !dc) { ok(name, false, "allocation failed"); return; }
+        st_memcpy(dt, tf32 ? (void*)tab32.data() : (void*)tab16.data(),
+                  tab32.size() * (tf32 ? 4 : 2), hipMemcpyHostToDevice);
+        st_memcpy(dc, coord.data(), coord.size() * 4, hipMemcpyHostToDevice);
+        std::vector<RadTensor> ts = {
+            T(dx, RAD_BF16, {g::rows, n}), T(dt, tf32 ? RAD_F32 : RAD_BF16, {g::side * g::side, n}),
+            T(dc, RAD_I32, {4, plane}),
+        };
+        ts[0].stride[0] = pitch;
+        // The first four rows use the original grid; both modes must preserve exact lookup.
+        for (bool aa : {false, true}) {
+            st_memcpy(dx, input.data(), input.size() * 2, hipMemcpyHostToDevice);
+            ts[0].shape[0] = aa ? g::rows : 4;
+            std::vector<RadParam> ps = {PI("M", g::rows), PI("n", n), PI("side", g::side),
+                                       PS("dtype", "bf16")};
+            if (aa) ps.push_back(PS("mode", "bilinear_antialias"));
+            run_case(row, ts, ps);
+            std::vector<uint16_t> got(input.size());
+            st_memcpy(got.data(), dx, got.size() * 2, hipMemcpyDeviceToHost);
+            const uint16_t* expected = tf32 ? g::f32 : g::bf16;
+            int errors = 0;
+            for (int r = 0; r < g::rows; ++r) for (int c = 0; c < pitch; ++c) {
+                const int i = r * pitch + c;
+                const uint16_t want = r < ts[0].shape[0] && c < n ?
+                    expected[r * g::n + c % g::n] : input[i];
+                if (got[i] != want) ++errors;
+            }
+            ok((std::string(name) + (aa ? " antialias" : " identity/default") +
+                (tf32 ? " f32 table" : " bf16 table") + " n=" + std::to_string(n)).c_str(),
+               errors == 0, std::to_string(errors) + " entries differ from GPU golden/padding");
+            if (aa) { ps.back() = PS("mode", "unknown"); run_case(row, ts, ps, RAD_E_INVAL); }
+        }
+    }
+}
+
+/* The opt-in must equal a bf16 normalized activation followed by a separate gain multiplication.
+ * Using a unit-gain device norm for that intermediate isolates the contract from differences in
+ * host/device reduction order. The default is also checked against explicit zero, byte for byte. */
+static void rmsnorm_rounding_case(const Plugin& pl) {
+    const char* name = "rmsnorm_bf16";
+    if (!sel(name)) return;
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    for (int n : {64, 2048}) for (bool wf32 : {false, true}) {
+        const int M = 3, xld = n + 3, yld = n + 5;
+        const float wadd = wf32 ? 0.25f : 0.0f;
+        std::vector<uint16_t> input((size_t)M * xld, h_to_bf16(31.0f));
+        std::vector<uint16_t> gain16((size_t)n), unit16((size_t)n, h_to_bf16(1.0f));
+        std::vector<float> gain32((size_t)n), unit32((size_t)n, 1.0f);
+        for (int r = 0; r < M; ++r) for (int c = 0; c < n; ++c)
+            input[r * xld + c] = h_to_bf16((float)((r * 13 + c * 7) % 127 - 63) / 16.0f);
+        for (int c = 0; c < n; ++c) {
+            gain32[c] = ((c % 2) ? -1.0f : 1.0f) * (0.7f + (c % 19) * 0.03125f);
+            gain16[c] = h_to_bf16(gain32[c]);
+        }
+        void* dx = dalloc(input.size() * 2);
+        void* dw = dalloc((size_t)n * (wf32 ? 4 : 2));
+        void* du = dalloc((size_t)n * (wf32 ? 4 : 2));
+        void* dy = dalloc((size_t)M * yld * 2);
+        if (!dx || !dw || !du || !dy) { ok(name, false, "allocation failed"); return; }
+        st_memcpy(dx, input.data(), input.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(dw, wf32 ? (void*)gain32.data() : (void*)gain16.data(),
+                  (size_t)n * (wf32 ? 4 : 2), hipMemcpyHostToDevice);
+        st_memcpy(du, wf32 ? (void*)unit32.data() : (void*)unit16.data(),
+                  (size_t)n * (wf32 ? 4 : 2), hipMemcpyHostToDevice);
+        std::vector<RadTensor> ts = {
+            T(dx, RAD_BF16, {M, n}), T(dw, wf32 ? RAD_F32 : RAD_BF16, {n}),
+            T(dy, RAD_BF16, {M, n}),
+        };
+        ts[0].stride[0] = xld; ts[2].stride[0] = yld;
+        auto evaluate = [&](void* weight, float add, int flag) {
+            std::vector<uint16_t> out((size_t)M * yld, h_to_bf16(-7.0f));
+            st_memcpy(dy, out.data(), out.size() * 2, hipMemcpyHostToDevice);
+            ts[1].data = weight;
+            std::vector<RadParam> ps = {
+                PI("M", M), PI("n", n), PF("eps", 1e-6), PS("dtype", "bf16"), PF("wadd", add),
+            };
+            if (flag >= 0) ps.push_back(PI("round_before_weight", flag));
+            run_case(row, ts, ps, flag > 1 ? RAD_E_INVAL : RAD_OK);
+            st_memcpy(out.data(), dy, out.size() * 2, hipMemcpyDeviceToHost);
+            return out;
+        };
+        const auto normalized = evaluate(du, 0.0f, -1);
+        const auto legacy = evaluate(dw, wadd, -1);
+        const auto explicit_zero = evaluate(dw, wadd, 0);
+        const auto rounded = evaluate(dw, wadd, 1);
+        auto expected = normalized;
+        int changed = 0;
+        for (int r = 0; r < M; ++r) for (int c = 0; c < n; ++c) {
+            const size_t i = (size_t)r * yld + c;
+            const float g = wf32 ? gain32[c] : h_bf16(gain16[c]);
+            expected[i] = h_to_bf16(h_bf16(normalized[i]) * (g + wadd));
+            changed += rounded[i] != legacy[i];
+        }
+        const std::string detail = fmt("n=%d gain=%s", n, wf32 ? "f32" : "bf16");
+        ok("rmsnorm default equals explicit zero", legacy == explicit_zero, detail);
+        ok("rmsnorm rounds before gain, preserves pitched padding", rounded == expected, detail);
+        ok("rmsnorm fixture distinguishes rounding modes", changed > 0, detail);
+        evaluate(dw, wadd, 2);
+    }
+}
+
+/* Non-tile widths and independently pitched rows include IEEE ties and signed zeros. */
+static void cast_numeric_case(const Plugin& pl, bool narrow) {
+    const char* name = narrow ? "cast_f32_bf16" : "cast_bf16_f32";
+    if (!sel(name)) return;
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    const int M = 3, n = 259, xld = n + 3, yld = n + 5;
+    const uint32_t bits[] = {
+        0x00000000u, 0x80000000u, 0x3f808000u, 0x3f818000u, 0xbf808000u, 0xbf818000u,
+        0x3f807fffu, 0x3f808001u, 0x7f800000u, 0xff800000u, 0x00008000u, 0x00018000u,
+    };
+    std::vector<float> input32((size_t)M * xld, 31.0f), expected32((size_t)M * yld, -7.0f);
+    std::vector<uint16_t> input16((size_t)M * xld, h_to_bf16(31.0f));
+    std::vector<uint16_t> expected16((size_t)M * yld, h_to_bf16(-7.0f));
+    for (int r = 0; r < M; ++r) for (int c = 0; c < n; ++c) {
+        const uint32_t u = bits[(r * n + c) % (sizeof(bits) / sizeof(bits[0]))];
+        float f; std::memcpy(&f, &u, 4);
+        input32[r * xld + c] = f;
+        input16[r * xld + c] = h_to_bf16(f);
+        expected16[r * yld + c] = h_to_bf16(f);
+        expected32[r * yld + c] = h_bf16(input16[r * xld + c]);
+    }
+    void* dx = dalloc((size_t)M * xld * (narrow ? 4 : 2));
+    void* dy = dalloc((size_t)M * yld * (narrow ? 2 : 4));
+    if (!dx || !dy) { ok(name, false, "allocation failed"); return; }
+    st_memcpy(dx, narrow ? (void*)input32.data() : (void*)input16.data(),
+              (size_t)M * xld * (narrow ? 4 : 2), hipMemcpyHostToDevice);
+    std::vector<float> actual32((size_t)M * yld, -7.0f);
+    std::vector<uint16_t> actual16((size_t)M * yld, h_to_bf16(-7.0f));
+    st_memcpy(dy, narrow ? (void*)actual16.data() : (void*)actual32.data(),
+              (size_t)M * yld * (narrow ? 2 : 4), hipMemcpyHostToDevice);
+    std::vector<RadTensor> ts = {
+        T(dx, narrow ? RAD_F32 : RAD_BF16, {M, n}), T(dy, narrow ? RAD_BF16 : RAD_F32, {M, n}),
+    };
+    ts[0].stride[0] = xld; ts[1].stride[0] = yld;
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("n", n), PS("from", narrow ? "f32" : "bf16"), PS("to", narrow ? "bf16" : "f32"),
+    };
+    run_case(row, ts, ps);
+    st_memcpy(narrow ? (void*)actual16.data() : (void*)actual32.data(), dy,
+              (size_t)M * yld * (narrow ? 2 : 4), hipMemcpyDeviceToHost);
+    const bool matches = narrow ? actual16 == expected16 :
+        std::memcmp(actual32.data(), expected32.data(), actual32.size() * 4) == 0;
+    ok(name, matches, "exact cast, ties-to-even, signed zeros and row padding");
+}
+
+static void silu_numeric_case(const Plugin& pl) {
+    const char* name = "silu_bf16";
+    if (!sel(name)) return;
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    const int M = 3, n = 10752, xld = 2 * n, yld = n + 7;
+    std::vector<uint16_t> input((size_t)M * xld, h_to_bf16(31.0f));
+    std::vector<uint16_t> expected((size_t)M * yld, h_to_bf16(-7.0f));
+    for (int r = 0; r < M; ++r) for (int c = 0; c < n; ++c) {
+        const float v = h_bf16(h_to_bf16((float)((r * 17 + c) % 1025 - 512) / 32.0f));
+        input[r * xld + c] = h_to_bf16(v);
+        expected[r * yld + c] = h_to_bf16(v * (1.0f / (1.0f + std::exp(-v))));
+    }
+    void* dx = dalloc(input.size() * 2);
+    void* dy = dalloc(expected.size() * 2);
+    if (!dx || !dy) { ok(name, false, "allocation failed"); return; }
+    std::vector<uint16_t> actual(expected.size(), h_to_bf16(-7.0f));
+    st_memcpy(dx, input.data(), input.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(dy, actual.data(), actual.size() * 2, hipMemcpyHostToDevice);
+    std::vector<RadTensor> ts = { T(dx, RAD_BF16, {M, n}), T(dy, RAD_BF16, {M, n}) };
+    ts[0].stride[0] = xld; ts[1].stride[0] = yld;
+    std::vector<RadParam> ps = { PI("M", M), PI("n", n), PS("dtype", "bf16") };
+    run_case(row, ts, ps);
+    st_memcpy(actual.data(), dy, actual.size() * 2, hipMemcpyDeviceToHost);
+    bool matches = true, padding = true;
+    for (int r = 0; r < M; ++r) for (int c = 0; c < yld; ++c) {
+        const size_t i = (size_t)r * yld + c;
+        // Host and device exp may straddle a bf16 midpoint; at most one unit is allowed.
+        if (c < n) matches &= std::abs((int)actual[i] - (int)expected[i]) <= 1;
+        else padding &= actual[i] == expected[i];
+    }
+    ok(name, matches && padding, "10752-wide strided gate slice, negative/positive input and padding");
+}
+
+/* A sequence oracle formed from explicit history ++ inputs, independent of the kernel's tiling.
+ * Compare both outputs and the entire persistent cache, including untouched slots/padding. */
+static void logits_select_case(const Plugin& pl) {
+    const char* name = "logits_select_bf16";
+    if (!sel(name)) return;
+    const auto* selected = find(pl, name);
+    const auto* dense = find(pl, "logits_gemm_bf16");
+    if (!selected || !dense) { ok(name, false, "row absent"); return; }
+    const int R = 11, V = 19, M = 7;
+    const std::vector<int32_t> rows = {10, 0, 3, 10, 9, 1, 10};
+    const std::vector<int32_t> tokens = {18, 2, 0, 18, 7, 1, 3};
+    for (int K : {2048, 4096}) {
+        const int pitch = K + 8;
+        std::vector<uint16_t> x(R * pitch), w(V * K);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = h_to_bf16((float)((i * 71 + 19) % 113 - 56.0) / 37.0f);
+        for (size_t i = 0; i < w.size(); ++i) w[i] = h_to_bf16((float)((i * 31 + 43) % 127 - 63.0) / 41.0f);
+        void* dx = dalloc(x.size() * 2); void* dw = dalloc(w.size() * 2);
+        void* dr = dalloc(M * 4); void* dt = dalloc(M * 4);
+        void* dy = dalloc(M * 4); void* dfull = dalloc(R * V * 4);
+        if (!dx || !dw || !dr || !dt || !dy || !dfull) { ok(name, false, "allocation failed"); return; }
+        st_memcpy(dx, x.data(), x.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(dw, w.data(), w.size() * 2, hipMemcpyHostToDevice);
+        fill_i32(dr, rows); fill_i32(dt, tokens);
+        std::vector<RadTensor> full = {T(dx, RAD_BF16, {R, K}), T(dw, RAD_BF16, {V, K}), T(dfull, RAD_F32, {R, V})};
+        full[0].stride[0] = pitch;
+        std::vector<RadParam> dense_params = {PI("M", R), PI("n_vocab", V), PI("n_embd", K), PS("dtype", "bf16")};
+        run_case(dense, full, dense_params);
+        std::vector<float> expected(R * V), actual(M);
+        st_memcpy(expected.data(), dfull, expected.size() * 4, hipMemcpyDeviceToHost);
+        std::vector<RadTensor> ts = {full[0], full[1], T(dr, RAD_I32, {M}), T(dt, RAD_I32, {M}), T(dy, RAD_F32, {M})};
+        for (int rounded : {0, 1}) {
+            std::vector<RadParam> params = {PI("M", M), PI("n_rows", R), PI("n_vocab", V), PI("n_embd", K),
+                                            PS("dtype", "bf16"), PI("round_bf16", rounded)};
+            run_case(selected, ts, params);
+            st_memcpy(actual.data(), dy, actual.size() * 4, hipMemcpyDeviceToHost);
+            bool match = true;
+            for (int i = 0; i < M; ++i) {
+                float want = expected[rows[i] * V + tokens[i]];
+                if (rounded) want = h_bf16(h_to_bf16(want));
+                match = match && actual[i] == want;
+            }
+            ok("selected logits exactly match full-head subset", match, fmt("K=%d round=%d", K, rounded));
+        }
+    }
+}
+
+static void causal_conv_case(const Plugin& pl) {
+    const char* name = "causal_conv1d_bf16";
+    if (!sel(name)) return;
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    for (int width : {2, 3, 8}) {
+        const int channels = 17, depth = width - 1 + 8, nslots = 4;
+        const int xld = channels + 3, yld = channels + 5, wld = width + 2;
+        std::vector<uint16_t> weights((size_t)channels * wld, h_to_bf16(31.0f));
+        for (int c = 0; c < channels; ++c)
+            for (int j = 0; j < width; ++j)
+                weights[c * wld + j] = h_to_bf16((j % 2 ? -1.0f : 1.0f) * (j + 1) / 16.0f);
+        std::vector<uint16_t> reference_state((size_t)nslots * channels * depth, h_to_bf16(37.0f));
+        void* dw = dalloc(weights.size() * 2);
+        void* ds = dalloc(reference_state.size() * 2);
+        if (!dw || !ds) { ok(name, false, "device allocation failed"); return; }
+        st_memcpy(dw, weights.data(), weights.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(ds, reference_state.data(), reference_state.size() * 2, hipMemcpyHostToDevice);
+        int step = 0;
+        auto check_step = [&](const char* label, const std::vector<int32_t>& lengths,
+                              const std::vector<int32_t>& warm, const std::vector<int32_t>& kept) {
+            const std::vector<int32_t> slots = {2, 0, -1};
+            std::vector<int32_t> cu = {0};
+            for (int length : lengths) cu.push_back(cu.back() + length);
+            const int count = cu.back();
+            std::vector<uint16_t> input((size_t)count * xld, h_to_bf16(41.0f));
+            std::vector<uint16_t> expected((size_t)count * yld, h_to_bf16(-7.0f));
+            for (int t = 0; t < count; ++t)
+                for (int c = 0; c < channels; ++c)
+                    input[t * xld + c] = h_to_bf16((float)((t * 3 + c + step * 11) % 29 - 14) / 4.0f);
+            for (size_t s = 0; s < lengths.size(); ++s) {
+                if (slots[s] < 0) continue;
+                const int history = width - 1, offset = kept.empty() ? 0 : kept[s] - 1;
+                for (int c = 0; c < channels; ++c) {
+                    const size_t base = ((size_t)slots[s] * channels + c) * depth;
+                    std::vector<uint16_t> sequence((size_t)history, 0);
+                    if (warm[s]) for (int j = 0; j < history; ++j)
+                        sequence[j] = reference_state[base + offset + j];
+                    for (int t = cu[s]; t < cu[s + 1]; ++t) sequence.push_back(input[t * xld + c]);
+                    for (int t = 0; t < lengths[s]; ++t) {
+                        float value = 0;
+                        for (int j = 0; j < width; ++j)
+                            value += h_bf16(sequence[t + j]) * h_bf16(weights[c * wld + j]);
+                        expected[(cu[s] + t) * yld + c] = h_to_bf16(value);
+                    }
+                    if (kept.empty()) {
+                        for (int j = 0; j < history; ++j)
+                            reference_state[base + j] = sequence[sequence.size() - history + j];
+                    } else {
+                        for (size_t j = 1; j < sequence.size(); ++j)
+                            reference_state[base + j - 1] = sequence[j];
+                    }
+                }
+            }
+            void* dx = dalloc(input.size() * 2);
+            void* dy = dalloc(expected.size() * 2);
+            void* dc = dalloc(cu.size() * 4);
+            void* di = dalloc(slots.size() * 4);
+            void* dh = dalloc(warm.size() * 4);
+            void* da = kept.empty() ? nullptr : dalloc(kept.size() * 4);
+            if (!dx || !dy || !dc || !di || !dh || (!kept.empty() && !da)) {
+                ok(name, false, "device allocation failed"); return;
+            }
+            st_memcpy(dx, input.data(), input.size() * 2, hipMemcpyHostToDevice);
+            const std::vector<uint16_t> sentinel(expected.size(), h_to_bf16(-7.0f));
+            st_memcpy(dy, sentinel.data(), sentinel.size() * 2, hipMemcpyHostToDevice);
+            fill_i32(dc, cu); fill_i32(di, slots); fill_i32(dh, warm);
+            if (da) fill_i32(da, kept);
+            std::vector<RadTensor> ts = {
+                T(dx, RAD_BF16, {count, channels}), T(dw, RAD_BF16, {channels, width}),
+                T(ds, RAD_BF16, {nslots, channels, depth}), T(dc, RAD_I32, {(int64_t)cu.size()}),
+                T(di, RAD_I32, {3}), T(dh, RAD_I32, {3}), T(da, RAD_I32, {3}),
+                T(dy, RAD_BF16, {count, channels}),
+            };
+            ts[0].stride[0] = xld; ts[1].stride[0] = wld; ts[7].stride[0] = yld;
+            if (!da) absent(ts[6]);
+            std::vector<RadParam> ps = {
+                PI("M", count), PI("n", channels), PI("width", width), PS("dtype", "bf16"),
+            };
+            run_case(row, ts, ps);
+            std::vector<uint16_t> actual(expected.size()), actual_state(reference_state.size());
+            st_memcpy(actual.data(), dy, actual.size() * 2, hipMemcpyDeviceToHost);
+            st_memcpy(actual_state.data(), ds, actual_state.size() * 2, hipMemcpyDeviceToHost);
+            const std::string detail = fmt("width=%d step=%s", width, label);
+            ok("causal_conv1d outputs, slots and pitched padding", actual == expected, detail);
+            ok("causal_conv1d rolling history and untouched slots", actual_state == reference_state, detail);
+            ++step;
+        };
+        check_step("cold/warm prefill across tile 32", {35, 1, 2}, {0, 512, 1}, {});
+        check_step("continuing prefill chunk", {1, 3, 1}, {35, 513, 1}, {});
+        check_step("verify candidates", {4, 3, 1}, {36, 516, 1}, {1, 1, 1});
+        check_step("rollback different accepted prefixes", {2, 1, 1}, {37, 519, 1}, {2, 3, 1});
+        check_step("recycled cold slots", {1, 1, 1}, {0, 0, 0}, {});
+    }
+}
+
+/* The 64-wide GQA4 specialization against a scalar softmax over physical cache pages. Both
+ * prefill and decode use the same device row, so the row's filtered case must exercise both. */
+static void attn_h64_case(const Plugin& pl) {
+    const char* name = "attn_h64_gqa4_bf16kv";
+    if (!sel(name)) return;
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    constexpr int hd = 64, gqa = 4, nkv = 2, nq = nkv * gqa, bs = 16, maxb = 6, nb = 12;
+    uint32_t seed = 912367u;
+    auto random = [&](float span) {
+        seed = seed * 1664525u + 1013904223u;
+        return ((float)(seed >> 8) / 16777216.0f * 2.0f - 1.0f) * span;
+    };
+    for (int mode = 0; mode < 4; ++mode) {
+        // Ragged cold prefill, ragged chunked prefill, uniform decode, and mixed prefill/decode.
+        const std::vector<int32_t> lengths = mode < 2 ? std::vector<int32_t>{35, 3}
+            : mode == 2 ? std::vector<int32_t>{1, 1} : std::vector<int32_t>{33, 1};
+        const std::vector<int32_t> used = mode == 0 ? lengths : std::vector<int32_t>{73, 45};
+        const std::vector<int32_t> cu = {0, lengths[0], lengths[0] + lengths[1]};
+        const int total = cu.back();
+        const float scale = mode == 3 ? 0.19f : 0.125f;
+        std::vector<int32_t> table(2 * maxb);
+        for (int s = 0; s < 2; ++s)
+            for (int b = 0; b < maxb; ++b) table[s * maxb + b] = s * maxb + (5 * b + 1) % maxb;
+        std::vector<uint16_t> query((size_t)total * nq * hd);
+        std::vector<uint16_t> cache((size_t)nb * nkv * bs * 2 * hd);
+        for (auto& value : query) value = h_to_bf16(random(0.5f));
+        for (auto& value : cache) value = h_to_bf16(random(1.0f));
+        std::vector<float> expected(query.size());
+        auto cache_at = [&](int s, int kvh, int t, int d, bool value) {
+            const int block = table[s * maxb + t / bs];
+            const size_t index = (((size_t)block * nkv + kvh) * bs + t % bs) * 2 * hd
+                + (value ? hd : 0) + d;
+            return (double)h_bf16(cache[index]);
+        };
+        for (int s = 0; s < 2; ++s) {
+            for (int t = 0; t < lengths[s]; ++t) {
+                const int visible = used[s] - lengths[s] + t + 1;
+                for (int h = 0; h < nq; ++h) {
+                    const size_t qbase = ((size_t)(cu[s] + t) * nq + h) * hd;
+                    std::vector<double> weights((size_t)visible);
+                    double peak = -1e30, sum = 0.0;
+                    for (int k = 0; k < visible; ++k) {
+                        double dot = 0.0;
+                        for (int d = 0; d < hd; ++d)
+                            dot += (double)h_bf16(query[qbase + d]) * cache_at(s, h / gqa, k, d, false);
+                        weights[k] = dot * scale;
+                        peak = std::max(peak, weights[k]);
+                    }
+                    for (auto& weight : weights) sum += weight = std::exp(weight - peak);
+                    for (int d = 0; d < hd; ++d) {
+                        double value = 0.0;
+                        for (int k = 0; k < visible; ++k)
+                            value += weights[k] / sum * cache_at(s, h / gqa, k, d, true);
+                        expected[qbase + d] = (float)value;
+                    }
+                }
+            }
+        }
+        void* dq = dalloc(query.size() * 2);
+        void* dk = dalloc(cache.size() * 2);
+        void* dy = dalloc(query.size() * 2);
+        if (!dq || !dk || !dy) { ok(name, false, "device allocation failed"); return; }
+        st_memcpy(dq, query.data(), query.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(dk, cache.data(), cache.size() * 2, hipMemcpyHostToDevice);
+        std::vector<RadTensor> ts = {
+            T(dq, RAD_BF16, {total, nq, hd}), T(dk, RAD_BF16, {nb, nkv, bs, 2 * hd}),
+            TI32({2, maxb}, table), TI32({2}, used), RadTensor{}, RadTensor{},
+            TI32({3}, cu), T(dy, RAD_BF16, {total, nq, hd}),
+        };
+        if (mode == 2) absent(ts[6]);  // also exercise uniform query-length extraction
+        std::vector<RadParam> ps = {
+            PI("q_len", *std::max_element(lengths.begin(), lengths.end())), PI("head_dim", hd),
+            PI("gqa", gqa), PI("block_size", bs), PI("causal", 1), PI("window", 0),
+            PS("q_dtype", "bf16"), PS("kv_dtype", "bf16"), PF("scale", scale),
+        };
+        run_case(row, ts, ps);
+        std::vector<uint16_t> actual(query.size());
+        st_memcpy(actual.data(), dy, actual.size() * 2, hipMemcpyDeviceToHost);
+        int bad = 0;
+        float worst = 0.0f;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            const float value = h_bf16(actual[i]), error = std::fabs(value - expected[i]);
+            worst = std::max(worst, error);
+            // BF16 probability fragments and output rounding differ from the double oracle.
+            if (!std::isfinite(value) || error > 0.002f + 0.01f * std::fabs(expected[i])) ++bad;
+        }
+        ok("h64 GQA4 paged attention matches scalar causal softmax", bad == 0,
+           fmt("mode=%d bad=%d max_abs=%g", mode, bad, (double)worst));
+    }
+}
+
 /* E4M3 -> f32, the software form. Exponent 0 is subnormal (no implicit leading one). This is the
  * ORACLE for the device's v_cvt_f32_fp8, so it is written from the format and not from the kernel. */
 static float h_e4m3(uint8_t b) {
@@ -10971,6 +11414,14 @@ static void device_phase(const Plugin& pl) {
 
     ngram_ahead_case(pl);
     embed_lookup_q_case(pl);
+    rmsnorm_rounding_case(pl);
+    grid_embed_case(pl);
+    cast_numeric_case(pl, true);
+    cast_numeric_case(pl, false);
+    silu_numeric_case(pl);
+    causal_conv_case(pl);
+    logits_select_case(pl);
+    attn_h64_case(pl);
 
     /* --- the paged cache's write side --- */
     kv_store_case(pl, "kv_store_bf16", "bf16");

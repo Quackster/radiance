@@ -520,6 +520,44 @@ AVX_KERNEL(gemm_nt_q_gated) {
  * apart even when one kernel serves both. N and K are spelled n_vocab and n_embd. */
 AVX_KERNEL(logits_gemm) { return gemm_nt_impl(a, false, "n_vocab", "n_embd"); }
 
+/* The selected head visits only the supplied (hidden row, vocabulary row) pairs. Each dot uses
+ * the same SIMD primitive as the GEMM's ragged edge, and owns its entire reduction even when
+ * candidates run on different threads. Keep duplicate pairs and the caller's ordering intact. */
+AVX_KERNEL(logits_select) {
+    const RadTensor* t[5];
+    if (!take(a, 5, t)) return RAD_E_INVAL;
+    const auto *x = t[0], *w = t[1], *rows = t[2], *tokens = t[3], *y = t[4];
+    if (rows->dtype != RAD_I32 || tokens->dtype != RAD_I32 || y->dtype != RAD_F32)
+        return RAD_E_DTYPE;
+    const int64_t K = p_int(a, "n_embd", 0), V = p_int(a, "n_vocab", 0);
+    const int64_t round = p_int(a, "round_bf16", 0);
+    if (K <= 0 || V <= 0 || (round != 0 && round != 1)) return RAD_E_INVAL;
+    const int64_t R = numel(x) / K, M = numel(rows);
+    if (R <= 0 || M <= 0 || numel(tokens) != M || numel(y) != M || numel(w) < V * K)
+        return RAD_E_SHAPE;
+    auto index = [](const RadTensor* ids, int64_t i) { return ldi(ids, offlin(ids, i)); };
+    // Refuse the whole call before any output is published, including when the last pair is bad.
+    for (int64_t i = 0; i < M; ++i)
+        if (index(rows, i) < 0 || index(rows, i) >= R || index(tokens, i) < 0 || index(tokens, i) >= V)
+            return RAD_E_INVAL;
+    auto pack = [](const RadTensor* src, int64_t row, int64_t cols, float* dst) -> const float* {
+        const int64_t base = rowoff(src, row, cols), stride = laststride(src);
+        if (stride == 1 && src->dtype == RAD_F32) return (const float*)src->data + base;
+        if (stride == 1) row_to_f32(src->dtype, byte_at(src->data, src->dtype, base), dst, cols);
+        else for (int64_t k = 0; k < cols; ++k) dst[k] = ldt(src, base + k * stride);
+        return dst;
+    };
+    AVX_PARALLEL_FOR_IF(M * K >= AVX_PAR_MIN)
+    for (int64_t i = 0; i < M; ++i) {
+        const float* xr = pack(x, index(rows, i), K, scratch_f32((size_t)K));
+        const float* wr = pack(w, index(tokens, i), K, scratch_f32_b((size_t)K));
+        float sum = dot1(xr, wr, 0, K);
+        if (round) sum = rad_bf16_to_f32(rad_f32_to_bf16(sum));
+        stt(y, offlin(y, i), sum);
+    }
+    return RAD_OK;
+}
+
 /* ================================================================== the vocabulary edges
  *
  * A gather, not a GEMM. A NEGATIVE token id writes a ZERO ROW -- the padding convention a batch

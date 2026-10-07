@@ -23,6 +23,8 @@
 #include "../libref/ref_common.h"
 #include "rad_sample.h"
 
+#include "grid_embed_golden.h"
+
 #include <deque>
 #include <string>
 #include <thread>
@@ -257,7 +259,7 @@ TEST(op_vocabulary) {
         "rmsnorm", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "mtp_enter",
         "layernorm", "add", "mul", "silu_mul", "gelu", "silu",
         "sigmoid", "fill", "gather_rows", "scatter_rows", "ngram_ids", "ple_gate", "ple_conv",
-        "embed_lookup_q", "cast",
+        "embed_lookup_q", "cast", "causal_conv1d",
         "scale_rows",
         "softmax",
         "quant_act_i8", "quant_act_fp8", "had_quant_act_fp8", "had_quant_act_i8", "gram_accum",
@@ -275,7 +277,7 @@ TEST(op_vocabulary) {
         "gdn_conv_prep", "gdn_conv_update", "gdn_kkt_solve", "gdn_chunk_scan",
         "gdn_recurrent_update", "gdn_conv_recurrent_update", "gdn_gated_rmsnorm",
         "all_reduce", "all_gather",
-        "embed_lookup", "logits_gemm",
+        "embed_lookup", "logits_gemm", "logits_select",
         "sample_penalties", "sample_dry", "sample_temp", "sample_topk", "sample_topp",
         "sample_minp", "sample_typical", "sample_xtc", "sample_mask", "sample_pick",
         "sample_argmax", "sample_merge_topk",
@@ -445,6 +447,19 @@ TEST(op_rmsnorm) {
     A b; b.t(x).t(w0).t(y2).i("M", 1).i("n", 4).d("eps", 0).s("dtype", "f32").d("wadd", 1);
     CHECK_OK(run("rmsnorm", b));
     CHECK_NEAR(y2.at(3), 4 * s, 1e-6);
+}
+
+TEST(op_rmsnorm_rounds_normalized_activation_only_when_requested) {
+    T x(RAD_BF16, {1, 4}); x.f({1, 2, 3, 4});
+    T w(RAD_F32, {4}); w.f({0.8046875f, 0.8046875f, 0.8046875f, 0.8046875f});
+    T legacy(RAD_BF16, {1, 4}), rounded(RAD_BF16, {1, 4});
+    A a; a.t(x).t(w).t(legacy).i("M", 1).i("n", 4).d("eps", 0).s("dtype", "bf16");
+    A b; b.t(x).t(w).t(rounded).i("M", 1).i("n", 4).d("eps", 0).s("dtype", "bf16")
+        .i("round_before_weight", 1);
+    CHECK_OK(run("rmsnorm", a)); CHECK_OK(run("rmsnorm", b));
+    // 3/sqrt(7.5) rounds to 1.09375 before multiplication by the exact BF16 gain.
+    CHECK_EQ(legacy.at(2), 0.8828125f);
+    CHECK_EQ(rounded.at(2), 0.87890625f);
 }
 
 TEST(op_rmsnorm_add) {
@@ -2106,6 +2121,60 @@ TEST(op_grid_embed) {
     CHECK_NEAR(x.at(4), want, 1e-4);
 }
 
+/* A reduction must widen the triangular footprint. For 4 -> 2, the first sample has
+ * weights [3, 3, 1, 0]/7, not the two middle pixels used without antialiasing. Upsampling uses
+ * half-pixel centers, distinct from the legacy aligned-corner mode. */
+TEST(op_grid_embed_antialias) {
+    constexpr int64_t side = 4, n = 2;
+    std::vector<float> values(side * side * n);
+    for (int y = 0; y < side; ++y) for (int x = 0; x < side; ++x)
+        for (int c = 0; c < n; ++c) values[(y * side + x) * n + c] = 10 * y + x + c;
+    T table(RAD_F32, {side * side, n}); table.f(values);
+    T x(RAD_F32, {6, n}); x.f(std::vector<float>(12, 0.0f));
+    T coord(RAD_I32, {4, 6});
+    coord.n({0, 1, 0, 1, 7, 0,  0, 1, 0, 3, 7, 0,
+             2, 2, 8, 8, 8, 1,  2, 2, 8, 8, 8, 1});
+    A a; a.t(x).t(table).t(coord).i("M", 6).i("n", n).i("side", side)
+          .s("dtype", "f32").s("mode", "bilinear_antialias");
+    CHECK_OK(run("grid_embed", a));
+    const float expected[] = {55.0f / 7, 176.0f / 7, 0, 3.75f, 33, 16.5f};
+    for (int r = 0; r < 6; ++r) for (int c = 0; c < n; ++c)
+        CHECK_NEAR(x.at(r * n + c), expected[r] + c, 4e-6);
+    A bad; bad.t(x).t(table).t(coord).i("n", n).i("side", side).s("mode", "unknown");
+    CHECK_EQ(run("grid_embed", bad), RAD_E_INVAL);
+}
+
+TEST(op_grid_embed_antialias_gpu_golden) {
+    namespace g = grid_embed_golden;
+    constexpr int pitch = 2 * g::n + 3;
+    for (uint32_t table_dt : {RAD_BF16, RAD_F32}) {
+        T x(RAD_BF16, {g::rows, pitch});
+        std::vector<float> input(g::rows * pitch, 19.0f);
+        for (int r = 0; r < g::rows; ++r) for (int c = 0; c < g::n; ++c)
+            input[r * pitch + c * 2] = g::patch(r, c);
+        x.f(input); x.t.shape[1] = g::n; x.t.stride[1] = 2;
+        T table(table_dt, {g::side * g::side, pitch});
+        std::vector<float> weights(g::side * g::side * pitch, -29.0f);
+        for (int r = 0; r < g::side * g::side; ++r) for (int c = 0; c < g::n; ++c)
+            weights[r * pitch + c * 2] = g::table(r, c);
+        table.f(weights); table.t.shape[1] = g::n; table.t.stride[1] = 2;
+        T coord(RAD_I32, {4, g::rows});
+        std::vector<int64_t> crd(4 * g::rows);
+        for (int r = 0; r < g::rows; ++r) for (int plane = 0; plane < 4; ++plane)
+            crd[plane * g::rows + r] = g::coord[r][plane];
+        coord.n(crd);
+        A a; a.t(x).t(table).t(coord).i("M", g::rows).i("n", g::n).i("side", g::side)
+              .s("dtype", "bf16").s("mode", "bilinear_antialias");
+        CHECK_OK(run("grid_embed", a));
+        const uint16_t* expected = table_dt == RAD_BF16 ? g::bf16 : g::f32;
+        for (int r = 0; r < g::rows; ++r) for (int i = 0; i < pitch; ++i) {
+            const float want = i < 2 * g::n && i % 2 == 0 ?
+                rad_bf16_to_f32(expected[r * g::n + i / 2]) : 19.0f;
+            CHECK_EQ(x.at(r * pitch + i), want);
+        }
+    }
+}
+
 TEST(op_qk_norm_rope) {
     /* At position 0 the rotation is the identity, so this isolates the per-head RMS norm. */
     T qkv(RAD_F32, {1, 6}); qkv.f({3, 4,  3, 4,  7, 7});
@@ -3301,4 +3370,104 @@ TEST(op_scatter_rows_round_trips_opaque_bytes_through_u8) {
         CHECK_EQ(dst.at(1 * n + i), 0.0f);                /* and the others are still untouched */
         CHECK_EQ(dst.at(3 * n + i), 0.0f);
     }
+}
+
+TEST(op_causal_conv1d_chunked_and_rollback_state) {
+    T w(RAD_F32, {1, 3}); w.f({1, 2, 3});
+    T state(RAD_F32, {1, 1, 4}); state.f({99, 99, 99, 99});
+    T slot(RAD_I32, {1}); slot.n({0});
+    T init(RAD_I32, {1}); init.n({0});
+    T cu(RAD_I32, {2}); cu.n({0, 3});
+    T x(RAD_F32, {3, 1}); x.f({1, 2, 3});
+    T y(RAD_F32, {3, 1});
+    A a; a.t(x).t(w).t(state).t(cu).t(slot).t(init).tnull().t(y)
+        .i("M", 128).i("n", 1).i("width", 3).s("dtype", "f32");
+    CHECK_OK(run("causal_conv1d", a));
+    CHECK_EQ(y.at(0), 3.0f); CHECK_EQ(y.at(1), 8.0f); CHECK_EQ(y.at(2), 14.0f);
+    CHECK_EQ(state.at(0), 2.0f); CHECK_EQ(state.at(1), 3.0f);
+    T one(RAD_F32, {1, 1}); one.f({4});
+    T out(RAD_F32, {1, 1});
+    T cu1(RAD_I32, {2}); cu1.n({0, 1});
+    init.n({256});  // A warm context length whose low byte is zero.
+    A b; b.t(one).t(w).t(state).t(cu1).t(slot).t(init).tnull().t(out)
+        .i("M", 128).i("n", 1).i("width", 3).s("dtype", "f32");
+    CHECK_OK(run("causal_conv1d", b)); CHECK_EQ(out.at(0), 20.0f);
+    CHECK_EQ(state.at(0), 3.0f); CHECK_EQ(state.at(1), 4.0f);
+    T accepted(RAD_I32, {1}); accepted.n({1});
+    x.f({5, 6, 7});
+    A c; c.t(x).t(w).t(state).t(cu).t(slot).t(init).t(accepted).t(y)
+        .i("M", 3).i("n", 1).i("width", 3).s("dtype", "f32");
+    CHECK_OK(run("causal_conv1d", c));
+    CHECK_EQ(y.at(0), 26.0f); CHECK_EQ(y.at(1), 32.0f); CHECK_EQ(y.at(2), 38.0f);
+    CHECK_EQ(state.at(0), 4.0f); CHECK_EQ(state.at(3), 7.0f);
+    one.f({9}); // Keep only the first candidate: rejected 6 and 7 must not enter the history.
+    A d; d.t(one).t(w).t(state).t(cu1).t(slot).t(init).t(accepted).t(out)
+        .i("M", 1).i("n", 1).i("width", 3).s("dtype", "f32");
+    CHECK_OK(run("causal_conv1d", d)); CHECK_EQ(out.at(0), 41.0f);
+}
+
+TEST(op_causal_conv1d_isolates_sequences_and_checks_slots) {
+    T x(RAD_BF16, {3, 1}); x.f({1, 2, 10});
+    T w(RAD_BF16, {1, 3}); w.f({1, 2, 3});
+    T y(RAD_BF16, {3, 1});
+    T state(RAD_BF16, {2, 1, 2}); state.f({2, 4, 9, 9});
+    T cu(RAD_I32, {3}); cu.n({0, 2, 3});
+    T slot(RAD_I32, {2}); slot.n({1, 0});
+    T init(RAD_I32, {2}); init.n({0, 256});
+    A a; a.t(x).t(w).t(state).t(cu).t(slot).t(init).tnull().t(y)
+        .i("M", 3).i("n", 1).i("width", 3).s("dtype", "bf16");
+    CHECK_OK(run("causal_conv1d", a));
+    CHECK_EQ(y.at(0), 3.0f); CHECK_EQ(y.at(1), 8.0f); CHECK_EQ(y.at(2), 40.0f);
+    CHECK_EQ(state.at(0), 4.0f); CHECK_EQ(state.at(1), 10.0f);
+    CHECK_EQ(state.at(2), 1.0f); CHECK_EQ(state.at(3), 2.0f);
+    slot.n({0, 0}); CHECK_EQ(run("causal_conv1d", a), RAD_E_INVAL);
+    slot.n({2, 0}); CHECK_EQ(run("causal_conv1d", a), RAD_E_INVAL);
+    slot.n({1, 0}); cu.n({0, 4, 3}); CHECK_EQ(run("causal_conv1d", a), RAD_E_INVAL);
+}
+
+TEST(op_causal_conv1d_prefill_suffix_preserves_decode_rows) {
+    T x(RAD_F32, {4, 1}); x.f({90, 91, 2, 3});
+    T y(RAD_F32, {4, 1}); y.f({10, 11, -1, -1});
+    T w(RAD_F32, {1, 3}); w.f({1, 2, 3});
+    T state(RAD_F32, {1, 1, 2}); state.f({7, 8});
+    T cu(RAD_I32, {2}); cu.n({2, 4});
+    T init(RAD_I32, {1}); init.n({0});
+    A a; a.t(x).t(w).t(state).t(cu).tnull().t(init).tnull().t(y)
+        .i("M", 4).i("n", 1).i("width", 3).s("dtype", "f32");
+    CHECK_OK(run("causal_conv1d", a));
+    CHECK_EQ(y.at(0), 10.0f); CHECK_EQ(y.at(1), 11.0f);
+    CHECK_EQ(y.at(2), 6.0f); CHECK_EQ(y.at(3), 13.0f);
+    CHECK_EQ(state.at(0), 2.0f); CHECK_EQ(state.at(1), 3.0f);
+    state.t.stride[2] = 2;
+    A pitched; pitched.t(x).t(w).t(state).t(cu).tnull().t(init).tnull().t(y)
+        .i("M", 4).i("n", 1).i("width", 3).s("dtype", "f32");
+    CHECK_EQ(run("causal_conv1d", pitched), RAD_E_SHAPE);
+}
+
+TEST(op_logits_select_preserves_order_duplicates_and_bf16_rounding) {
+    T x(RAD_BF16, {2, 8}); x.f({1.0078125f, 2, 0, 0, 0, 0, 0, 0, -1, 3, 0, 0, 0, 0, 0, 0});
+    T w(RAD_BF16, {3, 8}); w.f({1.0078125f, 0, 0, 0, 0, 0, 0, 0,
+                               2, 1, 0, 0, 0, 0, 0, 0, -1, 4, 0, 0, 0, 0, 0, 0});
+    T rows(RAD_I32, {4}); rows.n({1, 0, 1, 0});
+    T tokens(RAD_I32, {4}); tokens.n({2, 0, 2, 1});
+    T output(RAD_F32, {4});
+    A raw; raw.t(x).t(w).t(rows).t(tokens).t(output)
+        .i("M", 4).i("n_rows", 2).i("n_vocab", 3).i("n_embd", 8).s("dtype", "bf16");
+    CHECK_OK(run("logits_select", raw));
+    CHECK_EQ(output.at(0), 13.0f);
+    CHECK_EQ(output.at(1), 1.01568603515625f);
+    CHECK_EQ(output.at(2), output.at(0));
+    CHECK_EQ(output.at(3), 4.015625f);
+    A rounded; rounded.t(x).t(w).t(rows).t(tokens).t(output)
+        .i("M", 4).i("n_rows", 2).i("n_vocab", 3).i("n_embd", 8)
+        .s("dtype", "bf16").i("round_bf16", 1);
+    CHECK_OK(run("logits_select", rounded));
+    CHECK_EQ(output.at(0), 13.0f);
+    CHECK_EQ(output.at(1), 1.015625f);
+    CHECK_EQ(output.at(2), 13.0f);
+    CHECK_EQ(output.at(3), 4.0f); /* exact halfway, round to even */
+    tokens.n({2, 3, 2, 1});
+    CHECK_EQ(run("logits_select", rounded), RAD_E_INVAL);
+    tokens.n({2, 0, 2, 1}); rows.n({1, -1, 1, 0});
+    CHECK_EQ(run("logits_select", rounded), RAD_E_INVAL);
 }

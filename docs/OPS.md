@@ -158,13 +158,13 @@ adding a kernel plugin; "refused at load" names one op and leaves you to find th
 
 | op | params | operands |
 |---|---|---|
-| `rmsnorm` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `w`w → `y` |
+| `rmsnorm` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt `round_before_weight`/opt | `x`, `w`w → `y` |
 | `rmsnorm_add` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`, `w`w → `y`, `residual_out` |
 | `hc_enter` | `M`(range) `n` `hc` `dtype` | `x` → `h` |
 | `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`? |
 | `hc_write` | `M`(range) `n` `hc` `dtype` | `y`, `inj`, `h`:inout |
 | `layernorm` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `w`w, `b`w? → `y` |
-| `grid_embed` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
+| `grid_embed` | `M`(range) `n` `side` `dtype` `mode`:str/opt | `x`:inout, `table`w, `coord` |
 | `add` | `M`(range) `n` `dtype` | `a`, `b` → `y` |
 | `mul` | `M`(range) `n` `dtype` | `a`, `b` → `y` |
 | `silu_mul` | `M`(range) `n` `dtype` | `gate_up` → `y` (splits `[M,2n]` into gate·up) |
@@ -177,6 +177,11 @@ adding a kernel plugin; "refused at load" names one op and leaves you to find th
 
 `gelu` and `silu` are two ops with one schema, and `silu` carries a row of its own because a row
 names one op.
+
+`rmsnorm` normally narrows only after applying `(w + wadd)`. Its optional integer
+`round_before_weight=1` first rounds `x * rsqrt(mean(x²) + eps)` to the activation dtype, then
+applies the gain. The default is `0`. This preserves checkpoints that require the intermediate
+rounding; it is not an option on `rmsnorm_add` or the quantizing norm fusions.
 
 `rmsnorm_add` exists because the residual add and the next norm are one pass in every real
 implementation. A plugin asks for it first and falls back to `add` + `rmsnorm` (`spec.md` §2.3).
@@ -410,7 +415,13 @@ what a separate tensor would hold, so the fused form is the unfused chain to the
 **`grid_embed`** adds a learned `side x side` position table resampled to each row's grid: `coord`
 is `[4, M]` (row, column, grid height, grid width), sampled bilinearly with the grid's corners on the
 table's (align_corners), edge taps clamped, the four taps summed in f32 and rounded to `x`'s dtype
-before the add.
+before the add. This default is `mode="bilinear"`. `mode="bilinear_antialias"` instead uses
+half-pixel centers (`align_corners=false`) and a separable triangular filter whose support widens
+when downsampling. Edge weights are renormalized over surviving taps. Raw filter weights,
+normalized weights, each horizontal sum, and the vertical result round to the **table dtype**;
+the resized value then rounds to `x`'s dtype before addition. This reproduces GPU antialiased
+interpolation for a BF16 position table, including its intermediate rounding. Coordinates outside
+the grid clamp to its edge; nonpositive grid sizes are treated as one.
 
 | op | params | operands |
 |---|---|---|
@@ -826,9 +837,19 @@ form exists, as for `ar_hc_write`.
 | `embed_lookup` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt | `tokens`, `wte`w → `x` |
 | `embed_lookup_q` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt | `tokens`, `wte`w, `scale`w? → `x`, `ahead`? |
 | `logits_gemm` | `M`(range) `n_vocab` `n_embd` `dtype` | `x`, `lm_head`w → `logits` |
+| `logits_select` | `M`(range) `n_rows` `n_vocab` `n_embd` `dtype` `round_bf16`/opt | `x`, `lm_head`w, `rows`, `tokens` → `values` |
 | `ngram_ids` | `M`(range) `heads` `ngram` `eos` | `tok`, `state`:inout, `cu`, `mult`w, `vocab_sizes`w, `offsets`w, `cache_idx`?, `has_init`?, `num_accepted`? → `ids`, `ahead_ids`? |
 | `ple_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `gate_eps`:f64/opt | `k`, `q`, `v`, `w_key`w, `w_query`w, `w_conv`w → `gv`, `gvn` |
+| `causal_conv1d` | `M`(range) `n` `width` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `cache_idx`?, `has_init`?, `num_accepted`? → `y` |
 | `ple_conv` | `M`(range) `n` `width` `dilation` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `resid`?, `cache_idx`?, `has_init`?, `num_accepted`? → `y` |
+
+`logits_select` computes only the requested vocabulary entries: `values[i]` is the dot product
+of hidden row `rows[i]` and head row `tokens[i]`. Both index arrays are i32 with `M` elements;
+the f32 output preserves their order and duplicates. Token indices are local to this rank's head.
+`n_rows` describes the hidden-row capacity; indices must fit the actual input rows. With
+`round_bf16=1`, each accumulated dot is rounded to BF16 and widened to f32 before publication;
+the default is an unrounded f32 dot. No vocabulary softmax is performed. Invalid indices are
+rejected by the host reference and produce NaN on the GPU, where validation must not synchronize.
 
 Separate from `gemm_nt` because `lm_head` is its own access class (`RAD_ACCESS_VOCAB`) and because
 the sampler wants to fuse against it: at a 151K vocab and batch 256 the logits are ~77 MiB a step,
@@ -1038,6 +1059,28 @@ would differ in the last bits.
 multiply over tensors that are all `[M, hc*n]` — 10240 wide here — would be six launches against a
 ~4.5 µs per-kernel floor, every one of them memory-bound. `hc_read` is the same argument at the
 same width.
+
+### `causal_conv1d`: depthwise convolution with rolling state
+
+    y[t,c] = sum_j w[c,j] * x[t - (width-1) + j,c]
+
+There is no activation or residual, and dilation is one. The LFM2 architecture supplies the input
+and output gates as separate multiplications. `x` and `y` have shape `[M,n]`, `w` is `[n,width]`,
+and `conv_state` is packed `[n_slots,n,state_len]` with at least `width-1` history values per
+channel. `cu` delimits independent sequences; `cache_idx` optionally maps each to a state slot.
+Slot `-1` is inactive, and live sequences must own distinct slots.
+
+`has_init` zero supplies a zero history even when a recycled slot contains old values. Nonzero
+values mean warm history; the operand is an int32 context length, not a byte flag. Without
+`num_accepted`, every input commits and the last `width-1` values become the next history at
+offset zero. With `num_accepted`, read the old history at offset `num_accepted-1`, then store
+that history shifted left by one followed by every candidate input. This preserves the history
+for any accepted prefix of a speculative step. The window must fit `width-2+sequence_length`
+values in that form. These are the same state transitions as `ple_conv` below.
+
+The reference supports widths through 65. The BF16 device kernel supports widths 2–8, with
+pitched activation rows and packed state. Its first 32-token tile owns all history reads and
+updates; later tiles read only input rows, so the fused state update cannot race another tile.
 
 ### `ple_conv`: a dilated convolution cache is not a conv cache
 

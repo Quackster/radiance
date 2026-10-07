@@ -1510,6 +1510,13 @@ machinery is lifted underneath. This is real work: the pre-tokenizer regexes nee
 engine and ByteLevel's alphabet mapping has to be exact. It removes a failure class whose symptom
 is plausible text with wrong token boundaries, which is the hardest kind to notice.
 
+The BPE model's `ignore_merges` setting is also baked into the vocab. `RadVocabHeader.model_flags`
+uses the first formerly reserved 64-bit word, without changing header size or existing offsets;
+bit 0 (`RAD_VOCAB_F_IGNORE_MERGES`) takes a whole pre-token directly from the vocabulary when it
+exists, after normalization and pre-tokenization. Zero retains ordinary ranked BPE, including for
+older containers. Files setting the bit require a runtime that implements it; older readers treated
+that word as reserved and cannot reproduce this tokenizer's behavior.
+
 Detokenisation is incremental and streaming-safe: byte-level BPE emits partial UTF-8 sequences,
 and a stop string may straddle a chunk boundary, so both are buffered until they resolve.
 

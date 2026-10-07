@@ -16,6 +16,7 @@
  */
 #pragma once
 #include "iface.h"
+#include "sink.h"
 #include "mem/kvtier.h"
 
 #if !defined(RAD_SERVER_NO_ENGINE_BRIDGE) && \
@@ -46,6 +47,7 @@ namespace server {
 
 class SchedulerBridge final : public IScheduler {
 public:
+    bool supports_token_scores() const override { return true; }
     /* `sampler` is the rank-0 sampler, and it is optional only so that a caller with no engine
      * behind it still compiles. Every rank declares the same chain against the same hierarchy, so
      * whether a stage resolved is not a per-rank fact and asking one of them is asking all. */
@@ -69,12 +71,15 @@ public:
         auto p = std::make_unique<Request>(std::move(r));
         p->id = next_.fetch_add(1, std::memory_order_relaxed);
         const uint64_t id = p->id;
+        void* const sink = p->sink;
         int st = s_->add(std::move(p));
         if (st < 0) {
             /* Failing here means the request never entered the queue, so nothing will ever finish
              * its sink. Tell the sink itself, or the HTTP thread waits forever. */
             RAD_WARN("server: scheduler refused request %llu: %s",
                      (unsigned long long)id, rad_strerror(st));
+            if (sink && !static_cast<Sink*>(sink)->done())
+                sink_fail(sink, st, "the scheduler refused this request");
             return 0;
         }
         return id;
@@ -95,6 +100,8 @@ public:
             if (rc[i] >= 0) continue;
             RAD_WARN("server: scheduler refused request %llu: %s",
                      (unsigned long long)(*ids)[i], rad_strerror(rc[i]));
+            if (rs[i].sink && !static_cast<Sink*>(rs[i].sink)->done())
+                sink_fail(rs[i].sink, rc[i], "the scheduler refused this request");
             (*ids)[i] = 0;
         }
     }

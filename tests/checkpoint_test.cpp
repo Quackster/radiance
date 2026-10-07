@@ -122,6 +122,61 @@ TEST(the_metadata_names_the_architecture_and_the_quantisation) {
     remove_checkpoint(dir);
 }
 
+TEST(lfm2_vl_keeps_text_geometry_schedule_and_the_checkpoint_norm_epsilon) {
+    const std::string dir = write_checkpoint({bf16("x", {2, 2}, 0)},
+        "{\"model_type\":\"lfm2_vl\",\"tie_word_embeddings\":true,\"vision_config\":{\"hidden_size\":1152},"
+        "\"text_config\":{\"model_type\":\"lfm2\",\"hidden_size\":2048,\"intermediate_size\":10752,"
+        "\"num_hidden_layers\":3,\"num_attention_heads\":32,\"num_key_value_heads\":8,"
+        "\"norm_eps\":0.00001,\"conv_L_cache\":3,\"layer_types\":[\"conv\",\"conv\",\"full_attention\"],"
+        "\"rope_parameters\":{\"rope_theta\":1000000},\"vocab_size\":128000}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK_EQ(ck.meta().arch, std::string("lfm2"));
+    CHECK_EQ(ck.meta().quant, std::string());
+    CHECK_EQ(ck.meta().m.n_embd, (int64_t)2048);
+    CHECK_EQ(ck.meta().m.head_dim, (int64_t)64);
+    CHECK_EQ(ck.meta().m.n_ff, (int64_t)10752);
+    CHECK_EQ(ck.meta().m.rms_eps, 1e-5f);
+    CHECK_EQ(std::string(ck.meta().get("model_type")), std::string("lfm2_vl"));
+    CHECK_EQ(std::string(ck.meta().get("text_config.layer_types")),
+             std::string("conv conv full_attention"));
+    CHECK_EQ(std::string(ck.meta().get("vision_config.hidden_size")), std::string("1152"));
+    remove_checkpoint(dir);
+}
+
+TEST(nested_image_processor_metadata_uses_the_shared_preprocessor_namespace) {
+    const std::string dir = write_checkpoint({bf16("x", {2, 2}, 0)}, "{}");
+    auto put = [&](const char* name, const char* json) {
+        FILE* f = std::fopen((dir + "/" + name).c_str(), "wb");
+        REQUIRE(f);
+        std::fwrite(json, 1, std::strlen(json), f);
+        std::fclose(f);
+    };
+    put("processor_config.json",
+        "{\"processor_class\":\"Lfm2VlProcessor\",\"image_processor\":{"
+        "\"image_processor_type\":\"Lfm2VlImageProcessor\",\"do_image_splitting\":true,"
+        "\"image_mean\":[0.5,0.5,0.5],\"size\":{\"height\":512,\"width\":512},\"max_tiles\":10}}");
+    {
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        CHECK_EQ(std::string(ck.meta().get("preprocessor.image_processor_type")), std::string("Lfm2VlImageProcessor"));
+        CHECK_EQ(std::string(ck.meta().get("preprocessor.do_image_splitting")), std::string("1"));
+        CHECK_EQ(std::string(ck.meta().get("preprocessor.image_mean")), std::string("0.5 0.5 0.5"));
+        CHECK_EQ(std::string(ck.meta().get("preprocessor.size.height")), std::string("512"));
+        CHECK(!ck.meta().has("preprocessor.image_processor.size.height"));
+    }
+    put("preprocessor_config.json", "{\"max_tiles\":4}");
+    {
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        CHECK_EQ(std::string(ck.meta().get("preprocessor.max_tiles")), std::string("4"));
+        CHECK_EQ(std::string(ck.meta().get("preprocessor.size.width")), std::string("512"));
+    }
+    std::remove((dir + "/processor_config.json").c_str());
+    std::remove((dir + "/preprocessor_config.json").c_str());
+    remove_checkpoint(dir);
+}
+
 TEST(a_plain_tensor_is_its_own_encoding_and_reads_back_as_itself) {
     const std::string dir = write_checkpoint({ bf16("a.weight", { 4, 8 }, 1.0f) }, "{}");
     Checkpoint ck;

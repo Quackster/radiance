@@ -1520,6 +1520,7 @@ static const RadParamSpec pRmsNorm[] = {
     P_F64("eps"),
     { "dtype", RAD_P_STR, RAD_REQUIRED },
     P_F64O("wadd"),
+    P_INTO("round_before_weight"),
 };
 static const RadOperandSpec oRmsNorm[] = {
     { "x", RAD_OPD_IN,     0 },
@@ -1600,6 +1601,7 @@ static const RadOperandSpec oLayernorm[] = {
 };
 static const RadParamSpec pGridEmbed[] = {
     P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"),
+    { "mode", RAD_P_STR, RAD_OPTIONAL },
 };
 static const RadOperandSpec oGridEmbed[] = {
     { "x",     RAD_OPD_INOUT,  0 },
@@ -1691,6 +1693,20 @@ static const RadOperandSpec oPleGate[] = {
     { "gvn",     RAD_OPD_OUT,    0 },
 };
 
+static const RadParamSpec pCausalConv[] = {
+    P_INT("M"), P_INT("n"), P_INT("width"), P_STR("dtype"),
+};
+static const RadOperandSpec oCausalConv[] = {
+    { "x",            RAD_OPD_IN,     0 },
+    { "w",            RAD_OPD_WEIGHT, 0 },
+    { "conv_state",   RAD_OPD_INOUT,  0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "cache_idx",    RAD_OPD_IN,     1 },
+    { "has_init",     RAD_OPD_IN,     1 },
+    { "num_accepted", RAD_OPD_IN,     1 },
+    { "y",            RAD_OPD_OUT,    0 },
+};
+
 static const RadParamSpec pPleConv[] = {
     { "M",        RAD_P_INT, RAD_REQUIRED },
     { "n",        RAD_P_INT, RAD_REQUIRED },
@@ -1742,6 +1758,15 @@ static const RadOperandSpec oLogits[] = {
     { "x",       RAD_OPD_IN,     0 },
     { "lm_head", RAD_OPD_WEIGHT, 0 },
     { "logits",  RAD_OPD_OUT,    0 },
+};
+static const RadParamSpec pLogitsSelect[] = {
+    { "M", RAD_P_INT, RAD_REQUIRED }, { "n_rows", RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab", RAD_P_INT, RAD_REQUIRED }, { "n_embd", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED }, { "round_bf16", RAD_P_INT, 0 },
+};
+static const RadOperandSpec oLogitsSelect[] = {
+    { "x", RAD_OPD_IN, 0 }, { "lm_head", RAD_OPD_WEIGHT, 0 },
+    { "rows", RAD_OPD_IN, 0 }, { "tokens", RAD_OPD_IN, 0 }, { "values", RAD_OPD_OUT, 0 },
 };
 
 /* EVERY SAMPLER SCALAR IS PER ROW and arrives in `params`, an array of RadSampleParams
@@ -1831,7 +1856,9 @@ static const RadOperandSpec oMergeTopk[] = {
 static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm", pRmsNorm, oRmsNorm,
            "y = x * rsqrt(mean(x^2) + eps) * (w + wadd). `wadd` is GemmaRMSNorm's `1 +`, added in "
-           "f32 after the load because forming it in bf16 first costs 0.3% per channel."),
+           "f32 after the load because forming it in bf16 first costs 0.3% per channel. "
+           "`round_before_weight` defaults to 0; 1 narrows the normalized activation to the "
+           "activation dtype before applying the gain."),
     SCHEMA("add", pMnDtype, oBinary,
            "y = a + b. `b` carrying exactly n elements against an output of M rows broadcasts "
            "along rows, and nothing else broadcasts at all."),
@@ -1840,6 +1867,7 @@ static const RadOpSchema kSchemas[] = {
            "y[.., i] = silu(gate_up[.., i]) * gate_up[.., n + i]. The GATE IS THE FIRST HALF, "
            "which is the order rad-convert fuses gate_proj and up_proj in."),
     SCHEMA("sigmoid", pMnDtype, oUnary, "y = 1 / (1 + exp(-x))."),
+    SCHEMA("silu", pMnDtype, oUnary, "y = x * sigmoid(x)."),
     SCHEMA("fill", pFill, oFill,
            "y = value, every element of an [M, n] extent (default 0). The op a rank issues where "
            "it computes nothing and a reader downstream -- an all-reduce, a residual -- still "
@@ -1867,7 +1895,8 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("grid_embed", pGridEmbed, oGridEmbed,
            "x += a side x side table resampled bilinearly (corners aligned, taps clamped) to each "
            "row's grid; coord is [4, M] row, column, height, width. The taps are summed in f32 "
-           "and rounded before the add."),
+           "and rounded before the add. Optional mode=bilinear_antialias uses half-pixel centers, "
+           "normalized triangular filtering, and table-dtype rounding of weights and passes."),
     SCHEMA("gemm_nt_bias", pGemmBias, oGemmBias,
            "y = res + act(a @ b^T + bias), rounded to bf16 after the biased product, after the "
            "activation and after the residual -- the unfused chain's three tensors."),
@@ -1891,6 +1920,11 @@ static const RadOpSchema kSchemas[] = {
            "zero stays zero; then gv[c] = sigmoid(s[c]) * v, one v row gated per stream. `gvn` is "
            "grouped_rmsnorm(gv) * (w_conv + wadd) over the bytes gv was narrowed to. Both outputs "
            "leave: the convolution reads the normed copy and the residual add the un-normed one."),
+    SCHEMA("causal_conv1d", pCausalConv, oCausalConv,
+           "Depthwise causal convolution without activation. Cold slots read zero history. "
+           "Without num_accepted, save the committed chunk tail; with it, read at accepted-1 "
+           "and retain all candidate inputs in the rolling verification window. "
+           "Live sequences must own distinct state slots."),
     SCHEMA("ple_conv", pPleConv, oPleConv,
            "y[t] = resid[t] + silu(sum_j w[c][j] * x[t - (width-1-j)*dilation]), a DEPTHWISE "
            "CAUSAL convolution whose taps are `dilation` apart -- at width 4 and dilation 3 they "
@@ -1917,6 +1951,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("logits_gemm", pLogits, oLogits,
            "the lm_head projection. gemm_nt's arithmetic under the vocabulary edge's parameter "
            "spelling; M is one row per SAMPLED position, `gather_rows` having run first."),
+    SCHEMA("logits_select", pLogitsSelect, oLogitsSelect,
+           "Selected (hidden row, vocabulary token) dot products in compact order; optional "
+           "round_bf16 narrows to bf16 before widening each output to f32."),
     SCHEMA("sample_penalties", pPenal, oPenalties,
            "repetition, frequency and presence penalties over the row's history, llama.cpp's "
            "order. The repetition penalty is multiplicative and sign-dependent: dividing a "
@@ -2423,6 +2460,12 @@ static const RadConstraint cAttnVit[] = {
 static const RadConstraint cCastBf16[] = {
     C_IN("from", "bf16"), C_IN("to", "bf16"),
 };
+static const RadConstraint cCastF32Bf16[] = {
+    C_IN("from", "f32"), C_IN("to", "bf16"),
+};
+static const RadConstraint cCastBf16F32[] = {
+    C_IN("from", "bf16"), C_IN("to", "f32"),
+};
 
 /* ---- gated delta net ----------------------------------------------------------------------- */
 static const RadConstraint cGdnChunkScan[] = {
@@ -2661,6 +2704,11 @@ static const RadConstraint cLogitRerank[] = {
     C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_GE("n_vocab", 1), C_GE("n_embd", 1),
     C_IN("dtype", "bf16"),
 };
+static const RadConstraint cAttnH64Gqa4Bf16[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 64), C_EQ("gqa", 4), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_GE("q_len", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
+
 static const RadConstraint cGemmNt[] = {
     C_LE("M", 16), C_DIV("K", 256), C_IN("dtype", "bf16"),
 };
@@ -3188,6 +3236,8 @@ static const RadConstraint cPleGate[]   = { C_IN("dtype", "bf16"), C_GE("n", 1),
  * (width-1)*dilation -- the register window the state write-back holds -- cannot exceed 16. The
  * product is what the kernel actually bounds, and a constraint table cannot say "product"; these
  * two caps are the tightest pair that admits every combination under it. */
+static const RadConstraint cCausalConv[] = { C_IN("dtype", "bf16"), C_GE("n", 1),
+                                            C_GE("width", 2), C_LE("width", 8) };
 static const RadConstraint cPleConv[]   = { C_IN("dtype", "bf16"), C_GE("width", 1),
                                             C_LE("width", 5), C_GE("dilation", 1),
                                             C_LE("dilation", 4) };
@@ -3270,6 +3320,15 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_ple_gate, nullptr, nullptr, nullptr,
   nullptr, nullptr },
 
+{ "causal_conv1d_bf16", "causal_conv1d", "conv",
+  "depthwise causal convolution, one thread per channel and a fused rolling-state update",
+  "width 2 through 8; contiguous state and channel axes, optional pitched activation rows",
+  "bf16 activations, weights and state; i32 sequence metadata",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cCausalConv), NOTUNE,
+  nullptr, nullptr, r4d_rad_causal_conv1d, nullptr, nullptr, nullptr,
+  nullptr, nullptr, nullptr, r4d_rad_causal_conv1d_describe },
+
 { "ple_conv_bf16", "ple_conv", "norm",
   "PLE's dilated depthwise conv, silu and residual add; one thread a channel",
   "width up to 5 and dilation up to 4 -- (width-1)*dilation is a register window",
@@ -3340,10 +3399,28 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_cast, nullptr, nullptr, nullptr,
   r4d_shape_cast },
 
+{ "cast_f32_bf16", "cast", "elem",
+  "narrow f32 activations to bf16 with round-to-nearest-even",
+  "any M and n; independent source and destination row pitches",
+  "f32 in, bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cCastF32Bf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_cast, nullptr, nullptr, nullptr,
+  r4d_shape_cast },
+
+{ "cast_bf16_f32", "cast", "elem",
+  "widen bf16 activations exactly to f32",
+  "any M and n; independent source and destination row pitches",
+  "bf16 in, f32 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cCastBf16F32), NOTUNE,
+  nullptr, nullptr, r4d_rad_cast, nullptr, nullptr, nullptr,
+  r4d_shape_cast },
+
 { "rmsnorm_bf16", "rmsnorm", "norm",
   "root-mean-square norm with a gain, two passes over the row",
-  "any n; the sum of squares accumulates in f32 and only the store narrows",
-  "bf16 x / gain / y, fp32 reduction",
+  "any n; f32 reduction; round_before_weight=1 additionally narrows before the gain",
+  "bf16 x / y, f32 or bf16 gain, fp32 reduction",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r4d_rad_rmsnorm, nullptr, nullptr, nullptr,
@@ -3413,6 +3490,15 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_sigmoid, nullptr, nullptr, nullptr,
   r4d_shape_unary },
 
+{ "silu_bf16", "silu", "elem",
+  "SiLU activation, x * sigmoid(x), with a bf16 result",
+  "any M and n; independent input and output row pitches, including gate_up slices",
+  "bf16 in and out, fp32 arithmetic",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_silu, nullptr, nullptr, nullptr,
+  r4d_shape_unary },
+
 { "silu_mul_bf16", "silu_mul", "elem",
   "silu-gated product over a fused [M, 2n] gate_up",
   "any n; the gate is the first half",
@@ -3463,6 +3549,15 @@ static const RadKernelInfo kKernels[] = {
   ROW(cLogitsGemm), NOTUNE,
   nullptr, nullptr, r4d_rad_logits_gemm, nullptr, nullptr, nullptr,
   r4d_shape_logits_gemm },
+
+{ "logits_select_bf16", "logits_select", "vocab",
+  "selected vocabulary dot products, one workgroup a candidate pair",
+  "bf16 hidden/head, n_embd a multiple of8; arbitrary repeated row/token pairs",
+  "f32 accumulation, optional bf16 rounding before f32 output",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cLogitsGemm), NOTUNE,
+  nullptr, nullptr, r4d_rad_logits_select, nullptr, nullptr, nullptr,
+  r4d_shape_logits_select, nullptr, nullptr, r4d_rad_logits_select_describe },
 
 { "logits_gemm_fp8", "logits_gemm", "vocab",
   "the lm_head projection over an fp8 head: C[M, n_vocab] f32 = x[M, n_embd] @ dequant(W)^T, "
@@ -3624,6 +3719,15 @@ static const RadKernelInfo kKernels[] = {
 
 
 /* ---------------------------------------------------------------------------------- attention */
+{ "attn_h64_gqa4_bf16kv", "attn_paged", "attn",
+  "query-tiled causal paged attention for LFM2",
+  "head_dim 64, 4 queries per KV head, paged block 16, all query lengths, no window",
+  "bf16 query/cache/output, f32 accumulation",
+  RAD_DOMAIN_DEVICE, 50,
+  ROW(cAttnH64Gqa4Bf16), nullptr, 0, nullptr,
+  nullptr, nullptr, r4d_rad_attn_h64_gqa4_bf16, nullptr, nullptr, nullptr,
+  r4d_shape_attn_paged },
+
 { "attn_prefill_h256_gqa6_fp8kv", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",
   "head_dim 256, 6 queries per kv head, paged block 16, varlen",
@@ -4876,7 +4980,7 @@ static const RadKernelInfo kKernels[] = {
   /* `sigmoid` + `mul` + `quant_act_fp8`. This row rounds the activation to bf16 before the
    * multiply where its `gated_quant_fp8` sibling does not, precisely because the pair IT replaces
    * is two kernels with a bf16 buffer between them -- so the sibling's expressible arm is silu and
-   * this one's is sigmoid. The silu arm is declined: libr4d has no `silu` row and ref's is
+   * this one's is sigmoid. The silu arm is declined: standalone `silu` evaluates
    * `x * sigmoid(x)` against this kernel's `x / (1 + exp(-x))`. */
   r4d_fuse_gate_quant_fp8, r4d_rad_gate_quant_fp8_describe },
 

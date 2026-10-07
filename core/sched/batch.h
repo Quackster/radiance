@@ -24,6 +24,7 @@
 #include "metrics.h"
 
 namespace rad {
+namespace mm { struct DeviceRows; }
 
 /* One sequence's participation in one step. The scheduler fills these; the builder turns them
  * into device arrays and touches nothing else. */
@@ -73,6 +74,7 @@ struct StepEntry {
     bool    draft_out = false;
     bool    is_prefill = false;
     bool    produces_token = false;   /* this entry's last token is the sequence's last */
+    bool    produces_score = false;   /* final prompt row, appended after sampled logits rows */
     /* ITS DRAFTS CAME FROM PROMPT LOOKUP, not from the declared drafter. Their outcome is counted
      * in the reported acceptance like any other, and kept out of the adaptive window's estimate,
      * which describes the draft head (DraftController, draft.h). */
@@ -171,6 +173,9 @@ public:
     const RadBatch* build_encoder(const std::vector<EncoderPart>& parts, int step);
     bool    has_encoder() const { return mm_on_; }
     int64_t encoder_patches() const { return enc_patches_; }
+    /* Reserve retained encoder rows from the accounted pool. A full pool leaves
+     * device_rows empty, selecting the existing host path without blocking. */
+    int reserve_media_rows(mm::Item& item);
 
 
 private:
@@ -357,7 +362,8 @@ private:
      * The encoder rows a pass overwrites its embeddings with are NOT in the slab: the slab's
      * prefix crosses whole on every build, and max_tok rows of an embedding are megabytes a decode
      * step would copy for nothing. They have a device region of their own on every rank, filled
-     * only by a build that carries them -- rank 0 from pinned staging, every other rank with zeros
+     * only by a build that carries them -- rank 0 from retained device rows or pinned staging,
+     * every other rank with zeros
      * (RadBatch::mm_embd says why). The staging is refilled only once the last upload out of it
      * has run, which `mm_ev_` records. */
     bool                   mm_on_ = false;
@@ -366,6 +372,14 @@ private:
     uint16_t*              mm_host_ = nullptr;
     RadEvent               mm_ev_ = nullptr;
     bool                   mm_ev_live_ = false;
+    struct MediaPool;
+    std::shared_ptr<MediaPool> mm_pool_;
+    /* Source leases live until the device-to-device staging copies complete,
+     * independently of a request being cancelled or reaped. */
+    std::vector<std::shared_ptr<mm::DeviceRows>> mm_sources_;
+    std::vector<RadCopyRange> mm_host_ranges_;
+    struct MediaCopy { const void* src; int64_t dst, bytes; };
+    std::vector<MediaCopy> mm_device_copies_;
     /* ...and the encoder's inputs: patches, their coordinates and the segment boundaries, the
      * largest pass the plugin declared. One copy a rank, since each runs the tower itself. */
     int64_t                enc_patches_ = 0, enc_dim_ = 0, enc_segs_ = 0;
@@ -374,8 +388,8 @@ private:
     int32_t*               enc_coord_host_ = nullptr;
     int32_t*               enc_cu_host_ = nullptr;
     int64_t                last_n_tok_ = 0;
-    struct MediaBytes { int64_t mm = 0, pix = 0, crd = 0, cu = 0; };
-    MediaBytes media_bytes();   /* the four device regions alloc_media reserves, per rank */
+    struct MediaBytes { int64_t mm = 0, pix = 0, crd = 0, cu = 0, retained = 0; };
+    MediaBytes media_bytes();   /* staging per rank plus the retained rank-zero pool */
     int  alloc_media();
     void free_media();
     /* The encoder rows of one entry: the media tokens among its positions, their rows copied into

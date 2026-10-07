@@ -14,7 +14,7 @@
 // reads a negative id as unsigned, a rotary that pairs the wrong halves.  Each kernel below states
 // which ref function it must equal.  Where ref rounds, this rounds, in the same place:
 //
-//   * every reduction accumulates in f32 and only the store narrows to bf16;
+//   * reductions accumulate in f32; rmsnorm optionally rounds before the gain as its schema says;
 //   * `f32_to_bf16` is round-to-nearest-even (r4d_common.h), which is ref's rounder;
 //   * a NEGATIVE index -- token id, gather row, KV slot -- is the PADDING convention and writes a
 //     zero row or skips the store.  It is not an error and it is not clamped to zero, which would
@@ -232,6 +232,20 @@ __global__ __launch_bounds__(kThreads) void scatter_rows_u8_kernel(
     for (uint32_t i = threadIdx.x; i < n4; i += kThreads) dst[i] = src[i];
 }
 
+// ---------------------------------------------------------------------------- cast
+template <bool TO_BF16>
+__global__ __launch_bounds__(kThreads) void cast_kernel(
+    const void* __restrict__ x, void* __restrict__ y, uint32_t n,
+    uint32_t x_ld, uint32_t y_ld) {
+    const size_t xb = (size_t)blockIdx.x * x_ld, yb = (size_t)blockIdx.x * y_ld;
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads) {
+        if constexpr (TO_BF16)
+            ((uint16_t*)y)[yb + i] = f32_to_bf16(((const float*)x)[xb + i]);
+        else
+            ((float*)y)[yb + i] = bf2f(((const uint16_t*)x)[xb + i]);
+    }
+}
+
 // ---------------------------------------------------------------------------- rmsnorm
 // ref_rmsnorm: y = x * rsqrt(mean(x^2) + eps) * (w + wadd).
 //
@@ -248,7 +262,9 @@ __global__ __launch_bounds__(kThreads) void scatter_rows_u8_kernel(
 //
 // Two passes over the row.  n is 256 (a QK-norm head) or 5120 (the hidden state), so the row is in
 // L1 for the second pass and a one-pass Welford would buy nothing but a different rounding.
-template <bool WF32, uint32_t THR>
+// Some checkpoints round the normalized activation to bf16 before applying the gain. Keep that
+// opt-in separate from the default single narrowing, including for an f32 gain.
+template <bool WF32, bool ROUND_BEFORE_WEIGHT, uint32_t THR>
 __global__ __launch_bounds__(THR) void rmsnorm_kernel(
     const uint16_t* __restrict__ x, const void* __restrict__ w, uint16_t* __restrict__ y,
     uint32_t n, float eps, float wadd, uint32_t x_ld, uint32_t y_ld) {
@@ -263,7 +279,9 @@ __global__ __launch_bounds__(THR) void rmsnorm_kernel(
     const float s = rsqrtf(ss / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += THR) {
         const float g = WF32 ? ((const float*)w)[i] : bf2f(((const uint16_t*)w)[i]);
-        yr[i] = f32_to_bf16(bf2f(xr[i]) * s * (g + wadd));
+        float v = bf2f(xr[i]) * s;
+        if constexpr (ROUND_BEFORE_WEIGHT) v = bf2f(f32_to_bf16(v));
+        yr[i] = f32_to_bf16(v * (g + wadd));
     }
 }
 
@@ -301,6 +319,18 @@ __global__ __launch_bounds__(kThreads) void sigmoid_kernel(
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
     for (uint32_t i = threadIdx.x; i < n; i += kThreads)
         yr[i] = f32_to_bf16(1.0f / (1.0f + expf(-bf2f(xr[i]))));
+}
+
+// ---------------------------------------------------------------------------- silu
+__global__ __launch_bounds__(kThreads) void silu_kernel(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
+    uint32_t n, uint32_t x_ld, uint32_t y_ld) {
+    const uint16_t* __restrict__ xr = x + (size_t)blockIdx.x * x_ld;
+    uint16_t* __restrict__ yr = y + (size_t)blockIdx.x * y_ld;
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads) {
+        const float v = bf2f(xr[i]);
+        yr[i] = f32_to_bf16(v * (1.0f / (1.0f + expf(-v))));
+    }
 }
 
 // ---------------------------------------------------------------------------- silu_mul
@@ -675,8 +705,8 @@ extern "C" int r4d_scatter_rows_u8(long v, long idx, long x, int M, int n, int d
 }
 
 // `w_f32` says whether the gain is f32 (every norm gain the architecture plugins declare) or bf16.
-extern "C" int r4d_rmsnorm_bf16(long x, long w, long y, int M, int n, float eps, float wadd,
-                                int w_f32, int x_ld, int y_ld, long stream) {
+static int rmsnorm_bf16(long x, long w, long y, int M, int n, float eps, float wadd,
+                        int w_f32, int x_ld, int y_ld, long stream, bool round_before_weight) {
     if (!x || !w || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (!x_ld) x_ld = n;
@@ -688,19 +718,30 @@ extern "C" int r4d_rmsnorm_bf16(long x, long w, long y, int M, int n, float eps,
     // that disagree about it disagree in the last bits of the norm, and the fused one is required
     // to be byte-identical to this kernel followed by the quantiser.
     const int thr = r4d_act_threads(M, n);
-#define R4D_RN_T(wf, T)                                                                         \
-    hipLaunchKernelGGL((rmsnorm_kernel<wf, T>), dim3((uint32_t)M), dim3(T), 0,                  \
+#define R4D_RN_T(wf, rw, T)                                                                     \
+    hipLaunchKernelGGL((rmsnorm_kernel<wf, rw, T>), dim3((uint32_t)M), dim3(T), 0,              \
                        (hipStream_t)stream, (const uint16_t*)x, (const void*)w, (uint16_t*)y,   \
                        (uint32_t)n, eps, wadd, (uint32_t)x_ld, (uint32_t)y_ld)
-#define R4D_RN(wf)                                                                              \
-    do { if (thr == 1024)     R4D_RN_T(wf, 1024);                                               \
-         else if (thr == 512) R4D_RN_T(wf, 512);                                                \
-         else                 R4D_RN_T(wf, 256); } while (0)
-    if (w_f32) R4D_RN(true);
-    else       R4D_RN(false);
+#define R4D_RN(wf, rw)                                                                          \
+    do { if (thr == 1024)     R4D_RN_T(wf, rw, 1024);                                           \
+         else if (thr == 512) R4D_RN_T(wf, rw, 512);                                            \
+         else                 R4D_RN_T(wf, rw, 256); } while (0)
+    if (round_before_weight) {
+        if (w_f32) R4D_RN(true, true);
+        else       R4D_RN(false, true);
+    } else {
+        if (w_f32) R4D_RN(true, false);
+        else       R4D_RN(false, false);
+    }
 #undef R4D_RN
 #undef R4D_RN_T
     return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+// Preserve the raw C entrypoint's single-rounding contract. The op shim exposes the opt-in.
+extern "C" int r4d_rmsnorm_bf16(long x, long w, long y, int M, int n, float eps, float wadd,
+                                int w_f32, int x_ld, int y_ld, long stream) {
+    return rmsnorm_bf16(x, w, y, M, n, eps, wadd, w_f32, x_ld, y_ld, stream, false);
 }
 
 // `op` is 0 for a sum and 1 for a product.  `b_ld` of 0 with the same n is the broadcast form: the
@@ -1159,7 +1200,7 @@ static int rad_scatter_rows_bf16_body(const RadArgs* a, const R4dSink& sk) {
 }
 R4D_ENTRY(r4d_rad_scatter_rows_bf16, rad_scatter_rows_bf16_body)
 
-/* ------------------------------------------------------------------ cast (bf16 -> bf16) */
+/* ------------------------------------------------------------------ cast */
 /* A STRIDED ROW COPY, which is what `cast` degenerates to when the two ends are the same dtype,
  * and the reason there is a device row for it at all: an architecture that conditions a drafter on
  * the trunk's INTERMEDIATE hidden states has to move rows out of the residual stream before the
@@ -1175,8 +1216,10 @@ extern "C" int r4d_rad_cast(const RadArgs* a, RadStream s) {
     const RadTensor* x = r4d_opt(a, CS_X);
     const RadTensor* y = r4d_opt(a, CS_Y);
     if (!x || !y) return R4D_NO(RAD_E_INVAL);
-    R4D_NEED(dt_bf16(x));
-    R4D_NEED(dt_bf16(y));
+    const bool copy = x->dtype == RAD_BF16 && y->dtype == RAD_BF16;
+    const bool narrow = x->dtype == RAD_F32 && y->dtype == RAD_BF16;
+    const bool widen = x->dtype == RAD_BF16 && y->dtype == RAD_F32;
+    if (!copy && !narrow && !widen) return R4D_NO(RAD_E_DTYPE);
 
     const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
     if (n <= 0) return R4D_NO(RAD_E_SHAPE);
@@ -1189,8 +1232,18 @@ extern "C" int r4d_rad_cast(const RadArgs* a, RadStream s) {
      * must hold is that the source has the rows the destination asks for. */
     if (M <= 0 || Mx < M) return R4D_NO(RAD_E_SHAPE);
 
-    return r4d_p2p_copy2d(r4d_addr(y), r4d_addr(x), y_ld * 2, x_ld * 2, n * 2, M,
-                          (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+    if (copy)
+        return r4d_p2p_copy2d(r4d_addr(y), r4d_addr(x), y_ld * 2, x_ld * 2, n * 2, M,
+                              (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+    if (narrow)
+        hipLaunchKernelGGL((cast_kernel<true>), dim3((uint32_t)M), dim3(kThreads), 0,
+                           (hipStream_t)s, (const void*)r4d_addr(x), (void*)r4d_addr(y),
+                           (uint32_t)n, (uint32_t)x_ld, (uint32_t)y_ld);
+    else
+        hipLaunchKernelGGL((cast_kernel<false>), dim3((uint32_t)M), dim3(kThreads), 0,
+                           (hipStream_t)s, (const void*)r4d_addr(x), (void*)r4d_addr(y),
+                           (uint32_t)n, (uint32_t)x_ld, (uint32_t)y_ld);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ rmsnorm */
@@ -1223,9 +1276,11 @@ extern "C" int r4d_rad_rmsnorm(const RadArgs* a, RadStream s) {
 
     const float eps  = (float)r4d_getf(a, "eps", 1e-6);
     const float wadd = (float)r4d_getf(a, "wadd", 0.0);
-    return r4d_rmsnorm_bf16(r4d_addr(x), r4d_addr(w), r4d_addr(y), (int)M, (int)n, eps, wadd,
-                            w_f32, (int)x_ld, (int)y_ld, (long)(uintptr_t)s) == 0 ? RAD_OK
-                                                                                 : RAD_E_DEVICE;
+    const long long round_before_weight = r4d_geti_or(a, "round_before_weight", 0);
+    if (round_before_weight != 0 && round_before_weight != 1) return R4D_NO(RAD_E_INVAL);
+    return rmsnorm_bf16(r4d_addr(x), r4d_addr(w), r4d_addr(y), (int)M, (int)n, eps, wadd,
+                        w_f32, (int)x_ld, (int)y_ld, (long)(uintptr_t)s,
+                        round_before_weight != 0) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ add / mul */
@@ -1295,6 +1350,27 @@ extern "C" int r4d_rad_sigmoid(const RadArgs* a, RadStream s) {
 
     return r4d_sigmoid_bf16(r4d_addr(x), r4d_addr(y), (int)M, (int)n, (int)x_ld, (int)y_ld,
                             (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* ------------------------------------------------------------------ silu */
+
+extern "C" int r4d_rad_silu(const RadArgs* a, RadStream s) {
+    const RadTensor* x = r4d_opt(a, 0);
+    const RadTensor* y = r4d_opt(a, 1);
+    if (!x || !y) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_bf16(x));
+    R4D_NEED(dt_bf16(y));
+    const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, My = 0;
+    const long long x_ld = r4d_rows_pitch(x, n, &M);
+    const long long y_ld = r4d_rows_pitch(y, n, &My);
+    if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(silu_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+                       (hipStream_t)s, (const uint16_t*)r4d_addr(x), (uint16_t*)r4d_addr(y),
+                       (uint32_t)n, (uint32_t)x_ld, (uint32_t)y_ld);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ fill */

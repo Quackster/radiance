@@ -32,8 +32,11 @@ namespace rad {
 /* The scheduler's own per-request state. Request (rad_core.h) is shared across components and
  * frozen; anything only the scheduler needs lives here, so adding a scheduling concept never
  * touches a struct three other components read. */
+struct SharedPrefillState;
+
 struct SchedReq {
     std::unique_ptr<Request> req;
+    std::shared_ptr<SharedPrefillState> shared_prefill;
     uint64_t arrival = 0;        /* monotonic; the tiebreak below priority, and what makes a
                                   * preempted request re-enter AHEAD of everything admitted after
                                   * it rather than at the back of the queue */
@@ -306,6 +309,10 @@ public:
         return builder_.build_encoder(parts, step);
     }
     int64_t  encoder_patches() const { return builder_.encoder_patches(); }
+    int reserve_media_rows(mm::Item& item) {
+        std::lock_guard<std::mutex> lk(mu_);
+        return builder_.reserve_media_rows(item);
+    }
 
     /* Drop every prefix-cache entry, returning how many were dropped, or RAD_E_UNSUPPORTED when
      * this engine has no prefix cache. Under the step lock: releasing the cache's references is
@@ -670,6 +677,18 @@ private:
 
     /* arrival; mu_ held */
     int  add_locked(std::unique_ptr<Request> r);
+    int  join_shared_prefix(const Request& r, std::shared_ptr<SharedPrefillState>* out);
+    int  admit_shared_prefix(SchedReq& s);
+    void detach_shared_prefix(SchedReq& s);
+    int64_t request_capacity(const Request& r) const;
+    bool shared_capacity_fits(const SharedPrefillState* activate = nullptr,
+                              const Request* extra_member = nullptr,
+                              const SchedReq* entering = nullptr) const;
+    int64_t shared_target(const SchedReq& s) const;
+    bool shared_checkpoint(const SchedReq& s, StepEntry& e);
+    void publish_shared_prefix(SchedReq& s, const StepEntry& e);
+    std::unordered_map<const SharedPrefix*, std::weak_ptr<SharedPrefillState>> shared_prefixes_;
+
 
     /* ordering */
     bool ahead_of(int32_t a, int32_t b) const;

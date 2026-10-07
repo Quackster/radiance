@@ -381,12 +381,10 @@ extern "C" int r4d_shape_cast(const RadParam* p, int n_p, int operand,
 
     const int64_t M = pi(p, n_p, "M");
     const int64_t n = pi(p, n_p, "n");
-    /* `from` and `to` are separate keys because the whole point of the op is that the two ends
-     * differ. This row is compiled for bf16 -> bf16 only -- it is a strided row copy -- and the
-     * shim refuses anything else on dtype, so a geometry that names another pair is declined here
-     * rather than described into a refusal. */
+    /* The same shim serves a bf16 row copy and the two f32/bf16 conversions. */
     const uint32_t f = dt_par(p, n_p, "from"), t = dt_par(p, n_p, "to");
-    if (f != (uint32_t)RAD_BF16 || t != (uint32_t)RAD_BF16) return RAD_E_UNSUPPORTED;
+    if (!((f == RAD_BF16 && (t == RAD_BF16 || t == RAD_F32)) ||
+          (f == RAD_F32 && t == RAD_BF16))) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = { opd(f, M, n), opd(t, M, n) };
     R4D_PICK(l);
 }
@@ -647,6 +645,16 @@ extern "C" int r4d_shape_logits_gemm(const RadParam* p, int n_p, int operand,
          * bf16 GEMM instead writes bf16 pairs into an f32 plane -- every logit wrong, the
          * magnitudes roughly right, fluent nonsense out of the sampler. */
         opd((uint32_t)RAD_F32, M, nv),
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_logits_select(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), R = pi(p, n_p, "n_rows");
+    const int64_t V = pi(p, n_p, "n_vocab"), K = pi(p, n_p, "n_embd");
+    const RadOpdDesc l[] = {
+        opd(RAD_BF16, R, K), opd(RAD_BF16, V, K),
+        opd_idx(M, 0, R), opd_idx(M, 0, V), opd(RAD_F32, M),
     };
     R4D_PICK(l);
 }

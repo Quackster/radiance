@@ -82,6 +82,7 @@ int ref_scatter_rows       (const RadArgs*, RadStream);
 int ref_ngram_ids          (const RadArgs*, RadStream);
 int ref_ple_gate           (const RadArgs*, RadStream);
 int ref_ple_conv           (const RadArgs*, RadStream);
+int ref_causal_conv1d      (const RadArgs*, RadStream);
 int ref_cast               (const RadArgs*, RadStream);
 int ref_softmax            (const RadArgs*, RadStream);
 
@@ -107,6 +108,7 @@ int ref_gemm_nt_q_bias     (const RadArgs*, RadStream);
 int ref_embed_lookup       (const RadArgs*, RadStream);
 int ref_embed_lookup_q     (const RadArgs*, RadStream);
 int ref_logits_gemm        (const RadArgs*, RadStream);
+int ref_logits_select      (const RadArgs*, RadStream);
 
 /* ---- attention */
 int ref_attn_paged         (const RadArgs*, RadStream);
@@ -200,6 +202,7 @@ REF_SHAPE_FN(ref_scatter_rows);
 REF_SHAPE_FN(ref_ngram_ids);
 REF_SHAPE_FN(ref_ple_gate);
 REF_SHAPE_FN(ref_ple_conv);
+REF_SHAPE_FN(ref_causal_conv1d);
 REF_SHAPE_FN(ref_cast);
 REF_SHAPE_FN(ref_softmax);
 
@@ -223,6 +226,7 @@ REF_SHAPE_FN(ref_gemm_nt_q_bias);
 REF_SHAPE_FN(ref_embed_lookup);
 REF_SHAPE_FN(ref_embed_lookup_q);
 REF_SHAPE_FN(ref_logits_gemm);
+REF_SHAPE_FN(ref_logits_select);
 
 REF_SHAPE_FN(ref_attn_paged);
 REF_SHAPE_FN(ref_attn_dense);

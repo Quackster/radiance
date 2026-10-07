@@ -220,6 +220,7 @@ private:
     std::condition_variable       build_cv_;
     bool                          build_ready_  = false;
     int                           build_status_ = RAD_OK;
+    int32_t                       sampled_rows_ = 0;
 
     /* Scratch for the checkpoint copies: the state slots of one sequence, reused so the step path
      * does not allocate. See state_slots_of. */

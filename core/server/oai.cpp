@@ -862,8 +862,8 @@ static const char* const MEDIA_MARKER = RAD_MEDIA_MARKER;
  * arbitrary http(s) URL on a caller's behalf turns the inference server into an SSRF proxy with
  * network access to everything the deployment can reach, and no amount of allowlisting makes
  * that a good default. */
-static int decode_media_url(const std::string& url, const std::string& field,
-                            std::vector<uint8_t>* out, ApiError* err) {
+int decode_media_url(const std::string& url, const std::string& field,
+                     std::vector<uint8_t>* out, ApiError* err) {
     if (url.rfind("data:", 0) != 0) {
         *err = err_bad(field, "only data: URLs are accepted; the server does not fetch remote URLs "
                               "on a request's behalf");

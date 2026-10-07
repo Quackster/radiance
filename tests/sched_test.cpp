@@ -11,8 +11,10 @@
 #include "sched/scheduler.h"
 #include "sched/derive.h"
 #include "server/sink.h"
+#include "mm/processor.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -65,6 +67,7 @@ __attribute__((weak)) void rad_dev_free(void* p, int) { std::free(p); }
  * and that object's STRONG rad_dev_alloc/rad_memcpy_async would replace every weak fake above,
  * putting this test on the real HIP backend with the null stream it hands the scheduler. */
 __attribute__((weak)) int rad_dev_set(int) { return RAD_OK; }
+__attribute__((weak)) int rad_stream_sync(RadStream) { return RAD_OK; }
 
 __attribute__((weak)) int rad_memcpy_async(void* d, const void* s, int64_t n, RadStream) {
     if (n > 0) std::memcpy(d, s, (size_t)n);
@@ -92,6 +95,10 @@ __attribute__((weak)) int  rad_event_record(RadEvent, RadStream) { return RAD_OK
 __attribute__((weak)) int  rad_event_sync(RadEvent) { return RAD_OK; }
 
 }  /* extern "C" */
+
+/* Keep the retained-media path on the same fake device as the copies above,
+ * without pulling the real backend into this isolated scheduler executable. */
+namespace rad { __attribute__((weak)) bool device_is_host() { return false; } }
 
 /* ================================================================== fake core/mem */
 namespace {
@@ -184,6 +191,13 @@ struct FakeKV : IKVManager {
         seqs.erase(it);
     }
 
+    struct Copy { int32_t group, source, destination; };
+    std::vector<Copy> copies;
+    bool partial_shared(const Seq& q, size_t g, int64_t n) const {
+        return n > q.n && q.n > 0 && q.n % geom.g[g].block_size &&
+            (size_t)(q.n / geom.g[g].block_size) < q.blocks[g].size() &&
+            refcnt[g][(size_t)q.blocks[g][(size_t)(q.n / geom.g[g].block_size)]] > 1;
+    }
     int ensure(uint64_t id, int64_t n) override {
         auto it = seqs.find(id);
         if (it == seqs.end()) return RAD_E_NOTFOUND;
@@ -193,10 +207,19 @@ struct FakeKV : IKVManager {
         for (size_t i = 0; i < gs.size(); ++i) {
             if (!geom.g[i].paged) continue;
             int64_t need = rows_for((int)i, n) - (int64_t)q.blocks[i].size();
+            if (partial_shared(q, i, n)) ++need;
             if (need > 0 && need > (int64_t)freelist[i].size()) return RAD_E_FULL;
         }
         for (size_t i = 0; i < gs.size(); ++i) {
             if (geom.g[i].paged) {
+                if (partial_shared(q, i, n)) {
+                    const size_t at = (size_t)(q.n / geom.g[i].block_size);
+                    const int32_t old = q.blocks[i][at], fresh = grab((int32_t)i);
+                    q.blocks[i][at] = fresh;
+                    q.dirty[i] = std::min(q.dirty[i], (int64_t)at);
+                    copies.push_back({(int32_t)i, old, fresh});
+                    release((int32_t)i, old);
+                }
                 int64_t need = rows_for((int)i, n) - (int64_t)q.blocks[i].size();
                 if (need > 0) q.dirty[i] = std::min<int64_t>(q.dirty[i], (int64_t)q.blocks[i].size());
                 for (int64_t k = 0; k < need; ++k) q.blocks[i].push_back(grab((int32_t)i));
@@ -221,6 +244,35 @@ struct FakeKV : IKVManager {
         for (int32_t b : blocks) retain(g, b);
         if (n > q.n) q.n = n;
         return RAD_OK;
+    }
+
+    uint64_t reject_prefix_seq = 0;
+    int adopt_prefix(uint64_t id, int32_t g, const std::vector<int32_t>& blocks, int64_t n) override {
+        if (id == reject_prefix_seq) return RAD_E_UNSUPPORTED;
+        auto it = seqs.find(id);
+        if (it == seqs.end()) return RAD_E_NOTFOUND;
+        if ((int64_t)blocks.size() != rows_for(g, n) || !it->second.blocks[(size_t)g].empty())
+            return RAD_E_INVAL;
+        for (int32_t b : blocks) retain(g, b);
+        it->second.blocks[(size_t)g] = blocks;
+        it->second.dirty[(size_t)g] = 0;
+        it->second.n = n;
+        return RAD_OK;
+    }
+    int retain_block(int32_t g, int32_t b) override { retain(g, b); return RAD_OK; }
+    void release_block(int32_t g, int32_t b) override { release(g, b); }
+    int checkpoint_capacity = 8, next_checkpoint = 10000;
+    std::vector<int32_t> private_checkpoints, freed_checkpoints;
+    int alloc_checkpoint(int32_t* out) override {
+        if ((int)private_checkpoints.size() >= checkpoint_capacity) return RAD_E_FULL;
+        *out = next_checkpoint++;
+        private_checkpoints.push_back(*out);
+        return RAD_OK;
+    }
+    void free_checkpoint(int32_t slot) override {
+        auto at = std::find(private_checkpoints.begin(), private_checkpoints.end(), slot);
+        if (at != private_checkpoints.end()) private_checkpoints.erase(at);
+        freed_checkpoints.push_back(slot);
     }
 
     int preempt(uint64_t id) override {
@@ -501,6 +553,7 @@ struct Fixture {
         g_gdn_row = KernelRow{ &g_gdn_ki, "fake", 0, 0 };
 
         prog.meta.n_ctx_train = 4096;
+        prog.meta.n_vocab = 65536;
 
         /* index 0 is the sentinel every handle table in Program carries */
         prog.ops.emplace_back();
@@ -612,6 +665,19 @@ struct Fixture {
         uint64_t id = r->id;
         if (sch.add(std::move(r)) < 0) return 0;
         return id;
+    }
+
+    uint64_t submit_score(server::Sink* sink, int n_prompt,
+                          const std::shared_ptr<TokenScores>& scores, int priority = 0) {
+        auto r = std::make_unique<Request>();
+        r->id = next_id++;
+        r->sink = sink;
+        r->priority = priority;
+        r->token_scores = scores;
+        r->prompt.resize((size_t)n_prompt);
+        for (int i = 0; i < n_prompt; ++i) r->prompt[(size_t)i] = 1000 + i;
+        const uint64_t id = r->id;
+        return sch.add(std::move(r)) < 0 ? 0 : id;
     }
 
     /* Commit a step in which every sequence produced one token and none ended. */
@@ -2955,6 +3021,886 @@ TEST(a_sink_carries_its_requests_admission_and_draft_counts) {
     CHECK(drafted > 0);
     CHECK_EQ(sink.n_drafted(), drafted);
     CHECK_EQ(sink.n_draft_accepted(), accepted);
+}
+
+TEST(score_only_requests_finish_after_chunked_prefill_without_a_token) {
+    Fixture f;
+    f.build(4096, 64, 128);
+    CHECK_OK(f.start());
+    server::Sink sink;
+    auto scores = std::make_shared<TokenScores>();
+    scores->tokens = {7, 11};
+    const uint64_t id = f.submit_score(&sink, 300, scores);
+    REQUIRE(id != 0);
+    int steps = 0;
+    while (!sink.done() && steps++ < 10) {
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        const StepEntry& e = f.sch.plan().e[0];
+        CHECK(e.is_prefill);
+        CHECK(!e.produces_token);
+        CHECK_EQ(b->n_out, e.produces_score ? 1 : 0);
+        if (e.produces_score) CHECK_EQ(b->out_ids[0], b->n_tok - 1);
+        CHECK(f.sch.step_next() == nullptr);
+        f.commit_plain(999);
+        CHECK(f.sch.find(id)->output.empty());
+    }
+    CHECK(steps > 1);
+    CHECK(sink.done());
+    CHECK_EQ((int)sink.finish_reason(), (int)server::Finish::Stop);
+    CHECK_EQ(f.sch.find(id)->n_computed, 300);
+    server::SinkToken tok;
+    CHECK_EQ(sink.read(&tok, 1), (size_t)0);
+    CHECK(!f.kv.has_sequence(id));
+    f.sch.reap(id);
+    CHECK(f.sch.find(id) == nullptr);
+}
+
+TEST(scoring_rows_follow_generation_rows_even_when_scoring_arrives_first) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    server::Sink scored, generated;
+    auto scores = std::make_shared<TokenScores>();
+    scores->tokens = {3};
+    const uint64_t sid = f.submit_score(&scored, 4, scores);
+    const uint64_t gid = f.submit_to(&generated, 6, 1);
+    REQUIRE(sid && gid);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_out, 2);
+    CHECK_EQ(b->out_ids[0], 9);
+    CHECK_EQ(b->out_ids[1], 3);
+    CHECK_EQ(f.sch.plan().e[0].dev_out, -1);
+    CHECK_EQ(f.sch.plan().e[1].dev_out, 0);
+    f.sch.find(gid)->speculation_fixed = true;
+    CHECK(f.sch.step_next() == nullptr);
+    f.commit_plain(42);
+    CHECK(scored.done() && generated.done());
+    CHECK(f.sch.find(sid)->output.empty());
+    CHECK_EQ(f.sch.find(gid)->output[0], 42);
+}
+
+TEST(scoring_can_use_the_whole_context_and_a_cached_recurrent_prefix) {
+    Fixture f;
+    f.build(4096, 64, 512, 320);
+    CHECK_OK(f.start());
+    f.pc.seed(304);
+    f.pc.lin = 256;
+    f.pc.src = 3;
+    server::Sink sink;
+    auto scores = std::make_shared<TokenScores>();
+    scores->tokens = {4};
+    const uint64_t id = f.submit_score(&sink, 320, scores);
+    REQUIRE(id != 0);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->ctx_lens[0], 256);
+    CHECK_EQ(b->n_tok, 64);
+    CHECK_EQ(b->n_out, 1);
+    CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 3);
+    f.commit_plain();
+    CHECK(sink.done());
+    CHECK_EQ((int)sink.finish_reason(), (int)server::Finish::Stop);
+    CHECK_EQ(f.sch.find(id)->n_computed, 320);
+    CHECK(f.sch.find(id)->output.empty());
+}
+
+TEST(scoring_a_full_context_waits_for_the_final_prefill_chunk) {
+    Fixture f;
+    f.build(4096, 64, 128, 320);
+    f.cfg.prefix_cache = false;
+    CHECK_OK(f.start());
+    server::Sink sink;
+    auto scores = std::make_shared<TokenScores>();
+    scores->tokens = {4};
+    const uint64_t id = f.submit_score(&sink, 320, scores);
+    REQUIRE(id != 0);
+    int steps = 0;
+    while (!sink.done() && steps++ < 8) {
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        const bool final = f.sch.plan().e[0].produces_score;
+        f.commit_plain();
+        CHECK_EQ(sink.done(), final);
+    }
+    CHECK(steps > 1);
+    CHECK(sink.done());
+    CHECK_EQ((int)sink.finish_reason(), (int)server::Finish::Stop);
+    CHECK_EQ(f.sch.find(id)->n_computed, 320);
+    CHECK(f.sch.find(id)->output.empty());
+}
+
+TEST(a_cancelled_score_keeps_its_inflight_state_until_commit_and_emits_nothing) {
+    Fixture f;
+    f.build();
+    f.cfg.prefix_cache = false;
+    CHECK_OK(f.start());
+    server::Sink sink;
+    auto scores = std::make_shared<TokenScores>();
+    scores->tokens = {1, 9};
+    const uint64_t id = f.submit_score(&sink, 64, scores);
+    REQUIRE(id != 0);
+    REQUIRE(f.sch.step() != nullptr);
+    f.sch.cancel(id);
+    CHECK_EQ((int)sink.finish_reason(), (int)server::Finish::Cancelled);
+    CHECK(f.kv.has_sequence(id));
+    f.sch.reap(id);
+    f.commit_plain();
+    CHECK(!f.kv.has_sequence(id));
+    CHECK(f.sch.find(id) == nullptr);
+    server::SinkToken tok;
+    CHECK_EQ(sink.read(&tok, 1), (size_t)0);
+}
+
+TEST(scoring_candidate_ids_are_validated_before_admission) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    auto scores = std::make_shared<TokenScores>();
+    CHECK_EQ(f.submit_score(nullptr, 4, scores), (uint64_t)0);
+    scores->tokens = {-1};
+    CHECK_EQ(f.submit_score(nullptr, 4, scores), (uint64_t)0);
+    scores->tokens = {(int32_t)f.prog.meta.n_vocab};
+    CHECK_EQ(f.submit_score(nullptr, 4, scores), (uint64_t)0);
+    scores->tokens.assign(TokenScores::kMaxCandidates + 1, 0);
+    CHECK_EQ(f.submit_score(nullptr, 4, scores), (uint64_t)0);
+    CHECK_EQ(f.sch.metrics().queue_depth, 0);
+}
+
+TEST(a_preempted_score_recomputes_its_prompt_and_still_finishes_without_generation) {
+    Fixture f;
+    f.build(16, 64, 256);
+    f.cfg.prefix_cache = false;
+    CHECK_OK(f.start());
+    server::Sink sink;
+    auto scores = std::make_shared<TokenScores>();
+    scores->tokens = {2};
+    const uint64_t sid = f.submit_score(&sink, 240, scores);
+    const uint64_t gid = f.submit(128, 2, 5);
+    REQUIRE(sid && gid);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ(f.sch.find(sid)->n_computed, 128);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(sid)->state, (int)ReqState::Preempted);
+    CHECK_EQ(f.sch.find(sid)->n_computed, 0);
+    CHECK(!sink.done());
+    f.commit_plain();
+    int steps = 0;
+    while (!sink.done() && steps++ < 8) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    CHECK(sink.done());
+    CHECK_EQ((int)sink.finish_reason(), (int)server::Finish::Stop);
+    CHECK_EQ(f.sch.find(sid)->n_computed, 240);
+    CHECK(f.sch.find(sid)->output.empty());
+    CHECK_EQ(f.sch.metrics().preemptions, 1);
+}
+
+TEST(retained_media_pool_is_bounded_and_reclaims_fragmented_shared_leases) {
+    Fixture f;
+    f.build(64, 32, 64, 16);
+    f.prog.token_scores = true;
+    f.prog.encoder.modalities = RAD_MM_IMAGE;
+    f.prog.encoder.patch_dim = 3;
+    f.prog.encoder.merge = 4;
+    f.prog.encoder.max_patches = 64;
+    f.prog.encoder.n_embd = 4;
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    BatchBuilder bb;
+    struct Cleanup { BatchBuilder& batch; ~Cleanup() { batch.fini(); } } cleanup{bb};
+    REQUIRE_EQ(bb.init(f.prog, f.cfg, geo, KVGeom::of(f.prog.kv_groups),
+                      {{0, nullptr, &f.prog}}), RAD_OK);
+    auto item = [](int rows) {
+        mm::Item it;
+        it.n_seg = 1; it.seg_rows = rows;
+        return it;
+    };
+    auto a = item(4), b = item(4), c = item(4), joined = item(8), overflow = item(1);
+    CHECK_OK(bb.reserve_media_rows(a));
+    CHECK_OK(bb.reserve_media_rows(b));
+    CHECK_OK(bb.reserve_media_rows(c));
+    REQUIRE(a.device_rows && b.device_rows && c.device_rows);
+    auto shared = b.device_rows;
+    b.device_rows.reset();
+    CHECK_OK(bb.reserve_media_rows(joined));
+    CHECK(!joined.device_rows);  // another question still owns the middle allocation
+    shared.reset();
+    CHECK_OK(bb.reserve_media_rows(joined));
+    REQUIRE(joined.device_rows != nullptr);
+    REQUIRE_EQ(joined.device_rows->spans.size(), 2u);
+    CHECK_EQ(joined.device_rows->spans[0].row, 0);
+    CHECK_EQ(joined.device_rows->spans[0].count, 4);
+    CHECK_EQ(joined.device_rows->spans[1].row, 4);
+    CHECK_EQ(joined.device_rows->spans[1].count, 4);
+    CHECK_OK(bb.reserve_media_rows(overflow));
+    CHECK(!overflow.device_rows);  // caller retains the nonblocking host fallback
+    a.device_rows.reset(); c.device_rows.reset(); joined.device_rows.reset();
+    auto whole = item(16);
+    CHECK_OK(bb.reserve_media_rows(whole));
+    REQUIRE(whole.device_rows != nullptr);
+    CHECK_EQ(whole.device_rows->spans.size(), 1u);
+    auto lease = whole.device_rows;
+    static_cast<uint16_t*>(lease->spans[0].data)[0] = 1234;
+    bb.fini();
+    CHECK_EQ(static_cast<uint16_t*>(lease->spans[0].data)[0], 1234);
+}
+
+TEST(compact_score_metadata_is_included_in_the_device_plan) {
+    Fixture f;
+    f.build();
+    const KVGeom geometry = KVGeom::of(f.prog.kv_groups);
+    const int64_t ordinary = BatchBuilder::device_bytes(f.prog, f.cfg, geometry);
+    REQUIRE(ordinary > 0);
+    f.prog.token_scores = true;
+    CHECK_EQ(BatchBuilder::device_bytes(f.prog, f.cfg, geometry) - ordinary,
+             f.cfg.max_seqs * RAD_MAX_SCORE_CANDIDATES * 3 * (int64_t)sizeof(int32_t));
+}
+
+TEST(retained_media_budget_is_opt_in_capped_and_charged_only_to_rank_zero) {
+    Fixture f;
+    f.build(64, 32, 64, 262144);
+    f.prog.encoder.modalities = RAD_MM_IMAGE;
+    f.prog.encoder.patch_dim = 3;
+    f.prog.encoder.merge = 4;
+    f.prog.encoder.max_patches = 64;
+    f.prog.encoder.n_embd = 4096;
+    const KVGeom geometry = KVGeom::of(f.prog.kv_groups);
+    const int64_t scores = f.cfg.max_seqs * RAD_MAX_SCORE_CANDIDATES * 3 * (int64_t)sizeof(int32_t);
+    const int64_t cap = 128 * 1024 * 1024;
+    auto retained_budget = [&] {
+        f.prog.token_scores = false;
+        const int64_t ordinary = BatchBuilder::device_bytes(f.prog, f.cfg, geometry);
+        f.prog.token_scores = true;
+        return BatchBuilder::device_bytes(f.prog, f.cfg, geometry) - ordinary - scores;
+    };
+    CHECK_EQ(retained_budget(), cap);  // A long-context vision model does not reserve 2 GiB.
+    f.prog.ctx.rank = 1;
+    CHECK_EQ(retained_budget(), 0);    // Only rank zero retains image features.
+    f.prog.ctx.rank = 0;
+    f.cfg.max_ctx = 16;
+    CHECK_EQ(retained_budget(), 16 * 4096 * (int64_t)sizeof(uint16_t));
+    f.cfg.max_ctx = 32768;
+    f.prog.encoder.n_embd = 2048;
+    CHECK_EQ(retained_budget(), cap);  // The measured d1 configuration keeps its 128 MiB pool.
+}
+
+TEST(ordinary_vision_keeps_host_features_and_scoring_overflow_respects_the_byte_cap) {
+    Fixture f;
+    f.build(64, 32, 64, 65536);
+    f.prog.encoder.modalities = RAD_MM_IMAGE;
+    f.prog.encoder.patch_dim = 3;
+    f.prog.encoder.merge = 4;
+    f.prog.encoder.max_patches = 64;
+    f.prog.encoder.n_embd = 2048;
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    BatchBuilder bb;
+    struct Cleanup { BatchBuilder& batch; ~Cleanup() { batch.fini(); } } cleanup{bb};
+    auto item = [](int rows) {
+        mm::Item it;
+        it.n_seg = 1; it.seg_rows = rows;
+        return it;
+    };
+    REQUIRE_EQ(bb.init(f.prog, f.cfg, geo, KVGeom::of(f.prog.kv_groups),
+                      {{0, nullptr, &f.prog}}), RAD_OK);
+    auto host = item(1);
+    host.embd.assign(2048, 1234);
+    CHECK_OK(bb.reserve_media_rows(host));
+    CHECK(!host.device_rows);
+    CHECK_EQ(host.embd.front(), 1234);
+    bb.fini();
+
+    f.prog.token_scores = true;
+    REQUIRE_EQ(bb.init(f.prog, f.cfg, geo, KVGeom::of(f.prog.kv_groups),
+                      {{0, nullptr, &f.prog}}), RAD_OK);
+    auto too_large = item(32769), whole = item(32768), overflow = item(1);
+    CHECK_OK(bb.reserve_media_rows(too_large));
+    CHECK(!too_large.device_rows);  // Falls back even though the configured context has room.
+    CHECK_OK(bb.reserve_media_rows(whole));
+    REQUIRE(whole.device_rows != nullptr);
+    CHECK_EQ(whole.device_rows->rows, 32768);
+    CHECK_EQ(whole.device_rows->spans.size(), 1u);
+    CHECK_OK(bb.reserve_media_rows(overflow));
+    CHECK(!overflow.device_rows);
+    whole.device_rows.reset();
+    CHECK_OK(bb.reserve_media_rows(overflow));
+    CHECK(overflow.device_rows != nullptr);
+}
+
+TEST(media_batches_mix_device_spans_and_host_rows_across_prompt_chunks) {
+    Fixture f;
+    f.build(64, 32, 64, 16);
+    f.prog.token_scores = true;
+    f.prog.encoder.modalities = RAD_MM_IMAGE;
+    f.prog.encoder.patch_dim = 3;
+    f.prog.encoder.merge = 4;
+    f.prog.encoder.max_patches = 64;
+    f.prog.encoder.n_embd = 4;
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    BatchBuilder bb;
+    struct Cleanup { BatchBuilder& batch; ~Cleanup() { batch.fini(); } } cleanup{bb};
+    REQUIRE_EQ(bb.init(f.prog, f.cfg, geo, KVGeom::of(f.prog.kv_groups),
+                      {{0, nullptr, &f.prog}, {1, nullptr, &f.prog}}), RAD_OK);
+    auto item = [](int rows) {
+        auto it = std::make_shared<mm::Item>();
+        it->n_seg = 1; it->seg_rows = rows;
+        it->grid_t = 1; it->grid_h = 2; it->grid_w = rows * 2;
+        it->rows_h = 1; it->rows_w = rows; it->n_patch = rows * 4;
+        it->seg_at = {1}; it->linear_positions = true; it->encoded = true;
+        return it;
+    };
+    auto first = item(4), middle = item(4), last = item(4), device = item(8), host = item(2);
+    CHECK_OK(bb.reserve_media_rows(*first)); CHECK_OK(bb.reserve_media_rows(*middle));
+    CHECK_OK(bb.reserve_media_rows(*last)); first.reset();
+    CHECK_OK(bb.reserve_media_rows(*device));
+    REQUIRE(device->device_rows != nullptr);
+    REQUIRE_EQ(device->device_rows->spans.size(), 2u);
+    for (const auto& span : device->device_rows->spans)
+        for (int64_t row = 0; row < span.count; ++row)
+            for (int col = 0; col < 4; ++col)
+                static_cast<uint16_t*>(span.data)[row * 4 + col] = (uint16_t)(100 + (span.row + row) * 4 + col);
+    CHECK_OK(bb.reserve_media_rows(*host));
+    CHECK(!host->device_rows);
+    host->embd = {500, 501, 502, 503, 504, 505, 506, 507};
+    Request request;
+    request.id = 7; request.prompt.assign(16, 1);
+    request.media = std::make_shared<mm::PromptMedia>();
+    request.media->items = {{device, 1}, {host, 11}};
+    /* Layout is a processor concern; supply its two linear runs directly so
+     * this staging test keeps using the isolated device fakes above. */
+    request.media->rope.runs = {{2, 8, 8, 2, 0, 0, true, 0},
+                                {12, 2, 2, 12, 0, 1, true, 0}};
+    CHECK_OK(f.kv.add_sequence(request.id));
+    CHECK_OK(f.kv.ensure(request.id, 16));
+    StepPlan plan;
+    StepEntry entry;
+    entry.req = &request; entry.seq = request.id; entry.slot = 0; entry.card = 0;
+    entry.is_prefill = true; entry.ctx_len = 4; entry.n_tokens = 10;
+    plan.e = {entry}; plan.n_tok = 10; plan.phase = RAD_PHASE_PREFILL;
+    const auto* batch = bb.build(plan, f.kv, 0);
+    REQUIRE(batch != nullptr);
+    REQUIRE_EQ(batch->n_mm_rows, 8);
+    for (int row = 0; row < 8; ++row) {
+        CHECK_EQ(batch->mm_rows[row], row < 6 ? row : row + 2);
+        for (int col = 0; col < 4; ++col) {
+            const uint16_t expected = row < 6 ? (uint16_t)(108 + row * 4 + col)
+                                               : (uint16_t)(500 + (row - 6) * 4 + col);
+            CHECK_EQ(static_cast<const uint16_t*>(batch->mm_embd)[row * 4 + col], expected);
+            CHECK_EQ(static_cast<const uint16_t*>(bb.batch_for(1)->mm_embd)[row * 4 + col], 0);
+        }
+    }
+    // A shorter chunk repacks from the first device span; stale host rows cannot overwrite it.
+    plan.e[0].ctx_len = 1; plan.e[0].n_tokens = 4; plan.n_tok = 4;
+    batch = bb.build(plan, f.kv, 1);
+    REQUIRE(batch != nullptr);
+    REQUIRE_EQ(batch->n_mm_rows, 3);
+    for (int i = 0; i < 12; ++i)
+        CHECK_EQ(static_cast<const uint16_t*>(batch->mm_embd)[i], (uint16_t)(100 + i));
+    std::weak_ptr<mm::DeviceRows> source = device->device_rows;
+    request.media.reset(); device.reset();
+    CHECK(!source.expired());  // staging retains the lease through its completion event
+    auto retry = item(1);
+    CHECK_OK(bb.reserve_media_rows(*retry));
+    CHECK(source.expired());
+    CHECK(retry->device_rows != nullptr);
+}
+
+/* A tiled image can mix full tiles with a smaller thumbnail. An encoder pass can begin in
+ * the middle of that item and finish with another item's segments; cumulative pixel offsets,
+ * attention boundaries and coordinate-plane pitches must all describe exactly that subset. */
+TEST(encoder_batch_stages_variable_tiles_and_rejects_invalid_segment_ranges) {
+    Fixture f;
+    f.build();
+    f.prog.encoder.name = "test_vision";
+    f.prog.encoder.modalities = RAD_MM_IMAGE;
+    f.prog.encoder.patch_dim = 3;
+    f.prog.encoder.merge = 4;
+    f.prog.encoder.max_patches = 64;
+    f.prog.encoder.n_embd = 4;
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    BatchBuilder bb;
+    struct Cleanup { BatchBuilder& batch; ~Cleanup() { batch.fini(); } } cleanup{bb};
+    const std::vector<BatchBuilder::RankIO> ranks = {
+        {0, nullptr, &f.prog}, {1, nullptr, &f.prog},
+    };
+    REQUIRE_EQ(bb.init(f.prog, f.cfg, geo, KVGeom::of(f.prog.kv_groups), ranks), RAD_OK);
+    CHECK(bb.has_encoder());
+    CHECK_EQ(bb.encoder_patches(), 64);
+
+    auto item = [](std::initializer_list<std::pair<int32_t, int32_t>> grids, uint16_t seed) {
+        mm::Item it;
+        it.patch_dim = 3;
+        for (auto [h, w] : grids) {
+            it.segments.push_back({h, w, it.n_patch});
+            it.n_patch += h * w;
+        }
+        it.n_seg = (int32_t)it.segments.size();
+        it.grid_h = it.segments.front().h; it.grid_w = it.segments.front().w;
+        it.grid_t = it.n_seg;
+        it.rows_h = it.grid_h / 2; it.rows_w = it.grid_w / 2;
+        it.seg_rows = it.rows_h * it.rows_w;
+        it.linear_positions = true;
+        it.pixels.resize((size_t)(it.n_patch * it.patch_dim));
+        for (size_t i = 0; i < it.pixels.size(); ++i) it.pixels[i] = (uint16_t)(seed + i);
+        return it;
+    };
+    mm::Item a = item({{2, 2}, {2, 6}, {4, 2}}, 100);
+    mm::Item b = item({{4, 4}, {2, 2}}, 1000);
+    using Part = BatchBuilder::EncoderPart;
+    auto verify = [&](const std::vector<Part>& parts, int step,
+                      std::initializer_list<int32_t> boundaries, int32_t longest) {
+        std::vector<uint16_t> pixels;
+        std::vector<std::array<int32_t, 4>> coordinates;
+        // Walk blocks in forward order independently of Item::coords' inverse-index mapping.
+        for (const Part& part : parts) {
+            const auto& it = *part.item;
+            for (int seg = part.seg0; seg < part.seg0 + part.n_seg; ++seg) {
+                const auto& tile = it.segments[seg];
+                const int64_t first = tile.patch0 * it.patch_dim;
+                const int64_t count = tile.h * tile.w * it.patch_dim;
+                pixels.insert(pixels.end(), it.pixels.begin() + first, it.pixels.begin() + first + count);
+                for (int y = 0; y < tile.h; y += 2) for (int x = 0; x < tile.w; x += 2)
+                    for (int dy = 0; dy < 2; ++dy) for (int dx = 0; dx < 2; ++dx)
+                        coordinates.push_back({y + dy, x + dx, tile.h, tile.w});
+            }
+        }
+        const RadBatch* batch = bb.build_encoder(parts, step);
+        CHECK(batch != nullptr);
+        if (!batch) return false;
+        for (int rank = 0; rank < 2; ++rank) {
+            const RadBatch* staged = bb.batch_for(rank);
+            CHECK(staged != nullptr);
+            if (!staged) return false;
+            CHECK_EQ(staged->step, step);
+            CHECK_EQ(staged->enc, 1);
+            CHECK_EQ(staged->enc_n_patch, (int64_t)coordinates.size());
+            CHECK_EQ(staged->enc_n_seg, (int64_t)boundaries.size() - 1);
+            CHECK_EQ(staged->enc_max_seg, longest);
+            CHECK_EQ(staged->n_tok, 0);
+            int at = 0;
+            for (int32_t boundary : boundaries) CHECK_EQ(staged->enc_cu[at++], boundary);
+            const auto* copied = static_cast<const uint16_t*>(staged->enc_pixels);
+            for (size_t i = 0; i < pixels.size(); ++i) CHECK_EQ(copied[i], pixels[i]);
+            for (size_t i = 0; i < coordinates.size(); ++i) for (int plane = 0; plane < 4; ++plane)
+                CHECK_EQ(staged->enc_coord[plane * coordinates.size() + i], coordinates[i][plane]);
+        }
+        CHECK(bb.batch_for(0)->enc_pixels != bb.batch_for(1)->enc_pixels);
+        return true;
+    };
+    REQUIRE(verify({{&a, 1, 2}, {&b, 0, 1}}, 17, {0, 12, 20, 36}, 16));
+    // A shorter next pass must repack each coordinate plane and clear old segment/patch counts.
+    REQUIRE(verify({{&b, 1, 1}, {&a, 2, 1}}, 18, {0, 4, 12}, 8));
+
+    for (auto [first, count] : std::vector<std::pair<int32_t, int32_t>>{
+             {-1, 1}, {3, 1}, {2, 2}, {0, 4}, {0, 0}, {0, -1}, {INT32_MAX, 1}, {1, INT32_MAX}})
+        CHECK(bb.build_encoder({{&a, first, count}}, 19) == nullptr);
+    CHECK(bb.build_encoder({{nullptr, 0, 1}}, 19) == nullptr);
+    CHECK(bb.build_encoder({{&a, 1, 1}, {&b, -1, 1}}, 19) == nullptr);
+    // Refused passes have not published a new batch or uploaded partially staged pixels.
+    CHECK_EQ(bb.batch_for(0)->step, 18);
+    CHECK_EQ(bb.batch_for(1)->enc_n_patch, 12);
+    CHECK_EQ(static_cast<const uint16_t*>(bb.batch_for(0)->enc_pixels)[0], b.pixels[16 * 3]);
+    REQUIRE(verify({{&a, 1, 1}}, 20, {0, 12}, 12));
+}
+
+namespace {
+uint64_t shared_request(Fixture& f, const std::shared_ptr<SharedPrefix>& prefix, int total,
+                        int branch, server::Sink* sink = nullptr, int generate = 0, int priority = 0) {
+    auto r = std::make_unique<Request>();
+    r->id = f.next_id++;
+    r->shared_prefix = prefix;
+    r->sink = sink;
+    r->priority = priority;
+    r->max_tokens = generate;
+    for (int i = 0; i < total; ++i) r->prompt.push_back(i < prefix->n_tokens ? i + 1 : branch + i);
+    if (!generate) {
+        r->token_scores = std::make_shared<TokenScores>();
+        r->token_scores->tokens = {1};
+    }
+    const uint64_t id = r->id;
+    return f.sch.add(std::move(r)) < 0 ? 0 : id;
+}
+void shared_fixture(Fixture& f, int blocks = 64, int max_tok = 64) {
+    f.build(blocks, 64, max_tok);
+    f.prog.ops.resize(1); // d1 has unchunked convolution, plus paged attention.
+    f.cfg.prefix_cache = false;
+    f.cfg.checkpoint_interval = 0; // Private branch snapshots do not require global intervals.
+}
+
+// An independent order-sensitive recurrence represents both linear and convolution state.
+// Every final state must equal a fresh full-prompt pass, regardless of branch interleaving.
+uint64_t recurrence(const std::vector<int32_t>& tokens) {
+    uint64_t value = 0;
+    for (int32_t token : tokens) value = value * 131 + (uint32_t)token;
+    return value;
+}
+struct BranchOracle {
+    std::unordered_map<uint64_t, uint64_t> states;
+    std::unordered_map<int32_t, uint64_t> snapshots;
+    int64_t computed = 0;
+    int saves = 0, restores = 0;
+    void execute(Fixture& f) {
+        for (const StepEntry& e : f.sch.plan().e) {
+            uint64_t& value = states[e.seq];
+            if (e.ctx_len == 0) value = 0;
+            if (e.ckpt_restore >= 0) {
+                CHECK(snapshots.count(e.ckpt_restore));
+                value = snapshots[e.ckpt_restore];
+                ++restores;
+            }
+            for (int i = 0; i < e.n_tokens; ++i)
+                value = value * 131 + (uint32_t)e.req->prompt[(size_t)e.ctx_len + i];
+            computed += e.n_tokens;
+            if (e.ckpt_slot >= 0) { snapshots[e.ckpt_slot] = value; ++saves; }
+            if (e.produces_score) CHECK_EQ(value, recurrence(e.req->prompt));
+        }
+        f.commit_plain();
+    }
+};
+}
+
+TEST(shared_cold_prefix_is_computed_once_and_branches_restore_independent_states) {
+    for (int prefix_tokens : {7, 37, 80}) {
+        Fixture f;
+        shared_fixture(f);
+        CHECK_OK(f.start());
+        auto prefix = std::make_shared<SharedPrefix>();
+        prefix->n_tokens = prefix_tokens;
+        server::Sink sinks[3];
+        uint64_t ids[3];
+        int64_t expected = prefix_tokens;
+        for (int i = 0; i < 3; ++i) {
+            const int suffix = 9 + 20 * i;
+            expected += suffix;
+            ids[i] = shared_request(f, prefix, prefix_tokens + suffix, 100 * (i + 1), &sinks[i]);
+            REQUIRE(ids[i]);
+        }
+        BranchOracle oracle;
+        int steps = 0;
+        while (!(sinks[0].done() && sinks[1].done() && sinks[2].done()) && steps++ < 20) {
+            REQUIRE(f.sch.step() != nullptr);
+            oracle.execute(f);
+        }
+        CHECK_EQ(oracle.computed, expected);
+        CHECK_EQ(oracle.saves, 1);
+        CHECK_EQ(oracle.restores, 2);
+        CHECK_EQ(f.pc.lookups, 0);
+        CHECK(f.pc.committed.empty());
+        if (prefix_tokens % 16) CHECK_EQ(f.kv.copies.size(), 3u);
+        CHECK(f.kv.private_checkpoints.empty()); // terminal cleanup does not require reap
+        for (int i = 0; i < 3; ++i) {
+            CHECK(sinks[i].done());
+            CHECK_EQ((int)sinks[i].finish_reason(), (int)server::Finish::Stop);
+            CHECK_EQ(f.sch.find(ids[i])->n_cached, i ? prefix_tokens : 0);
+            CHECK_OK(f.sch.reap(ids[i]));
+        }
+        CHECK(f.kv.private_checkpoints.empty());
+        CHECK_EQ(f.kv.freed_checkpoints.size(), 1u);
+        CHECK_EQ(f.kv.free_blocks(0), 64);
+        CHECK(f.kv.seqs.empty());
+    }
+}
+
+TEST(shared_prefix_snapshot_survives_leader_retirement_and_serial_admission) {
+    Fixture f;
+    shared_fixture(f);
+    f.cfg.max_seqs = 1;
+    CHECK_OK(f.start());
+    auto prefix = std::make_shared<SharedPrefix>(); prefix->n_tokens = 7;
+    server::Sink first, second;
+    const auto a = shared_request(f, prefix, 16, 100, &first);
+    const auto b = shared_request(f, prefix, 28, 300, &second);
+    BranchOracle oracle;
+    REQUIRE(f.sch.step()); oracle.execute(f);
+    REQUIRE(f.sch.step()); oracle.execute(f);
+    CHECK(first.done() && !second.done());
+    CHECK_OK(f.sch.reap(a));
+    CHECK_EQ(f.kv.private_checkpoints.size(), 1u);
+    REQUIRE(f.sch.step());
+    CHECK_EQ(f.sch.plan().e[0].ctx_len, 7);
+    CHECK(f.sch.plan().e[0].ckpt_restore >= 0);
+    oracle.execute(f);
+    CHECK(second.done());
+    CHECK_EQ(oracle.computed, 37);
+    CHECK_OK(f.sch.reap(b));
+    CHECK(f.kv.private_checkpoints.empty());
+    CHECK_EQ(f.kv.free_blocks(0), 64);
+}
+
+TEST(shared_prefix_cancellation_during_snapshot_defers_release_until_commit) {
+    Fixture f;
+    shared_fixture(f);
+    CHECK_OK(f.start());
+    auto prefix = std::make_shared<SharedPrefix>(); prefix->n_tokens = 7;
+    const auto a = shared_request(f, prefix, 16, 100);
+    const auto b = shared_request(f, prefix, 28, 300);
+    REQUIRE(f.sch.step());
+    CHECK(f.sch.plan().e[0].ckpt_slot >= 0);
+    CHECK_OK(f.sch.cancel(a)); CHECK_OK(f.sch.reap(a));
+    CHECK_OK(f.sch.cancel(b)); CHECK_OK(f.sch.reap(b));
+    CHECK_EQ(f.kv.private_checkpoints.size(), 1u);
+    f.commit_plain();
+    CHECK(f.kv.private_checkpoints.empty());
+    CHECK_EQ(f.kv.freed_checkpoints.size(), 1u);
+    CHECK_EQ(f.kv.free_blocks(0), 64);
+    CHECK(f.sch.find(a) == nullptr);
+}
+
+TEST(shared_prefix_cancelled_trunk_and_unavailable_snapshot_fall_back_to_full_prefill) {
+    for (bool no_snapshot : {false, true}) {
+        Fixture f;
+        shared_fixture(f);
+        if (no_snapshot) f.kv.checkpoint_capacity = 0;
+        CHECK_OK(f.start());
+        auto prefix = std::make_shared<SharedPrefix>(); prefix->n_tokens = 80;
+        server::Sink survivor;
+        const auto a = shared_request(f, prefix, 89, 100);
+        const auto b = shared_request(f, prefix, 101, 300, &survivor);
+        REQUIRE(f.sch.step());
+        CHECK_OK(f.sch.cancel(a)); CHECK_OK(f.sch.reap(a));
+        f.commit_plain();
+        BranchOracle oracle;
+        for (int step = 0; !survivor.done() && step < 8; ++step) {
+            REQUIRE(f.sch.step()); oracle.execute(f);
+        }
+        CHECK(survivor.done());
+        CHECK_EQ(oracle.computed, 101);
+        CHECK_EQ(oracle.restores, 0);
+        CHECK_EQ(f.sch.find(b)->n_cached, 0);
+        CHECK_OK(f.sch.reap(b));
+        CHECK(f.kv.private_checkpoints.empty());
+        CHECK_EQ(f.kv.free_blocks(0), 64);
+    }
+}
+
+TEST(shared_prefix_preempted_branch_reuses_immutable_snapshot) {
+    Fixture f;
+    shared_fixture(f, 23, 512);
+    CHECK_OK(f.start());
+    auto prefix = std::make_shared<SharedPrefix>(); prefix->n_tokens = 7;
+    const auto high = shared_request(f, prefix, 160, 100, nullptr, 2, 5);
+    const auto low = shared_request(f, prefix, 160, 300, nullptr, 2);
+    REQUIRE(f.sch.step()); f.commit_plain(); // shared trunk
+    REQUIRE(f.sch.step());
+    CHECK_EQ(f.sch.plan().e.size(), 2u);
+    f.commit_plain(); // both now decode at 160; 20 private pages plus the held partial trunk
+    // Simulate an external pool user taking the reserved headroom. Ordinary admissions now
+    // respect the reservation, but preemption must still preserve the reusable checkpoint.
+    const int32_t held_a = f.kv.grab(0), held_b = f.kv.grab(0);
+    REQUIRE(f.sch.step());
+    CHECK_EQ((int)f.sch.find(low)->state, (int)ReqState::Preempted);
+    CHECK_EQ(f.sch.metrics().preemptions, 1);
+    f.commit_plain(); // high finishes
+    f.kv.release(0, held_a); f.kv.release(0, held_b);
+    CHECK_OK(f.sch.reap(high));
+    REQUIRE(f.sch.step());
+    CHECK_EQ(f.sch.plan().e[0].seq, low);
+    CHECK_EQ(f.sch.plan().e[0].ctx_len, 7);
+    CHECK(f.sch.plan().e[0].ckpt_restore >= 0);
+    f.commit_plain();
+    CHECK_OK(f.sch.reap(low));
+    CHECK(f.kv.private_checkpoints.empty());
+    CHECK_EQ(f.kv.free_blocks(0), 23);
+}
+
+TEST(shared_prefix_checks_token_and_media_identity_and_avoids_unaffordable_cow) {
+    Fixture f;
+    shared_fixture(f, 1);
+    CHECK_OK(f.start());
+    auto prefix = std::make_shared<SharedPrefix>(); prefix->n_tokens = 7;
+    const auto a = shared_request(f, prefix, 12, 100);
+    auto wrong = std::make_unique<Request>();
+    wrong->id = f.next_id++; wrong->prompt.assign(12, 99); wrong->shared_prefix = prefix;
+    CHECK_EQ(f.sch.add(std::move(wrong)), RAD_E_INVAL);
+    wrong = std::make_unique<Request>();
+    wrong->id = f.next_id++; wrong->prompt = f.sch.find(a)->prompt; wrong->shared_prefix = prefix;
+    wrong->media = std::make_shared<mm::PromptMedia>();
+    CHECK_EQ(f.sch.add(std::move(wrong)), RAD_E_INVAL);
+    const auto b = shared_request(f, prefix, 14, 300);
+    BranchOracle oracle;
+    for (int i = 0; i < 2; ++i) { REQUIRE(f.sch.step()); oracle.execute(f); }
+    CHECK_EQ(oracle.computed, 26);
+    CHECK_EQ(oracle.saves, 0);
+    CHECK_OK(f.sch.reap(a)); CHECK_OK(f.sch.reap(b));
+    CHECK_EQ(f.kv.free_blocks(0), 1);
+}
+
+
+TEST(concurrent_private_prefix_groups_release_capacity_before_any_requests_are_reaped) {
+    Fixture f;
+    shared_fixture(f, 8, 128);
+    CHECK_OK(f.start());
+    auto first = std::make_shared<SharedPrefix>(); first->n_tokens = 65;
+    auto second = std::make_shared<SharedPrefix>(); second->n_tokens = 65;
+    server::Sink sinks[6];
+    uint64_t ids[6];
+    ids[0] = shared_request(f, first, 80, 100, &sinks[0]);
+    ids[1] = shared_request(f, first, 80, 200, &sinks[1]);
+    ids[2] = shared_request(f, second, 80, 300, &sinks[2]);
+    ids[3] = shared_request(f, second, 80, 400, &sinks[3]);
+    BranchOracle oracle;
+    REQUIRE(f.sch.step());
+    REQUIRE_EQ(f.sch.plan().e.size(), 1u);
+    CHECK_EQ(f.sch.plan().e[0].seq, ids[0]);
+    oracle.execute(f);
+    // Either complete group fits: five retained pages plus one private tail per branch.
+    // Both trunks cannot fit. Neither a later high-priority request nor a late group member
+    // may consume the pages reserved for the first group's remaining branch work.
+    auto score = std::make_shared<TokenScores>(); score->tokens = {1};
+    ids[4] = f.submit_score(&sinks[4], 80, score, 9);
+    ids[5] = shared_request(f, first, 128, 500, &sinks[5]);
+    for (int step = 0; step < 16; ++step) {
+        REQUIRE(f.sch.step());
+        if (step == 0) {
+            CHECK_EQ((int)f.sch.find(ids[2])->state, (int)ReqState::Waiting);
+            CHECK_EQ((int)f.sch.find(ids[4])->state, (int)ReqState::Waiting);
+            CHECK_EQ((int)f.sch.find(ids[5])->state, (int)ReqState::Waiting);
+            CHECK_EQ(f.sch.plan().e.size(), 2u);
+        }
+        oracle.execute(f);
+        bool done = true;
+        for (int i = 0; i < 6; ++i) {
+            if (!sinks[i].done()) { done = false; continue; }
+            CHECK_EQ((int)sinks[i].finish_reason(), (int)server::Finish::Stop);
+            CHECK_EQ(f.sch.find(ids[i])->n_cached, (i == 1 || i == 3) ? 65 : 0);
+        }
+        if (done) break;
+    }
+    for (const auto& sink : sinks) CHECK(sink.done());
+    CHECK_EQ(oracle.computed, 398);
+    CHECK_EQ(oracle.saves, 2);
+    CHECK_EQ(oracle.restores, 2);
+    CHECK_EQ(f.sch.metrics().failed, 0);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+    CHECK_EQ(f.kv.free_blocks(0), 8);
+    CHECK(f.kv.private_checkpoints.empty());
+    for (uint64_t id : ids) { REQUIRE(f.sch.find(id)); CHECK_OK(f.sch.reap(id)); }
+}
+
+TEST(shared_prefix_unavailable_restore_releases_capacity_without_reaping_finished_members) {
+    for (bool missing_snapshot : {false, true}) {
+        Fixture f;
+        shared_fixture(f, 7, 128);
+        f.cfg.max_seqs = 1;
+        CHECK_OK(f.start());
+        auto prefix = std::make_shared<SharedPrefix>(); prefix->n_tokens = 65;
+        server::Sink first, second;
+        const auto a = shared_request(f, prefix, 80, 100, &first);
+        const auto b = shared_request(f, prefix, 80, 200, &second);
+        BranchOracle oracle;
+        REQUIRE(f.sch.step()); oracle.execute(f); // save common state
+        if (missing_snapshot) {
+            REQUIRE_EQ(f.kv.private_checkpoints.size(), 1u);
+            f.kv.ck_gone.push_back(f.kv.private_checkpoints[0]);
+        } else f.kv.reject_prefix_seq = b;
+        REQUIRE(f.sch.step()); oracle.execute(f); // leader finishes, its Request stays alive
+        CHECK(first.done() && !second.done());
+        REQUIRE(f.sch.find(a));
+        REQUIRE(f.sch.step());
+        CHECK_EQ(f.sch.plan().e[0].seq, b);
+        CHECK_EQ(f.sch.plan().e[0].ctx_len, 0);
+        CHECK_EQ(f.sch.plan().e[0].ckpt_restore, -1);
+        oracle.execute(f);
+        CHECK(second.done());
+        CHECK_EQ(oracle.computed, 160);
+        CHECK_EQ(f.kv.free_blocks(0), 7);
+        CHECK(f.kv.private_checkpoints.empty());
+        CHECK_OK(f.sch.reap(a)); CHECK_OK(f.sch.reap(b));
+    }
+}
+
+TEST(detached_member_returns_its_suffix_reservation_while_other_branches_still_run) {
+    Fixture f;
+    shared_fixture(f, 7, 48);
+    CHECK_OK(f.start());
+    auto prefix = std::make_shared<SharedPrefix>(); prefix->n_tokens = 17;
+    server::Sink sinks[3];
+    const uint64_t ids[] = {
+        shared_request(f, prefix, 32, 100, &sinks[0]),
+        shared_request(f, prefix, 32, 200, &sinks[1]),
+        shared_request(f, prefix, 64, 300, &sinks[2])
+    };
+    f.kv.reject_prefix_seq = ids[1];
+    BranchOracle oracle;
+    REQUIRE(f.sch.step()); oracle.execute(f); // 17-token trunk
+    REQUIRE(f.sch.step()); oracle.execute(f); // leader finishes; last branch reaches token 48
+    CHECK(sinks[0].done() && !sinks[1].done() && !sinks[2].done());
+    REQUIRE(f.sch.step());
+    REQUIRE_EQ(f.sch.plan().e.size(), 2u);
+    CHECK_EQ(f.sch.plan().e[0].seq, ids[2]);
+    CHECK_EQ(f.sch.plan().e[0].ctx_len, 48);
+    CHECK_EQ(f.sch.plan().e[1].seq, ids[1]);
+    CHECK_EQ(f.sch.plan().e[1].ctx_len, 0); // an independent full prompt beside the last branch
+    oracle.execute(f);
+    for (const auto& sink : sinks) CHECK(sink.done());
+    CHECK_EQ(oracle.computed, 111);
+    CHECK_EQ(oracle.restores, 1);
+    CHECK_EQ(f.kv.free_blocks(0), 7);
+    CHECK(f.kv.private_checkpoints.empty());
+    for (uint64_t id : ids) CHECK_OK(f.sch.reap(id));
+}
+
+TEST(shared_prefix_cancellation_without_reap_retains_snapshot_only_until_inflight_commit) {
+    Fixture f;
+    shared_fixture(f);
+    CHECK_OK(f.start());
+    auto prefix = std::make_shared<SharedPrefix>(); prefix->n_tokens = 7;
+    const auto a = shared_request(f, prefix, 16, 100);
+    const auto b = shared_request(f, prefix, 28, 300);
+    REQUIRE(f.sch.step());
+    CHECK_OK(f.sch.cancel(a)); CHECK_OK(f.sch.cancel(b));
+    CHECK_EQ(f.kv.private_checkpoints.size(), 1u);
+    f.commit_plain();
+    CHECK(f.kv.private_checkpoints.empty());
+    CHECK_EQ(f.kv.free_blocks(0), 64);
+    REQUIRE(f.sch.find(a)); REQUIRE(f.sch.find(b));
+    CHECK_OK(f.sch.reap(a)); CHECK_OK(f.sch.reap(b));
+}
+
+TEST(shared_capacity_accounts_for_speculative_lookahead_of_ordinary_requests) {
+    Fixture f;
+    shared_fixture(f, 15, 256);
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    auto prefix = std::make_shared<SharedPrefix>(); prefix->n_tokens = 17;
+    server::Sink first, second;
+    const auto a = shared_request(f, prefix, 32, 100, &first);
+    const auto b = shared_request(f, prefix, 32, 200, &second);
+    REQUIRE(f.sch.step()); f.commit_plain();
+    const auto ordinary = f.submit(167, 2, 9);
+    REQUIRE(ordinary);
+    REQUIRE(f.sch.step());
+    // Two shared branches reserve four pages. Current verification reaches token172, but
+    // a step issued ahead reaches token177: twelve pages, not the current window's eleven.
+    CHECK_EQ((int)f.sch.find(ordinary)->state, (int)ReqState::Waiting);
+    CHECK_EQ(f.sch.plan().e.size(), 2u);
+    f.commit_plain();
+    CHECK(first.done() && second.done());
+    CHECK(f.kv.private_checkpoints.empty());
+    REQUIRE(f.sch.step()); f.commit_plain(); // ordinary prefill
+    int32_t draft[4] = {11, 12, 13, 14};
+    CHECK_OK(f.sch.set_draft(ordinary, draft, 4));
+    REQUIRE(f.sch.step());
+    REQUIRE_EQ(f.sch.plan().e.size(), 1u);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 5);
+    CHECK_EQ(f.kv.block_table(ordinary, 0).size(), 11u);
+    f.sch.find(ordinary)->speculation_fixed = true;
+    f.sch.expect_draft(ordinary, 4);
+    REQUIRE(f.sch.step_next());
+    CHECK_EQ(f.kv.block_table(ordinary, 0).size(), 12u);
+    f.commit_plain(); // terminal Request remains held by the already issued next step
+    CHECK(f.kv.has_sequence(ordinary));
+    f.sch.promote_next();
+    f.commit_plain();
+    CHECK_EQ(f.sch.metrics().failed, 0);
+    CHECK_EQ(f.kv.free_blocks(0), 15);
+    CHECK_OK(f.sch.reap(a)); CHECK_OK(f.sch.reap(b)); CHECK_OK(f.sch.reap(ordinary));
 }
 
 RAD_TEST_MAIN()

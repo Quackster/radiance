@@ -208,6 +208,9 @@ class IScheduler {
 public:
     virtual ~IScheduler() = default;
     virtual uint64_t     submit(Request&& r) = 0;
+    /* Request::token_scores uses the same admission, cancellation and sink lifetime as generation.
+     * A backend that implements only generation must refuse that surface before submission. */
+    virtual bool supports_token_scores() const { return false; }
     /* THE SEQUENCES OF ONE API REQUEST, all admitted before a step can see any of them: a prompt
      * array or `n` > 1 submitted one call at a time can have a step begin between two calls, so
      * the batch they decode in -- and its tie-level rounding -- would depend on thread timing.

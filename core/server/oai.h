@@ -392,6 +392,9 @@ std::string sse_error(const ApiError& e);
 
 std::string base64_encode(const void* data, size_t len);
 bool        base64_decode(const std::string& in, std::vector<uint8_t>* out);
+/* Shared by chat image parts and System One images. Decode data URLs only; never fetch a URL. */
+int decode_media_url(const std::string& url, const std::string& field,
+                     std::vector<uint8_t>* out, ApiError* err);
 /* A token id as a request spells it: an integer in [0, INT32_MAX]. False for anything else, and
  * the caller refuses the request -- narrowing instead would make 2^32 + 5 an alias of token 5. */
 bool        token_id(const json& v, int32_t* out);

@@ -2790,7 +2790,7 @@ int Engine::configure_kv() {
             slot += ranks_[i]->kv.checkpoint_bytes();
         }
         const int64_t n = cfg_.checkpoint_slots > 0 ? cfg_.checkpoint_slots : 0;
-        if (slot > 0 && n > 0 && cfg_.prefix_cache) {
+        if (slot > 0 && n > 0 && (cfg_.prefix_cache || ranks_[0]->program.token_scores)) {
             if (ck_store_.open(slot, slot * n) != RAD_OK) {
                 RAD_WARN("checkpoint slots: no pinned host memory for %lld snapshot(s) of %s; a "
                          "hybrid session's prefix hits replay their linear layers from zero. "

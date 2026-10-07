@@ -333,3 +333,184 @@ TEST(a_media_configuration_with_an_empty_band_names_it) {
 }
 
 RAD_TEST_MAIN()
+
+/* Golden hashes from transformers 5.14.1 Lfm2VlProcessor, d1-3B revision
+ * da1fe36a861f24690f27f622dca1d8688503d113. RGB input is frame(0,h,w);
+ * BF16 patches are reordered into 2x2 blocks without changing patch contents.
+ * Hashing the full patch tensor catches resize, HWC order and normalization. */
+namespace {
+VisionConfig lfm_cfg() {
+    VisionConfig c;
+    c.family = VisionFamily::Lfm2;
+    c.patch = 16; c.temporal = 1; c.merge = 2;
+    c.image_min_pixels = 65536; c.image_max_pixels = 262144;
+    c.tok_image = 124907; c.max_patches = 16384;
+    return c;
+}
+std::vector<int32_t> lfm_special(const std::string& s) {
+    if (s == "<image>") return {124907};
+    if (s == "<|image_end|>") return {125010};
+    if (s == "<|image_start|>") return {125009};
+    if (s == "<|img_row_10_col_10|>") return {125007};
+    if (s == "<|img_row_10_col_1|>") return {124998};
+    if (s == "<|img_row_10_col_2|>") return {124999};
+    if (s == "<|img_row_10_col_3|>") return {125000};
+    if (s == "<|img_row_10_col_4|>") return {125001};
+    if (s == "<|img_row_10_col_5|>") return {125002};
+    if (s == "<|img_row_10_col_6|>") return {125003};
+    if (s == "<|img_row_10_col_7|>") return {125004};
+    if (s == "<|img_row_10_col_8|>") return {125005};
+    if (s == "<|img_row_10_col_9|>") return {125006};
+    if (s == "<|img_row_1_col_10|>") return {124917};
+    if (s == "<|img_row_1_col_1|>") return {124908};
+    if (s == "<|img_row_1_col_2|>") return {124909};
+    if (s == "<|img_row_1_col_3|>") return {124910};
+    if (s == "<|img_row_1_col_4|>") return {124911};
+    if (s == "<|img_row_1_col_5|>") return {124912};
+    if (s == "<|img_row_1_col_6|>") return {124913};
+    if (s == "<|img_row_1_col_7|>") return {124914};
+    if (s == "<|img_row_1_col_8|>") return {124915};
+    if (s == "<|img_row_1_col_9|>") return {124916};
+    if (s == "<|img_row_2_col_10|>") return {124927};
+    if (s == "<|img_row_2_col_1|>") return {124918};
+    if (s == "<|img_row_2_col_2|>") return {124919};
+    if (s == "<|img_row_2_col_3|>") return {124920};
+    if (s == "<|img_row_2_col_4|>") return {124921};
+    if (s == "<|img_row_2_col_5|>") return {124922};
+    if (s == "<|img_row_2_col_6|>") return {124923};
+    if (s == "<|img_row_2_col_7|>") return {124924};
+    if (s == "<|img_row_2_col_8|>") return {124925};
+    if (s == "<|img_row_2_col_9|>") return {124926};
+    if (s == "<|img_row_3_col_10|>") return {124937};
+    if (s == "<|img_row_3_col_1|>") return {124928};
+    if (s == "<|img_row_3_col_2|>") return {124929};
+    if (s == "<|img_row_3_col_3|>") return {124930};
+    if (s == "<|img_row_3_col_4|>") return {124931};
+    if (s == "<|img_row_3_col_5|>") return {124932};
+    if (s == "<|img_row_3_col_6|>") return {124933};
+    if (s == "<|img_row_3_col_7|>") return {124934};
+    if (s == "<|img_row_3_col_8|>") return {124935};
+    if (s == "<|img_row_3_col_9|>") return {124936};
+    if (s == "<|img_row_4_col_10|>") return {124947};
+    if (s == "<|img_row_4_col_1|>") return {124938};
+    if (s == "<|img_row_4_col_2|>") return {124939};
+    if (s == "<|img_row_4_col_3|>") return {124940};
+    if (s == "<|img_row_4_col_4|>") return {124941};
+    if (s == "<|img_row_4_col_5|>") return {124942};
+    if (s == "<|img_row_4_col_6|>") return {124943};
+    if (s == "<|img_row_4_col_7|>") return {124944};
+    if (s == "<|img_row_4_col_8|>") return {124945};
+    if (s == "<|img_row_4_col_9|>") return {124946};
+    if (s == "<|img_row_5_col_10|>") return {124957};
+    if (s == "<|img_row_5_col_1|>") return {124948};
+    if (s == "<|img_row_5_col_2|>") return {124949};
+    if (s == "<|img_row_5_col_3|>") return {124950};
+    if (s == "<|img_row_5_col_4|>") return {124951};
+    if (s == "<|img_row_5_col_5|>") return {124952};
+    if (s == "<|img_row_5_col_6|>") return {124953};
+    if (s == "<|img_row_5_col_7|>") return {124954};
+    if (s == "<|img_row_5_col_8|>") return {124955};
+    if (s == "<|img_row_5_col_9|>") return {124956};
+    if (s == "<|img_row_6_col_10|>") return {124967};
+    if (s == "<|img_row_6_col_1|>") return {124958};
+    if (s == "<|img_row_6_col_2|>") return {124959};
+    if (s == "<|img_row_6_col_3|>") return {124960};
+    if (s == "<|img_row_6_col_4|>") return {124961};
+    if (s == "<|img_row_6_col_5|>") return {124962};
+    if (s == "<|img_row_6_col_6|>") return {124963};
+    if (s == "<|img_row_6_col_7|>") return {124964};
+    if (s == "<|img_row_6_col_8|>") return {124965};
+    if (s == "<|img_row_6_col_9|>") return {124966};
+    if (s == "<|img_row_7_col_10|>") return {124977};
+    if (s == "<|img_row_7_col_1|>") return {124968};
+    if (s == "<|img_row_7_col_2|>") return {124969};
+    if (s == "<|img_row_7_col_3|>") return {124970};
+    if (s == "<|img_row_7_col_4|>") return {124971};
+    if (s == "<|img_row_7_col_5|>") return {124972};
+    if (s == "<|img_row_7_col_6|>") return {124973};
+    if (s == "<|img_row_7_col_7|>") return {124974};
+    if (s == "<|img_row_7_col_8|>") return {124975};
+    if (s == "<|img_row_7_col_9|>") return {124976};
+    if (s == "<|img_row_8_col_10|>") return {124987};
+    if (s == "<|img_row_8_col_1|>") return {124978};
+    if (s == "<|img_row_8_col_2|>") return {124979};
+    if (s == "<|img_row_8_col_3|>") return {124980};
+    if (s == "<|img_row_8_col_4|>") return {124981};
+    if (s == "<|img_row_8_col_5|>") return {124982};
+    if (s == "<|img_row_8_col_6|>") return {124983};
+    if (s == "<|img_row_8_col_7|>") return {124984};
+    if (s == "<|img_row_8_col_8|>") return {124985};
+    if (s == "<|img_row_8_col_9|>") return {124986};
+    if (s == "<|img_row_9_col_10|>") return {124997};
+    if (s == "<|img_row_9_col_1|>") return {124988};
+    if (s == "<|img_row_9_col_2|>") return {124989};
+    if (s == "<|img_row_9_col_3|>") return {124990};
+    if (s == "<|img_row_9_col_4|>") return {124991};
+    if (s == "<|img_row_9_col_5|>") return {124992};
+    if (s == "<|img_row_9_col_6|>") return {124993};
+    if (s == "<|img_row_9_col_7|>") return {124994};
+    if (s == "<|img_row_9_col_8|>") return {124995};
+    if (s == "<|img_row_9_col_9|>") return {124996};
+    if (s == "<|img_thumbnail|>") return {125008};
+    return {};
+}
+}
+TEST(lfm2_image_preprocessing_matches_official_processor) {
+    Processor proc;
+    CHECK_OK(proc.init(lfm_cfg(), {}, lfm_special));
+    struct Case { int h, w, patches, segments, tokens; uint64_t pixels_hash, tokens_hash; };
+    const Case cases[] = {
+        {16, 16, 256, 1, 66, 0xe04d460c9bfbe78aull, 0xd9c141ece3579ef6ull},
+        {31, 53, 308, 1, 79, 0xcb6128893c66ae6dull, 0x9e5512d6bcc5404dull},
+        {256, 384, 384, 1, 98, 0x59f6a22946c260d3ull, 0x48946d2523bcdfb6ull},
+        {768, 1024, 7080, 7, 1779, 0x3c22fb784d4d10a0ull, 0x6408425fc2e79681ull},
+        {128, 2048, 1024, 1, 258, 0x9eaa0899c82d7c9eull, 0xa3fceabcb4070e76ull},
+        {1536, 2048, 7080, 7, 1779, 0x82870b1336bd3dd0ull, 0x6408425fc2e79681ull},
+    };
+    for (const auto& g : cases) {
+        std::shared_ptr<Item> it; std::string why;
+        CHECK_OK(proc.image_from(frame(0, g.h, g.w), &it, &why));
+        CHECK_EQ(it->n_patch, g.patches);
+        CHECK_EQ(it->n_seg, g.segments);
+        CHECK_EQ(it->expand.size(), (size_t)g.tokens);
+        uint64_t th = 0xcbf29ce484222325ull;
+        for (uint32_t t : it->expand)
+            for (int b = 0; b < 4; ++b) th = (th ^ (uint8_t)(t >> (b * 8))) * 0x100000001b3ull;
+        if (fnv(it->pixels) != g.pixels_hash)
+            std::fprintf(stderr, "LFM2 %dx%d pixels=%016llx expected=%016llx\n", g.h, g.w,
+                         (unsigned long long)fnv(it->pixels), (unsigned long long)g.pixels_hash);
+        CHECK_EQ(fnv(it->pixels), g.pixels_hash);
+        CHECK_EQ(th, g.tokens_hash);
+        CHECK(it->linear_positions);
+        CHECK_EQ(it->n_rows(), it->n_patch / 4);
+        PromptMedia pm; pm.items.push_back({it, 7}); pm.layout();
+        for (int t = 0; t < g.tokens + 30; ++t) {
+            int32_t xyz[3]; pm.rope.at(t, xyz);
+            CHECK_EQ(xyz[0], t); CHECK_EQ(xyz[1], t); CHECK_EQ(xyz[2], t);
+        }
+        int64_t total_rows = 0;
+        for (int seg = 0; seg < it->n_seg; ++seg) {
+            const int64_t n = it->segment_patches(seg);
+            std::vector<int32_t> coords((size_t)n * 4);
+            it->coords(it->patch_at(seg), n, coords.data());
+            const int gh = it->segment_h(seg), gw = it->segment_w(seg);
+            CHECK_EQ(pm.rope.runs[seg].row0, total_rows);
+            CHECK_EQ(pm.rope.runs[seg].n, n / 4);
+            for (int64_t k = 0; k < n; ++k) {
+                CHECK_EQ(coords[k], (k / 4 / (gw / 2)) * 2 + (k / 2) % 2);
+                CHECK_EQ(coords[n + k], (k / 4 % (gw / 2)) * 2 + k % 2);
+                CHECK_EQ(coords[2*n + k], gh); CHECK_EQ(coords[3*n + k], gw);
+            }
+            total_rows += n / 4;
+        }
+    }
+}
+
+TEST(lfm2_image_limits_refuse_segments_larger_than_encoder_pass) {
+    VisionConfig cfg = lfm_cfg(); cfg.max_patches = 512;
+    Processor p; CHECK_OK(p.init(cfg, {}, lfm_special));
+    std::shared_ptr<Item> it; std::string why;
+    CHECK(p.image_from(frame(0,768,1024), &it, &why) < 0);
+    CHECK(!it);
+    CHECK(why.find("tile") != std::string::npos);
+}

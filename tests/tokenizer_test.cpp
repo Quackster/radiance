@@ -348,6 +348,47 @@ TEST(bpe_merges_as_worked_out_by_hand) {
     }
 }
 
+TEST(bpe_ignore_merges_takes_whole_pretokens_and_keeps_the_default_merge_order) {
+    /* "abc" exists, but the only merge stops at "ab". Normalization and pre-tokenization
+     * must still run before the optional whole-token lookup. Exercise both ByteLevel paths. */
+    const char* chains[] = {
+        R"({"type":"WhitespaceSplit"})",
+        R"({"type":"Sequence","pretokenizers":[{"type":"WhitespaceSplit"},{"type":"ByteLevel","add_prefix_space":false,"use_regex":false}]})",
+        R"({"type":"Sequence","pretokenizers":[{"type":"WhitespaceSplit"},{"type":"ByteLevel","add_prefix_space":false,"use_regex":false},{"type":"Split","pattern":{"String":" "},"behavior":"Removed"}]})"
+    };
+    for (const char* chain : chains)
+        for (const char* flag : {"", "\"ignore_merges\":false,", "\"ignore_merges\":true,"}) {
+            const bool ignore = std::strstr(flag, "true") != nullptr;
+            const std::string js = std::string("{\"normalizer\":{\"type\":\"Lowercase\"},\"pre_tokenizer\":") +
+                chain + ",\"model\":{\"type\":\"BPE\"," + flag +
+                R"("vocab":{"a":0,"b":1,"c":2,"ab":3,"abc":4,"abc abc":5},"merges":["a b"]}})";
+            auto v = from_json(js.c_str());
+            REQUIRE(v != nullptr);
+            CHECK_EQ(v->build().ignore_merges, ignore);
+            Tokenizer t;
+            CHECK_OK(t.init(v));
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                CHECK(encode_new(t, "ABC") == (ignore ? std::vector<int32_t>{4} : std::vector<int32_t>{3, 2}));
+                CHECK(encode_new(t, "ABCABC") == (std::vector<int32_t>{3, 2, 3, 2}));
+                CHECK(encode_new(t, "ABC ABC") == (ignore ? std::vector<int32_t>{4, 4} : std::vector<int32_t>{3, 2, 3, 2}));
+            }
+        }
+}
+
+TEST(bpe_ignore_merges_does_not_enable_disabled_control_tokens) {
+    auto v = from_json(R"JSON({
+      "added_tokens":[{"id":4,"content":"abc","special":true}],
+      "pre_tokenizer":{"type":"WhitespaceSplit"},
+      "model":{"type":"BPE","ignore_merges":true,
+               "vocab":{"a":0,"b":1,"c":2,"ab":3},"merges":["a b"]}
+    })JSON");
+    REQUIRE(v != nullptr);
+    Tokenizer t;
+    CHECK_OK(t.init(v));
+    CHECK(encode_new(t, "abc", true) == (std::vector<int32_t>{4}));
+    CHECK(encode_new(t, "abc", false) == (std::vector<int32_t>{3, 2}));
+}
+
 TEST(byte_fallback_and_unk_follow_the_declared_chain) {
     auto v = from_json(k_spm);
     REQUIRE(v != nullptr);

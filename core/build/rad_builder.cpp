@@ -1040,6 +1040,15 @@ int Builder::declare_logits(rad_buf b) {
     return RAD_OK;
 }
 
+int Builder::declare_token_scores() {
+    if (finished_ || !scope_.empty()) {
+        err(RAD_E_STATE, "declare_token_scores requires an unfinished main model declaration");
+        return RAD_E_STATE;
+    }
+    prog_.token_scores = true;
+    return RAD_OK;
+}
+
 
 /* WHAT THE ENCODER IS. Checked here, at declare, for the drafter's reason: an encoder is exercised
  * only when a request carries media, so a declaration the engine cannot drive would otherwise
@@ -1686,6 +1695,11 @@ int rad_decl_name_map(RadBuilder* b, const RadNameMap* m) {
 int rad_declare_logits(RadBuilder* b, rad_buf logits) {
     if (!b) return RAD_E_INVAL;
     return B(b)->declare_logits(logits);
+}
+
+int rad_declare_token_scores(RadBuilder* b) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->declare_token_scores();
 }
 
 int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {

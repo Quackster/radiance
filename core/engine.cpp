@@ -77,7 +77,7 @@ Engine::~Engine() {
                  (unsigned long long)r->ctx.route_dropped());
         RAD_INFO("%s", r->mover.report().c_str());
     }
-    for (auto& r : ranks_) r->ctx.shutdown();
+    for (auto& r : ranks_) { r->token_scores.reset(); r->ctx.shutdown(); }
     step_state_fini();
     ranks_.clear();
     for (TableCopy& c : table_copies_) table_copy_free(&c);
@@ -146,6 +146,10 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
         }
     }
     sc.max_seqs      = cfg_.max_seqs;
+    if (!sizing) {
+        r.score_vocab_first = sc.vocab_off;
+        r.score_vocab_width = sc.n_vocab_local;
+    }
     sc.max_spec      = cfg_.n_spec;
     sc.rank          = rank;
     sc.world_size    = cfg_.tp;
@@ -297,7 +301,13 @@ void Engine::rank_loop(int index) {
             }
             b = mine;
             const int what = issue_what_.load(std::memory_order_acquire);
-            int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
+            int s = RAD_OK;
+            if (r.program.token_scores && what == kIssueAll && b->draft_pass == 0 && !b->enc) {
+                r.scoring_batch = *b;
+                s = r.token_scores.bind(&r.scoring_batch, r.ctx.stream());
+                b = &r.scoring_batch;
+            }
+            if (s >= 0 && what != kIssueSampler) s = r.ctx.run_step(b);
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
                 step_status_.store(s, std::memory_order_release);
@@ -316,7 +326,11 @@ void Engine::rank_loop(int index) {
                  * host synchronisation between them: it is more ops on the compute stream and not
                  * a second phase (spec §13). */
                 if (bst >= 0) {
-                    s = r.sampler.run(&r.ctx, r.program.logits_buf, r.tok_buf);
+                    if (b->draft_pass == 0)
+                        s = r.token_scores.issue(
+                            static_cast<const float*>(r.ctx.buf_ptr(r.program.logits_buf)), r.ctx.stream());
+                    if (s >= 0 && (b->draft_pass != 0 || sampled_rows_ > 0))
+                        s = r.sampler.run(&r.ctx, r.program.logits_buf, r.tok_buf);
                     if (s < 0) {
                         RAD_ERR("rank %d step %d: sampler: %s", index, b->step, rad_strerror(s));
                         step_status_.store(s, std::memory_order_release);
@@ -345,6 +359,14 @@ int Engine::prepare_release(const RadBatch* b) {
         if (rad_dev_set(ranks_[i]->device) < 0) continue;
         if (ranks_[i]->kv.follow(ranks_[0]->kv) < 0)
             step_status_.store(RAD_E_NOMEM, std::memory_order_release);
+    }
+    /* Branches can share a partially filled attention block. ensure() allocates their
+     * private tail and records the copy; enqueue it after pool growth and before any
+     * layer writes the branch suffix. Every rank copies its own shard. */
+    const auto copies = ranks_[0]->kv.take_pending_copies();
+    if (!copies.empty()) for (auto& rk : ranks_) {
+        RAD_TRY(rad_dev_set(rk->device));
+        RAD_TRY(rk->kv.copy_blocks(copies, rk->ctx.stream()));
     }
     if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
     return RAD_OK;
@@ -572,6 +594,23 @@ int Engine::step_loop() {
             so.reqs.push_back(const_cast<Request*>(e.req));
         }
         so.n_rows = logit_row;
+        sampled_rows_ = logit_row;
+
+        /* Final-prompt scoring rows follow sampled rows in BatchBuilder. Capture their selected
+         * values on each rank's stream before the sampler or another pass can touch the logits.
+         * A scoring request has no produces_token, so step_next cannot carry it into a decode. */
+        std::vector<TokenScoreRow> token_score_rows;
+        for (const StepEntry& e : plan.e)
+            if (e.produces_score) token_score_rows.push_back({e.req->token_scores, logit_row++});
+        for (auto& rk : ranks_) {
+            const int64_t width = rk->score_vocab_width;
+            const int64_t owned = width >= meta_.n_vocab && rk->index != 0 ? 0 : width;
+            const int ps = rk->token_scores.prepare(token_score_rows, rk->score_vocab_first, owned,
+                                                    b->n_out, rk->device,
+                                                    rk->program.token_scores, sampled_rows_);
+            if (ps < 0) return fail_loop(ps);
+        }
+        if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
 
         /* THE SAMPLER'S HOST WORK, staged by this lambda either in front of the ranks or -- by
          * default, see build_mu_ in engine.h -- underneath them. It touches request state and the
@@ -806,6 +845,13 @@ int Engine::step_loop() {
         st = issue_ahead(&ahead);
         if (st < 0) return fail_loop(st);
         st = collect_step(b, so);
+        if (st >= 0) {
+            for (auto& rk : ranks_) {
+                st = rk->token_scores.collect();
+                if (st < 0) break;
+            }
+            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+        }
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
         if (cfg_.kld()) {
@@ -956,15 +1002,43 @@ int Engine::mark_step_end(const RadBatch* b, StepOut& so) {
  * and to stream them. Everything else in a step is enqueued and never waited on (spec §5.4). */
 int Engine::collect_step(const RadBatch* b, StepOut& so) {
     const StepPlan& plan = sched_.plan();
+    auto fence_private_snapshots = [&]() -> int {
+        if (ranks_.size() <= 1) return RAD_OK;
+        const bool pending = std::any_of(plan.e.begin(), plan.e.end(), [](const StepEntry& e) {
+            return e.req && e.req->shared_prefix && (e.ckpt_slot >= 0 || e.ckpt_restore >= 0);
+        });
+        if (!pending) return RAD_OK;
+        // A private snapshot spans every rank. Rank zero's step event cannot fence
+        // another rank's asynchronous save/restore before cancellation releases it.
+        for (auto& rk : ranks_) {
+            RAD_TRY(rad_dev_set(rk->device));
+            RAD_TRY(rad_stream_sync(rk->ctx.stream()));
+        }
+        return rad_dev_set(ranks_[0]->device);
+    };
     so.token.assign(plan.e.size(), 0);
     so.accepted.assign(plan.e.size(), 0);
     so.eos.assign(plan.e.size(), 0);
-    if (so.n_rows <= 0) return RAD_OK;
+    if (so.n_rows <= 0) {
+        /* A final scoring step still owns the forward and any checkpoint save behind it. Wait
+         * for their end before commit releases the sequence, even though there are no sampled
+         * ids to copy. Non-final prefill chunks retain the existing enqueue-only behavior. */
+        bool wait = false, shared_snapshot = false;
+        for (const StepEntry& e : plan.e) {
+            wait |= e.produces_score;
+            shared_snapshot |= e.req && e.req->shared_prefix &&
+                               (e.ckpt_slot >= 0 || e.ckpt_restore >= 0);
+        }
+        if (wait || shared_snapshot) RAD_TRY(rad_event_sync(step_end_));
+        if (shared_snapshot) RAD_TRY(fence_private_snapshots());
+        return RAD_OK;
+    }
 
     so.rows.resize((size_t)so.n_rows);
     /* The step's one wait. For the step's end and not for the stream: a step issued ahead is
      * behind it, and the host's commit and staging are what that step runs over. */
     RAD_TRY(rad_event_sync(step_end_));
+    RAD_TRY(fence_private_snapshots());
     std::memcpy(so.rows.data(), so.rb, (size_t)so.n_rows * sizeof(int32_t));
     so.rb = nullptr;
     const std::vector<float>& lg = so.lg;
@@ -2139,12 +2213,15 @@ int Engine::run_server() {
     }
 
     server::ServerOptions o{};
+    o.decision_type = rad_meta_gets(&meta_, "decision.type",
+        rad_meta_gets(&meta_, "lfm2.decision.type", ""));
     o.model_id = !cfg_.served_model_name.empty() ? cfg_.served_model_name
                : meta_.name && *meta_.name       ? meta_.name : "radiance";
     o.host     = cfg_.host;
     o.port     = cfg_.port;
     o.api_key  = cfg_.api_key;
     o.max_seqs = cfg_.max_seqs;
+    o.max_batch_tokens = cfg_.max_tok;
     /* `n` fans one request out over the batch, so a server that runs more sequences a step takes
      * more choices a request; the floor keeps a small batch from refusing what it would queue. */
     o.max_n    = cfg_.max_n > 0 ? (int)cfg_.max_n : (int)std::max<int64_t>(o.max_n, cfg_.max_seqs);
@@ -2235,6 +2312,8 @@ int Engine::run_server() {
         mm_proc = std::make_unique<mm::Processor>();
         RAD_TRY(mm_proc->init(vc, [&tok_bridge](const std::string& t) {
             return tok_bridge.encode(t, /*add_special=*/false, /*parse_special=*/false);
+        }, [&tok_bridge](const std::string& t) {
+            return tok_bridge.encode(t, /*add_special=*/false, /*parse_special=*/true);
         }));
         mm_bridge = std::make_unique<server::MultimodalBridge>(mm_proc.get(), encd.modalities);
         d.mm = mm_bridge.get();

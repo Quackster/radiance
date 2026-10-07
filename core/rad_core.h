@@ -346,6 +346,7 @@ public:
      * purpose -- the engine refuses to SERVE such a program and says so at startup, rather
      * than discovering at the first step that there is nothing to sample. */
     rad_buf logits_buf = 0;
+    bool token_scores = false;  /* architecture implements RadBatch's compact score pairs */
 
     /* THE DRAFT HEAD THIS PLUGIN DECLARED (rad_declare_drafter). `kind == RAD_DRAFT_NONE` when
      * it declared none, which is the normal case -- the engine then speculates with the
@@ -531,11 +532,30 @@ struct SamplingParams {
     std::shared_ptr<const GbnfProgram> grammar_program;
 };
 
+/* A score-only request reads the raw final-prompt logits at these vocabulary ids. The caller
+ * fills tokens before submission and must not modify it afterwards. The engine publishes logits
+ * in the same order before finishing the request's sink. Read them only after successful finish;
+ * cancellation and failure do not promise a result. No sampler, generated token or normalisation
+ * is involved. Shared ownership keeps the result alive if the HTTP peer leaves during a pass. */
+struct TokenScores {
+    static constexpr size_t kMaxCandidates = RAD_MAX_SCORE_CANDIDATES;
+    std::vector<int32_t> tokens;
+    std::vector<float> logits;
+};
+
+/* Requests carrying the same immutable descriptor may share these initial prompt tokens.
+ * The scheduler validates token equality and media identity before doing any reuse. */
+struct SharedPrefix {
+    int32_t n_tokens = 0;
+};
+
 struct Request {
     uint64_t             id = 0;
     std::vector<int32_t> prompt;
     std::vector<int32_t> output;
     SamplingParams       sp;
+    std::shared_ptr<TokenScores> token_scores;  /* non-null: finish after scoring the prompt */
+    std::shared_ptr<const SharedPrefix> shared_prefix;
     int32_t              max_tokens = 0;
     std::vector<std::string> stop;
     /* GENERATE PAST THE END-OF-TEXT TOKEN, to max_tokens. It exists so a caller can ask for a

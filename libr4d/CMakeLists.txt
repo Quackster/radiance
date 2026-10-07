@@ -57,6 +57,7 @@ set(RAD_W4_GROUP 128 CACHE STRING "libr4d quantised-weight group size (must matc
 set(R4D_UNITS
   "r4d_attn_paged_h256_gqa6|"
   "r4d_attn_paged_h128_gqa4|"
+  "r4d_attn_paged_h64_gqa4|"
   # Eight queries per KV head, at both head widths: the routed 35B-A3B is 16 over 2 at 256
   # and MiniCPM5-2B is 16 over 2 at 128. Same device code, different instantiations.
   "r4d_attn_paged_gqa8|"
@@ -83,6 +84,8 @@ set(R4D_UNITS
   "r4d_ngram_ids|"
   "r4d_ple_gate_bf16|"
   "r4d_ple_conv_bf16|"
+  "r4d_causal_conv_bf16|"
+  "r4d_logits_select_bf16|"
   # The all-reduce family is ONE unit and not one per kernel: they share a single instance --
   # peer scratch, IPC-equivalent pointers, per-block flags, device sequence counters -- and one
   # rendezvous that establishes it across every rank before the first launch. Splitting the entry

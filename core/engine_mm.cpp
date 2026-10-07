@@ -2,8 +2,8 @@
  *
  * The scheduler holds back a request whose media is not encoded (Scheduler::media_ready) and hands
  * its items here. They are encoded BETWEEN steps, never inside one: a pass is issued with no step
- * in flight, read back, and the item marked done, so the next step's admission finds its rows in
- * host memory and the batch builder copies them in with the chunk that reaches them. Nothing on the
+ * in flight, its rows retained, and the item marked done, so the next step's admission finds its
+ * features ready for the chunk that reaches them. Nothing on the
  * step path ever waits on the tower.
  *
  * A PASS IS WHOLE SEGMENTS. An image is one segment and a video one per temporal group, and the
@@ -11,14 +11,15 @@
  * inside one; the processor has already kept every segment within a pass. Several items share a
  * pass when they fit, which is what a request with a handful of small pictures wants.
  *
- * EVERY RANK RUNS THE WHOLE TOWER on its own card from its own copy of the patches. The rows are
- * needed on every rank anyway -- each rank embeds every token -- and running it everywhere costs the
- * encoder's compute once per card instead of a transfer of its output between them.
+ * EVERY RANK RUNS THE WHOLE TOWER on its own card from its own copy of the patches. Rank zero's
+ * result supplies the embeddings; other ranks contribute zero rows before the vocabulary
+ * reduction. Retained features use the budgeted device pool, with host storage for overflow.
  */
 #include "engine_priv.h"
 
 #include "mm/processor.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -58,7 +59,9 @@ int Engine::run_encodes() {
 
     for (auto& ip : items) {
         if (ip->encoded) continue;
-        ip->embd.assign((size_t)(ip->n_rows() * n_embd), 0);
+        RAD_TRY(sched_.reserve_media_rows(*ip));
+        if (!ip->device_rows || (dump_dir && *dump_dir))
+            ip->embd.assign((size_t)(ip->n_rows() * n_embd), 0);
         if (dump_dir && *dump_dir) dump(*ip, ".pix.bf16", ip->pixels.data(), ip->pixels.size());
     }
 
@@ -70,18 +73,20 @@ int Engine::run_encodes() {
         while (i < items.size()) {
             mm::Item& it = *items[i];
             if (it.encoded) { ++i; seg = 0; continue; }
-            const int64_t seg_p = (int64_t)it.grid_h * it.grid_w;
-            if (seg_p > max_p) {
-                RAD_ERR("encoder: a segment of %lld patches does not fit a pass of %lld",
-                        (long long)seg_p, (long long)max_p);
-                return RAD_E_STATE;
+            const int32_t begin = seg;
+            while (seg < it.n_seg) {
+                const int64_t seg_p = it.segment_patches(seg);
+                if (seg_p > max_p) {
+                    RAD_ERR("encoder: a segment of %lld patches does not fit a pass of %lld",
+                            (long long)seg_p, (long long)max_p);
+                    return RAD_E_STATE;
+                }
+                if (np + seg_p > max_p) break;
+                np += seg_p;
+                ++seg;
             }
-            const int64_t room = (max_p - np) / seg_p;
-            const int32_t can = (int32_t)std::min<int64_t>(it.n_seg - seg, room);
-            if (can <= 0) break;
-            parts.push_back({ &it, seg, can });
-            np += (int64_t)can * seg_p;
-            seg += can;
+            if (seg == begin) break;
+            parts.push_back({ &it, begin, seg - begin });
             if (seg == it.n_seg) { ++i; seg = 0; }
         }
         if (parts.empty()) break;
@@ -100,16 +105,34 @@ int Engine::run_encodes() {
             RAD_ERR("encoder pass failed: %s -- the engine cannot continue", rad_strerror(st));
             return st;
         }
-        /* The rows, in pass order: each part's segments are consecutive rows of its item. */
+        /* Keep the rows on rank zero, whose embeddings are injected before the
+         * vocabulary reduction. The host copy is only needed by the host backend,
+         * pool overflow, or an explicit diagnostic dump. */
         int64_t row = 0;
         for (const BatchBuilder::EncoderPart& p : parts) {
             mm::Item& it = *const_cast<mm::Item*>(p.item);
-            const int64_t rows = (int64_t)p.n_seg * it.seg_rows;
+            const int64_t first = it.row_at(p.seg0);
+            const int64_t rows = it.row_at(p.seg0 + p.n_seg) - first;
             const int64_t bytes = rows * n_embd * (int64_t)sizeof(uint16_t);
-            RAD_TRY(rad_memcpy_async(it.embd.data() + (int64_t)p.seg0 * it.seg_rows * n_embd,
-                                     static_cast<const char*>(out) +
-                                         row * n_embd * (int64_t)sizeof(uint16_t),
-                                     bytes, r0.ctx.stream()));
+            const char* src = static_cast<const char*>(out) +
+                              row * n_embd * (int64_t)sizeof(uint16_t);
+            if (it.device_rows) {
+                int64_t copied = 0;
+                for (const auto& span : it.device_rows->spans) {
+                    const int64_t lo = std::max(first, span.row);
+                    const int64_t hi = std::min(first + rows, span.row + span.count);
+                    if (lo >= hi) continue;
+                    RAD_TRY(rad_memcpy_async(
+                        static_cast<char*>(span.data) + (lo - span.row) * n_embd * (int64_t)sizeof(uint16_t),
+                        src + (lo - first) * n_embd * (int64_t)sizeof(uint16_t),
+                        (hi - lo) * n_embd * (int64_t)sizeof(uint16_t), r0.ctx.stream()));
+                    copied += hi - lo;
+                }
+                if (copied != rows) return RAD_E_STATE;
+            }
+            if (!it.embd.empty())
+                RAD_TRY(rad_memcpy_async(it.embd.data() + first * n_embd,
+                                         src, bytes, r0.ctx.stream()));
             row += rows;
         }
         /* Every rank's stream, not only rank 0's: the next pass rewrites the staging every rank's

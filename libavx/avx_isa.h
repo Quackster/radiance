@@ -90,7 +90,7 @@ int         avx_isa_force(int level);
     X(mul)                  X(silu_mul)             X(gelu)                 X(silu)               \
     X(sigmoid)              X(gather_rows)          X(scatter_rows)         X(ngram_ids)          \
     X(ple_gate)             X(ple_conv)             X(cast)                 X(softmax)            \
-    X(scale_rows)           X(fill)                                                               \
+    X(scale_rows)           X(fill)                 X(causal_conv1d)                              \
     /* ---- quantisation and rotation */                                                          \
     X(quant_act_i8)         X(had_quant_act_i8)     X(quant_act_fp8)        X(had_quant_act_fp8)  \
     X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8)   X(dequant)            \
@@ -98,6 +98,7 @@ int         avx_isa_force(int level);
     /* ---- gemm and the vocabulary edges */                                                      \
     X(gemm_nt)              X(gemm_nt_bias)         X(gemm_nt_q)            X(gemm_nt_q_bias)     \
     X(gemm_nt_q_gated)      X(embed_lookup)         X(embed_lookup_q)       X(logits_gemm)        \
+    X(logits_select)                                                                              \
     /* ---- attention */                                                                          \
     X(attn_paged)           X(attn_dense)           X(kv_store)             X(rope)               \
     X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)                              \

@@ -1,6 +1,9 @@
 /* processor.h -- what an image or a video becomes before an encoder sees it (spec §11).
  *
- * THIS IS THE QWEN-VL PROCESSOR FAMILY (Qwen2-VL through Qwen3.x), and what is family-specific is
+ * Qwen-VL (Qwen2-VL through Qwen3.x) and LFM2-VL share decoding and encoder staging.
+ * The Qwen family below fixes its arithmetic; LFM2-VL instead uses HWC patch values,
+ * independent image tiles plus an optional thumbnail, and ordinary token positions.
+ * In either family, what is family-specific is
  * the arithmetic, not the numbers: every size, rate and token id comes from the container, which
  * carries the checkpoint's config.json and its two preprocessor configs (rad-convert writes them
  * under `vision_config.*`, `preprocessor.*` and `video_preprocessor.*`). What the family fixes:
@@ -39,7 +42,15 @@ namespace mm {
 
 enum class Kind { Image, Video };
 
+enum class VisionFamily { Qwen, Lfm2 };
+
 struct VisionConfig {
+    VisionFamily family = VisionFamily::Qwen;
+    int32_t min_tiles = 2, max_tiles = 10, tile_size = 512;
+    bool split_images = true, use_thumbnail = true;
+    double max_pixels_tolerance = 2.0;
+    int64_t cap_image_pixels = 1048576;
+    int64_t max_segment_patches = 1024;
     int32_t patch = 0, temporal = 0, merge = 0;
     int64_t image_min_pixels = 0, image_max_pixels = 0;
     int64_t video_min_pixels = 0, video_max_pixels = 0;
@@ -75,6 +86,22 @@ struct VisionConfig {
     int from_meta(const RadModelMeta& m, std::string* why);
 };
 
+/* Retained encoder output on the rank that supplies multimodal embeddings. A
+ * bounded pool owns the allocation; the last shared media owner releases its
+ * spans. Spans are in logical row order, though fragmentation may place their
+ * storage apart. No device allocation is performed by an Item. */
+struct DeviceRows {
+    struct Span { int64_t row = 0, count = 0; void* data = nullptr; };
+    int device = -1;
+    int64_t rows = 0, width = 0;
+    std::vector<Span> spans;
+    std::function<void()> release;
+    DeviceRows() = default;
+    DeviceRows(const DeviceRows&) = delete;
+    DeviceRows& operator=(const DeviceRows&) = delete;
+    ~DeviceRows() { if (release) release(); }
+};
+
 /* One media part after processing: its patches, its place in the prompt's token stream, and --
  * once the encoder has run -- its rows. Shared between the request that owns it and the engine
  * thread that encodes it; the engine writes `embd` once and nothing reads it before then. */
@@ -88,7 +115,23 @@ struct Item {
     /* The encoder's output: n_seg segments of seg_rows rows, one segment per temporal group.
      * `rows_w` is a segment's width in output rows, which is where its rotary grid wraps. */
     int32_t n_seg = 0, seg_rows = 0, rows_w = 0, rows_h = 0;
-    int64_t n_rows() const { return (int64_t)n_seg * seg_rows; }
+    /* Optional variable-size segments, used by tiled images plus their thumbnail.
+     * Empty keeps the uniform Qwen image/video representation. */
+    struct Segment { int32_t h = 0, w = 0; int64_t patch0 = 0; };
+    std::vector<Segment> segments;
+    bool linear_positions = false;
+    int32_t segment_h(int s) const { return segments.empty() ? grid_h : segments[s].h; }
+    int32_t segment_w(int s) const { return segments.empty() ? grid_w : segments[s].w; }
+    int32_t merge_size() const { return grid_h / rows_h; }
+    int64_t patch_at(int s) const {
+        return segments.empty() ? (int64_t)s * grid_h * grid_w
+             : s == n_seg ? n_patch : segments[s].patch0;
+    }
+    int64_t row_at(int s) const { return segments.empty() ? (int64_t)s * seg_rows
+             : patch_at(s) / (merge_size() * merge_size()); }
+    int64_t segment_patches(int s) const { return patch_at(s + 1) - patch_at(s); }
+    int64_t segment_rows(int s) const { return row_at(s + 1) - row_at(s); }
+    int64_t n_rows() const { return row_at(n_seg); }
 
     /* THE TOKENS THAT REPLACE THE MEDIA MARKER, and where in them each segment's run of
      * placeholders starts. Placeholders are the checkpoint's own pad ids, not an arbitrary one:
@@ -101,8 +144,11 @@ struct Item {
      * what the encoder is a function of, and they already reflect every preprocessing choice. */
     uint64_t key_hi = 0, key_lo = 0;
 
-    /* [n_rows, n_embd] bf16, written by the engine after the encoder pass. */
+    /* [n_rows, n_embd] bf16, written by the engine after the encoder pass.
+     * Real devices prefer the accounted device pool; host execution, pool
+     * pressure and explicit diagnostic dumps retain the host representation. */
     std::vector<uint16_t> embd;
+    std::shared_ptr<DeviceRows> device_rows;
     bool encoded = false;
     /* Handed to the engine's encoder queue and not yet encoded -- the scheduler's thread only. */
     bool queued = false;
@@ -123,6 +169,7 @@ struct RopeLayout {
         int32_t base = 0;       /* the rotary position of its first token */
         int32_t shift = 0;      /* rotary minus token index for the text AFTER the run */
         int32_t item = 0;       /* which of PromptMedia::items the run belongs to */
+        bool linear = false;   /* ordinary one-dimensional positions through media */
         int32_t row0 = 0;       /* the item's encoder row that its first token takes */
     };
     std::vector<Run> runs;      /* ascending */
@@ -142,7 +189,7 @@ struct RopeLayout {
     /* (t, h, w) of token index i. Past the prompt, text continues from the last run's shift. */
     void at(int64_t i, int32_t out[3]) const {
         const Run* r = last_at(i);
-        if (!r) { out[0] = out[1] = out[2] = (int32_t)i; return; }
+        if (!r || r->linear) { out[0] = out[1] = out[2] = (int32_t)i; return; }
         const int64_t k = i - r->tok;
         if (k < r->n) {
             out[0] = r->base;
@@ -181,7 +228,9 @@ class Processor {
 public:
     /* `encode_text` tokenises the timestamp text between a video's groups: plain text, no
      * special tokens added and none parsed. */
-    int init(const VisionConfig& cfg, std::function<std::vector<int32_t>(const std::string&)> encode_text);
+    int init(const VisionConfig& cfg,
+             std::function<std::vector<int32_t>(const std::string&)> encode_text,
+             std::function<std::vector<int32_t>(const std::string&)> encode_special = {});
     const VisionConfig& config() const { return cfg_; }
 
     int image(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out, std::string* why) const;
@@ -192,7 +241,10 @@ public:
     int video_from(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
 
 private:
+    int image_lfm2(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     VisionConfig cfg_{};
+    int32_t tok_thumbnail_ = -1;
+    std::vector<int32_t> tile_tokens_;
     std::function<std::vector<int32_t>(const std::string&)> encode_text_;
 };
 

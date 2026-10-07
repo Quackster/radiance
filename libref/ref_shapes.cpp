@@ -596,6 +596,22 @@ int ref_ple_conv_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("ple_conv", operand, out);
 }
 
+int ref_causal_conv1d_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), width = gi(p, n_p, "width", 0);
+    if (M <= 0 || n <= 0 || width < 2 || width > 65) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, {M, n});
+    o.t(D, {n, width});
+    o.t(D, {1, n, width - 2 + M});
+    o.t_idx({2}, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);
+    o.t_idx({1}, 1, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);
+    o.t_idx({1}, 0, 1, 0);
+    o.t_idx({1}, 0, M, 0);
+    o.t(D, {M, n});
+    return o.finish("causal_conv1d", operand, out);
+}
+
 int ref_ngram_ids_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M     = gi(p, n_p, "M", 0);
     const int64_t heads = gi(p, n_p, "heads", 0);
@@ -1690,6 +1706,19 @@ int ref_embed_lookup_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     o.t(D, { M, ne });                               /* x */
     o.skip();                                        /* ahead: a later call's ids, optional */
     return o.finish("embed_lookup_q", operand, out);
+}
+
+int ref_logits_select_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), R = gi(p, n_p, "n_rows", 0);
+    const int64_t V = gi(p, n_p, "n_vocab", 0), K = gi(p, n_p, "n_embd", 0);
+    if (M <= 0 || R <= 0 || V <= 0 || K <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(act_dt(p, n_p), {R, K});
+    o.t(act_dt(p, n_p), {V, K});
+    o.t_idx({M}, R, -1, 0);
+    o.t_idx({M}, V, -1, 0);
+    o.t(RAD_F32, {M});
+    return o.finish("logits_select", operand, out);
 }
 
 int ref_logits_gemm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

@@ -27,6 +27,7 @@
 #include "runtime/ctx.h"
 #include "sample/sampler.h"
 #include "sched/advance.h"
+#include "sched/token_scores.h"
 
 namespace rad {
 
@@ -84,6 +85,9 @@ struct Engine::Rank {
     StagerChain stagers;
     Ctx       ctx;
     Sampler   sampler;          /* one per rank: each samples its own vocab shard (spec §9) */
+    TokenScoreReadback token_scores;
+    RadBatch scoring_batch{};       /* retained because Ctx keeps its current batch pointer */
+    int64_t score_vocab_first = 0, score_vocab_width = 0;
     rad_buf   tok_buf = 0;      /* where the chain writes the sampled ids */
     /* THE CARD'S STEP STATE (sched/advance.h): one StepSlot a scheduler slot, and the
      * end-of-generation ids acceptance stops at, sorted. Every rank keeps its own and computes the

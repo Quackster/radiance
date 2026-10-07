@@ -13,6 +13,221 @@
 
 namespace rad {
 
+/* A request-local prefix owns KV references and a snapshot independently of global cache
+ * retention. Members detach after the scheduler's in-flight guards allow their KV to be freed;
+ * finished Request objects can remain available to clients without retaining device capacity. */
+struct SharedPrefillState {
+    IKVManager* kv = nullptr;
+    std::shared_ptr<const SharedPrefix> descriptor;
+    std::vector<int32_t> tokens;
+    const mm::PromptMedia* media = nullptr;
+    std::vector<std::vector<int32_t>> blocks;
+    std::vector<int64_t> reserved; // retained trunk plus every branch's private suffix pages
+    bool capacity_active = false;
+    int64_t members = 0;
+    uint64_t leader = 0;
+    int32_t checkpoint = -1;
+    bool ready = false, disabled = false;
+    ~SharedPrefillState() {
+        for (size_t g = 0; g < blocks.size(); ++g)
+            for (int32_t b : blocks[g]) kv->release_block((int32_t)g, b);
+        if (checkpoint >= 0) kv->free_checkpoint(checkpoint);
+    }
+};
+
+int Scheduler::join_shared_prefix(const Request& r, std::shared_ptr<SharedPrefillState>* out) {
+    if (!r.shared_prefix) return RAD_OK;
+    const int32_t count = r.shared_prefix->n_tokens;
+    if (count <= 0 || (size_t)count >= r.prompt.size()) return RAD_E_INVAL;
+    auto& weak = shared_prefixes_[r.shared_prefix.get()];
+    auto group = weak.lock();
+    if (group) {
+        if ((int64_t)group->tokens.size() != count || group->media != r.media.get() ||
+            !std::equal(group->tokens.begin(), group->tokens.end(), r.prompt.begin()))
+            return RAD_E_INVAL;
+    } else {
+        group = std::make_shared<SharedPrefillState>();
+        group->kv = kv_;
+        group->descriptor = r.shared_prefix;
+        group->tokens.assign(r.prompt.begin(), r.prompt.begin() + count);
+        group->media = r.media.get();
+        group->blocks.resize(kvgeom_.g.size());
+        group->reserved.resize(kvgeom_.g.size(), 0);
+        // Full-attention pages and independently restorable recurrent state are supported.
+        // A chunked recurrent kernel may require the branch origin to be chunk-aligned.
+        group->disabled = geo_.state_chunk > 1 && count % geo_.state_chunk != 0;
+        for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+            if (kvgeom_.g[g].kind == RAD_KV_WINDOW) group->disabled = true;
+            const int64_t block = kv_->block_tokens((int32_t)g);
+            if (block > 0) {
+                group->reserved[g] = (count + block - 1) / block;
+                group->blocks[g].reserve((size_t)group->reserved[g]);
+            }
+        }
+        weak = group;
+    }
+    // A late member cannot enlarge an already active reservation into somebody else's
+    // capacity. It can still execute independently once the reserved branches have drained.
+    if (group->capacity_active && !shared_capacity_fits(group.get(), &r)) return RAD_OK;
+    for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+        const int64_t block = kv_->block_tokens((int32_t)g);
+        if (block > 0)
+            group->reserved[g] += (request_capacity(r) + block - 1) / block - count / block;
+    }
+    ++group->members;
+    *out = std::move(group);
+    return RAD_OK;
+}
+
+void Scheduler::detach_shared_prefix(SchedReq& s) {
+    if (!s.shared_prefill) return;
+    auto group = std::move(s.shared_prefill);
+    for (size_t g = 0; g < group->reserved.size(); ++g) {
+        const int64_t block = kv_->block_tokens((int32_t)g);
+        if (block > 0)
+            group->reserved[g] -= (request_capacity(*s.req) + block - 1) / block -
+                                  (int64_t)group->tokens.size() / block;
+    }
+    if (--group->members == 0) shared_prefixes_.erase(group->descriptor.get());
+    // The last member releases the retained pages and snapshot here. Callers must have
+    // completed all passes naming this member, or be declining reuse before it is issued.
+}
+
+int64_t Scheduler::request_capacity(const Request& r) const {
+    if (r.token_scores) return (int64_t)r.prompt.size();
+    // Verification and one step issued ahead can both write a full draft window even when
+    // only one output token remains. The sampler can refresh may_speculate between passes.
+    const int64_t lookahead = 2 * std::max<int64_t>(cfg_.n_spec, 0);
+    const int64_t end = r.max_tokens > 0 ? (int64_t)r.prompt.size() + r.max_tokens + lookahead :
+                        (ctx_limit_ > 0 ? ctx_limit_ : INT32_MAX);
+    return ctx_limit_ > 0 ? std::min(end, ctx_limit_) : end;
+}
+
+bool Scheduler::shared_capacity_fits(const SharedPrefillState* activate,
+                                      const Request* extra_member, const SchedReq* entering) const {
+    bool any = activate != nullptr;
+    for (const auto& entry : shared_prefixes_)
+        if (auto group = entry.second.lock(); group && group->capacity_active) { any = true; break; }
+    if (!any) return true; // Preserve ordinary admission when no private pages are retained.
+    for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+        const int64_t block = kv_->block_tokens((int32_t)g);
+        if (block <= 0) continue;
+        int64_t used = 0;
+        for (const auto& entry : shared_prefixes_) {
+            const auto group = entry.second.lock();
+            if (group && (group->capacity_active || group.get() == activate)) used += group->reserved[g];
+        }
+        if (extra_member)
+            used += (request_capacity(*extra_member) + block - 1) / block -
+                    (int64_t)activate->tokens.size() / block;
+        for (const auto& slot : reqs_) {
+            if (!slot || !slot->req || slot.get() == entering) continue;
+            const auto& group = slot->shared_prefill;
+            if (group && ((group->capacity_active && !group->disabled) || group.get() == activate)) continue;
+            // A cache hit kept across a refused admission can own pages without running yet.
+            if (slot->running || slot->pending_free ||
+                (slot->req->n_computed > 0 && kv_->has_sequence(slot->req->id)))
+                used += (request_capacity(*slot->req) + block - 1) / block;
+        }
+        if (entering) used += (request_capacity(*entering->req) + block - 1) / block;
+        if (used > kv_->total_blocks((int32_t)g)) return false;
+    }
+    return true;
+}
+
+int Scheduler::admit_shared_prefix(SchedReq& s) {
+    auto& group = s.shared_prefill;
+    if (!group || group->disabled)
+        return shared_capacity_fits(nullptr, nullptr, &s) ? RAD_OK : kAdmitWait;
+    if (s.req->n_computed != 0) return RAD_OK;
+    if (!group->leader) {
+        for (size_t g = 0; g < group->reserved.size(); ++g)
+            if (kv_->block_tokens((int32_t)g) > 0 && group->reserved[g] > kv_->total_blocks((int32_t)g))
+                group->disabled = true;
+        if (group->disabled)
+            return shared_capacity_fits(nullptr, nullptr, &s) ? RAD_OK : kAdmitWait;
+        if (!shared_capacity_fits(group.get())) return kAdmitWait;
+        if (has_linear_state_ && kv_->alloc_checkpoint(&group->checkpoint) < 0) {
+            group->disabled = true; // Safe independent prefill when no snapshot fits.
+            return shared_capacity_fits(nullptr, nullptr, &s) ? RAD_OK : kAdmitWait;
+        }
+        group->capacity_active = true;
+        group->leader = s.req->id;
+    }
+    if (!group->ready) return group->leader == s.req->id ? RAD_OK : kAdmitWait;
+    if (has_linear_state_ && !kv_->checkpoint_held(group->checkpoint)) {
+        // A store that declined this snapshot cannot safely serve this member's reuse.
+        detach_shared_prefix(s);
+        return shared_capacity_fits(nullptr, nullptr, &s) ? RAD_OK : kAdmitWait;
+    }
+    for (size_t g = 0; g < group->blocks.size(); ++g) {
+        if (kv_->block_tokens((int32_t)g) <= 0) continue;
+        const int rc = kv_->adopt_prefix(s.req->id, (int32_t)g, group->blocks[g], group->tokens.size());
+        if (rc < 0) {
+            kv_->preempt(s.req->id);
+            detach_shared_prefix(s);
+            return shared_capacity_fits(nullptr, nullptr, &s) ? RAD_OK : kAdmitWait;
+        }
+    }
+    s.req->n_computed = s.req->n_cached = (int32_t)group->tokens.size();
+    s.ckpt_src = group->checkpoint;
+    s.hit_attn = (int32_t)group->tokens.size();
+    return RAD_OK;
+}
+
+int64_t Scheduler::shared_target(const SchedReq& s) const {
+    const auto& group = s.shared_prefill;
+    return group && !group->disabled && !group->ready && group->leader == s.req->id ?
+        (int64_t)group->tokens.size() : s.seq_len();
+}
+
+bool Scheduler::shared_checkpoint(const SchedReq& s, StepEntry& e) {
+    const auto& group = s.shared_prefill;
+    if (!group || group->disabled || group->ready || group->leader != s.req->id ||
+        (int64_t)e.ctx_len + e.n_tokens != (int64_t)group->tokens.size()) return false;
+    if (group->checkpoint >= 0) {
+        e.ckpt_tok = e.n_tokens - 1;
+        e.ckpt_slot = group->checkpoint;
+        ++m_.checkpoints_written;
+    }
+    return true;
+}
+
+void Scheduler::publish_shared_prefix(SchedReq& s, const StepEntry& e) {
+    auto& group = s.shared_prefill;
+    if (!group || group->disabled || group->ready || group->leader != s.req->id ||
+        s.req->n_computed != (int64_t)group->tokens.size()) return;
+    auto abandon = [&] {
+        for (size_t g = 0; g < group->blocks.size(); ++g) {
+            for (int32_t block : group->blocks[g]) kv_->release_block((int32_t)g, block);
+            group->blocks[g].clear();
+        }
+        group->disabled = true;
+        group->capacity_active = false;
+    };
+    if (has_linear_state_ && (e.ckpt_slot != group->checkpoint || group->checkpoint < 0)) {
+        abandon();
+        return;
+    }
+    for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+        if (kv_->block_tokens((int32_t)g) <= 0) continue;
+        const int64_t count = (group->tokens.size() + kvgeom_.g[g].block_size - 1) / kvgeom_.g[g].block_size;
+        const auto& blocks = kv_->block_table(s.req->id, (int32_t)g);
+        if (kv_->first_block_pos(s.req->id, (int32_t)g) != 0 || (int64_t)blocks.size() < count) {
+            abandon();
+            return;
+        }
+        for (int64_t i = 0; i < count; ++i) {
+            if (kv_->retain_block((int32_t)g, blocks[(size_t)i]) < 0) {
+                abandon();
+                return;
+            }
+            group->blocks[g].push_back(blocks[(size_t)i]);
+        }
+    }
+    group->ready = true;
+}
+
 /* Wall-clock microseconds on a monotonic base. Used only by the live request table -- the step
  * path measures with its own steady_clock points and never calls this. */
 static int64_t mono_us() {
@@ -148,9 +363,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 
 void Scheduler::fini() {
     for (auto& s : reqs_)
-        if (s && s->req && (s->running || s->pending_free)) kv_->free_sequence(s->req->id);
+        if (s && s->req && kv_->has_sequence(s->req->id)) kv_->free_sequence(s->req->id);
     builder_.fini();
     reqs_.clear();
+    shared_prefixes_.clear();
     free_slots_.clear();
     free_cards_.clear();
     by_id_.clear();
@@ -176,6 +392,17 @@ void Scheduler::add_all(std::unique_ptr<Request>* rs, size_t n, int* rc) {
 int Scheduler::add_locked(std::unique_ptr<Request> r) {
     if (!r) return RAD_E_INVAL;
     if (r->prompt.empty()) return RAD_E_INVAL;
+    if (r->token_scores) {
+        auto& sc = *r->token_scores;
+        if (r->score || sc.tokens.empty() || sc.tokens.size() > TokenScores::kMaxCandidates)
+            return RAD_E_INVAL;
+        for (int32_t t : sc.tokens)
+            if (t < 0 || t >= prog_->meta.n_vocab) return RAD_E_INVAL;
+        sc.logits.assign(sc.tokens.size(), 0.0f);
+        r->may_speculate = false;
+        r->n_draft = 0;
+        r->draft = nullptr;
+    }
     if (by_id_.count(r->id)) return RAD_E_DUPLICATE;
     /* NO ENGINE BEHIND THE QUEUE ANY MORE. Accepting would leave the caller waiting on a step
      * that is never coming, so the sink is failed here -- it is the one thing the caller is
@@ -186,6 +413,10 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
         return RAD_E_STATE;
     }
 
+    std::shared_ptr<SharedPrefillState> shared;
+    RAD_TRY(join_shared_prefix(*r, &shared));
+    if (shared) r->may_speculate = false;
+
     int32_t slot;
     if (!free_slots_.empty()) { slot = free_slots_.back(); free_slots_.pop_back(); }
     else { slot = (int32_t)reqs_.size(); reqs_.emplace_back(); }
@@ -193,6 +424,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
 
     SchedReq& s = *reqs_[(size_t)slot];
     s.req = std::move(r);
+    s.shared_prefill = std::move(shared);
     s.arrival = ++arrival_;
     s.arrived_us = mono_us();
     s.first_tok_us = 0;
@@ -358,6 +590,10 @@ void Scheduler::trim_prefix_cache() {
 
 void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
                               bool publish, int status, const char* why) {
+    if (s.shared_prefill && !s.shared_prefill->ready && s.shared_prefill->leader == s.req->id) {
+        s.shared_prefill->disabled = true;
+        s.shared_prefill->capacity_active = false;
+    }
     /* PUBLISH BEFORE FREEING. This is the only moment the sequence's whole prefix is both
      * computed and still owned, and it is what makes the cache a cache rather than a permanently
      * empty lookup: insert() takes its own KV references, so the blocks survive the free below.
@@ -401,7 +637,7 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
          * depending on free_sequence() being idempotent. */
         kv_->free_sequence(s.req->id);
     }
-    if (!defer_free) drop_card(s);
+    if (!defer_free) { drop_card(s); detach_shared_prefix(s); }
     s.running = false;
     s.req->state = st;
     if (s.req->finish_reason.empty() && reason) s.req->finish_reason = reason;
@@ -467,6 +703,7 @@ void Scheduler::release_locked(SchedReq& s) {
     if (s.pending_free) { free_kv(s); s.pending_free = false; --n_deferred_; }
     if (s.reap_pending) { s.reap_pending = false; --n_deferred_; }
     by_id_.erase(s.req->id);
+    detach_shared_prefix(s);
     s.req.reset();
     free_slots_.push_back(s.slot);
 }
@@ -474,6 +711,7 @@ void Scheduler::release_locked(SchedReq& s) {
 void Scheduler::free_kv(SchedReq& s) {
     kv_->free_sequence(s.req->id);
     drop_card(s);
+    detach_shared_prefix(s);
 }
 
 void Scheduler::drop_card(SchedReq& s) {
@@ -712,7 +950,7 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
 
     int64_t want = remaining < budget ? remaining : budget;
 
-    if (geo_.checkpoints()) {
+    if (cfg_.prefix_cache && geo_.checkpoints()) {
         const int64_t I = geo_.checkpoint_interval;
         int64_t next = ((n_computed / I) + 1) * I;      /* strictly after n_computed */
         if (n_computed + want > next) want = next - n_computed;
@@ -827,6 +1065,9 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget) {
     if (budget < std::max<int64_t>(geo_.quantum, 1) && budget < s.seq_len() - r.n_computed)
         return RAD_E_FULL;
 
+    const int shared_status = admit_shared_prefix(s);
+    if (shared_status != RAD_OK) return shared_status;
+
     if (r.n_computed == 0 && cfg_.prefix_cache) {
         /* BEFORE the lookup, because the lookup stops at the first block the tiers hold -- an
          * honest shorter hit, but a shorter one. This is where a cold session gets its
@@ -838,7 +1079,14 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget) {
             cap.tokens = std::max<int64_t>(0, (int64_t)r.prompt.size() - draft_refill_);
             cap.max_give_back = 2 * draft_refill_;
         }
-        const CacheHit h = pc_->lookup(r, &hit_blocks_, draft_refill_ > 0 ? &cap : nullptr);
+        bool use_cap = draft_refill_ > 0;
+        if (s.shared_prefill && !s.shared_prefill->disabled && !s.shared_prefill->ready) {
+            // Leave at least one prefix token to compute and snapshot into the private slot.
+            cap.tokens = (int64_t)s.shared_prefill->tokens.size() - 1;
+            cap.max_give_back = INT64_MAX;
+            use_cap = true;
+        }
+        const CacheHit h = pc_->lookup(r, &hit_blocks_, use_cap ? &cap : nullptr);
         if (h.given_back > 0) {
             m_.draft_refill_tokens += h.given_back;
             ++m_.draft_refills;
@@ -897,7 +1145,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget) {
         s.hit_attn = h.n_attn_tokens;
     }
 
-    int64_t target = s.seq_len();
+    int64_t target = shared_target(s);
     int64_t ckpt = -1;
     int64_t want = plan_chunk(r.n_computed, target, budget, &ckpt);
     int rc = RAD_OK;
@@ -1005,7 +1253,7 @@ const RadBatch* Scheduler::step() {
         SchedReq& s = *reqs_[(size_t)slot];
         Request& r = *s.req;
 
-        const int64_t target = s.seq_len();
+        const int64_t target = shared_target(s);
         const bool prefill = (r.n_computed < (int64_t)r.prompt.size()) ||
                              (r.n_computed + 1 < target);
 
@@ -1122,12 +1370,13 @@ const RadBatch* Scheduler::step() {
         e.n_draft = s.n_draft;
         e.is_prefill = prefill;
         e.ngram = !prefill && s.draft_ngram && s.n_draft > 0;
-        e.produces_token = (r.n_computed + want >= target);
+        e.produces_score = r.token_scores && (r.n_computed + want >= s.seq_len());
+        e.produces_token = !r.token_scores && (r.n_computed + want >= s.seq_len());
         /* The snapshot a hit resumes from, consumed once: the state is in the slot for the whole
          * sequence after this, and restoring it again on a later chunk would rewind it. */
         e.ckpt_restore = s.ckpt_src;
         s.ckpt_src = -1;
-        if (ckpt > 0) {
+        if (!shared_checkpoint(s, e) && ckpt > 0) {
             /* The checkpoint is the state AFTER the last token of the chunk, and that token sits
              * at the interval boundary because the split put it there. */
             int32_t cs = -1;
@@ -1166,7 +1415,8 @@ const RadBatch* Scheduler::step() {
              * have. The server refuses such a prompt at the door; this is the scheduler's own
              * bound for any caller that did not. close_request takes it out of waiting_, so the
              * same index now names the next request. */
-            if (ctx_limit_ > 0 && s.seq_len() >= ctx_limit_) {
+            if (ctx_limit_ > 0 && (s.seq_len() > ctx_limit_ ||
+                                  (s.seq_len() == ctx_limit_ && !s.req->token_scores))) {
                 RAD_WARN("request %llu failed: %lld tokens leave no room in a %lld-token context",
                          (unsigned long long)s.req->id, (long long)s.seq_len(),
                          (long long)ctx_limit_);
@@ -1203,14 +1453,15 @@ const RadBatch* Scheduler::step() {
             e.draft = s.draft;
             e.n_draft = 0;
             e.is_prefill = true;
-            e.produces_token = (r.n_computed + s.sched_tokens >= s.seq_len());
+            e.produces_score = r.token_scores && (r.n_computed + s.sched_tokens >= s.seq_len());
+            e.produces_token = !r.token_scores && (r.n_computed + s.sched_tokens >= s.seq_len());
             /* THE ADMISSION PATH IS THE ONE THAT MATTERS for a restore -- admit_one set ckpt_src
              * moments ago and this is the entry it applies to. Consumed once: the state is in the
              * slot for the rest of the sequence, and restoring it again on a later chunk would
              * rewind the recurrence to where the hit started. */
             e.ckpt_restore = s.ckpt_src;
             s.ckpt_src = -1;
-            if (s.pending_ckpt > 0) {
+            if (!shared_checkpoint(s, e) && s.pending_ckpt > 0) {
                 int32_t cs = -1;
                 if (pc_->reserve_checkpoint(r, s.pending_ckpt, &cs) >= 0 && cs >= 0) {
                     e.ckpt_tok = s.sched_tokens - 1;
@@ -1588,13 +1839,16 @@ int Scheduler::commit(const StepResult& res) {
          * still holding the previous tenant's state. Stream ordering does the rest -- a later
          * restore is enqueued on the same stream behind this save, so validity does not have to
          * wait on the copy landing, only on it being issued. */
-        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && pc_) {
+        const bool private_checkpoint = s.shared_prefill &&
+            e.ckpt_slot >= 0 && e.ckpt_slot == s.shared_prefill->checkpoint;
+        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && pc_ && !private_checkpoint) {
             const int64_t pos = (int64_t)e.ctx_len + e.ckpt_tok + 1;
             pc_->commit_checkpoint(r, pos, last_checkpoint(pos, s.seq_len()));
         }
 
         if (e.is_prefill) {
             r.n_computed += e.n_tokens;
+            publish_shared_prefix(s, e);
             step_prefill_tok_ += e.n_tokens;
             /* Once, when the prompt is fully placed: the admission accounting the usage block
              * reports. `n_cached` is what the prefix cache supplied and is not recomputed here. */
@@ -1715,14 +1969,19 @@ int Scheduler::commit(const StepResult& res) {
             close_request(s, ReqState::Cancelled, "cancelled", carried);
             ++m_.cancelled;
             completed_.push_back(r.id);
+        } else if (e.produces_score) {
+            close_request(s, ReqState::Finished, "scored", carried);
+            ++m_.finished;
+            completed_.push_back(r.id);
         } else if (r.max_tokens > 0 && (int64_t)r.output.size() >= r.max_tokens) {
             r.output.resize((size_t)r.max_tokens);
             close_request(s, ReqState::Finished, "length", carried);
             ++m_.finished;
             completed_.push_back(r.id);
-        } else if (ctx_limit_ > 0 && s.seq_len() >= ctx_limit_) {
+        } else if (!r.token_scores && ctx_limit_ > 0 && s.seq_len() >= ctx_limit_) {
             /* The context is full. The same finish as max_tokens, because to the caller it is
-             * the same thing: the generation ran out of room. */
+             * the same thing: the generation ran out of room. A score-only prompt can fill the
+             * context before all its chunks ran; only produces_score finishes that request. */
             close_request(s, ReqState::Finished, "length", carried);
             ++m_.finished;
             completed_.push_back(r.id);
@@ -1889,6 +2148,8 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         SchedReq& s = *reqs_[(size_t)e.slot];
         if (!s.req || s.req->state != ReqState::Running || !s.running) continue;
         Request& r = *s.req;
+
+        if (r.token_scores) continue;  /* scoring has no continuation for a draft head */
 
         /* THE VERIFIED POSITIONS: the last 1 + n_spec of the entry. Round 1 continues from the
          * last committed one, which is the first of them plus however many drafts were accepted

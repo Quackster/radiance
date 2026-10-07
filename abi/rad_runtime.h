@@ -22,6 +22,7 @@ typedef struct RadCtx RadCtx;
  * Every pointer here is device memory unless the field name says _h. The host mirrors exist
  * because the scheduler and the run phase both need the bounds without a device read. */
 enum { RAD_PHASE_PREFILL = 0, RAD_PHASE_DECODE = 1, RAD_PHASE_MIXED = 2 };
+enum { RAD_MAX_SCORE_CANDIDATES = 4096 };
 
 typedef struct RadKVGroupBatch {
     rad_kvgroup group;
@@ -223,6 +224,18 @@ typedef struct RadBatch {
     int64_t        enc_n_seg;
     const int32_t* enc_cu;             /* [enc_n_seg + 1] device: segment boundaries in patches */
     int32_t        enc_max_seg;        /* host: the longest segment, which bands the attention */
+
+    /* Optional compact vocabulary projection, enabled only for a plugin that calls
+     * rad_declare_token_scores. Each pair selects a gathered output row and a vocabulary
+     * column local to this rank's head. The plugin writes one f32 value per pair.
+     * The leading n_full_logits output rows still require the ordinary vocabulary head
+     * (generation and scoring can share a step). With n_score_values == 0 the existing
+     * n_out/full-head contract applies unchanged. */
+    int64_t        n_score_values;
+    const int32_t* score_rows;         /* [n_score_values] device: indices into out_ids */
+    const int32_t* score_tokens;       /* [n_score_values] device: rank-local vocabulary ids */
+    float*         score_values;       /* [n_score_values] device */
+    int64_t        n_full_logits;
 } RadBatch;
 
 /* ================================================================== operands */

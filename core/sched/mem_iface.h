@@ -122,6 +122,17 @@ struct IKVManager {
      * that restores from a slot the store gave back would read another session's state or
      * nothing, so the scheduler asks before it builds one. */
     virtual bool checkpoint_held(int32_t slot) const = 0;
+
+    /* Request-local branches own their references and snapshots independently of the global
+     * prefix cache. Defaults let an alternate backend decline this optional optimization. */
+    virtual int adopt_prefix(uint64_t, int32_t, const std::vector<int32_t>&, int64_t) {
+        return RAD_E_UNSUPPORTED;
+    }
+    virtual int retain_block(int32_t, int32_t) { return RAD_E_UNSUPPORTED; }
+    virtual void release_block(int32_t, int32_t) {}
+    virtual int alloc_checkpoint(int32_t*) { return RAD_E_UNSUPPORTED; }
+    virtual void free_checkpoint(int32_t) {}
+
 };
 
 /* ------------------------------------------------------------------ the prefix cache */
@@ -313,6 +324,14 @@ struct KVBinding final : IKVManager {
         return m->take_table_changes(s, g);
     }
     bool checkpoint_held(int32_t slot) const override { return m->checkpoint_held(slot); }
+    int adopt_prefix(uint64_t s, int32_t g, const std::vector<int32_t>& b, int64_t n) override {
+        return m->adopt_prefix(s, g, b, n);
+    }
+    int retain_block(int32_t g, int32_t b) override { return m->retain_prefix_block(g, b); }
+    void release_block(int32_t g, int32_t b) override { m->release_prefix_block(g, b); }
+    int alloc_checkpoint(int32_t* slot) override { return m->alloc_checkpoint(slot); }
+    void free_checkpoint(int32_t slot) override { m->free_checkpoint(slot); }
+
 };
 
 /* The prefix cache's own lookup takes tokens and content-hashed multimodal keys rather than a

@@ -1104,6 +1104,20 @@ int KVManager::reserve_specific_block(int32_t g, int32_t b) {
     return RAD_OK;
 }
 
+int KVManager::retain_prefix_block(int32_t g, int32_t b) {
+    if (g < 0 || g >= (int32_t)refcount_.size() || b < 0 ||
+        b >= (int32_t)refcount_[(size_t)g].size() || refcount_[(size_t)g][(size_t)b] <= 0)
+        return RAD_E_INVAL;
+    add_ref((size_t)g, b);
+    return RAD_OK;
+}
+
+void KVManager::release_prefix_block(int32_t g, int32_t b) {
+    if (g >= 0 && g < (int32_t)refcount_.size() && b >= 0 &&
+        b < (int32_t)refcount_[(size_t)g].size() && refcount_[(size_t)g][(size_t)b] > 0)
+        drop_block(g, b);
+}
+
 int KVManager::retain_block(int32_t g, int32_t b) {
     if (g < 0 || g >= (int32_t)refcount_.size()) return RAD_E_INVAL;
     if (b < 0 || b >= (int32_t)refcount_[(size_t)g].size()) return RAD_E_INVAL;
@@ -1263,6 +1277,42 @@ int KVManager::adopt(uint64_t id, int32_t g, const std::vector<int32_t>& blocks,
     s->blocks[(size_t)g] = blocks;
     s->dirty_from[(size_t)g] = 0;
     s->n_tokens = n_tokens;
+    return RAD_OK;
+}
+
+int KVManager::adopt_prefix(uint64_t id, int32_t g, const std::vector<int32_t>& blocks,
+                             int64_t n_tokens) {
+    Seq* seq = find(id);
+    const KVGroupPlan* p = plan(g);
+    if (!seq) return RAD_E_NOTFOUND;
+    if (!p || p->kind != RAD_KV_FULL || n_tokens <= 0 || p->block_size <= 0 ||
+        (int64_t)blocks.size() != ceil_div(n_tokens, p->block_size) ||
+        !seq->blocks[(size_t)g].empty() || (seq->n_tokens && seq->n_tokens != n_tokens))
+        return RAD_E_INVAL;
+    for (int32_t block : blocks)
+        if (block < 0 || block >= p->n_blocks || refcount_[(size_t)g][(size_t)block] <= 0)
+            return RAD_E_INVAL;
+    for (int32_t block : blocks) add_ref((size_t)g, block);
+    seq->blocks[(size_t)g] = blocks;
+    seq->first_block_pos[(size_t)g] = 0;
+    seq->dirty_from[(size_t)g] = 0;
+    seq->n_tokens = n_tokens;
+    return RAD_OK;
+}
+
+int KVManager::copy_blocks(const std::vector<BlockCopy>& copies, RadStream stream) const {
+    for (const BlockCopy& copy : copies) {
+        const KVGroupPlan* p = plan(copy.group);
+        if (!p || !p->paged() || copy.src_block < 0 || copy.dst_block < 0 ||
+            copy.src_block >= p->n_blocks || copy.dst_block >= p->n_blocks) return RAD_E_INVAL;
+        if (p->zero) continue;
+        if (!p->base || p->n_layers <= 0) return RAD_E_STATE;
+        const int64_t bytes = p->layer_bytes_per_block();
+        const auto* src = static_cast<const char*>(p->base) + copy.src_block * bytes;
+        auto* dst = static_cast<char*>(p->base) + copy.dst_block * bytes;
+        RAD_TRY(rad_memcpy_2d_async(dst, p->layer_stride(), src, p->layer_stride(),
+                                    bytes, p->n_layers, stream));
+    }
     return RAD_OK;
 }
 

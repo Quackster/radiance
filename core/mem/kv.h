@@ -221,6 +221,13 @@ public:
      * caller must snapshot-restore into it. */
     int  fork(uint64_t parent, uint64_t child);
 
+    /* A request-local prefix can end inside a block. Its owner retains the source blocks;
+     * ensure() copies a shared partial tail before any branch writes into it. */
+    int adopt_prefix(uint64_t seq, int32_t group, const std::vector<int32_t>& blocks,
+                     int64_t n_tokens);
+    int copy_blocks(const std::vector<BlockCopy>& copies, RadStream stream) const;
+
+
     std::vector<BlockCopy> take_pending_copies();
 
     /* The prefix cache's handle on a block. It holds a reference on every block it indexes, and
@@ -244,6 +251,9 @@ public:
     /* The cache's reference on a block a sequence already holds. The block is marked as the
      * cache's for cache_only_blocks(). */
     int  retain_block(int32_t group, int32_t block);
+    /* Request-local references are not global-cache entries or eligible for eviction. */
+    int  retain_prefix_block(int32_t group, int32_t block);
+    void release_prefix_block(int32_t group, int32_t block);
     /* A reserved block's reference handed to the cache as it stands: marked, not counted again. */
     void cache_reserved_block(int32_t group, int32_t block);
     /* Lets go of the cache's reference on a marked block and of a reservation's on any other. */

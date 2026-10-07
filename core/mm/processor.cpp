@@ -27,6 +27,30 @@ static bool read_triple(const RadModelMeta& m, const char* key, float out[3]) {
 }
 
 int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
+    if (std::strcmp(rad_meta_gets(&m, "vision_config.model_type", ""), "siglip2_vision_model") == 0) {
+        family = VisionFamily::Lfm2;
+        max_segment_patches = rad_meta_geti(&m, "max_num_patches", 1024);
+        patch = (int32_t)rad_meta_geti(&m, "vision_config.patch_size", 16);
+        temporal = 1;
+        merge = (int32_t)rad_meta_geti(&m, "downsample_factor", 2);
+        const int64_t f2 = (int64_t)factor() * factor();
+        image_min_pixels = rad_meta_geti(&m, "preprocessor.min_image_tokens", 64) * f2;
+        image_max_pixels = rad_meta_geti(&m, "preprocessor.max_image_tokens", 256) * f2;
+        min_tiles = (int32_t)rad_meta_geti(&m, "preprocessor.min_tiles", 2);
+        max_tiles = (int32_t)rad_meta_geti(&m, "preprocessor.max_tiles", 10);
+        tile_size = (int32_t)rad_meta_geti(&m, "preprocessor.tile_size", 512);
+        auto flag = [&](const char* k, bool def) {
+            const char* v = rad_meta_gets(&m, k, def ? "true" : "false");
+            return std::strcmp(v, "true") == 0 || std::strcmp(v, "1") == 0;
+        };
+        split_images = flag("preprocessor.do_image_splitting", true);
+        use_thumbnail = flag("preprocessor.use_thumbnail", true);
+        max_pixels_tolerance = rad_meta_getf(&m, "preprocessor.max_pixels_tolerance", 2.0);
+        tok_image = (int32_t)rad_meta_geti(&m, "image_token_id", -1);
+        read_triple(m, "preprocessor.image_mean", mean);
+        read_triple(m, "preprocessor.image_std", stdv);
+        return check(why);
+    }
     patch    = (int32_t)rad_meta_geti(&m, "vision_config.patch_size", 0);
     temporal = (int32_t)rad_meta_geti(&m, "vision_config.temporal_patch_size", 0);
     merge    = (int32_t)rad_meta_geti(&m, "vision_config.spatial_merge_size", 0);
@@ -81,6 +105,18 @@ int VisionConfig::check(std::string* why) const {
     if (image_max_pixels < image_min_pixels)
         return no("image_max_pixels " + std::to_string(image_max_pixels) + " is below image_min_pixels " +
                   std::to_string(image_min_pixels));
+    if (family == VisionFamily::Lfm2) {
+        if (patch <= 0 || merge <= 0 || temporal != 1 || max_segment_patches <= 0) return no("invalid LFM2 vision geometry");
+        if (tok_image < 0) return no("image_token_id is missing");
+        if (min_tiles < 1 || max_tiles < min_tiles || max_tiles > 16 ||
+            tile_size < factor() || tile_size % factor()) return no("invalid LFM2 tile configuration");
+        if (!(max_pixels_tolerance > 0.0) || !std::isfinite(max_pixels_tolerance))
+            return no("max_pixels_tolerance must be finite and positive");
+        for (int c = 0; c < 3; ++c)
+            if (!std::isfinite(mean[c]) || !(stdv[c] > 0.0f) || !std::isfinite(stdv[c]))
+                return no("image_mean and image_std must be finite, and image_std positive");
+        return RAD_OK;
+    }
     if (video_min_pixels <= 0) return no("video_min_pixels must be positive");
     if (video_max_pixels < video_min_pixels)
         return no("video_max_pixels " + std::to_string(video_max_pixels) + " is below video_min_pixels " +
@@ -192,20 +228,21 @@ inline double bicubic(double x) {
     return 0.0;
 }
 
-inline uint8_t clip8(int32_t v) {
-    const int32_t s = v >> kPrec;
+inline uint8_t clip8(int32_t v, int precision) {
+    const int32_t s = v >> precision;
     return (uint8_t)(s < 0 ? 0 : (s > 255 ? 255 : s));
 }
 
 /* One axis: `bounds` gets (first, count) per output pixel and `kk` its fixed-point weights, `ksize`
  * a row. */
 int coeffs(int32_t in_size, int32_t out_size, std::vector<int32_t>* bounds,
-           std::vector<int32_t>* kk) {
+           std::vector<int32_t>* kk, int* precision, bool tensor) {
     const double scale = (double)in_size / (double)out_size;
     const double fscale = scale < 1.0 ? 1.0 : scale;
     const double support = 2.0 * fscale;
     const int ksize = (int)std::ceil(support) * 2 + 1;
-    std::vector<double> k((size_t)ksize);
+    std::vector<double> k((size_t)ksize), weights((size_t)out_size * ksize);
+    double largest = 0.0;
     bounds->assign((size_t)out_size * 2, 0);
     kk->assign((size_t)out_size * (size_t)ksize, 0);
     for (int xx = 0; xx < out_size; ++xx) {
@@ -227,23 +264,35 @@ int coeffs(int32_t in_size, int32_t out_size, std::vector<int32_t>* bounds,
             if (ww != 0.0) k[(size_t)x] /= ww;
         for (; x < ksize; ++x) k[(size_t)x] = 0.0;
         for (x = 0; x < ksize; ++x) {
-            const double v = k[(size_t)x];
-            (*kk)[(size_t)xx * ksize + x] = v < 0 ? (int32_t)(-0.5 + v * (1 << kPrec))
-                                                  : (int32_t)(0.5 + v * (1 << kPrec));
+            weights[(size_t)xx * ksize + x] = k[(size_t)x];
+            largest = std::max(largest, k[(size_t)x]);
         }
         (*bounds)[(size_t)xx * 2]     = xmin;
         (*bounds)[(size_t)xx * 2 + 1] = xmax;
+    }
+    *precision = kPrec;
+    /* torchvision's native uint8 bicubic uses int16 coefficients and chooses the
+     * highest precision that fits, independently per axis. PIL uses 22 bits.
+     * Both round to uint8 between the two passes. */
+    if (tensor) {
+        for (*precision = 0; *precision < 22; ++*precision)
+            if ((int)(0.5 + largest * (1 << (*precision + 1))) >= (1 << 15)) break;
+    }
+    for (size_t i = 0; i < weights.size(); ++i) {
+        const double v = weights[i] * (1 << *precision);
+        (*kk)[i] = (int32_t)(v < 0 ? -0.5 + v : 0.5 + v);
     }
     return ksize;
 }
 
 }  /* namespace */
 
-void resize_bicubic(const Frame& in, int32_t w, int32_t h, Frame* out) {
+static void resize_bicubic_impl(const Frame& in, int32_t w, int32_t h, Frame* out, bool tensor) {
     if (in.w == w && in.h == h) { *out = in; return; }
     std::vector<int32_t> bh, kh, bv, kv;
-    const int ksh = coeffs(in.w, w, &bh, &kh);
-    const int ksv = coeffs(in.h, h, &bv, &kv);
+    int ph = kPrec, pv = kPrec;
+    const int ksh = coeffs(in.w, w, &bh, &kh, &ph, tensor);
+    const int ksv = coeffs(in.h, h, &bv, &kv, &pv, tensor);
 
     /* The source rows the vertical pass reads, which is all the horizontal pass has to produce. */
     const int y_first = bv[0];
@@ -265,16 +314,16 @@ void resize_bicubic(const Frame& in, int32_t w, int32_t h, Frame* out) {
             for (int xx = 0; xx < w; ++xx) {
                 const int xmin = bh[(size_t)xx * 2], xmax = bh[(size_t)xx * 2 + 1];
                 const int32_t* k = kh.data() + (size_t)xx * ksh;
-                int32_t s0 = 1 << (kPrec - 1), s1 = s0, s2 = s0;
+                int32_t s0 = 1 << (ph - 1), s1 = s0, s2 = s0;
                 for (int x = 0; x < xmax; ++x) {
                     const uint8_t* p = row + (size_t)(x + xmin) * 3;
                     s0 += p[0] * k[x];
                     s1 += p[1] * k[x];
                     s2 += p[2] * k[x];
                 }
-                o[xx * 3 + 0] = clip8(s0);
-                o[xx * 3 + 1] = clip8(s1);
-                o[xx * 3 + 2] = clip8(s2);
+                o[xx * 3 + 0] = clip8(s0, ph);
+                o[xx * 3 + 1] = clip8(s1, ph);
+                o[xx * 3 + 2] = clip8(s2, ph);
             }
         }
         src = &tmp;
@@ -289,18 +338,22 @@ void resize_bicubic(const Frame& in, int32_t w, int32_t h, Frame* out) {
         const int32_t* k = kv.data() + (size_t)yy * ksv;
         uint8_t* o = out->rgb.data() + (size_t)yy * src->w * 3;
         for (int xx = 0; xx < src->w; ++xx) {
-            int32_t s0 = 1 << (kPrec - 1), s1 = s0, s2 = s0;
+            int32_t s0 = 1 << (pv - 1), s1 = s0, s2 = s0;
             for (int y = 0; y < ymax; ++y) {
                 const uint8_t* p = src->rgb.data() + ((size_t)(y + ymin) * src->w + xx) * 3;
                 s0 += p[0] * k[y];
                 s1 += p[1] * k[y];
                 s2 += p[2] * k[y];
             }
-            o[xx * 3 + 0] = clip8(s0);
-            o[xx * 3 + 1] = clip8(s1);
-            o[xx * 3 + 2] = clip8(s2);
+            o[xx * 3 + 0] = clip8(s0, pv);
+            o[xx * 3 + 1] = clip8(s1, pv);
+            o[xx * 3 + 2] = clip8(s2, pv);
         }
     }
+}
+
+void resize_bicubic(const Frame& in, int32_t w, int32_t h, Frame* out) {
+    resize_bicubic_impl(in, w, h, out, false);
 }
 
 /* ================================================================== patches */
@@ -321,6 +374,10 @@ void content_key(const Item& it, uint64_t* hi, uint64_t* lo) {
     uint64_t a = 0x6a09e667f3bcc908ull ^ mix64((uint64_t)it.grid_t << 42 ^
                                                (uint64_t)it.grid_h << 21 ^ (uint64_t)it.grid_w);
     uint64_t b = 0xbb67ae8584caa73bull ^ mix64(it.kind == Kind::Image ? 1u : 2u);
+    for (const auto& seg : it.segments) {
+        a = mix64(a ^ (uint64_t)seg.h << 32 ^ (uint64_t)seg.w);
+        b = mix64(b + (uint64_t)seg.patch0);
+    }
     const uint8_t* p = reinterpret_cast<const uint8_t*>(it.pixels.data());
     const size_t n = it.pixels.size() * sizeof(uint16_t);
     size_t i = 0;
@@ -389,7 +446,8 @@ void finish_item(const VisionConfig& c, Item* it) {
 /* ================================================================== the processor */
 
 int Processor::init(const VisionConfig& cfg,
-                    std::function<std::vector<int32_t>(const std::string&)> encode_text) {
+                    std::function<std::vector<int32_t>(const std::string&)> encode_text,
+                    std::function<std::vector<int32_t>(const std::string&)> encode_special) {
     if (cfg.patch <= 0 || cfg.temporal <= 0 || cfg.merge <= 0 || cfg.max_patches <= 0)
         return RAD_E_INVAL;
     cfg_ = cfg;
@@ -400,12 +458,33 @@ int Processor::init(const VisionConfig& cfg,
     if (cfg_.image_min_pixels > cfg_.image_max_pixels) cfg_.image_min_pixels = cfg_.image_max_pixels;
     if (cfg_.max_video_patches <= 0)
         cfg_.max_video_patches = cfg_.video_max_pixels / ((int64_t)cfg.patch * cfg.patch);
+    if (cfg_.family == VisionFamily::Lfm2) {
+        if (!encode_special) return RAD_E_INVAL;
+        auto special = [&](const std::string& text) {
+            const auto ids = encode_special(text);
+            return ids.size() == 1 ? ids[0] : -1;
+        };
+        cfg_.tok_start = special("<|image_start|>");
+        cfg_.tok_end = special("<|image_end|>");
+        tok_thumbnail_ = special("<|img_thumbnail|>");
+        if (cfg_.tok_start < 0 || cfg_.tok_end < 0 || tok_thumbnail_ < 0) return RAD_E_INVAL;
+        tile_tokens_.assign((size_t)cfg_.max_tiles * cfg_.max_tiles, -1);
+        for (int row = 0; row < cfg_.max_tiles; ++row)
+            for (int col = 0; col < cfg_.max_tiles; ++col) {
+                if ((row + 1) * (col + 1) > cfg_.max_tiles) continue;
+                auto id = special("<|img_row_" + std::to_string(row + 1) + "_col_" +
+                                  std::to_string(col + 1) + "|>");
+                if (id < 0) return RAD_E_INVAL;
+                tile_tokens_[(size_t)row * cfg_.max_tiles + col] = id;
+            }
+    }
     encode_text_ = std::move(encode_text);
     return RAD_OK;
 }
 
 int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
     const VisionConfig& c = cfg_;
+    if (c.family == VisionFamily::Lfm2) return image_lfm2(f, out, why);
     int64_t h = 0, w = 0;
     RAD_TRY(smart_resize_image(f.h, f.w, c.factor(), c.image_min_pixels, c.image_max_pixels,
                                &h, &w, why));
@@ -431,6 +510,120 @@ int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::strin
     it->seg_at.push_back(1);
     it->expand.insert(it->expand.end(), (size_t)it->seg_rows, c.tok_image);
     it->expand.push_back(c.tok_end);
+    *out = std::move(it);
+    return RAD_OK;
+}
+
+/* LFM2-VL uses RGB values within each patch, a variable tile grid and ordinary
+ * token positions. Tiles attend independently, including the optional thumbnail. */
+int Processor::image_lfm2(const Frame& input, std::shared_ptr<Item>* out, std::string* why) const {
+    const auto& c = cfg_;
+    auto no = [&](const char* msg) { if (why) *why = msg; return RAD_E_INVAL; };
+    if (input.w <= 0 || input.h <= 0 || input.rgb.size() != (size_t)input.w * input.h * 3)
+        return no("the picture has no valid RGB pixels");
+    Frame capped;
+    const Frame* source = &input;
+    const int64_t area = (int64_t)input.w * input.h;
+    if (c.cap_image_pixels > 0 && area > c.cap_image_pixels) {
+        const double scale = std::sqrt((double)c.cap_image_pixels / area);
+        resize_bicubic(input, std::max(1, (int)(input.w * scale)),
+                       std::max(1, (int)(input.h * scale)), &capped);
+        source = &capped;
+    }
+    const Frame& f = *source;
+    const int factor = c.factor();
+    int64_t h = std::max<int64_t>(factor, pyround((double)f.h / factor) * factor);
+    int64_t w = std::max<int64_t>(factor, pyround((double)f.w / factor) * factor);
+    const int64_t rh = std::max<int64_t>(c.patch, pyround((double)f.h / factor) * factor);
+    const int64_t rw = std::max<int64_t>(c.patch, pyround((double)f.w / factor) * factor);
+    const bool large = (double)(rh * rw) > c.image_max_pixels * c.max_pixels_tolerance;
+    if (h * w > c.image_max_pixels) {
+        const double beta = std::sqrt((double)((int64_t)f.h * f.w) / c.image_max_pixels);
+        h = std::max<int64_t>(factor, (int64_t)std::floor(f.h / beta / factor) * factor);
+        w = std::max<int64_t>(factor, (int64_t)std::floor(f.w / beta / factor) * factor);
+    } else if (h * w < c.image_min_pixels) {
+        const double beta = std::sqrt((double)c.image_min_pixels / ((int64_t)f.h * f.w));
+        h = (int64_t)std::ceil(f.h * beta / factor) * factor;
+        w = (int64_t)std::ceil(f.w * beta / factor) * factor;
+    }
+    if (h / c.patch * (w / c.patch) > std::min(c.max_patches, c.max_segment_patches))
+        return no("the image aspect ratio needs more patches than the encoder segment limit");
+    int cols = 1, rows = 1;
+    if (large && c.split_images && c.max_tiles > 1) {
+        double best = INFINITY;
+        const double ratio = (double)f.w / f.h;
+        /* Sorted by tile count, as the reference. Equal ratios prefer the larger
+         * grid only when the original image covers more than half its area. */
+        for (int n = c.min_tiles; n <= c.max_tiles; ++n)
+            for (int x = 1; x <= n; ++x) {
+                if (n % x) continue;
+                const int y = n / x;
+                const double diff = std::abs(ratio - (double)x / y);
+                if (diff < best || (diff == best && (int64_t)f.w * f.h > 0.5 * c.tile_size * c.tile_size * n)) {
+                    best = diff; cols = x; rows = y;
+                }
+            }
+    }
+    const bool tiled = cols * rows > 1;
+    if (tiled && (int64_t)(c.tile_size / c.patch) * (c.tile_size / c.patch) > std::min(c.max_patches, c.max_segment_patches))
+        return no("a tile has more patches than one encoder pass holds");
+    auto it = std::make_shared<Item>();
+    it->linear_positions = true;
+    it->patch_dim = c.patch_dim();
+    /* The entire grid is known before patchification. Reserving at each tile grows
+     * and copies the already packed pixels repeatedly for a large picture. */
+    const int64_t tile_patches = tiled ? (int64_t)cols * rows *
+        (c.tile_size / c.patch) * (c.tile_size / c.patch) : 0;
+    const int64_t thumbnail_patches = (!tiled || c.use_thumbnail) ?
+        (h / c.patch) * (w / c.patch) : 0;
+    it->pixels.reserve((size_t)(tile_patches + thumbnail_patches) * it->patch_dim);
+    it->segments.reserve((size_t)(tiled ? cols * rows : 0) + ((!tiled || c.use_thumbnail) ? 1 : 0));
+    it->expand.push_back(c.tok_start);
+    uint16_t lut[3][256];
+    for (int ch = 0; ch < 3; ++ch)
+        for (int v = 0; v < 256; ++v)
+            lut[ch][v] = rad_f32_to_bf16(((float)v - 255.0f * c.mean[ch]) / (255.0f * c.stdv[ch]));
+    auto append = [&](const Frame& frame, int x0, int y0, int width, int height) {
+        const int gh = height / c.patch, gw = width / c.patch;
+        it->segments.push_back({gh, gw, it->n_patch});
+        it->n_patch += (int64_t)gh * gw;
+        it->seg_at.push_back((int32_t)it->expand.size());
+        it->expand.insert(it->expand.end(), (size_t)gh * gw / (c.merge * c.merge), c.tok_image);
+        for (int bh = 0; bh < gh / c.merge; ++bh)
+            for (int bw = 0; bw < gw / c.merge; ++bw)
+                for (int mh = 0; mh < c.merge; ++mh)
+                    for (int mw = 0; mw < c.merge; ++mw)
+                        for (int y = 0; y < c.patch; ++y)
+                            for (int x = 0; x < c.patch; ++x)
+                                for (int ch = 0; ch < 3; ++ch) {
+                                    const int py = y0 + (bh * c.merge + mh) * c.patch + y;
+                                    const int px = x0 + (bw * c.merge + mw) * c.patch + x;
+                                    it->pixels.push_back(lut[ch][frame.rgb[((size_t)py * frame.w + px) * 3 + ch]]);
+                                }
+    };
+    if (tiled) {
+        Frame big;
+        resize_bicubic_impl(f, cols * c.tile_size, rows * c.tile_size, &big, true);
+        for (int y = 0; y < rows; ++y)
+            for (int x = 0; x < cols; ++x) {
+                it->expand.push_back(tile_tokens_[(size_t)y * c.max_tiles + x]);
+                append(big, x * c.tile_size, y * c.tile_size, c.tile_size, c.tile_size);
+            }
+    }
+    if (!tiled || c.use_thumbnail) {
+        Frame small;
+        resize_bicubic_impl(f, (int32_t)w, (int32_t)h, &small, true);
+        if (tiled) it->expand.push_back(tok_thumbnail_);
+        append(small, 0, 0, small.w, small.h);
+    }
+    it->expand.push_back(c.tok_end);
+    it->grid_t = it->n_seg = (int32_t)it->segments.size();
+    it->grid_h = it->segments[0].h;
+    it->grid_w = it->segments[0].w;
+    it->rows_h = it->grid_h / c.merge;
+    it->rows_w = it->grid_w / c.merge;
+    it->seg_rows = it->rows_h * it->rows_w;
+    content_key(*it, &it->key_hi, &it->key_lo);
     *out = std::move(it);
     return RAD_OK;
 }
@@ -552,14 +745,15 @@ void PromptMedia::layout() {
             pos += run_tok - tok;            /* the text in front of the run counts up */
             RopeLayout::Run r;
             r.tok = (int32_t)run_tok;
-            r.n = it.seg_rows;
-            r.w = it.rows_w;
+            r.n = (int32_t)it.segment_rows(s);
+            r.w = it.segment_w(s) / it.merge_size();
+            r.linear = it.linear_positions;
             r.base = (int32_t)pos;
-            pos += std::max(it.rows_h, it.rows_w);
-            tok = run_tok + it.seg_rows;
+            pos += r.linear ? r.n : std::max(it.segment_h(s), it.segment_w(s)) / it.merge_size();
+            tok = run_tok + r.n;
             r.shift = (int32_t)(pos - tok);
             r.item = (int32_t)pi;
-            r.row0 = s * it.seg_rows;
+            r.row0 = (int32_t)it.row_at(s);
             rope.runs.push_back(r);
         }
     }

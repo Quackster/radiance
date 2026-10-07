@@ -993,6 +993,10 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     mix((uint64_t)b->n_tok_decode);    mix((uint64_t)b->max_q_len_decode);
     mix((uint64_t)b->max_q_len_prefill); mix((uint64_t)b->n_draft_out); mix((uint64_t)b->n_ahead);
     mix((uint64_t)b->rope_mixed);      ptr(b->rope_pos);
+    /* Compact scoring changes both the issued head and its raw operands. Staging storage can
+     * move after a larger candidate request; a tape must never retain those old pointers. */
+    mix((uint64_t)b->n_score_values); mix((uint64_t)b->n_full_logits);
+    ptr(b->score_rows); ptr(b->score_tokens); ptr(b->score_values);
     ptr(b->token_ids);  ptr(b->positions);  ptr(b->cu_seqlens);    ptr(b->seq_ids);
     ptr(b->out_ids);    ptr(b->q_lens);     ptr(b->ctx_lens);      ptr(b->num_accepted);
     ptr(b->spec_parent); ptr(b->checkpoint_tok); ptr(b->checkpoint_slot); ptr(b->draft_out_ids);

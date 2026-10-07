@@ -443,6 +443,10 @@ int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
  * the first step. An embedding-only or encoder-only plugin declares none, deliberately. */
 int rad_declare_logits(RadBuilder* b, rad_buf logits);
 
+/* Opt in to RadBatch's compact token-score projection. Ordinary logits remain declared
+ * and available for generation or an engine that supplies no compact score pairs. */
+int rad_declare_token_scores(RadBuilder* b);
+
 
 /* ================================================================== the drafter */
 /* WHAT THE PLUGIN'S DRAFT HEAD IS, declared the same way and for the same reason the logits
