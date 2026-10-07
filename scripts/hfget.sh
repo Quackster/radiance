@@ -20,16 +20,25 @@
 # saturate the link and more only makes the destination seek.
 set -e
 
-# ---- child mode: one file, named by "<size><tab><path>" in $1, everything else inherited -------
+# ---- child mode: one file, named by "<oid><tab><size><tab><path>" in $1, everything else inherited
 # sh cannot export a function, so parallelism is one re-entry of this script per file under
 # `xargs -P` rather than a worker pool.
 if [ -n "$HFGET_CHILD" ]; then
-    size=${1%%	*}; path=${1#*	}
+    oid=${1%%	*}; rest=${1#*	}; size=${rest%%	*}; path=${rest#*	}
+    key=${oid:-$size}                                  # LFS: sha256, non-LFS: size
     out=$HFGET_DEST/$path
-    if [ -f "$out" ]; then
-        cur=$(wc -c < "$out")
-        if [ "$cur" = "$size" ]; then echo "  = $path"; exit 0; fi
-        echo "  + $path (resuming at $cur of $size)"
+    man=$HFGET_DEST/.hfget-manifest
+    rec=""; [ -f "$man" ] && rec=$(p="$path" awk -F'\t' '$2==ENVIRON["p"]{print $1; exit}' "$man")
+    if [ -f "$out" ] && [ "$(wc -c < "$out")" = "$size" ]; then
+        if [ -z "$rec" ] || [ "$rec" = "$key" ]; then  # warm: size ok AND content-key matches (or unrecorded)
+            echo "  = $path"
+            printf '%s\t%s\n' "$key" "$path" >> "$HFGET_MAN_OUT"
+            exit 0
+        fi
+        rm -f "$out"                                   # SAME SIZE, NEW CONTENT: resume is size-based and useless -> fresh
+        echo "  ~ $path (same size, new content)"
+    elif [ -f "$out" ]; then
+        echo "  + $path (resuming at $(wc -c < "$out") of $size)"
     else
         echo "  > $path"
     fi
@@ -44,6 +53,7 @@ if [ -n "$HFGET_CHILD" ]; then
     fi
     got=$(wc -c < "$out")
     [ "$got" = "$size" ] || { echo "hfget: $path is $got bytes, listing says $size" >&2; exit 1; }
+    printf '%s\t%s\n' "$key" "$path" >> "$HFGET_MAN_OUT"
     exit 0
 fi
 
@@ -87,12 +97,12 @@ sel='.[] | select(.type == "file")'
 [ "$have_st" -gt 0 ] && sel="$sel"' | select((.path | test("\\.(bin|pth|msgpack|h5|onnx|onnx_data|gguf)$")) | not)'
 
 list=$(mktemp "${TMPDIR:-/tmp}/hfget.XXXXXX")
-trap 'rm -f "$list"' EXIT INT TERM
-printf '%s' "$listing" | jq -r "$sel"' | "\(.size)\t\(.path)"' > "$list"
+trap 'rm -f "$list" "$dest/.hfget-manifest.tmp"' EXIT INT TERM
+printf '%s' "$listing" | jq -r "$sel"' | "\(.lfs.oid // "")\t\(.size)\t\(.path)"' > "$list"
 
 n=$(wc -l < "$list")
 [ "$n" -gt 0 ] || { echo "hfget: the listing has no files" >&2; exit 1; }
-need=$(awk -F'\t' '{s += $1} END {printf "%.1f", s / 1073741824}' "$list")
+need=$(awk -F'\t' '{s += $2} END {printf "%.1f", s / 1073741824}' "$list")
 mkdir -p "$dest"
 free=$(df -BG --output=avail "$dest" | tail -1 | tr -dc '0-9')
 echo "hfget: $n file(s), $need GiB -> $dest"
@@ -100,8 +110,9 @@ echo "hfget: $n file(s), $need GiB -> $dest"
 echo "hfget: $free GiB free on the destination filesystem"
 awk -v n="$need" -v f="$free" 'BEGIN { if (n > f) { print "hfget: THE DOWNLOAD DOES NOT FIT"; exit 1 } }'
 
-export HFGET_CHILD=1 HFGET_DEST="$dest" HFGET_REPO="$repo" HFGET_REV="$rev"
+export HFGET_CHILD=1 HFGET_DEST="$dest" HFGET_REPO="$repo" HFGET_REV="$rev" HFGET_MAN_OUT="$dest/.hfget-manifest.tmp"
 self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 tr '\n' '\0' < "$list" | xargs -0 -P "$jobs" -I{} sh "$self" "{}" \
     || { echo "hfget: incomplete -- re-run to resume" >&2; exit 1; }
+mv "$HFGET_MAN_OUT" "$dest/.hfget-manifest"
 echo "hfget: complete -- $(du -sh "$dest" | cut -f1) in $dest"

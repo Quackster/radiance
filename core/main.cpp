@@ -9,6 +9,8 @@ int main(int argc, char** argv) {
     if (s == 1) { rad::config_usage(argv[0]); return 0; }
     if (s < 0)  { rad::config_usage(argv[0]); return 2; }
 
+    if (!rad::resolve_hf_model(cfg)) return 2;   /* --model given as an HF repo id: fetch + rewrite */
+
     rad::Engine engine(std::move(cfg));
 
     s = engine.start();

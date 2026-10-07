@@ -921,4 +921,5 @@ struct Config {
 namespace rad {
 int  config_parse(int argc, char** argv, Config* c);
 void config_usage(const char* argv0);
+bool resolve_hf_model(Config& c);   /* --model given as an HF repo id: fetch into the cache, rewrite c.model */
 }
