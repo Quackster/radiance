@@ -915,7 +915,8 @@ static void rmsnorm_rounding_case(const Plugin& pl) {
         auto evaluate = [&](void* weight, float add, int flag, float mult = 1.0f) {
             std::vector<uint16_t> out((size_t)M * yld, h_to_bf16(-7.0f));
             st_memcpy(dy, out.data(), out.size() * 2, hipMemcpyHostToDevice);
-            ts[1].data = weight;
+            ts[1] = T(weight, wf32 ? RAD_F32 : RAD_BF16, {n});
+            if (!weight) absent(ts[1]);
             std::vector<RadParam> ps = {
                 PI("M", M), PI("n", n), PF("eps", 1e-6), PS("dtype", "bf16"), PF("wadd", add),
             };
