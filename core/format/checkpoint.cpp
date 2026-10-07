@@ -522,6 +522,67 @@ void Checkpoint::detect_import() {
         else
             import_why_ = "Quark's weight scheme here is not MXFP4 (fp4, per_group 32, e8m0 scales) "
                           "throughout, which is the one this reads";
+    } else if (qm == "compressed-tensors" || qm == "modelopt") {
+        /* THE NVFP4 SIGNATURE: 4-bit weights, an e4m3 scale a 16 of K,
+         * an f32 global a tensor, stated in two schemas. The flat one
+         * puts the weight's own description at the top level --
+         * `weights.type` (some tools write `weights.dtype`) fp4 /
+         * e2m1 / nvfp4, with `weights.group_size` 16. The
+         * compressed-tensors one states it per group under
+         * `config_groups`: a group in the format
+         * `nvfp4-pack-quantized` is the NVFP4 one (the 4-bit group
+         * of 16 with its e4m3 table), and a release that mixes
+         * NVFP4 MLPs with FP8 or bf16 linears carries several
+         * groups, so the test is SOME group, not all, under a
+         * top-level `format` of `mixed-precision`. A single-group
+         * config may state its format at the top level instead.
+         * The tensors confirm the form at the weight, so a config
+         * that says one thing and holds another is refused there,
+         * by name. A file that is this tool's in another scheme --
+         * its FP8 releases, its int4 packings -- reads stock, and
+         * a weight the recipe does not name is refused by the loader
+         * with the remedy. */
+        std::string t = qc("weights.type");
+        if (t.empty()) t = qc("weights.dtype");
+        const std::string gs = qc("weights.group_size");
+        const bool flat = (t == "fp4" || t == "e2m1" || t == "nvfp4") &&
+                          gs == "16";
+        bool groups = qc("format") == "nvfp4-pack-quantized";
+        std::vector<std::string> others;
+        for (size_t i = 0; i < meta_.keys.size(); ++i) {
+            const std::string& k = meta_.keys[i];
+            if (k.rfind("quantization_config.config_groups.", 0) != 0 ||
+                k.compare(k.size() - 7, 7, ".format") != 0)
+                continue;
+            if (meta_.vals[i] == "nvfp4-pack-quantized") {
+                groups = true;
+                continue;
+            }
+            bool seen = false;
+            for (const std::string& f : others)
+                seen = seen || f == meta_.vals[i];
+            if (!seen) others.push_back(meta_.vals[i]);
+        }
+        std::string formats;
+        for (size_t i = 0; i < others.size(); ++i)
+            formats += (i ? ", " : "") + others[i];
+        if (flat || groups) import_ = Import::Nvfp4;
+        else {
+            std::string have;
+            if (!t.empty())
+                have = "its weights are " + t +
+                       (gs.empty() ? "" : " in a " + gs + "-wide group");
+            if (!formats.empty()) {
+                if (!have.empty()) have += ", and ";
+                have += "its config groups are in the format " + formats;
+            }
+            if (have.empty())
+                have = "it states neither a weight type nor a config group";
+            import_why_ = qm + "'s config is not NVFP4: " + have +
+                          "; this reads the weight's type fp4, e2m1 or nvfp4 "
+                          "in a 16-wide group, or a config group in the format "
+                          "nvfp4-pack-quantized";
+        }
     }
     /* THE TOOL'S DESCRIPTION IS KEPT, UNDER ANOTHER NAME. A plugin reads quantization_config as
      * the statement of the format it serves (qwen35_fp8 checks quant_method is "fp8"), and an
@@ -564,6 +625,76 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
         sliced_.push_back(std::move(c));
         *codes = &sliced_.back();
         sliced_.push_back(std::move(x));
+        *scale = &sliced_.back();
+        imported_[name] = { *codes, *scale };
+        return RAD_OK;
+    }
+
+    if (import_ == Import::Nvfp4) {
+        /* NVFP4 AS SHIPPED: `X.weight_packed` U8 [N, K/2] -- two e2m1 codes a byte, the even k
+         * in the low nibble -- `X.weight_scale` e4m3 [N, K/16], and `X.weight_global_scale` f32:
+         * the DIVISOR the checkpoint's quantiser scaled the weights by, which a dequant applies
+         * in reverse. The core's affine scheme multiplies, so the scale the weight is read as is
+         * the e4m3 table divided by the divisor, one f32 a 16 of K, owned: vLLM's own scheme and
+         * the TensorRT-LLM runner both reciprocal the divisor at load for exactly this reason, and
+         * the division is their dequant's first step, so the values it yields are the values they
+         * measured.
+         *
+         * A tensor WITHOUT its three is not NVFP4: the release is mixed (its non-MLP layers ship
+         * FP8 or bf16 beside the NVFP4 MLPs) and the stock path reads those. */
+        const std::string suffix = ".weight";
+        if (name.size() <= suffix.size() ||
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+            return RAD_E_NOTFOUND;
+        const std::string base = name.substr(0, name.size() - suffix.size());
+        const SrcTensor* p = find(base + ".weight_packed");
+        if (!p) return RAD_E_NOTFOUND;
+        if (p->rad_dtype != RAD_U8 || p->shape.size() != 2)
+            return refuse(RAD_E_FORMAT, "'" + p->name + "' is not the U8 [N, K/2] packed tensor the"
+                                          " NVFP4 form ships beside its scales");
+        const SrcTensor* s = find(base + ".weight_scale");
+        if (!s || s->rad_dtype != RAD_F8E4M3 || s->shape.size() != 2)
+            return refuse(RAD_E_FORMAT, "'" + name + "' has no e4m3 [N, K/16] weight_scale beside "
+                                          "its packed codes, which is the form this reads");
+        const SrcTensor* g = find(base + ".weight_global_scale");
+        if (!g || g->rad_dtype != RAD_F32 || g->bytes != 4)
+            return refuse(RAD_E_FORMAT, "'" + name +
+                                          "' has no single f32 weight_global_scale beside its "
+                                          "packed codes, which is the form this reads");
+        const int64_t N = p->shape[0], K = p->shape[1] * 2;
+        if (N <= 0 || p->shape[1] <= 0 || K % 16)
+            return refuse(RAD_E_SHAPE, "'" + p->name + "' packs " + std::to_string(K) +
+                                         " columns of K, which the 16-wide e4m3 scale does not "
+                                         "divide");
+        if (s->shape[0] != N || s->shape[1] != K / 16)
+            return refuse(RAD_E_SHAPE, "'" + s->name + "' is not the [" + std::to_string(N) +
+                                         ", " + std::to_string(K / 16) + "] e4m3 scale of '"
+                                         + p->name + "'");
+        float d;
+        std::memcpy(&d, g->data, 4);
+        if (!(d > 0.0f) || !std::isfinite(d))
+            return refuse(RAD_E_FORMAT, "'" + g->name + "' is not a usable f32 divisor: " +
+                                         std::to_string(d));
+        /* The folded table: the e4m3 value -- exact in f32 -- over the divisor, one rounding: the
+         * quotient their dequant forms before it multiplies the codes, so the value a piece decodes
+         * to is the value that piece's global was measured with. */
+        const int64_t nsc = N * (K / 16);
+        std::unique_ptr<uint8_t> raw(new uint8_t[(size_t)nsc * 4]);
+        float* tab = (float*)raw.get();
+        const uint8_t* sb = (const uint8_t*)s->data;
+        for (int64_t i = 0; i < nsc; ++i) tab[i] = rad_fp8e4m3_to_f32(sb[(size_t)i]) / d;
+        owned_.push_back(std::move(raw));
+        SrcTensor sv = *s;
+        sv.rad_dtype = RAD_F32;
+        sv.data      = owned_.back().get();
+        sv.bytes     = nsc * 4;
+        SrcTensor pv = *p;
+        pv.rad_dtype = RAD_FP4E2M1;
+        pv.shape     = { p->shape[0], K };
+        sliced_.push_back(std::move(pv));
+        const SrcTensor* pc = &sliced_.back();   /* the code view; a deque keeps it stable */
+        sliced_.push_back(std::move(sv));
+        *codes = pc;
         *scale = &sliced_.back();
         imported_[name] = { *codes, *scale };
         return RAD_OK;
@@ -726,9 +857,6 @@ const SrcTensor* Checkpoint::slice(const SrcTensor& st, int index, const char* d
 
 namespace {
 
-/* FP8's scale plane is a companion tensor: `X.weight` is scaled by `X.weight_scale_inv`. */
-std::string scale_name(const std::string& codes) { return codes + "_scale_inv"; }
-
 }  /* namespace */
 
 std::string ckpt_tensor_of(const SrcTensor& t) {
@@ -785,7 +913,12 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
     const bool alternatives = maps.front()->mode == RAD_MAP_COPY && srcs.size() > 1;
     for (const Src1& s1 : srcs) {
         const SrcTensor* st = ck.find(s1.name);
-        const SrcTensor* sc = st ? ck.find(scale_name(s1.name)) : nullptr;
+        /* THE SCALE PLANE OF A SCALED WEIGHT: the checkpoint's two fp8 spellings, the block one
+         * first -- `X.weight_scale_inv`, or `X.weight_scale` for the per-channel one, one scale
+         * a row. An imported weight's is import_piece's, above, and its owned views replace
+         * these when it answers. */
+        const SrcTensor* sc = st ? ck.find(std::string(s1.name) + "_scale_inv") : nullptr;
+        if (!sc && st) sc = ck.find(std::string(s1.name) + "_scale");
         /* A WEIGHT THE CHECKPOINT SHIPS IN AN IMPORTED FORM is read through that form's views. */
         {
             const SrcTensor *ic = nullptr, *is = nullptr;
@@ -892,29 +1025,53 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
                        "container it writes";
         }
     } else if (dt == RAD_FP4E2M1 && scaled) {
-        /* QUARK'S MXFP4, byte for byte: the codes and exponents are the planes of
-         * `fp4_e2m1*e8m0[1x32]`. Joined only along rows, which is how gate and up become one. */
-        out->trivial = d == 0 || out->pieces.size() == 1;
-        if (!out->trivial) out->why = "its MXFP4 pieces are joined along a column";
-        if (out->trivial) {
+        const uint32_t sdt = out->scales[0]->rad_dtype;
+        if (sdt != RAD_E8M0) {
+            /* NVFP4, AS READ: the packed e2m1 codes beside the e4m3 table divided by the tensor's
+             * f32 global (import_piece folded it, a piece's own). Not trivial -- the scale is
+             * derived and no kernel serves the form -- so the loader refuses it with the remedy,
+             * and rad-convert decodes it exactly and quantises from the value. Joined only along
+             * rows, the way a piece's global stays a piece's. */
+            out->trivial = false;
+            out->imported = true;
+            out->why = "it is NVFP4 as shipped (e2m1 codes, an e4m3 scale a 16 of K and an f32 "
+                       "global a tensor); the global is folded into the scale at import and no "
+                       "kernel serves the form";
+            if (d != 0 && out->pieces.size() > 1)
+                out->why = "its NVFP4 pieces are joined along a column, across their global scales";
             rad_enc_clear(&out->enc);
             rad_enc_copy_str(out->enc.scheme, "affine");
             rad_enc_add_plane(&out->enc, "codes", RAD_FP4E2M1, 1, 1);
-            rad_enc_add_plane(&out->enc, "scale", RAD_E8M0, 1, 32);
+            rad_enc_add_plane(&out->enc, "scale", RAD_F32, 1, 16);
+        } else {
+            /* QUARK'S MXFP4, byte for byte: the codes and exponents are the planes of
+             * `fp4_e2m1*e8m0[1x32]`. Joined only along rows, which is how gate and up become one. */
+            out->trivial = d == 0 || out->pieces.size() == 1;
+            if (!out->trivial) out->why = "its MXFP4 pieces are joined along a column";
+            if (out->trivial) {
+                rad_enc_clear(&out->enc);
+                rad_enc_copy_str(out->enc.scheme, "affine");
+                rad_enc_add_plane(&out->enc, "codes", RAD_FP4E2M1, 1, 1);
+                rad_enc_add_plane(&out->enc, "scale", RAD_E8M0, 1, 32);
+            }
         }
     } else if ((dt == RAD_F8E4M3 || dt == RAD_F8E5M2) && scaled) {
-        /* BLOCK-SCALED FP8, byte for byte: the codes and the scale plane are the planes of
-         * `fp8_e4m3*bf16[128x128]` (whatever the scale's own dtype). Joined only along rows, and
-         * only where each piece but the last fills its last row block -- a scale covering the
-         * tail of one piece and the head of the next belongs to neither. */
+        /* FP8's scale plane is a companion tensor: the codes of a [br x bc] block times one
+         * scale of the block's own dtype, the block the checkpoint states (128x128 by the
+         * plugin's check). The one exception is a scale with one a row across the row's full
+         * width -- [N, 1], PER-CHANNEL fp8: its value is the code times the row's scale, which
+         * rad-convert decodes and a recipe quantises, but no kernel serves the form, so it is
+         * never trivial. Joined only along rows, and only where each piece but the last fills
+         * its last row block -- a scale covering the tail of one piece and the head of the next
+         * belongs to neither. A piece is read against its OWN scale plane, so a join that is
+         * not served as it stands is still readable -- and states its encoding -- but a weight
+         * that mixes a row-scaled piece with a block-scaled one, or carries a scale of neither
+         * shape, has no encoding that reads it: the read refuses it with the reason. */
         const int64_t br = ck.fp8_block_rows(), bc = ck.fp8_block_cols();
         const uint32_t sdt = out->scales[0]->rad_dtype;
-        out->trivial = true;
-        if (d != 0 && out->pieces.size() > 1) {
-            out->trivial = false;
-            out->why = "its FP8 pieces are joined along a column, across their scale blocks";
-        }
-        for (size_t k = 0; k < out->pieces.size() && out->trivial; ++k) {
+        int n_ch = 0, n_blk = 0;
+        bool bad = false;
+        for (size_t k = 0; k < out->pieces.size() && !bad; ++k) {
             const SrcTensor& pk = *out->pieces[k];
             const SrcTensor& sk = *out->scales[k];
             int64_t r = 0, c = 0;
@@ -923,21 +1080,52 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             int64_t sr = 0, scl = 0;
             rad_enc_view((uint32_t)sk.shape.size(), sk.shape.data(), &sr, &scl);
             if (sk.rad_dtype != sdt || sr != want_r || scl != want_c) {
-                out->trivial = false;
-                out->why = "'" + sk.name + "' is not the [" + std::to_string(want_r) + ", " +
-                           std::to_string(want_c) + "] " + std::to_string(br) + "x" +
-                           std::to_string(bc) + " scale plane of '" + pk.name + "'";
-            } else if (k + 1 < out->pieces.size() && r % br) {
-                out->trivial = false;
-                out->why = "'" + pk.name + "' ends inside a scale block, so the next piece's "
-                           "scales cannot follow it";
+                if (sr == r && scl == 1)
+                    ++n_ch;   /* per-channel: one scale a row */
+                else {
+                    bad = true;
+                    out->why = "'" + sk.name + "' is not the [" + std::to_string(want_r) + ", " +
+                               std::to_string(want_c) + "] " + std::to_string(br) + "x" +
+                               std::to_string(bc) + " scale plane of '" + pk.name + "'";
+                }
+            } else {
+                ++n_blk;
+                if (out->why.empty() && d == 0 && k + 1 < out->pieces.size() && r % br)
+                    out->why = "'" + pk.name + "' ends inside a scale block, so the next piece's "
+                               "scales cannot follow it";
             }
         }
-        if (out->trivial) {
+        if (!bad && n_ch && n_blk)
+            out->why = "its FP8 pieces disagree: some scale a row, some a " + std::to_string(br) +
+                       "x" + std::to_string(bc) + " block";
+        const bool block = !bad && n_blk == (int)out->pieces.size();
+        out->trivial = block && out->why.empty() && (d == 0 || out->pieces.size() == 1);
+        if (out->trivial || block) {
+            /* Every piece block-shaped: the value is the code times the piece's own [br x bc]
+             * plane, so a join that is not served as it stands (a column join, or a piece that
+             * ends inside a scale block) still reads it piece by piece. */
+            if (out->why.empty() && d != 0 && out->pieces.size() > 1)
+                out->why = "its FP8 pieces are joined along a column, across their scale blocks";
             rad_enc_clear(&out->enc);
             rad_enc_copy_str(out->enc.scheme, "affine");
             rad_enc_add_plane(&out->enc, "codes", dt, 1, 1);
             rad_enc_add_plane(&out->enc, "scale", sdt, br, bc);
+        } else if (!bad && n_ch == (int)out->pieces.size()) {
+            /* All the pieces per-channel: the value is the code times the row's scale, which
+             * rad-convert decodes and a recipe quantises -- but no kernel serves the form, so
+             * the weight is never trivial. */
+            out->why = "it is per-channel FP8, one scale a row; the engine serves a " +
+                       std::to_string(br) + "x" + std::to_string(bc) + " block scale, which " +
+                       "a recipe quantises from the value";
+            if (d == 0 || out->pieces.size() == 1) {
+                int64_t K = out->pieces[0]->shape.back();
+                rad_enc_clear(&out->enc);
+                rad_enc_copy_str(out->enc.scheme, "affine");
+                rad_enc_add_plane(&out->enc, "codes", dt, 1, 1);
+                rad_enc_add_plane(&out->enc, "scale", sdt, 1, K);
+            }
+            /* A column join's pieces have different widths, which one [1, K] plane cannot
+             * cover, so no encoding is stated and the read refuses with the reason. */
         }
     } else if (!unscaled) {
         out->why = "some of its pieces carry a scale plane and some do not";
@@ -1123,8 +1311,9 @@ int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::
                                             : std::string(rad_dtype_name(w.pieces[0]->rad_dtype))) +
                           ")");
     /* A GPTQ-PACKED CODE TIMES ITS GROUP'S SCALE, the scale read as shipped: the scale tensor is
-     * [groups, N], so row r's scales are a column of it. */
-    if (w.imported) {
+     * [groups, N], so row r's scales are a column of it. An NVFP4 import (no gptq group) falls
+     * through to the block-scale form below, where the scale is the piece's own table. */
+    if (w.imported && w.pieces[0]->gptq_group) {
         int64_t base = 0;
         for (size_t k = 0; k < w.pieces.size(); ++k) {
             const SrcTensor& pk = *w.pieces[k];
@@ -1138,12 +1327,22 @@ int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::
         }
         return RAD_OK;
     }
-    /* FP8 IS ITS CODE TIMES ITS BLOCK'S SCALE (and MXFP4 its code times its exponent): the pieces
-     * are joined along rows, so logical row r is in the piece whose rows cover it, and its scales
-     * are that piece's. */
-    if (!w.scales.empty() && w.scales[0]) {
-        const int64_t br = w.enc.n_planes > 1 ? w.enc.plane[1].block[0] : 128;
-        const int64_t bc = w.enc.n_planes > 1 ? w.enc.plane[1].block[1] : 128;
+    /* FP8 IS ITS CODE TIMES ITS BLOCK'S SCALE (and MXFP4 its code times its exponent, and NVFP4
+     * its code times the e4m3-over-divisor table a 16 of K): the pieces are joined along rows, so
+     * logical row r is in the piece whose rows cover it, and its scales are that piece's. */
+    bool has_scale = false;
+    for (const SrcTensor* s : w.scales)
+        if (s) { has_scale = true; break; }
+    if (has_scale) {
+        /* A scale plane WITHOUT A STATED ENCODING has no block that reads it: a [N, 1] plane
+         * indexed as [N, K/128] would read the wrong row, and a piece without a plane would be
+         * dereferenced. ckpt_resolve states the encoding of every weight it can read and refuses
+         * the rest with the reason; the read refuses the same way rather than guess a block. */
+        if (w.enc.n_planes < 2)
+            return refuse(RAD_E_UNSUPPORTED, "its scale plane has no stated encoding" +
+                                           (w.why.empty() ? "" : ": " + w.why));
+        const int64_t br = w.enc.plane[1].block[0];
+        const int64_t bc = w.enc.plane[1].block[1];
         int64_t base = 0;
         for (size_t k = 0; k < w.pieces.size(); ++k) {
             const SrcTensor& pk = *w.pieces[k];
@@ -1176,7 +1375,7 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
     const uint32_t dt = w.enc.plane[k].dtype;
     const int64_t eb = rad_dtype_bits(dt) / 8;
     uint8_t* o = (uint8_t*)dst;
-    if (w.imported) {
+    if (w.imported && w.pieces[0]->gptq_group) {
         /* GPTQ-PACKED, RE-LAID: a row of codes is a column of the qweight, its words' bytes in
          * order -- two codes a byte for int4, low nibble first, as the encoding packs them -- each
          * offset to signed by flipping the top bit of every field; a row of scales is a column of

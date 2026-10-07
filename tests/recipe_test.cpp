@@ -8,6 +8,8 @@
 #include "format/recipe.h"
 
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 using namespace rad;
@@ -115,6 +117,63 @@ TEST(the_recorded_recipe_reads_back_as_the_same_rules) {
         CHECK_EQ(back.rules()[i].quantizer, r.rules()[i].quantizer);
         CHECK(back.rules()[i].options == r.rules()[i].options);
     }
+}
+
+namespace {
+bool has_opt(const RecipeRule* r, const char* k, const char* v) {
+    for (const auto& [kk, vv] : r->options)
+        if (kk == k && vv == v) return true;
+    return false;
+}
+}  /* namespace */
+
+/* THE NVFP4 RECIPE, READ FROM THE FILE IT SHIPS IN: it parses, and its patterns decide the real
+ * declared names of the 27B architecture -- the fused MLPs and the GDN in-projections (whose a/b
+ * pieces ship bf16 beside the NVFP4 ones) to the MXFP4 target, the head to block fp8, the norms
+ * and the convolution to the checkpoint's own form. A pattern that matched the wrong weight here
+ * would be found only by measuring the container afterwards. */
+TEST(the_nvfp4_recipe_decides_the_model_it_was_written_for) {
+    std::ifstream in(std::string(RAD_RECIPES) + "/q38-27b-nvfp4-df2.recipe");
+    REQUIRE(in.good());
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Recipe r;
+    std::string why;
+    REQUIRE_EQ(r.add_text(text, "q38-27b-nvfp4-df2.recipe", &why), RAD_OK);
+    CHECK_EQ(r.rules().size(), (size_t)17);
+
+    /* every linear of the model, the whole layer range, to the MXFP4 target -- the fused names
+     * the builder hands out, each with its `.weight` suffix */
+    const char* linears[] = { "blk.47.ffn_gate_up.weight", "blk.47.ffn_down.weight",
+                              "blk.3.ffn_gate_up.weight", "blk.3.attn_qg.weight",
+                              "blk.3.attn_k.weight", "blk.3.attn_v.weight",
+                              "blk.3.attn_output.weight", "blk.47.ssm_inz.weight",
+                              "blk.47.ssm_out.weight" };
+    for (const char* n : linears) {
+        const RecipeRule* m = r.match(n);
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->quantizer, std::string("rtn"));
+        CHECK(has_opt(m, "codes", "fp4_e2m1"));
+        CHECK(has_opt(m, "group", "32"));
+        CHECK(has_opt(m, "scale", "e8m0"));
+    }
+    /* the head to block fp8, not the fp4 of the trunk */
+    const RecipeRule* head = r.match("output.weight");
+    REQUIRE(head != nullptr);
+    CHECK(has_opt(head, "codes", "fp8_e4m3"));
+    CHECK(has_opt(head, "block", "128x128"));
+    /* a norm, the convolution, the delta net's a/b projection (kept bf16, as the checkpoint
+     * ships it) and the embedding keep the checkpoint's own form */
+    const char* kept[] = { "blk.0.ffn_norm.weight", "blk.0.attn_norm.weight", "blk.47.ssm_conv1d.weight",
+                           "blk.47.ssm_a_log", "blk.47.ssm_ab.weight", "token_embd.weight", "output_norm.weight" };
+    for (const char* n : kept)
+        CHECK(r.match(n) == nullptr);
+    /* the drafter's own linears */
+    const RecipeRule* fc = r.match("dflash.fc.weight");
+    REQUIRE(fc != nullptr);
+    CHECK(has_opt(fc, "codes", "fp4_e2m1"));
+    const RecipeRule* dh = r.match("dflash.draft_head.weight");
+    REQUIRE(dh != nullptr);
+    CHECK(has_opt(dh, "codes", "u2"));
 }
 
 RAD_TEST_MAIN()

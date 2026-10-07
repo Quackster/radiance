@@ -89,7 +89,8 @@ foreach(t ${RAD_TESTS})
     target_link_libraries(${n} PRIVATE rad_legacy_toolparse)
   endif()
   target_compile_definitions(${n} PRIVATE RAD_CHAT_FIXTURES="${RAD_CHAT_FIXTURES}"
-                                          RAD_MEDIA_FIXTURES="${RAD_MEDIA_FIXTURES}")
+                                          RAD_MEDIA_FIXTURES="${RAD_MEDIA_FIXTURES}"
+                                          RAD_RECIPES="${CMAKE_SOURCE_DIR}/data/recipes")
   # include/ normally arrives through rad_core's PUBLIC interface; a test that does not link it
   # still needs the ABI headers, since that is the whole surface it is testing against.
   target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/abi

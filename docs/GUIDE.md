@@ -311,27 +311,41 @@ rad-convert $SRC -o new.rad --recipe new.recipe --reuse old.rad
 The conversions of record live in `scripts/convfn.sh` and `scripts/convdspark.sh`, with their
 recipes in `data/recipes/`.
 
-**A release someone else already quantised is read as it ships.** Two forms are imported weight
+**A release someone else already quantised is read as it ships.** Three forms are imported weight
 by weight, so their quantised linears need no recipe rule:
 
 | `quantization_config` | read as | |
 |---|---|---|
 | `quark`, MXFP4 weights (fp4, per_group 32, e8m0) | `fp4_e2m1*e8m0[1x32]` | byte for byte: the same codes and exponents. A checkpoint of this form is also served as it stands (§3.4) |
 | `auto-round` with `packing_format: auto_round:auto_gptq`, and `gptq` (v1) | `i4*bf16[1x128]` or `i8*bf16[1x128]` | the GPTQ-packed codes transposed and made signed, the f16 scales rounded to bf16. Symmetric, group 128 or a multiple of it (per channel included), no act-order. Convert-time only, because the scales are not served as shipped |
+| `compressed-tensors` / `modelopt`, NVFP4 (fp4, per_group 16, an e4m3 scale a 16 of K, an f32 global a tensor) | `fp4_e2m1*f32[1x16]` | the packed codes as fp4 beside the e4m3 table divided by the tensor's f32 global, one rounding: the checkpoint stores the DIVISOR its quantiser scaled the weights by, and the value a dequant applies is the reciprocal -- the same reciprocal vLLM's own scheme and the
+TensorRT-LLM runner forms at load. A piece's own global stays a piece's, so a fused weight's partitions are dequantised exactly, the way the online requantisation dequantises per partition of a merged linear. Convert-time only: no kernel serves the form |
 
 The width is read per tensor, so a release mixing int4 experts with int8 projections imports both.
-What an import cannot read — an asymmetric zero point, an act-order index, a group under 128 — is
+A mixed-precision release -- NVFP4 MLPs beside FP8 or bf16 linears, the common case for an NVFP4
+model -- reads every weight by its own form: a tensor without its `weight_packed` / `weight_scale` /
+`weight_global_scale` trio is not NVFP4 and takes the stock path. What an import cannot read -- an
+asymmetric zero point, an act-order index, a group under 128, a missing or zero global -- is
 refused by name at the weight. The release's `quantization_config` names the tool, not a served
 form, so it is kept in the container as `imported_quantization_config.*`, and the model is served by
 its family's quantised plugin (`qwen35_fp8` for Qwen3.8-27B; `qwen4exp_fp8` for Flash-Next).
 
 A weight the architecture declares in another form than the release holds still takes a rule: the
-recipe dequantises the import exactly and quantises from that. The two recipes of record:
+recipe dequantises the import exactly and quantises from that. NVFP4 is that form for the models
+that ship it -- the online requantisation vLLM does in `process_weights_after_loading` is here a
+`rad-convert` run: the recipe names the target (OCP-MXFP4, the kernel the Quark release is served
+on, or block fp8, or the checkpoint's own form) and the source does not matter to it, so a recipe
+covers a mixed release in one pass. The recipes of record:
 
 ```sh
 # AMD's Quark AWQ-MXFP4 Qwen3.8-27B with the DFlash2 drafter
 rad-convert ~/models/amd/Qwen3.8-27B-Quark-AWQ-MXFP4 --draft-model ~/models/z-lab/Qwen3.8-27B-DFlash2 \
     --recipe data/recipes/q38-27b-quark-mxfp4-df2.recipe -o q38-27b-quark-mxfp4-df2.rad
+
+# unsloth's NVFP4 Qwen3.8-27B with the DFlash2 drafter: the NVFP4 MLPs -- and the FP8 and bf16
+# linears beside them -- made OCP-MXFP4 by one recipe, the head block fp8
+rad-convert ~/models/unsloth/Qwen3.8-27B-NVFP4 --draft-model ~/models/z-lab/Qwen3.8-27B-DFlash2 \
+    --recipe data/recipes/q38-27b-nvfp4-df2.recipe -o q38-27b-nvfp4-df2.rad
 
 # An AutoRound int4 Qwen3.8-Flash-Next: its experts imported, its int4 projections made int8
 rad-convert ~/models/ukisai/Swift-1.5-Qwen3.8-Flash-Next-W4A16-AutoRound \

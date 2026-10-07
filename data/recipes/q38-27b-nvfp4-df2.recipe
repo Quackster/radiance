@@ -1,0 +1,54 @@
+# q38-27b-nvfp4-df2.recipe -- unsloth's Qwen3.8-27B-NVFP4 with the DFlash2 drafter.
+#
+#   rad-convert <unsloth/Qwen3.8-27B-NVFP4> --draft-model <z-lab/Qwen3.8-27B-DFlash2> \
+#       --recipe q38-27b-nvfp4-df2.recipe -o q38-27b-nvfp4-df2.rad
+#
+# The checkpoint is mixed precision: the first 56 layers' MLPs are NVFP4 (e2m1 codes, an e4m3
+# scale a 16 of K, an f32 global a tensor -- the core's import reads it exactly, the global folded
+# into the scale as the divisor's reciprocal, a piece's own), the attention and GDN projections
+# beside them and the last 8 MLPs FP8 per-channel (an e4m3 code a value, a bf16 scale a row --
+# the core decodes the value exactly the same way), and the GDN a/b projections bf16. The source
+# does not matter to the target: every rule below quantises the weight's VALUE, whatever the
+# checkpoint stored it as, so one recipe covers the whole model.
+#
+#   - the trunk's linears at OCP-MXFP4 (`fp4_e2m1`, an e8m0 scale a 32 of K): the same encoding
+#     and kernel as q38-27b-quark-mxfp4-df2.recipe. The block exponent is the OCP rule -- floor of
+#     log2 of the block amax minus the code's top exponent -- which is the rule vLLM's online
+#     requantisation calls `ocp`; its `mse` mode (the best of two exponents by squared error) has
+#     no form in the grid, where an e8m0 scale is a bare exponent and rule=mx is the one that
+#     governs it. Against the bf16 original, vLLM measured the OCP form at 0.161 relRMS (16 dB)
+#     and its mse form at 0.158, against 0.112-0.113 for the NVFP4 source itself: the cost is the
+#     double rounding, not the exponent rule, and GSM8K does not see the difference.
+#   - the GDN a/b projections kept bf16, as the checkpoint ships them: this engine's delta net
+#     reads a and b as a separate projection beside the [q|k|v|z] one -- 96 rows of 5120, half a
+#     percent of a layer's projection bytes, one extra launch -- and a+b's 96 rows fill no 128
+#     rows, which is why the release never quantised them.
+#   - the lm_head at block fp8, as in the other recipes: the widest GEMM in the model at half the
+#     bytes. vLLM's notes never convert it (its draft and verify heads read the 8-bit matrix
+#     directly); here the drafter is a separate checkpoint and its own head is the 2-bit copy
+#     below, so the target's head is free to take the fp8 form.
+#
+# THE DRAFTER is made as small as its acceptance allows, exactly as q38-27b-quark-mxfp4-df2.recipe
+# does it: its linears at OCP-MXFP4 from its release, and a 2-bit copy of the target's head
+# (u2 with a u8 zero, least-squares clip search) whose top 32 the engine rescores against the
+# target's fp8 head.
+
+blk.*.ffn_gate_up.weight                 rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ffn_down.weight                    rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_qg.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_k.weight                      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_v.weight                      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_output.weight                 rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ssm_inz.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ssm_out.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+
+output.weight                            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.draft_head.weight                 rtn  codes=u2 zero=u8 group=128 scale=f16 rule=search
+
+dflash.fc.weight                         rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_q.weight               rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_k.weight               rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_v.weight               rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_output.weight          rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_gate_up.weight          rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_down.weight             rtn  codes=fp4_e2m1 group=32 scale=e8m0

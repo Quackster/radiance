@@ -138,7 +138,11 @@ build/bin/rad-convert ~/models/Qwen/Qwen3.8-Flash-Next -o qwen3.8-flash-next-bf1
 
 With Docker, use `docker run --rm -v ~/models:/models --entrypoint rad-convert stilldeadcode/radiance ...`. In
 the image the recipes are in `/opt/radiance/share/radiance/recipes/`. A checkpoint served at its own
-precision needs no container: `radiance --model ~/models/Qwen/Qwen3.8-27B-FP8`.
+precision needs no container: `radiance --model ~/models/Qwen/Qwen3.8-27B-FP8`. A release someone else
+quantised is read as it ships when the form is one the engine serves (block-scaled FP8, Quark's
+MXFP4) and converted from its exact dequant when it is not -- NVFP4 (modelopt's e2m1 weights, an
+e4m3 scale a 16 of K and an f32 global a tensor) to the MXFP4 kernels, AutoRound and GPTQ int4 to
+int8: [docs/GUIDE.md](docs/GUIDE.md) names the recipes of record with their `rad-convert` commands.
 
 ## Test
 
