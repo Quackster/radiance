@@ -2514,7 +2514,11 @@ TEST(models_and_health_answer) {
     CHECK_EQ(j["object"].get<std::string>(), std::string("list"));
     CHECK_EQ(j["data"][0]["id"].get<std::string>(), std::string("test-model"));
 
-    CHECK_EQ(f.get("/v1/models/test-model").status, 200);
+    HttpResponse one = f.get("/v1/models/test-model");
+    CHECK_EQ(one.status, 200);
+    /* The entry itself, the way OpenAI's retrieve answers it. */
+    CHECK_EQ(json::parse(one.body).value("id", std::string()), std::string("test-model"));
+    CHECK_EQ(json::parse(one.body).value("object", std::string()), std::string("model"));
     CHECK_EQ(f.get("/v1/models/other").status, 404);
 
     HttpResponse h = f.get("/health");
@@ -2525,11 +2529,12 @@ TEST(models_and_health_answer) {
 TEST(the_model_entry_carries_the_context_length_the_server_was_started_with) {
     /* Both routes a client sizes its window from: the list, and the entry it fetches by id. */
     Fixture f(true, 262144);
-    for (const char* path : {"/v1/models", "/v1/models/test-model"}) {
-        HttpResponse r = f.get(path);
-        CHECK_EQ(r.status, 200);
-        CHECK_EQ(json::parse(r.body)["data"][0].value("max_model_len", (int64_t)0), (int64_t)262144);
-    }
+    HttpResponse list = f.get("/v1/models");
+    CHECK_EQ(list.status, 200);
+    CHECK_EQ(json::parse(list.body)["data"][0].value("max_model_len", (int64_t)0), (int64_t)262144);
+    HttpResponse one = f.get("/v1/models/test-model");
+    CHECK_EQ(one.status, 200);
+    CHECK_EQ(json::parse(one.body).value("max_model_len", (int64_t)0), (int64_t)262144);
     Fixture unknown;
     CHECK(!json::parse(unknown.get("/v1/models").body)["data"][0].contains("max_model_len"));
 }

@@ -318,13 +318,23 @@ std::string text_completion_body(const OaiRequest& r, const std::vector<ChoiceOu
                                  const UsageOut& u, const TimingsOut& t = TimingsOut());
 std::string embeddings_body(const OaiRequest& r, const std::vector<std::vector<float>>& vecs,
                             const UsageOut& u);
-/* `max_model_len` is the context the server was started with (--max-model-len, else the
- * container's trained length), the field vLLM's model card carries. Clients size their own
- * context from it -- an agent that compresses its history at the window's edge, a UI that shows
- * how much is left -- and without it they guess from the model's name, which is wrong whenever the
- * deployment sets its own length. 0 leaves the field out rather than reporting a length the
- * server does not know. */
-std::string models_body(const std::string& model_id, int64_t created, int64_t max_model_len = 0);
+/* ONE MODEL ENTRY: what /v1/models lists and /v1/models/:id returns on its own. */
+struct ModelCard {
+    std::string id;
+    int64_t     created = 0;
+    /* The context the server was started with (--max-model-len, else the container's trained
+     * length), the field vLLM's model card carries. Clients size their own context from it -- an
+     * agent that compresses its history at the window's edge, a UI that shows how much is left --
+     * and without it they guess from the model's name, which is wrong whenever the deployment sets
+     * its own length. 0 leaves the field out rather than reporting a length the server does not
+     * know. */
+    int64_t     max_model_len = 0;
+};
+/* The list, for GET /v1/models. */
+std::string models_body(const ModelCard& m);
+/* The entry itself, for GET /v1/models/:id: OpenAI's retrieve answers the model object, not a
+ * list of one, and its SDK reads `id` off the top level. */
+std::string model_body(const ModelCard& m);
 
 /* The usage chunk of each endpoint's stream: an SSE event whose choices array is empty and whose
  * only payload is `usage`. Emitted when the request asked for stream_options.include_usage, ONCE

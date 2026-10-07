@@ -2205,17 +2205,25 @@ std::string embeddings_body(const OaiRequest& r, const std::vector<std::vector<f
     return o.dump();
 }
 
-std::string models_body(const std::string& model_id, int64_t created, int64_t max_model_len) {
+static json model_card(const ModelCard& c) {
     json m;
-    m["id"] = model_id;
+    m["id"] = c.id;
     m["object"] = "model";
-    m["created"] = created;
+    m["created"] = c.created;
     m["owned_by"] = "radiance";
-    if (max_model_len > 0) m["max_model_len"] = max_model_len;
+    if (c.max_model_len > 0) m["max_model_len"] = c.max_model_len;
+    return m;
+}
+
+std::string models_body(const ModelCard& c) {
     json o;
     o["object"] = "list";
-    o["data"] = json::array({m});
+    o["data"] = json::array({model_card(c)});
     return o.dump();
+}
+
+std::string model_body(const ModelCard& c) {
+    return model_card(c).dump();
 }
 
 /* ================================================================== SSE */

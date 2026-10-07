@@ -1132,7 +1132,7 @@ for a model that takes no images or video.
 | `POST /v1/chat/completions` | chat, with tools, reasoning and streaming |
 | `POST /v1/completions` | raw text completion |
 | `POST /v1/embeddings` | needs a model with an embedding head, else 501 |
-| `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves, as vLLM reports it) |
+| `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves, as vLLM reports it); `:id` answers the entry itself, as OpenAI's retrieve does |
 | `GET /health`, `/ping`, `POST /ping` | liveness |
 | `GET /load` | current load |
 | `GET /version` | server version |

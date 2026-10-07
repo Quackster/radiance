@@ -404,8 +404,16 @@ json parsed(const std::string& body) {
 
 }  /* namespace */
 
+static ModelCard card(const char* id, int64_t created, int64_t max_model_len = 0) {
+    ModelCard c;
+    c.id = id;
+    c.created = created;
+    c.max_model_len = max_model_len;
+    return c;
+}
+
 TEST(the_model_list_is_a_list_of_one_with_the_fields_clients_read) {
-    const json o = parsed(models_body("q38-flashnext", 1700000000));
+    const json o = parsed(models_body(card("q38-flashnext", 1700000000)));
     CHECK_EQ(o.value("object", std::string()), std::string("list"));
     CHECK(o["data"].is_array());
     CHECK_EQ(o["data"].size(), 1u);
@@ -420,8 +428,16 @@ TEST(the_model_list_is_a_list_of_one_with_the_fields_clients_read) {
 }
 
 TEST(the_model_list_reports_the_context_the_server_runs_with) {
-    const json o = parsed(models_body("q38-flashnext", 1700000000, 262144));
+    const json o = parsed(models_body(card("q38-flashnext", 1700000000, 262144)));
     CHECK_EQ(o["data"][0].value("max_model_len", (int64_t)0), (int64_t)262144);
+}
+
+TEST(one_model_is_the_entry_itself_not_a_list_of_one) {
+    const json m = parsed(model_body(card("q38-flashnext", 1700000000, 262144)));
+    CHECK_EQ(m.value("object", std::string()), std::string("model"));
+    CHECK_EQ(m.value("id", std::string()), std::string("q38-flashnext"));
+    CHECK_EQ(m.value("max_model_len", (int64_t)0), (int64_t)262144);
+    CHECK(!m.contains("data"));
 }
 
 TEST(a_chat_body_carries_usage_and_one_choice_per_completion) {

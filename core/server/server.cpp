@@ -1152,8 +1152,12 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
         e.message = "no such model: " + id;
         return error_response(e, req.peer);
     }
+    ModelCard c;
+    c.id = opt_.model_id;
+    c.created = started_at_;
+    c.max_model_len = opt_.max_ctx;
     metrics_.observe_http(200);
-    return HttpResponse::json_body(200, models_body(opt_.model_id, started_at_, opt_.max_ctx));
+    return HttpResponse::json_body(200, id.empty() ? models_body(c) : model_body(c));
 }
 
 HttpResponse Server::handle_metrics(const HttpRequest&) {
