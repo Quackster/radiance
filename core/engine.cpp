@@ -2264,6 +2264,7 @@ int Engine::run_server() {
      * more choices a request; the floor keeps a small batch from refusing what it would queue. */
     o.max_n    = cfg_.max_n > 0 ? (int)cfg_.max_n : (int)std::max<int64_t>(o.max_n, cfg_.max_seqs);
     o.max_ctx  = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
+    o.model_path = cfg_.model;
     o.default_reasoning_effort = cfg_.reasoning_effort;
     o.reasoning_effort_map = cfg_.reasoning_effort_map;
     o.default_thinking_budget = cfg_.thinking_token_budget;

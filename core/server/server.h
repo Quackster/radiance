@@ -57,6 +57,10 @@ struct ServerOptions {
      * /v1/completions answer 501 naming /v1/embeddings, rather than queueing a request the engine
      * would finish after one step with no text. */
     bool        embedding_model = false;
+    /* What --model named, reported as the model entry's `root` the way vLLM reports the path it
+     * loaded: a served name chosen for clients says nothing about which file is behind it. Empty
+     * leaves the field out. */
+    std::string model_path;
     std::string host = "0.0.0.0";
     int         port = 8000;
     int         n_threads = 0;

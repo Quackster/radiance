@@ -329,6 +329,8 @@ struct ModelCard {
      * its own length. 0 leaves the field out rather than reporting a length the server does not
      * know. */
     int64_t     max_model_len = 0;
+    /* What the server loaded (ServerOptions::model_path), vLLM's `root`. Empty leaves it out. */
+    std::string root;
 };
 /* The list, for GET /v1/models. */
 std::string models_body(const ModelCard& m);

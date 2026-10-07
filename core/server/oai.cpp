@@ -2212,6 +2212,7 @@ static json model_card(const ModelCard& c) {
     m["created"] = c.created;
     m["owned_by"] = "radiance";
     if (c.max_model_len > 0) m["max_model_len"] = c.max_model_len;
+    if (!c.root.empty()) m["root"] = c.root;
     return m;
 }
 

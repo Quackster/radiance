@@ -343,7 +343,7 @@ struct Fixture {
     FakeGrammar      gram;
     std::unique_ptr<Server> srv;
 
-    explicit Fixture(bool with_tools = true, int64_t max_ctx = 0) {
+    explicit Fixture(bool with_tools = true, int64_t max_ctx = 0, const char* model_path = "") {
         Deps d;
         d.sched = &sched;
         d.tok = &tok;
@@ -357,6 +357,7 @@ struct Fixture {
         o.default_max_tokens = 32;
         o.max_seqs = 4;
         o.max_ctx = max_ctx;
+        o.model_path = model_path;
         srv.reset(new Server(d, o));
     }
 
@@ -2528,7 +2529,9 @@ TEST(models_and_health_answer) {
 
 TEST(the_model_entry_carries_the_context_length_the_server_was_started_with) {
     /* Both routes a client sizes its window from: the list, and the entry it fetches by id. */
-    Fixture f(true, 262144);
+    Fixture f(true, 262144, "/models/m.rad");
+    CHECK_EQ(json::parse(f.get("/v1/models/test-model").body).value("root", std::string()),
+             std::string("/models/m.rad"));
     HttpResponse list = f.get("/v1/models");
     CHECK_EQ(list.status, 200);
     CHECK_EQ(json::parse(list.body)["data"][0].value("max_model_len", (int64_t)0), (int64_t)262144);

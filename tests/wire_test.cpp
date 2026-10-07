@@ -425,6 +425,13 @@ TEST(the_model_list_is_a_list_of_one_with_the_fields_clients_read) {
     /* No length known, none reported: a client falls back to its own default rather than
      * trusting a made-up one. */
     CHECK(!o["data"][0].contains("max_model_len"));
+    CHECK(!o["data"][0].contains("root"));
+}
+
+TEST(the_model_entry_names_the_file_behind_the_served_name) {
+    ModelCard c = card("q38-flashnext", 1700000000);
+    c.root = "/models/qwen3.8-next-flash-fp8-iq4r-moe.rad";
+    CHECK_EQ(parsed(model_body(c)).value("root", std::string()), c.root);
 }
 
 TEST(the_model_list_reports_the_context_the_server_runs_with) {
