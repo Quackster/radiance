@@ -2205,12 +2205,13 @@ std::string embeddings_body(const OaiRequest& r, const std::vector<std::vector<f
     return o.dump();
 }
 
-std::string models_body(const std::string& model_id, int64_t created) {
+std::string models_body(const std::string& model_id, int64_t created, int64_t max_model_len) {
     json m;
     m["id"] = model_id;
     m["object"] = "model";
     m["created"] = created;
     m["owned_by"] = "radiance";
+    if (max_model_len > 0) m["max_model_len"] = max_model_len;
     json o;
     o["object"] = "list";
     o["data"] = json::array({m});

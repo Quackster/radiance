@@ -1153,7 +1153,7 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
         return error_response(e, req.peer);
     }
     metrics_.observe_http(200);
-    return HttpResponse::json_body(200, models_body(opt_.model_id, started_at_));
+    return HttpResponse::json_body(200, models_body(opt_.model_id, started_at_, opt_.max_ctx));
 }
 
 HttpResponse Server::handle_metrics(const HttpRequest&) {

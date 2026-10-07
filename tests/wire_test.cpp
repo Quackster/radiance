@@ -414,6 +414,14 @@ TEST(the_model_list_is_a_list_of_one_with_the_fields_clients_read) {
     CHECK_EQ(o["data"][0].value("created", (int64_t)0), (int64_t)1700000000);
     /* `owned_by` is in the schema and generated clients deserialise it. */
     CHECK(o["data"][0].contains("owned_by"));
+    /* No length known, none reported: a client falls back to its own default rather than
+     * trusting a made-up one. */
+    CHECK(!o["data"][0].contains("max_model_len"));
+}
+
+TEST(the_model_list_reports_the_context_the_server_runs_with) {
+    const json o = parsed(models_body("q38-flashnext", 1700000000, 262144));
+    CHECK_EQ(o["data"][0].value("max_model_len", (int64_t)0), (int64_t)262144);
 }
 
 TEST(a_chat_body_carries_usage_and_one_choice_per_completion) {

@@ -343,7 +343,7 @@ struct Fixture {
     FakeGrammar      gram;
     std::unique_ptr<Server> srv;
 
-    explicit Fixture(bool with_tools = true) {
+    explicit Fixture(bool with_tools = true, int64_t max_ctx = 0) {
         Deps d;
         d.sched = &sched;
         d.tok = &tok;
@@ -356,6 +356,7 @@ struct Fixture {
         o.model_id = "test-model";
         o.default_max_tokens = 32;
         o.max_seqs = 4;
+        o.max_ctx = max_ctx;
         srv.reset(new Server(d, o));
     }
 
@@ -2519,6 +2520,18 @@ TEST(models_and_health_answer) {
     HttpResponse h = f.get("/health");
     CHECK_EQ(h.status, 200);
     CHECK(json::parse(h.body)["status"].get<std::string>() == "ok");
+}
+
+TEST(the_model_entry_carries_the_context_length_the_server_was_started_with) {
+    /* Both routes a client sizes its window from: the list, and the entry it fetches by id. */
+    Fixture f(true, 262144);
+    for (const char* path : {"/v1/models", "/v1/models/test-model"}) {
+        HttpResponse r = f.get(path);
+        CHECK_EQ(r.status, 200);
+        CHECK_EQ(json::parse(r.body)["data"][0].value("max_model_len", (int64_t)0), (int64_t)262144);
+    }
+    Fixture unknown;
+    CHECK(!json::parse(unknown.get("/v1/models").body)["data"][0].contains("max_model_len"));
 }
 
 TEST(embeddings_without_an_embedder_is_501_not_an_empty_200) {
