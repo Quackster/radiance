@@ -623,6 +623,10 @@ struct Config {
     int64_t max_tok = 8192;            /* --max-num-batched-tokens */
     int64_t max_seqs = 256;
     int64_t max_ctx = 0;               /* 0 = the model's training context */
+    /* --rope-scaling: "yarn:FACTOR[:ORIG]" writes YaRN over the checkpoint's own rotary keys (the
+     * model card's extension past its trained context, no reconvert); "none" takes a checkpoint's
+     * YaRN off; empty serves what the checkpoint says. Engine::apply_rope_scaling. */
+    std::string rope_scaling;
 
     /* THE OPERATOR STATES A BUDGET OR THE ENGINE DERIVES ONE FROM THE CARD, AND EITHER WAY IT IS
      * STATED IN FULL BEFORE ANYTHING IS ALLOCATED.

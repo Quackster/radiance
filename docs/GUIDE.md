@@ -906,6 +906,7 @@ one line naming each one the command line moved.
 | `--max-num-batched-tokens N` | 8192 | largest token count one step may carry |
 | `--max-num-seqs N` | 256 | largest number of sequences one step may carry |
 | `--max-model-len N` | 0 | context bound; 0 takes the model's training context |
+| `--rope-scaling SPEC` | — | `yarn:FACTOR[:ORIG]`: static YaRN over the container's own rotary keys, no reconvert; `none` takes a checkpoint's YaRN off ([YARN.md](YARN.md)) |
 
 **Memory**
 

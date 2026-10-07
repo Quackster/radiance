@@ -6,6 +6,7 @@
  * (spec §6).
  */
 #include "rad_core.h"
+#include "format/rope_override.h"
 #include "sample/host_ref.h"
 #include "server/oai.h"
 
@@ -45,6 +46,8 @@ static const Flag g_flags[] = {
     { "--max-num-batched-tokens", "N",  "the largest token count one step may carry" },
     { "--max-num-seqs",       "N",      "the largest number of sequences one step may carry" },
     { "--max-model-len",      "N",      "context bound; 0 takes the model's training context" },
+    { "--rope-scaling",       "SPEC",   "yarn:FACTOR[:ORIG]: static YaRN over the container's own rotary\n"
+                                        "keys, no reconvert (docs/YARN.md); none: off" },
 
     { "--gpu-headroom-mib",   "N",      "VRAM left unclaimed on every card (default 96)" },
     { "--vram-weights-mib",   "N",      "the resident weight slab; 0 derives it from the card" },
@@ -376,6 +379,18 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--max-num-batched-tokens")){ if (!(v = need(i))) return RAD_E_INVAL; c->max_tok = atoll(v); }
         else if (S("--max-num-seqs"))          { if (!(v = need(i))) return RAD_E_INVAL; c->max_seqs = atoll(v); }
         else if (S("--max-model-len"))         { if (!(v = need(i))) return RAD_E_INVAL; c->max_ctx = atoll(v); }
+        else if (S("--rope-scaling")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            /* Checked here, so a typo is a refusal at the command line and not a model served
+             * with its trained rotary at a length it cannot reach. */
+            RopeSpec rs;
+            if (!rope_spec_parse(v, &rs) || rs.kind == RopeSpec::Keep) {
+                RAD_ERR("--rope-scaling takes yarn:FACTOR (above 1) with an optional :ORIG trained "
+                        "length, or none -- got '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->rope_scaling = v;
+        }
         else if (S("--vram-weights-mib"))      { if (!(v = need(i))) return RAD_E_INVAL; c->vram_weights_mib = atoll(v); }
         else if (S("--vram-kv-mib"))           { if (!(v = need(i))) return RAD_E_INVAL; c->vram_kv_mib = atoll(v); }
         /* --gpu-headroom takes the short name too: it is the flag an operator reaches for and

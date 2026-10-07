@@ -825,3 +825,21 @@ TEST(usage_names_every_flag_it_documents) {
 }
 
 RAD_TEST_MAIN()
+
+/* --rope-scaling is checked at the command line: a typo is a refusal, not a model served with its
+ * trained rotary at a length it cannot reach. */
+TEST(rope_scaling_takes_yarn_with_a_factor_above_one_or_none) {
+    for (const char* ok : { "yarn:4", "yarn:2.5", "yarn:4:262144", "none" }) {
+        Config c;
+        CHECK_EQ(parse({ "--rope-scaling", ok }, &c), RAD_OK);
+        CHECK_EQ(c.rope_scaling, std::string(ok));
+    }
+    for (const char* bad : { "yarn:1", "yarn:0.5", "yarn:4x", "yarn:", "yarn:4:", "yarn:4:0",
+                             "yarn:4:12k", "linear:2", "yarn" }) {
+        Config c;
+        CHECK(parse({ "--rope-scaling", bad }, &c) < 0);
+    }
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.rope_scaling.empty());
+}

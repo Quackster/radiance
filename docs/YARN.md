@@ -82,6 +82,34 @@ successful actual long requests must be checked; the command is not a promise
 of concurrency or accuracy. Keep the unmodified model and serving setup until
 long-context quality and speed meet the deployment's requirements.
 
+## Serve an existing container: `--rope-scaling`
+
+The same metadata can be written when the container is loaded instead of converted in:
+
+```sh
+radiance --model /models/qwen3.8-next-flash-fp8.rad \
+  --rope-scaling yarn:2 --max-model-len 409600
+```
+
+`yarn:FACTOR[:ORIG]` sets `rope_type = yarn`, `factor` and `original_max_position_embeddings`
+(`ORIG`, default the container's own trained length) in the rotary object the reader above
+takes first -- for a Qwen3.8 container that is `text_config.rope_parameters`, which already says
+`default`; YaRN written under plain `rope_parameters` would sit behind it and never be read. A
+DFlash2 drafter gets the same factor over its own trained length. Over a checkpoint's own YaRN
+the factor is replaced, its trained length kept unless `ORIG` is given, and an explicit
+`attention_factor` (or `mscale` variant) dropped so the magnitude is derived for the new factor.
+`none` takes a checkpoint's YaRN off. A linear or other explicit rotary type is refused rather
+than stacked over. The result is resolved and checked exactly as a converted container's is
+(`core/format/rope_override.h`, held to `yarn_from` in `tests/yarn_test.cpp`).
+
+Startup says what the rotary is (`rope: YaRN factor 2 over 262144 trained positions -- the rotary
+reaches 524288`) and warns when `--max-model-len` is past what it covers -- also with no scaling
+at all, past the trained length. A persisted prefix cache (`--prefix-cache-dir`) written under a
+different `--rope-scaling` is not reused: every cached key was rotated differently.
+
+The flag is for trying a factor, or serving a container whose source checkpoints are not at hand;
+a deployment that settles on one can convert it in as above and drop the flag.
+
 ## Kernel and test contract
 
 `rope` and `rope_table` take optional resolved coefficients `yarn_factor`,

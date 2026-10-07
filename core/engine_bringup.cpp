@@ -14,6 +14,7 @@
 #include "device/device.h"
 #include "device/directio.h"
 #include "format/radfile.h"
+#include "format/rope_override.h"
 #include "format/share.h"
 #include "format/table_copy.h"
 #include "rad_plugin.h"
@@ -707,6 +708,7 @@ int Engine::read_metadata() {
             default:         meta_kv_v_.push_back(file_->str(kv.v.s)); break;
         }
     }
+    RAD_TRY(apply_rope_scaling());
     meta_kv_kp_.clear(); meta_kv_vp_.clear();
     for (auto& s : meta_kv_k_) meta_kv_kp_.push_back(s.c_str());
     for (auto& s : meta_kv_v_) meta_kv_vp_.push_back(s.c_str());
@@ -741,6 +743,7 @@ int Engine::read_checkpoint_metadata() {
     }
     meta_kv_k_ = mo.keys;
     meta_kv_v_ = mo.vals;
+    RAD_TRY(apply_rope_scaling());
     meta_kv_kp_.clear(); meta_kv_vp_.clear();
     for (auto& k : meta_kv_k_) meta_kv_kp_.push_back(k.c_str());
     for (auto& v : meta_kv_v_) meta_kv_vp_.push_back(v.c_str());
@@ -751,6 +754,59 @@ int Engine::read_checkpoint_metadata() {
              "served as it stands)", meta_.name, meta_.arch_id,
              meta_.quant && *meta_.quant ? meta_.quant : "bf16", (long long)meta_.n_layers,
              (long long)meta_.n_ctx_train, ckpt_->tensors().size());
+    return RAD_OK;
+}
+
+/* --rope-scaling (format/rope_override.h): YaRN written into the container's own rotary keys at
+ * load, where the architecture's reader takes them, so an existing container serves past its
+ * trained context with no reconvert -- and is checked by the same reader a converted one is. The
+ * drafter, when there is one, gets the same factor over its own trained length. Then one line says
+ * what the rotary is, and a context past what it covers is named. */
+int Engine::apply_rope_scaling() {
+    RopeSpec spec;
+    if (!rope_spec_parse(cfg_.rope_scaling.c_str(), &spec)) {
+        RAD_ERR("--rope-scaling '%s': yarn:FACTOR (above 1) with an optional :ORIG, or none",
+                cfg_.rope_scaling.c_str());
+        return RAD_E_INVAL;
+    }
+    if (spec.kind != RopeSpec::Keep) {
+        const RopeResolved before = rope_resolve(meta_kv_k_, meta_kv_v_, "");
+        std::string why;
+        if (!rope_override_group(meta_kv_k_, meta_kv_v_, spec, "", meta_.n_ctx_train, &why)) {
+            RAD_ERR("--rope-scaling %s: %s", cfg_.rope_scaling.c_str(), why.c_str());
+            return RAD_E_INVAL;
+        }
+        RopeKeys kv{ meta_kv_k_, meta_kv_v_ };
+        if (kv.any_prefix("draft.")) {
+            int64_t dtrain = meta_.n_ctx_train;
+            if (const std::string* t = kv.get("draft.max_position_embeddings"))
+                dtrain = std::atoll(t->c_str());
+            if (!rope_override_group(meta_kv_k_, meta_kv_v_, spec, "draft.", dtrain, &why)) {
+                RAD_ERR("--rope-scaling %s: %s", cfg_.rope_scaling.c_str(), why.c_str());
+                return RAD_E_INVAL;
+            }
+        }
+        /* A converter that read a YaRN factor as the linear rope_scale left it there; with YaRN
+         * taken off it would stay behind as a position divisor. */
+        if (spec.kind == RopeSpec::None && before.type == "yarn") meta_.rope_scale = 1.0f;
+    }
+
+    const RopeResolved r = rope_resolve(meta_kv_k_, meta_kv_v_, "");
+    const long long want = cfg_.max_ctx > 0 ? (long long)cfg_.max_ctx : (long long)meta_.n_ctx_train;
+    if (r.type == "yarn" && r.factor > 1.0) {
+        const long long reach = (long long)(r.orig * r.factor);
+        RAD_INFO("rope: YaRN factor %g over %lld trained positions -- the rotary reaches %lld; "
+                 "--max-model-len %lld%s", r.factor, (long long)r.orig, reach, want,
+                 spec.kind == RopeSpec::Yarn ? " (--rope-scaling)" : " (the container's own)");
+        if (want > reach)
+            RAD_WARN("--max-model-len %lld is past the %lld positions YaRN factor %g covers; "
+                     "positions beyond them are extrapolated", want, reach, r.factor);
+    } else if (meta_.n_ctx_train > 0 && want > meta_.n_ctx_train && !(meta_.rope_scale > 1.0f)) {
+        RAD_WARN("--max-model-len %lld is past the %lld positions the model was trained on and "
+                 "nothing scales its rotary, so positions beyond them are extrapolated; a model "
+                 "card's YaRN extension is --rope-scaling yarn:FACTOR (docs/YARN.md)", want,
+                 (long long)meta_.n_ctx_train);
+    }
     return RAD_OK;
 }
 
@@ -2754,7 +2810,11 @@ int Engine::configure_kv() {
                             std::to_string(ranks_[0]->prefix.block_size()) + "|" +
                             std::to_string(slot_bytes) + "|" + std::to_string(ck_slot_bytes) + "|" +
                             cfg_.kv_cache_dtype + "|" +
-                            std::to_string((long long)ranks_.size()) + "|" + RAD_VERSION;
+                            std::to_string((long long)ranks_.size()) + "|" + RAD_VERSION +
+                            /* --rope-scaling rotates every cached key differently. Appended only
+                             * when given, so a store written without it keeps its fingerprint. */
+                            (cfg_.rope_scaling.empty() ? std::string()
+                                                       : "|rope=" + cfg_.rope_scaling);
                         uint64_t h = 1469598103934665603ull;
                         for (char c : id) { h ^= (unsigned char)c; h *= 1099511628211ull; }
                         sc.fingerprint = h;

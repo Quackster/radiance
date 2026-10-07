@@ -117,6 +117,9 @@ private:
     int load_plugins();
     int read_metadata();
     int read_checkpoint_metadata();
+    /* --rope-scaling over the free-form keys, then the startup line and the context checks;
+     * runs on meta_kv_k_/meta_kv_v_ before their pointer arrays are built. */
+    int apply_rope_scaling();
     int declare();
     int plan();
     /* --embedding-placement and --ngram-placement, resolved into Config before the card is split
