@@ -792,8 +792,9 @@ which is why it is a named flag and not a heuristic.
 single-sequence decode exact and compresses prefill, which is where the win is.
 
 At four ranks `wht6` selects a different lossy wire with the same floor: tiered int8 over a
-two-shot all-reduce, both hops quantised. Eight ranks have no lossy wire, and `--tp 8 --tp-wire
-wht6` stops at startup naming the all-reduce it found no kernel for. The exact wire at four and
+two-shot all-reduce, both hops quantised. Three and eight ranks have no lossy wire, and `--tp 3`
+or `--tp 8` with `--tp-wire wht6` stops at startup naming the all-reduce it found no kernel for,
+rather than booting and stopping inside the first prefill. The exact wire at four and
 eight ranks is one-shot up to 1 MiB a message and two-shot above it, which sends
 2·(ranks−1)/ranks of the message per rank instead of (ranks−1) times it; the two produce the same
 bits.

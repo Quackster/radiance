@@ -50,6 +50,37 @@
 namespace rad {
 
 /* ================================================================== the miss report */
+/* THE HOLES A STEP CANNOT AVOID: a cross-rank collective with no DEVICE kernel for a message size.
+ *
+ * Every other hole is a band a request MIGHT land in -- whether the configured step ever reaches it
+ * is a question about the plugin's shapes this cannot answer, so it stays a report and a failure at
+ * issue. A collective is different. Its ranged key is the message, every layer issues one over the
+ * step's whole residual stream, and its bands run up to the largest step the engine builds: the
+ * first prefill chunk that selects it reaches the hole. Booting anyway serves /health, takes the
+ * first request and stops the process inside it (#46: --tp 3 --tp-wire wht6, where the blocks
+ * declare the lossy all-reduce beside the exact one and no row implements it at three ranks).
+ *
+ * A HOST KERNEL DOES NOT COVER IT, which is why this is not miss_report's no_host test. The host
+ * rows for a collective resolve at any world size, but the op carries no weights, so bind_ops keeps
+ * it on the device and the issue path does not change domain per band -- miss_report's "host-only,
+ * not a hole" is the wrong sentence for it. On the host backend (CPU-only serving) the device domain
+ * is host memory and every op runs its host kernel, so there it is not a hole and this is empty.
+ *
+ * Which world sizes a wire has kernels for is the kernel libraries' business and not a list in the
+ * core: this reads what declare resolved, so a library that adds a kernel closes the hole with no
+ * change here. */
+static bool device_collective(const std::string& op) {
+    return !device_is_host() && (op == "all_reduce" || op == "all_gather");
+}
+
+static std::vector<std::string> collective_holes(const Program& p) {
+    std::vector<std::string> out;
+    for (const Program::Miss& m : p.misses)
+        if (m.domain != RAD_DOMAIN_HOST && device_collective(m.op)) out.push_back(m.line());
+    return out;
+}
+
+
 /* WHAT DID NOT RESOLVE, in the three shapes the three answers want.
  *
  * A DEVICE miss WITH NO HOST KERNEL EITHER is a hole. The band exists, a request can land in it,
@@ -98,7 +129,9 @@ static MissReport miss_report(const Program& p) {
     std::vector<std::string> host_only_ops;
     for (const Program::Miss& m : p.misses) {
         if (m.domain != RAD_DOMAIN_HOST) {
-            if (no_host.count(std::make_pair(m.op, m.span))) r.device.push_back(m.line());
+            /* A collective runs on the device whatever the host has (collective_holes). */
+            if (no_host.count(std::make_pair(m.op, m.span)) || device_collective(m.op))
+                r.device.push_back(m.line());
             else if (std::find(host_only_ops.begin(), host_only_ops.end(), m.op) ==
                      host_only_ops.end()) host_only_ops.push_back(m.op);
             continue;
@@ -991,6 +1024,29 @@ int Engine::declare() {
             }
             if (!rep[i].host_only.empty()) RAD_INFO("%s", rep[i].host_only.c_str());
             if (!rep[i].host.empty()) RAD_INFO("%s", rep[i].host.c_str());
+        }
+    }
+    /* A HOLE IN A COLLECTIVE REFUSES THE CONFIGURATION (see collective_holes). Reported once when
+     * every rank has the same holes, which is the case whenever the ranks agree on the wire. */
+    {
+        std::vector<std::string> first;
+        size_t n_ranks = 0;
+        for (auto& r : ranks_) {
+            std::vector<std::string> h = collective_holes(r->program);
+            if (h.empty()) continue;
+            if (!n_ranks++) first = std::move(h);
+        }
+        if (n_ranks) {
+            /* The miss report above already listed every band; one is enough to read here. */
+            RAD_ERR("%zu of %zu rank(s): a cross-rank collective has no device kernel for a message "
+                    "size every prefill issues (%zu band(s), listed above), so this configuration "
+                    "would serve its first request and stop inside it -- refused. The first:",
+                    n_ranks, ranks_.size(), first.size());
+            RAD_ERR("    %s", first[0].c_str());
+            if (cfg_.tp > 1 && !cfg_.tp_wire_exact)
+                RAD_ERR("--tp-wire wht6 asks for a lossy wire the loaded kernel libraries do not "
+                        "implement at --tp %d; --tp-wire exact serves it", cfg_.tp);
+            return RAD_E_NOKERNEL;
         }
     }
     /* A CHECKPOINT WEIGHT THAT IS NOT SERVED AS IT STANDS was declared as plain and nothing can
