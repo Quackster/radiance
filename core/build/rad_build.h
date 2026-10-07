@@ -133,6 +133,7 @@ public:
     int         decl_name_map(const RadNameMap* m);
     int         declare_logits(rad_buf b);
     int         declare_token_scores();
+    int         declare_pooled(rad_buf b);
     int         declare_drafter(const RadDrafterDecl* d);
     int         declare_encoder(const RadEncoderDecl* d);
     void        note_v       (const char* f, va_list ap);

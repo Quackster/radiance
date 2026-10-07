@@ -17,6 +17,7 @@
 #include "sched/scheduler.h"
 #include "server/adapters.h"
 #include "server/server.h"
+#include "server/sink.h"
 #include "server/liveview.h"
 #include "text/tokenizer.h"
 
@@ -59,6 +60,7 @@ Engine::~Engine() {
      * says nothing is worse than no flag at all. */
     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();
     for (float* p : kld_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
+    if (pooled_host_) rad_dev_free(pooled_host_, RAD_MEM_HOST_PINNED);
     /* The disk thread first: it reads the host arena and writes the store, both of which go with
      * the ranks and kv_disk_ below. */
     if (pump_) pump_->io.stop();
@@ -430,7 +432,7 @@ int Engine::step_loop() {
     std::vector<uint64_t> cancel;
     /* Not in the KL mode: its scored rows are copied out of the logits buffer after the step is
      * collected, and a pass issued ahead would have overwritten them by then. */
-    pipelining_ = !cfg_.kld() && drafter_.kind != RAD_DRAFT_BLOCK &&
+    pipelining_ = !cfg_.kld() && !embedding_ && drafter_.kind != RAD_DRAFT_BLOCK &&
                   (serial_drafting() || cfg_.n_spec <= 0);
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* Read once. See the block in the idle branch below for what it is for. */
@@ -621,7 +623,7 @@ int Engine::step_loop() {
          * rank threads are reading through batch_for() while this runs; they are applied after the
          * join, ahead of collect_step. */
         auto stage_sampler = [&]() -> int {
-        if (!so.reqs.empty()) {
+        if (!so.reqs.empty() && !embedding_) {
             /* PER-REQUEST SAMPLER STATE IS BUILT HERE, ON FIRST SIGHT. A grammar arrives compiled
              * from admission and is only positioned here; a DRY sequence-breaker set is resolved
              * against the vocabulary once. Both belong off the step path, and this is the first
@@ -742,7 +744,8 @@ int Engine::step_loop() {
                 build_status_ = RAD_OK;
             }
             if (const int ps = prepare_release(b); ps < 0) return fail_loop(ps);
-            issue_what_.store(kIssueAll, std::memory_order_release);
+            /* An embedding program has no sampler to issue behind its pass. */
+            issue_what_.store(embedding_ ? kIssueModel : kIssueAll, std::memory_order_release);
             step_batch_.store(b, std::memory_order_release);
             barrier_->arrive_and_wait();      /* release the ranks */
             {
@@ -844,8 +847,8 @@ int Engine::step_loop() {
          * wait, commit and staging all happen while it runs. */
         st = issue_ahead(&ahead);
         if (st < 0) return fail_loop(st);
-        st = collect_step(b, so);
-        if (st >= 0) {
+        st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
+        if (st >= 0 && !embedding_) {
             for (auto& rk : ranks_) {
                 st = rk->token_scores.collect();
                 if (st < 0) break;
@@ -993,8 +996,54 @@ int Engine::collect_issue(const RadBatch* b, StepOut& so) {
 }
 
 int Engine::mark_step_end(const RadBatch* b, StepOut& so) {
-    if (so.n_rows > 0 && !so.rb) RAD_TRY(collect_issue(b, so));
+    if (embedding_) RAD_TRY(collect_pooled_issue(b, so));
+    else if (so.n_rows > 0 && !so.rb) RAD_TRY(collect_issue(b, so));
     return rad_event_record(step_end_, ranks_[0]->ctx.stream());
+}
+
+/* AN EMBEDDING STEP'S ANSWER, ON ITS WAY TO THE HOST: the pooled buffer's first n_seq rows, copied
+ * into pinned memory behind the pass on rank 0's stream -- every rank holds the same vectors, so
+ * one copy is the answer. Nothing waits here; collect_pooled does, once. */
+int Engine::collect_pooled_issue(const RadBatch* b, StepOut& /*so*/) {
+    if (b->n_seq <= 0) return RAD_OK;
+    Rank& r0 = *ranks_[0];
+    const void* src = r0.ctx.buf_ptr(r0.program.pooled_buf);
+    if (!src) {
+        RAD_ERR("the pooled output was declared but never planned");
+        return RAD_E_STATE;
+    }
+    return rad_memcpy_async(pooled_host_, src,
+                            (int64_t)b->n_seq * pooled_dim_ * (int64_t)sizeof(float),
+                            r0.ctx.stream());
+}
+
+/* Each sequence's vector to its request's sink, and the step's three per-sequence arrays set so
+ * the commit FINISHES every request it carried: an embedding request is one step long. The token
+ * is never emitted (Request::embed), so its value is irrelevant; eos is what ends the request. */
+int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
+    const StepPlan& plan = sched_.plan();
+    so.token.assign(plan.e.size(), 0);
+    so.accepted.assign(plan.e.size(), 0);
+    so.eos.assign(plan.e.size(), 1);
+    if (plan.e.empty()) return RAD_OK;
+    RAD_TRY(rad_event_sync(step_end_));
+    if ((int64_t)plan.e.size() != (int64_t)b->n_seq) {
+        RAD_ERR("an embedding step planned %zu sequences and its batch carries %lld",
+                plan.e.size(), (long long)b->n_seq);
+        return RAD_E_STATE;
+    }
+    for (size_t i = 0; i < plan.e.size(); ++i) {
+        const StepEntry& e = plan.e[i];
+        if (!e.req) continue;
+        if (!e.produces_token) {
+            RAD_ERR("an embedding step carried part of request %llu's input; an encoder must see "
+                    "the whole of it in one step", (unsigned long long)e.req->id);
+            return RAD_E_STATE;
+        }
+        const float* row = pooled_host_ + (int64_t)i * pooled_dim_;
+        server::sink_embedding(e.req->sink, row, pooled_dim_);
+    }
+    return RAD_OK;
 }
 
 /* Wait for the sampled ids and turn them into the three per-sequence arrays the scheduler wants.
@@ -1567,11 +1616,42 @@ int Engine::serve() {
         RAD_ERR("serve: start() has not run, or stopped at --debug-graph");
         return RAD_E_STATE;
     }
-    if (ranks_[0]->program.logits_buf == RAD_NULL_HANDLE) {
-        RAD_ERR("the '%s' plugin declared no logits buffer (rad_declare_logits), so there is "
-                "nothing to sample. An encoder-only plugin cannot serve completions.",
-                plugins_.arch_plugin.c_str());
+    embedding_ = ranks_[0]->program.pooled_buf != RAD_NULL_HANDLE;
+    if (ranks_[0]->program.logits_buf == RAD_NULL_HANDLE && !embedding_) {
+        RAD_ERR("the '%s' plugin declared no logits buffer (rad_declare_logits) and no pooled "
+                "output (rad_declare_pooled), so a step produces nothing anyone can read. An "
+                "encoder-only plugin cannot serve.", plugins_.arch_plugin.c_str());
         return RAD_E_UNSUPPORTED;
+    }
+    if (embedding_) {
+        if (cfg_.kld() || cfg_.n_spec > 0) {
+            RAD_ERR("the '%s' plugin is an embedding model: it generates nothing, so --kld and "
+                    "speculative decoding have nothing to work on", plugins_.arch_plugin.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        const Program& p0 = ranks_[0]->program;
+        pooled_dim_ = p0.buffers[p0.pooled_buf].decl.shape[1];
+        for (size_t i = 1; i < ranks_.size(); ++i) {
+            const Program& pi = ranks_[i]->program;
+            if (pi.pooled_buf == RAD_NULL_HANDLE ||
+                pi.buffers[pi.pooled_buf].decl.shape[1] != pooled_dim_) {
+                RAD_ERR("rank %zu declared a different pooled output from rank 0's", i);
+                return RAD_E_STATE;
+            }
+        }
+        pooled_host_ = static_cast<float*>(
+            rad_dev_alloc(cfg_.max_seqs * pooled_dim_ * (int64_t)sizeof(float),
+                          RAD_MEM_HOST_PINNED));
+        if (!pooled_host_) {
+            RAD_ERR("no pinned host memory for a step's pooled rows (%lld x %lld f32)",
+                    (long long)cfg_.max_seqs, (long long)pooled_dim_);
+            return RAD_E_NOMEM;
+        }
+        /* NO PREFIX CACHE: an encoder keeps no KV to reuse, and attending both ways means a
+         * shared prefix does not even compute to the same rows. */
+        cfg_.prefix_cache = false;
+        RAD_INFO("embedding model: %lld-wide pooled vectors, one step an input, up to %lld "
+                 "tokens an input", (long long)pooled_dim_, (long long)cfg_.max_tok);
     }
 
     /* The scheduler drives ONE block manager. Block ids are pure bookkeeping and identical on
@@ -2202,8 +2282,42 @@ int Engine::run_server() {
     /* load_from_vocab warns on its own when the template is missing or will not compile; all we
      * decide here is whether the endpoint exists. The reply format is the architecture plugin's
      * when it declares one, and the template's otherwise. */
+    /* WHAT AN EMBEDDING MODEL SERVES: /v1/embeddings, and no chat. */
+    /* Its named prompts are the checkpoint's sentence-transformers configuration
+     * (`sentence_transformers.prompts.*`), and a `messages` input renders through its chat
+     * template. */
+    struct EmbedInfo final : server::IEmbedder {
+        int64_t d = 0, n = 0;
+        const RadModelMeta* meta = nullptr;
+        server::IChatTemplate* tpl = nullptr;
+        int64_t dim() const override { return d; }
+        int64_t max_input() const override { return n; }
+        bool prompt(const std::string& name, std::string* text) const override {
+            const std::string key = "sentence_transformers.prompts." + name;
+            const char* v = rad_meta_gets(meta, key.c_str(), nullptr);
+            if (!v) return false;
+            *text = v;
+            return true;
+        }
+        std::string default_prompt() const override {
+            const char* v = rad_meta_gets(meta, "sentence_transformers.default_prompt_name", "");
+            return v ? std::string(v) : std::string();
+        }
+        server::IChatTemplate* message_template() const override { return tpl; }
+    } embed_info;
+    embed_info.d = pooled_dim_;
+    embed_info.n = cfg_.max_tok;
+    embed_info.meta = &meta_;
+    if (embedding_) d.embed = &embed_info;
+
     const RadChatFormat* declared_format = rad_tools_chat_format(plugins_, meta_);
-    if (vocab_ && !vocab_->chat_template().empty() &&
+    if (embedding_) {
+        /* No chat endpoint: the model's template, when it has one, renders a `messages` input. */
+        if (vocab_ && !vocab_->chat_template().empty() &&
+            chat_bridge.init(*vocab_, declared_format, plugins_.arch_plugin) >= 0 &&
+            chat_bridge.ready())
+            embed_info.tpl = &chat_bridge;
+    } else if (vocab_ && !vocab_->chat_template().empty() &&
         chat_bridge.init(*vocab_, declared_format, plugins_.arch_plugin) >= 0 &&
         chat_bridge.ready()) {
         d.chat = &chat_bridge;
@@ -2215,6 +2329,7 @@ int Engine::run_server() {
     server::ServerOptions o{};
     o.decision_type = rad_meta_gets(&meta_, "decision.type",
         rad_meta_gets(&meta_, "lfm2.decision.type", ""));
+    o.embedding_model = embedding_;
     o.model_id = !cfg_.served_model_name.empty() ? cfg_.served_model_name
                : meta_.name && *meta_.name       ? meta_.name : "radiance";
     o.host     = cfg_.host;
@@ -2279,15 +2394,37 @@ int Engine::run_server() {
         }
         vc.max_patches = encd.max_patches;
         /* THE COMMAND LINE OVER THE CONTAINER, field by field, and the result checked as a whole:
-         * a minimum stated alone can land above the maximum the container states. */
-        if (cfg_.image_min_pixels)       vc.image_min_pixels  = *cfg_.image_min_pixels;
-        if (cfg_.image_max_pixels)       vc.image_max_pixels  = *cfg_.image_max_pixels;
-        if (cfg_.video_min_pixels)       vc.video_min_pixels  = *cfg_.video_min_pixels;
-        if (cfg_.video_max_pixels)       vc.video_max_pixels  = *cfg_.video_max_pixels;
+         * a minimum stated alone can land above the maximum the container states.
+         *
+         * A TOKEN-BUDGET PROCESSOR (Gemma 4's) sizes images and frames by soft tokens, not pixel
+         * bands: the band flags would do nothing on it, so they are refused by name, and the
+         * budgets come from --image-tokens and --video-max-frame-tokens. */
+        if (vc.family == mm::Family::Gemma4) {
+            if (cfg_.image_min_pixels || cfg_.image_max_pixels || cfg_.video_min_pixels ||
+                cfg_.video_max_pixels || cfg_.video_min_frames) {
+                RAD_ERR("media: this model's processor sizes images and video frames by a token "
+                        "budget, so --image-min/max-pixels, --video-min/max-pixels and "
+                        "--video-min-frames do nothing; use --image-tokens and "
+                        "--video-max-frame-tokens");
+                return RAD_E_INVAL;
+            }
+            if (cfg_.image_tokens)           vc.image_soft_tokens = *cfg_.image_tokens;
+            if (cfg_.video_max_frame_tokens) vc.video_soft_tokens = *cfg_.video_max_frame_tokens;
+        } else {
+            if (cfg_.image_tokens) {
+                RAD_ERR("media: --image-tokens is a token budget, and this model's processor "
+                        "sizes images by pixels (--image-min-pixels, --image-max-pixels)");
+                return RAD_E_INVAL;
+            }
+            if (cfg_.image_min_pixels)       vc.image_min_pixels  = *cfg_.image_min_pixels;
+            if (cfg_.image_max_pixels)       vc.image_max_pixels  = *cfg_.image_max_pixels;
+            if (cfg_.video_min_pixels)       vc.video_min_pixels  = *cfg_.video_min_pixels;
+            if (cfg_.video_max_pixels)       vc.video_max_pixels  = *cfg_.video_max_pixels;
+            if (cfg_.video_min_frames)       vc.min_frames        = *cfg_.video_min_frames;
+            if (cfg_.video_max_frame_tokens) vc.max_frame_rows    = *cfg_.video_max_frame_tokens;
+        }
         if (cfg_.video_fps)              vc.fps               = *cfg_.video_fps;
-        if (cfg_.video_min_frames)       vc.min_frames        = *cfg_.video_min_frames;
         if (cfg_.video_max_frames)       vc.max_frames        = *cfg_.video_max_frames;
-        if (cfg_.video_max_frame_tokens) vc.max_frame_rows    = *cfg_.video_max_frame_tokens;
         if (cfg_.max_source_pixels)      vc.max_source_pixels = *cfg_.max_source_pixels;
         if (cfg_.media_flags_set() && vc.check(&why) < 0) {
             RAD_ERR("media: the media flags and what the container states disagree: %s",
@@ -2309,20 +2446,34 @@ int Engine::run_server() {
                     (long long)encd.patch_dim, (long long)encd.merge);
             return RAD_E_INVAL;
         }
+        if (vc.family == mm::Family::Gemma4 &&
+            (int64_t)std::max(vc.image_soft_tokens, vc.video_soft_tokens) * vc.merge * vc.merge >
+                encd.max_patches) {
+            RAD_ERR("media: an image of %d soft tokens or a video frame of %d is more patches than "
+                    "one encoder pass holds (--mm-max-patches %lld)", vc.image_soft_tokens,
+                    vc.video_soft_tokens, (long long)encd.max_patches);
+            return RAD_E_INVAL;
+        }
         mm_proc = std::make_unique<mm::Processor>();
         RAD_TRY(mm_proc->init(vc, [&tok_bridge](const std::string& t) {
             return tok_bridge.encode(t, /*add_special=*/false, /*parse_special=*/false);
         }, [&tok_bridge](const std::string& t) {
             return tok_bridge.encode(t, /*add_special=*/false, /*parse_special=*/true);
         }));
-        mm_bridge = std::make_unique<server::MultimodalBridge>(mm_proc.get(), encd.modalities);
-        d.mm = mm_bridge.get();
         o.allow_image = (encd.modalities & RAD_MM_IMAGE) != 0;
         o.allow_video = (encd.modalities & RAD_MM_VIDEO) != 0;
         if (!mm::decoder_available())
             RAD_WARN("media: the '%s' encoder is loaded but this build has no media decoder "
                      "(RAD_WITH_FFMPEG), so every media part will be refused",
                      ranks_[0]->program.encoder_name.c_str());
+        else if (mm_proc->config().family == mm::Family::Gemma4)
+            RAD_INFO("media: %s%s through '%s'; an image becomes at most %d soft tokens (a "
+                     "request's image_tokens may ask for 70..1120), a video %d a frame at %.3g "
+                     "frames a second, at most %d frames; %lld patches a pass",
+                     o.allow_image ? "images" : "", o.allow_video ? " and video" : "",
+                     ranks_[0]->program.encoder_name.c_str(), mm_proc->config().image_soft_tokens,
+                     mm_proc->config().video_soft_tokens, mm_proc->config().fps,
+                     mm_proc->config().max_frames, (long long)encd.max_patches);
         else
             RAD_INFO("media: %s%s through '%s'; an image resizes to at most %lld pixels (%lld "
                      "patches a pass), a video to %lld pixels over all its frames",
@@ -2331,8 +2482,42 @@ int Engine::run_server() {
                      (long long)mm_proc->config().image_max_pixels, (long long)encd.max_patches,
                      (long long)mm_proc->config().video_max_pixels);
     }
+    /* AUDIO, WHEN THE PROGRAM DECLARED AN AUDIO ENCODER: the feature extractor reads its framing
+     * from the container, and the encoder states the frame width and the frames an output row. */
+    const RadEncoderDecl& aend = ranks_[0]->program.audio_encoder;
+    if (aend.modalities != 0) {
+        mm::AudioConfig ac;
+        std::string why;
+        if (ac.from_meta(meta_, &why) < 0) {
+            RAD_ERR("the '%s' encoder has no feature extractor: %s",
+                    ranks_[0]->program.audio_encoder_name.c_str(), why.c_str());
+            return RAD_E_INVAL;
+        }
+        if (ac.n_mels != aend.patch_dim) {
+            RAD_ERR("the container's feature extractor makes %d-bin frames; the '%s' encoder takes "
+                    "%lld", ac.n_mels, ranks_[0]->program.audio_encoder_name.c_str(),
+                    (long long)aend.patch_dim);
+            return RAD_E_INVAL;
+        }
+        ac.merge = (int32_t)aend.merge;
+        ac.max_frames = aend.max_patches;
+        if (!mm_proc) mm_proc = std::make_unique<mm::Processor>();
+        RAD_TRY(mm_proc->init_audio(ac));
+        o.allow_audio = true;
+        if (mm::decoder_available())
+            RAD_INFO("media: audio through '%s'; a clip is cut at %.3g s, %d mel bins a %d ms frame, "
+                     "%d frames a token; %lld frames a pass",
+                     ranks_[0]->program.audio_encoder_name.c_str(),
+                     (double)ac.max_samples / (double)ac.rate, ac.n_mels,
+                     ac.hop * 1000 / ac.rate, ac.merge, (long long)aend.max_patches);
+    }
+    if (mm_proc) {
+        mm_bridge = std::make_unique<server::MultimodalBridge>(
+            mm_proc.get(), encd.modalities | aend.modalities);
+        d.mm = mm_bridge.get();
+    }
 
-    if (encd.modalities == 0 && cfg_.media_flags_set())
+    if (encd.modalities == 0 && aend.modalities == 0 && cfg_.media_flags_set())
         RAD_WARN("media: the media flags do nothing here -- this model %s",
                  cfg_.mm_max_patches == 0 ? "is served text only (--mm-max-patches 0)"
                                           : "takes no images or video");
@@ -2385,9 +2570,13 @@ int Engine::run_server() {
                 why.c_str());
         return RAD_E_INVAL;
     }
-    RAD_INFO("serving on http://%s:%d  (/v1/completions%s)%s", o.host.c_str(), o.port,
-             d.chat ? "; /v1/chat/completions with tools and reasoning" : "; chat is 501",
-             o.api_key.empty() ? "" : "  -- a bearer key is required");
+    if (embedding_)
+        RAD_INFO("serving on http://%s:%d  (/v1/embeddings; completions and chat are 501)%s",
+                 o.host.c_str(), o.port, o.api_key.empty() ? "" : "  -- a bearer key is required");
+    else
+        RAD_INFO("serving on http://%s:%d  (/v1/completions%s)%s", o.host.c_str(), o.port,
+                 d.chat ? "; /v1/chat/completions with tools and reasoning" : "; chat is 501",
+                 o.api_key.empty() ? "" : "  -- a bearer key is required");
 
     /* THE LIVE VIEW (spec §16), constructed here and nowhere else.
      *

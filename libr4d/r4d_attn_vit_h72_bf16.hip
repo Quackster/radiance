@@ -531,6 +531,8 @@ extern "C" int r4d_rad_attn_vit(const RadArgs* a, RadStream s) {
      * kernel steps by. */
     const long long head_dim = r4d_geti_or(a, "head_dim", q->rank == 3 ? q->shape[2] : 72);
     if (head_dim != 72) return R4D_NO(RAD_E_SHAPE);
+    /* Every key of a segment is attended to; a window would be ignored, so it is refused. */
+    if (r4d_geti_or(a, "window", 0) != 0) return R4D_NO(RAD_E_INVAL);
     auto rows = [&](const RadTensor* t, long long* n_tok, long long* n_head, long long* ld) {
         long long width = 1;
         for (uint32_t i = 1; i < t->rank; ++i) width *= t->shape[i];

@@ -14,6 +14,7 @@ into the id an architecture plugin claims.
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LFM2 and LFM2-VL from safetensors, served bf16 on one rank; optional SigLIP2 vision and [d1 decisions](SYSTEMONE.md) |
+| `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
 
 This document is the geometry of each, and the handful of readings that are **arithmetically
 silent** — wrong in a way that produces fluent output and no error anywhere.
@@ -396,3 +397,52 @@ N = 160 — wide enough that formats which differ by less than that rank in any 
 graded statistic that has thousands of samples rather than hundreds (the mean |delta| over the
 logits row, or the per-position KL of `radiance --kld-ref`), and confirm any ordering at N ≥ 160
 before acting on it.
+
+---
+
+# `embeddinggemma2` — an embedding model
+
+`arch/embgemma2` declares a POOLED output (`rad_declare_pooled`) and no logits, which makes the
+program an embedding program: the engine runs it with no sampler and no KV cache, carries every
+input whole in one step, and returns each sequence's pooled row on `/v1/embeddings`
+([GUIDE §5.6](GUIDE.md)). One card (`--tp 1`).
+
+```
+text      24 layers, hidden 512, ffn 2048 (gelu-tanh, gated), vocab 262144
+          layer_types: five sliding (|i-j| <= 512, 4 x 256, 2 kv heads, theta 1e4) then one full
+          (4 x 512, 1 kv head, theta 1e6), four times; BIDIRECTIONAL everywhere, scale 1
+          q, k RMS-normed with a gain, v without; sandwich norms with plain gains
+          per-layer inputs: the embedding projected to 24 x 512 and normed, gating a 512 bottleneck
+          a learned scalar a layer on the residual; mean over every token, then 512 -> 768
+vision    Gemma 4's: 16 layers of 768 (12 x 64), a learned row/column table, a two-block 2-D rotary
+          (x on the first half of a head, y on the second, theta 100), 3 x 3 mean pooling * sqrt(768),
+          an unscaled RMS norm and 768 -> 512; up to 280 soft tokens an image by default
+audio     Gemma 4's USM conformer: two stride-2 3 x 3 convolutions over (time, mel), 12 blocks
+          (half-weight feed-forwards, local attention 11 back with a relative-position term and a
+          softcap of 50, a gated depthwise causal convolution), clipped linears; 1024 -> 1536 ->
+          embedder -> 512; 4 frames (40 ms) a token, clips cut at 30 s
+```
+
+The traps:
+
+- **The embedding scale is the bf16 of sqrt(512)**, 22.625, because the reference stores it as a
+  bf16 buffer. sqrt(512) itself is off by one part in 800 on every embedding.
+- **A media row replaces its placeholder's embedding before the per-layer inputs are projected.**
+  The per-layer input of an image token is computed from its image row, not from the placeholder
+  id's embedding.
+- **The vision rotary is two independent neox rotaries**, one over each half of a head (`qk_norm_rope`
+  mode `blocks`). `rope` mode `axial` pairs across the halves and is a different function.
+- **The vision pooler stores the mean in bf16 before scaling it by sqrt(768)** (`pool_rows`), and
+  the processor lays each 3 x 3 window's patches out consecutively so the pooler is a mean of nine
+  consecutive rows; attention and both position terms read each patch's own coordinates.
+- **The audio subsampler masks its input to the clip's real frames before each convolution**: the
+  second convolution reads the first one's output at frame 2t's validity (`conv2d`'s `valid`
+  operand, stride 2), which zeroes the one row past the real ones that the zero padding alone
+  would not.
+- **The audio attention reaches 11 rows back, not 12.** The config says `attention_context_left`
+  13 and the chunked layout fetches 12 keys behind each block, but the mask transformers applies
+  keeps a key only when `0 <= q - k < context_left - 1`. Twelve back drifts a few percent a block
+  and leaves rows at cosine 0.6 by the last one.
+- **An audio clip's tokens are ceil(real frames / 4)**, real frames being those whose last sample
+  is a real one; the processor stages exactly those plus zero frames to whole rows, which
+  reproduces every row the reference keeps.

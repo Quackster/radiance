@@ -63,19 +63,27 @@ static void widen_gain(const RadTensor* w, int64_t n, float wadd, float* out) {
 /* ------------------------------------------------------------------ rmsnorm */
 /* y = x * rsqrt(mean(x^2) + eps) * (w + wadd) */
 AVX_KERNEL(rmsnorm) {
-    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
-    const RadTensor *x = &a->t[0], *w = &a->t[1], *y = &a->t[2];
-    const int64_t n = p_int(a, "n", w->rank ? w->shape[w->rank - 1] : 0);
+    if (!a || a->n_t < 3 || !a->t[0].data || !a->t[2].data) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *y = &a->t[2];
+    /* An absent gain is one (libref's reading), and `wadd` belongs to a gain. */
+    const RadTensor* w = a->t[1].data ? &a->t[1] : nullptr;
+    const int64_t n = p_int(a, "n", w && w->rank ? w->shape[w->rank - 1] : 0);
     const float eps  = p_f32(a, "eps", 1e-6f);
     const float wadd = p_f32(a, "wadd", 0.0f);
     const int64_t round_before_weight = p_int(a, "round_before_weight", 0);
     if (round_before_weight != 0 && round_before_weight != 1) return RAD_E_INVAL;
     if (n <= 0) return RAD_E_SHAPE;
+    if (!w && wadd != 0.0f) return RAD_E_INVAL;
     const int64_t rows = rows_of(x, n);
-    if (rows <= 0 || numel(y) < rows * n || numel(w) < n) return RAD_E_SHAPE;
+    if (rows <= 0 || numel(y) < rows * n || (w && numel(w) < n)) return RAD_E_SHAPE;
 
     float* gain = (float*)scratch_raw((size_t)n * sizeof(float));
-    widen_gain(w, n, wadd, gain);
+    if (w) widen_gain(w, n, wadd, gain);
+    else   for (int64_t i = 0; i < n; ++i) gain[i] = 1.0f;
+    /* `mult` folded into the gain: the row is scaled before its one rounding. */
+    const float mult = p_f32(a, "mult", 1.0f);
+    if (mult != 1.0f)
+        for (int64_t i = 0; i < n; ++i) gain[i] *= mult;
 
     AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
     for (int64_t r = 0; r < rows; ++r) {

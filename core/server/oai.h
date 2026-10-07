@@ -114,6 +114,11 @@ struct OaiRequest {
 
     /* /v1/embeddings */
     bool base64_embeddings = false;
+    /* OpenAI's `dimensions`: the vector's first `dimensions` components, renormalised -- a
+     * Matryoshka-trained model's shorter embedding. 0 is the model's own width. */
+    int64_t dimensions = 0;
+    /* /v1/embeddings: a soft-token budget for the request's images, 0 the server's. */
+    int32_t image_tokens = 0;
 
     int  n_choices() const { return (int)prompts.size() * n; }
 };
@@ -239,6 +244,7 @@ struct OaiDeps {
     IChatTemplate*    chat = nullptr;
     IGrammarCompiler* grammar = nullptr;
     IMultimodal*      mm = nullptr;
+    IEmbedder*        embed = nullptr;
 };
 
 /* Parse. `body` is the raw request body; a malformed body is a 400 that says where. */

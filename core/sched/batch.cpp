@@ -502,7 +502,7 @@ int BatchBuilder::layout(Program& prog, const Config& cfg) {
                                                   : a.conv_grp < b.conv_grp;
               });
 
-    mm_on_ = prog.encoder.modalities != 0;
+    mm_on_ = prog.encoder.modalities != 0 || prog.audio_encoder.modalities != 0;
     return RAD_OK;
 }
 
@@ -567,15 +567,21 @@ struct BatchBuilder::MediaPool : std::enable_shared_from_this<MediaPool> {
 };
 
 BatchBuilder::MediaBytes BatchBuilder::media_bytes() {
-    const RadEncoderDecl& e = prog_->encoder;
-    n_embd_ = e.n_embd;
-    enc_patches_ = e.max_patches;
-    enc_dim_ = e.patch_dim;
-    /* The most segments one pass can hold: a segment is at least one output row, `merge` patches. */
-    enc_segs_ = e.max_patches / (e.merge > 0 ? e.merge : 1) + 1;
+    /* The larger of the two encoders' passes, field by field: they run one at a time. Both write
+     * rows of the model's embedding width. */
+    enc_patches_ = enc_pix_elems_ = enc_segs_ = 0;
+    n_embd_ = 0;
+    for (const RadEncoderDecl* e : { &prog_->encoder, &prog_->audio_encoder }) {
+        if (e->modalities == 0) continue;
+        n_embd_ = std::max<int64_t>(n_embd_, e->n_embd);
+        enc_patches_ = std::max<int64_t>(enc_patches_, e->max_patches);
+        enc_pix_elems_ = std::max<int64_t>(enc_pix_elems_, e->max_patches * e->patch_dim);
+        /* The most segments one pass can hold: a segment is at least one output row. */
+        enc_segs_ = std::max<int64_t>(enc_segs_, e->max_patches / (e->merge > 0 ? e->merge : 1) + 1);
+    }
     MediaBytes m;
     m.mm  = max_tok_ * n_embd_ * (int64_t)sizeof(uint16_t);
-    m.pix = enc_patches_ * enc_dim_ * (int64_t)sizeof(uint16_t);
+    m.pix = enc_pix_elems_ * (int64_t)sizeof(uint16_t);
     m.crd = 4 * enc_patches_ * (int64_t)sizeof(int32_t);
     m.cu  = (enc_segs_ + 1) * (int64_t)sizeof(int32_t);
     /* Retaining features is an opt-in for compact-scoring architectures, so an
@@ -652,7 +658,7 @@ int BatchBuilder::alloc_media() {
     mm_host_ranges_.reserve((size_t)max_tok_);
     mm_device_copies_.reserve((size_t)max_tok_);
     RAD_INFO("media staging: %s a rank for a step's encoder rows and %s for an encoder pass of "
-             "%lld patches", humanb(mm_bytes).c_str(),
+             "up to %lld patches", humanb(mm_bytes).c_str(),
              humanb(pix_bytes + crd_bytes + cu_bytes).c_str(), (long long)enc_patches_);
     if (m.retained > 0)
         RAD_INFO("media features: %s retained on rank zero; overflow uses host staging",
@@ -1444,8 +1450,11 @@ AdvanceArgs BatchBuilder::advance_args(int rank) const {
 }
 
 /* ------------------------------------------------------------------ the encoder pass */
-const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& parts, int step) {
-    if (!mm_on_ || parts.empty()) return nullptr;
+const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& parts, int step,
+                                            const RadEncoderDecl& enc) {
+    if (!mm_on_ || parts.empty() || enc.modalities == 0) return nullptr;
+    const int64_t enc_dim = enc.patch_dim;
+    const int64_t max_segs = enc.max_patches / (enc.merge > 0 ? enc.merge : 1) + 1;
     int64_t n_patch = 0, n_seg = 0, max_seg = 0;
     enc_cu_host_[0] = 0;
     for (const EncoderPart& p : parts) {
@@ -1456,16 +1465,16 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
         }
         const mm::Item& it = *p.item;
         const int64_t np = it.patch_at(p.seg0 + p.n_seg) - it.patch_at(p.seg0);
-        if (it.patch_dim != enc_dim_ || n_patch + np > enc_patches_ ||
-            n_seg + p.n_seg > enc_segs_ || p.seg0 + p.n_seg > it.n_seg) {
+        if (it.patch_dim != enc_dim || n_patch + np > enc.max_patches ||
+            n_seg + p.n_seg > max_segs || p.seg0 + p.n_seg > it.n_seg) {
             RAD_ERR("encoder pass: %lld patches in %lld segments do not fit the declared pass of "
                     "%lld patches of %lld elements", (long long)(n_patch + np),
-                    (long long)(n_seg + p.n_seg), (long long)enc_patches_, (long long)enc_dim_);
+                    (long long)(n_seg + p.n_seg), (long long)enc.max_patches, (long long)enc_dim);
             return nullptr;
         }
-        std::memcpy(enc_pix_host_ + n_patch * enc_dim_,
-                    it.pixels.data() + it.patch_at(p.seg0) * enc_dim_,
-                    (size_t)(np * enc_dim_) * sizeof(uint16_t));
+        std::memcpy(enc_pix_host_ + n_patch * enc_dim,
+                    it.pixels.data() + it.patch_at(p.seg0) * enc_dim,
+                    (size_t)(np * enc_dim) * sizeof(uint16_t));
         n_patch += np;
         for (int32_t q = 0; q < p.n_seg; ++q) {
             const int64_t seg_p = it.segment_patches(p.seg0 + q);
@@ -1492,7 +1501,7 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
     for (size_t r = 0; r < ranks_.size(); ++r) {
         RadStream st = ranks_[r].stream;
         if (rad_memcpy_async(enc_pix_dev_[r], enc_pix_host_,
-                             n_patch * enc_dim_ * (int64_t)sizeof(uint16_t), st) < 0 ||
+                             n_patch * enc_dim * (int64_t)sizeof(uint16_t), st) < 0 ||
             rad_memcpy_async(enc_coord_dev_[r], enc_coord_host_,
                              4 * n_patch * (int64_t)sizeof(int32_t), st) < 0 ||
             rad_memcpy_async(enc_cu_dev_[r], enc_cu_host_,
@@ -1509,7 +1518,7 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
         B.step = step;
         B.n_kv_groups = (int)o.kv[r].size();
         B.kv = o.kv[r].data();
-        B.enc = 1;
+        B.enc = (int32_t)enc.modalities;
         B.enc_n_patch = n_patch;
         B.enc_pixels = enc_pix_dev_[r];
         B.enc_coord = static_cast<const int32_t*>(enc_coord_dev_[r]);

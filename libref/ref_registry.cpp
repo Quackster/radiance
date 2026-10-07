@@ -73,11 +73,15 @@
 #define ARR(a)  (a), (int)(sizeof(a) / sizeof((a)[0]))
 
 /* ---- elementwise and norms ---------------------------------------------------------------- */
-static const RadParamSpec pRmsnorm[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
-                                          P_F64O("wadd"), P_INTO("round_before_weight") };
+/* `mult` scales the normed row before its one rounding (default 1). */
+/* rmsnorm_add has no `mult`: it is the fused pair, and nothing fuses a scaled branch. */
 static const RadParamSpec pRmsnormAdd[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
                                           P_F64O("wadd") };
-static const RadOperandSpec oRmsnorm[] = { OPD("x"), WGT("w"), OUT("y") };
+static const RadParamSpec pRmsnorm[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
+                                          P_F64O("wadd"), P_F64O("mult"), P_INTO("round_before_weight") };
+/* `w` is optional: absent, the gain is one (a norm with no scale, such as Gemma 4's value norm and
+ * its multimodal embedder's pre-projection norm). */
+static const RadOperandSpec oRmsnorm[] = { OPD("x"), WGT_O("w"), OUT("y") };
 
 /* The GATED RESIDUAL pair. `inject` and `group` are the two switches the operand list is banded
  * on: `inject` 0 is the final mixer (no per-branch gate weight, no gate output) and `group` 0 is a
@@ -148,9 +152,41 @@ static const RadParamSpec pGridEmbed[] = { P_INT("M"), P_INT("n"), P_INT("side")
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
 
 static const RadParamSpec pMnD[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+/* `scalar` 1 says `w` is one element rather than one row: a kernel reads that off the operand, and
+ * the parameter is what lets a shape description say which of the two geometries it is. */
+static const RadParamSpec pMulWeight[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_INTO("scalar") };
 static const RadOperandSpec oBinary[]  = { OPD("a"), OPD("b"), OUT("y") };
 static const RadOperandSpec oGateUp[]  = { OPD("gate_up"), OUT("y") };
+static const RadOperandSpec oMulWeight[] = { OPD("x"), WGT("w"), OUT("y") };
+static const RadParamSpec pActMul[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
+/* `M` is the step's token count and bands the op; the segment count is cu_seqlens' length. */
+static const RadParamSpec pSegMean[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oSegMean[] = { OPD("x"), OPD("cu_seqlens"), OUT("y") };
+/* `M` is the INPUT row count, a multiple of `k`; y has M / k rows. */
+static const RadParamSpec pPoolRows[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_F64O("mult"),
+                                          P_STR("dtype") };
 static const RadOperandSpec oUnary[]   = { OPD("x"), OUT("y") };
+/* The audio (USM conformer) tower's operators. */
+static const RadOperandSpec oClamp[]  = { OPD("x"), WGT("lo"), WGT("hi"), OUT("y") };
+/* `M` is the INPUT time rows. */
+static const RadParamSpec pConv2d[]   = { P_INT("M"), P_INT("width"), P_INT("cin"), P_INT("cout"),
+                                          P_INT("kh"), P_INT("kw"), P_INT("stride"), P_INT("pad"),
+                                          P_INTO("cu_div"), P_INTO("valid_stride"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oConv2d[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OPD_O("valid"),
+                                          OUT("y") };
+static const RadParamSpec pConv1dDw[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_INTO("cu_div"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oConv1dDw[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OUT("y") };
+/* `M` is the table's rows: one a distance. */
+static const RadParamSpec pRelSin[]   = { P_INT("M"), P_INT("n"), P_F64O("max_timescale"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oRelSin[] = { OUT("y") };
+static const RadParamSpec pAttnLocalRel[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
+                                              P_INT("left"), P_INT("right"), P_F64("softcap"),
+                                              P_INTO("cu_div"), P_STR("dtype") };
+static const RadOperandSpec oAttnLocalRel[] = { OPD("q"), OPD("k"), OPD("v"), OPD("relk"),
+                                                WGT("pds"), OPD("cu_seqlens"), OUT("out") };
 /* `fill` has no input: `value` is the whole of what it writes. */
 static const RadParamSpec pFill[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("value") };
 static const RadOperandSpec oFill[] = { OUT("y") };
@@ -269,7 +305,7 @@ static const RadConstraint cPagedBlock[] = { RAD_CGE("block_size", 1) };
 
 static const RadParamSpec pAttnDense[] = { P_INT("M"), P_INT("head_dim"), P_INT("gqa"),
                                            P_INT("causal"), P_STR("dtype"), P_F64O("scale"),
-                                           P_INTO("max_seqlen") };
+                                           P_INTO("max_seqlen"), P_INTO("window") };
 static const RadOperandSpec oAttnDense[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
                                              OUT("out") };
 
@@ -311,10 +347,13 @@ static const RadParamSpec pQsaBlockKey[] = { P_INT("M"), P_INT("n"), P_INT("rati
 static const RadOperandSpec oQsaBlockKey[] = { OPD("k"), WGT("w"), OPD_O("page"), OPD_O("pos"),
                                                OUT("out") };
 
+/* `mode` "blocks" rotates each of `sections` (pair counts) as its own neox block of channels,
+ * reading the position component `comps` names for it; positions are then [C, M]. */
 static const RadParamSpec pQkNormRope[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
                                             P_INT("n_head_kv"), P_F64("theta"), P_F64("eps"),
                                             P_F64O("scale"), P_STRO("mode"), P_INTO("rotary_dim"),
-                                            P_F64O("wadd") };
+                                            P_F64O("wadd"), P_INTO("v_norm"), P_STRO("sections"),
+                                            P_STRO("comps") };
 static const RadOperandSpec oQkNormRope[] = { INOUT("qkv"), OPD("positions"), WGT("q_w"),
                                               WGT("k_w") };
 
@@ -513,6 +552,11 @@ static const RadParamSpec pEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_voc
                                         * A parameter because a global scale needs the whole table
                                         * and the transform sees one block. */
                                        P_F64O("wscale") };
+/* embed_lookup's own list: pEmbed and `mult`, the factor every gathered row is multiplied by --
+ * Gemma's sqrt(hidden). embed_lookup_q has its table scale and does not take it. */
+static const RadParamSpec pEmbedM[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
+                                        P_STR("dtype"), P_INTO("vocab_offset"),
+                                        P_F64O("wscale"), P_F64O("mult") };
 static const RadOperandSpec oEmbed[] = { OPD("tokens"), WGT("wte"), OUT("x") };
 /* The quantised table: one scale for all of it. A SEPARATE OP and not a dtype on the above --
  * the operand list differs and operands are positional, the same argument gemm_nt_q makes. */
@@ -577,11 +621,12 @@ static const RadOperandSpec oMerge[]     = { OPD("gathered"), OPD("params"),
 /* ================================================================== the schema table */
 static const RadOpSchema kSchemas[] = {
 { "rmsnorm", ARR(pRmsnorm), ARR(oRmsnorm),
-  "y = x * rsqrt(mean(x^2) + eps) * (w + wadd). `wadd` is not in docs/OPS.md's elementwise table: "
+  "y = x * rsqrt(mean(x^2) + eps) * (w + wadd) * mult. `wadd` is not in docs/OPS.md's elementwise table: "
   "it is GemmaRMSNorm's `1 +`, which Qwen3.5, Qwen3-Next and Gemma all need, and it defaults to 0. "
   "Spelled `wadd` and not `w_add` because that is what libr4d's fused norms call it and one "
-  "vocabulary cannot have two spellings of one parameter. Optional round_before_weight=1 "
-  "narrows x * rsqrt to x's dtype before multiplying by the gain; the default is 0." },
+  "vocabulary cannot have two spellings of one parameter. `mult` (default 1) scales the row "
+  "before its one rounding. Optional round_before_weight=1 "
+  "narrows x * rsqrt to x's dtype before multiplying by the gain and mult." },
 { "rmsnorm_add", ARR(pRmsnormAdd), ARR(oRmsnormAdd),
   "residual_out = x + residual, then y = rmsnorm(residual_out) * w. The variance is taken from "
   "the unrounded f32 sum; the multiply reads residual_out back AFTER it has been narrowed, which "
@@ -620,6 +665,38 @@ static const RadOpSchema kSchemas[] = {
   "y = a + b. An operand carrying exactly n elements against a taller output broadcasts along "
   "rows; nothing else broadcasts." },
 { "mul", ARR(pMnD), ARR(oBinary), "y = a * b, with the same one broadcast rule as `add`." },
+{ "mul_weight", ARR(pMulWeight), ARR(oMulWeight),
+  "y = x * w, `w` a WEIGHT of one element (a scalar for the whole output) or of one row "
+  "(broadcast down the rows): a learned gain on an activation. f32 product, rounded once." },
+{ "act_mul", ARR(pActMul), ARR(oBinary),
+  "y = act(a) * b, `act` \"silu\", \"gelu\" (exact erf), \"gelu_tanh\" or \"sigmoid\". The activation is "
+  "rounded to y's dtype before the product, which is the unfused pair. `a` and `b` may be column "
+  "slices of one fused row." },
+{ "seg_mean", ARR(pSegMean), ARR(oSegMean),
+  "y[s] = mean of x's rows [cu[s], cu[s+1]): one row a segment, summed in double and rounded "
+  "once to y's dtype. An empty segment is a zero row." },
+{ "pool_rows", ARR(pPoolRows), ARR(oUnary),
+  "Row r of y is the mean of x's rows [r*k, r*k + k), summed in f32 and rounded to y's dtype, then "
+  "times `mult` (default 1) and rounded again. M, the input rows, is a multiple of k." },
+{ "relu", ARR(pMnD), ARR(oUnary), "y = max(x, 0), each operand at its own row pitch." },
+{ "clamp", ARR(pMnD), ARR(oClamp),
+  "y = min(max(x, lo), hi), `lo` and `hi` WEIGHTS of one element each: a clipped linear's range." },
+{ "conv2d", ARR(pConv2d), ARR(oConv2d),
+  "A 2-D convolution over (time, width), channels innermost: x[t, w*cin + c] -> y[t, w*cout + c], "
+  "w [cout, cin, kh, kw]. Each cu_seqlens segment (rows cu/cu_div) is convolved on its own with "
+  "zero padding `pad` at its edges; its output rows start at cu/(cu_div*stride). With `valid`, "
+  "input row t reads as zeros unless valid[t * valid_stride] != 0. f32 sum, one rounding." },
+{ "conv1d_dw", ARR(pConv1dDw), ARR(oConv1dDw),
+  "Causal depthwise convolution over time: y[t, c] = sum_j w[c, 0, j] * x[t - (k-1) + j, c], rows "
+  "before the segment's start (cu/cu_div) read as zeros. f32 sum, one rounding." },
+{ "rel_sinusoid", ARR(pRelSin), ARR(oRelSin),
+  "Row d: sin(d * inv[i]) then cos(d * inv[i]) over n/2 timescales, inv[i] = exp(i * "
+  "-log(max_timescale) / max(n/2 - 1, 1)), each step in f32, rounded once." },
+{ "attn_local_rel", ARR(pAttnLocalRel), ARR(oAttnLocalRel),
+  "Local attention with a relative-position term (Gemma 4's audio): query i of a segment sees "
+  "keys j with 0 <= i - j <= left (`right` 0). qf = q * head_dim^-0.5/ln2 * softplus(pds); logit "
+  "= qf.k * ln(1+e)/ln2 + qf.relk[i-j]; softcap * tanh(logit / softcap); softmax; .v. f32, one "
+  "rounding." },
 { "silu_mul", ARR(pMnD), ARR(oGateUp),
   "y[i] = silu(gate_up[i]) * gate_up[n + i]. The GATE IS THE FIRST HALF, which is the order "
   "rad-convert fuses gate and up into one weight in." },
@@ -774,7 +851,8 @@ static const RadOpSchema kSchemas[] = {
   "including this step's query rows. k_descale / v_descale are optional and apply to an fp8 "
   "cache. `scale` is not in docs/OPS.md and defaults to 1/sqrt(head_dim)." },
 { "attn_dense", ARR(pAttnDense), ARR(oAttnDense),
-  "Dense varlen attention over cu_seqlens segments -- the vision tower's. Nothing paged." },
+  "Dense varlen attention over cu_seqlens segments. Nothing paged. `window` is attn_paged's rule "
+  "over a segment's positions: causal, i - j < window; non-causal, |i - j| < window; 0 none." },
 { "kv_store", ARR(pKvStore), ARR(oKvStore),
   "Writes k and v into the paged cache at slot_mapping; a negative slot is skipped. The cache is "
   "INOUT rather than the OUT docs/OPS.md draws, because the op touches only the mapped slots." },
@@ -797,7 +875,8 @@ static const RadOpSchema kSchemas[] = {
   "`scale` divides the position; `rotary_dim` is optional and defaults to head_dim." },
 { "qk_norm_rope", ARR(pQkNormRope), ARR(oQkNormRope),
   "Per-head RMS norm of q and k against their own gains, then rope. THE NORM OUTPUT IS ROUNDED "
-  "TO THE TENSOR'S DTYPE BEFORE THE ROTATION, which is what the unfused pair does." },
+  "TO THE TENSOR'S DTYPE BEFORE THE ROTATION, which is what the unfused pair does. `v_norm` 1 "
+  "also RMS-norms each v head with a unit gain, unrotated." },
 
 { "scale_rows", ARR(pScaleRows), ARR(oScaleRows),
   "y[m, i] = x[m, i] * act(s[m]): one scalar per ROW, broadcast ACROSS the row. `mul` broadcasts "
@@ -914,9 +993,10 @@ static const RadOpSchema kSchemas[] = {
   "[rows][row] and y is [rows][world_size][row], so one row of y carries every rank's words for "
   "that row. The vocab-parallel candidate merge reads exactly that." },
 
-{ "embed_lookup", ARR(pEmbed), ARR(oEmbed),
+{ "embed_lookup", ARR(pEmbedM), ARR(oEmbed),
   "A gather from wte[n_vocab, n_embd]. A negative token id writes a zero row (padding); an id at "
-  "or above n_vocab fails the launch." },
+  "or above n_vocab fails the launch. `mult`, when given, multiplies every gathered row and the "
+  "product is rounded once to x's dtype (Gemma's sqrt(hidden)); absent it is a plain copy." },
 { "embed_lookup_q", ARR(pEmbed), ARR(oEmbedQ),
   "The same gather from a table quantised with ONE scale for all of it: x[m] = wte[id] * scale[0]. "
   "Qwen3.8-Flash-Next-FP8's 320-million-row n-gram embedding is stored that way -- E4M3 codes and a "
@@ -1029,6 +1109,24 @@ SIMPLE("ref_add", "add", "elem", "elementwise sum", DT_FLOAT, ref_add),
 SIMPLE("ref_mul", "mul", "elem", "elementwise product", DT_FLOAT, ref_mul),
 SIMPLE("ref_silu_mul", "silu_mul", "elem", "silu-gated product over a fused gate_up", DT_FLOAT,
        ref_silu_mul),
+SIMPLE("ref_act_mul", "act_mul", "elem", "act(a) * b over two operands", DT_FLOAT, ref_act_mul),
+SIMPLE("ref_mul_weight", "mul_weight", "elem", "x * a scalar or one-row weight", DT_FLOAT,
+       ref_mul_weight),
+SIMPLE("ref_seg_mean", "seg_mean", "elem", "mean of each cu_seqlens segment's rows", DT_FLOAT,
+       ref_seg_mean),
+SIMPLE("ref_pool_rows", "pool_rows", "elem", "mean of every k consecutive rows, then a multiplier",
+       DT_FLOAT, ref_pool_rows),
+SIMPLE("ref_relu", "relu", "elem", "max(x, 0)", DT_FLOAT, ref_relu),
+SIMPLE("ref_clamp", "clamp", "elem", "x clamped to two weight scalars", DT_FLOAT, ref_clamp),
+SIMPLE("ref_conv2d", "conv2d", "elem", "segment-wise 2-D convolution, channels innermost",
+       DT_FLOAT, ref_conv2d),
+SIMPLE("ref_conv1d_dw", "conv1d_dw", "elem", "segment-wise causal depthwise convolution",
+       DT_FLOAT, ref_conv1d_dw),
+SIMPLE("ref_rel_sinusoid", "rel_sinusoid", "elem", "sinusoidal relative-position table", DT_FLOAT,
+       ref_rel_sinusoid),
+SIMPLE("ref_attn_local_rel", "attn_local_rel", "attn",
+       "local attention with a relative-position term and a softcap", DT_FLOAT,
+       ref_attn_local_rel),
 SIMPLE("ref_gelu", "gelu", "elem", "exact erf gelu", DT_FLOAT, ref_gelu),
 SIMPLE("ref_silu", "silu", "elem", "silu", DT_FLOAT, ref_silu),
 SIMPLE("ref_sigmoid", "sigmoid", "elem", "logistic sigmoid", DT_FLOAT, ref_sigmoid),
@@ -1052,7 +1150,7 @@ SIMPLE("ref_quant_act_fp8", "quant_act_fp8", "quant", "symmetric block-scaled E4
        "float in, fp8_e4m3 out, f32 scale", ref_quant_act_fp8),
 /* THE FUSED FORMS, AND THEY EXIST SO A HOST RUN IS POSSIBLE AT ALL. libr4d fuses the fp8
  * activation quantiser into whichever kernel already has the row in registers and declares the
- * fused op as its own; without host kernels for those names, RADIANCE_HOST_DOMAIN -- the only
+ * fused op as its own; without host kernels for those names, a host-backend run -- the only
  * thing that can answer "is the GRAPH right", because the per-op oracle reads the same graph on
  * both sides -- cannot start on an fp8 model. */
 SIMPLE("ref_rmsnorm_quant_fp8", "rmsnorm_quant_fp8", "quant",

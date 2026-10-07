@@ -11,8 +11,8 @@
 #
 # Stages:
 #   ffmpeg   FFmpeg built with only the demuxers core/mm/media.cpp admits and the decoders their
-#            streams need; the distribution's build brings ~200 packages of encoders, filters and
-#            display libraries the engine never calls
+#            streams need (pictures, video, and audio with swresample); the distribution's build
+#            brings ~200 packages of encoders, filters and display libraries the engine never calls
 #   build    ROCm dev image + cmake/ninja/g++-14; configures, builds, installs to /stage
 #   test     `ctest -LE gpu` on that build -- everything that does not need a card
 #   rootfs   the install tree stripped, and every library its binaries and plugins load, resolved
@@ -59,11 +59,11 @@ RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
  && tar -xJf ffmpeg.tar.xz && cd "ffmpeg-${FFMPEG_VERSION}" \
  && ./configure --prefix=/opt/ffmpeg --enable-shared --disable-static --disable-debug \
       --disable-programs --disable-doc --disable-network --disable-autodetect --disable-everything \
-      --disable-avdevice --disable-avfilter --disable-swresample \
+      --disable-avdevice --disable-avfilter --enable-swresample \
       --enable-zlib --enable-libdav1d \
-      --enable-demuxer=mov,matroska,avi,mpegts,flv,ogg,gif,apng,image2pipe,image_png_pipe,image_jpeg_pipe,image_jpegls_pipe,image_jpegxl_pipe,image_webp_pipe,image_bmp_pipe,image_tiff_pipe,image_qoi_pipe,image_pgm_pipe,image_ppm_pipe,image_pbm_pipe,image_pam_pipe,image_gif_pipe \
-      --enable-decoder=h264,hevc,vp8,vp9,libdav1d,mpeg4,mpeg1video,mpeg2video,mjpeg,jpegls,png,apng,gif,webp,bmp,tiff,qoi,pgm,ppm,pbm,pam,pgmyuv,theora,vp3,flv,h263 \
-      --enable-parser=h264,hevc,vp8,vp9,av1,mpeg4video,mpegvideo,mjpeg,png,gif,bmp,webp,vp3,qoi,pnm,h263,jpegxl \
+      --enable-demuxer=mov,matroska,avi,mpegts,flv,ogg,gif,apng,image2pipe,image_png_pipe,image_jpeg_pipe,image_jpegls_pipe,image_jpegxl_pipe,image_webp_pipe,image_bmp_pipe,image_tiff_pipe,image_qoi_pipe,image_pgm_pipe,image_ppm_pipe,image_pbm_pipe,image_pam_pipe,image_gif_pipe,wav,w64,mp3,flac,aac,aiff \
+      --enable-decoder=h264,hevc,vp8,vp9,libdav1d,mpeg4,mpeg1video,mpeg2video,mjpeg,jpegls,png,apng,gif,webp,bmp,tiff,qoi,pgm,ppm,pbm,pam,pgmyuv,theora,vp3,flv,h263,pcm_u8,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,pcm_s32be,pcm_f32le,pcm_f32be,pcm_f64le,pcm_alaw,pcm_mulaw,mp3float,mp2float,flac,vorbis,opus,aac \
+      --enable-parser=h264,hevc,vp8,vp9,av1,mpeg4video,mpegvideo,mjpeg,png,gif,bmp,webp,vp3,qoi,pnm,h263,jpegxl,mpegaudio,flac,aac,vorbis,opus \
  && make -j"${JOBS:-$(nproc)}" \
  && make install \
  && mkdir -p /opt/ffmpeg/share/doc/ffmpeg \

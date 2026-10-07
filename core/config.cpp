@@ -192,7 +192,10 @@ static const Flag g_flags[] = {
     { "--video-fps",          "F",      "frames sampled per second of video" },
     { "--video-min-frames",   "N",      "the fewest frames sampled from a video" },
     { "--video-max-frames",   "N",      "the most frames sampled from a video" },
-    { "--video-max-frame-tokens", "N",  "the most prompt tokens one video frame may become; 0 is no cap" },
+    { "--video-max-frame-tokens", "N",  "the most prompt tokens one video frame may become; 0 is no cap (a token\n"
+    "                                    budget processor -- Gemma 4's -- takes 70, 140, 280, 560 or 1120)" },
+    { "--image-tokens",       "N",      "a token-budget processor's image budget (Gemma 4: 70, 140, 280, 560, 1120;\n"
+    "                                    default the container's); a request's `image_tokens` overrides it" },
     { "--max-source-pixels",  "N",      "the largest image or video frame the decoder accepts, before any resize\n"
     "                                    (default 67108864). The media flags above default to what the container\n"
     "                                    states, and do nothing for a model that takes no media" },
@@ -680,6 +683,12 @@ int config_parse(int argc, char** argv, Config* c) {
             if (!parse_num(a.c_str(), v, &d)) return RAD_E_INVAL;
             if (!(d > 0.0)) { RAD_ERR("--video-fps must be > 0, not '%s'", v); return RAD_E_INVAL; }
             c->video_fps = d;
+        }
+        else if (S("--image-tokens")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int64_t n = 0;
+            if (!parse_int(a.c_str(), v, 1, INT32_MAX, &n)) return RAD_E_INVAL;
+            c->image_tokens = (int32_t)n;
         }
         else if (S("--video-min-frames") || S("--video-max-frames") || S("--video-max-frame-tokens")) {
             if (!(v = need(i))) return RAD_E_INVAL;

@@ -146,14 +146,19 @@ int meta_merge_generation_config(const std::string& dir, MetaOwn* out) {
  * reads the pixel bands, the normalisation and the frame rate from here; the geometry the encoder
  * itself needs is already in config.json's vision_config. Flattened under their own prefixes --
  * `size.shortest_edge` means two different things in the two files. Absent is not an error: a
- * text model has neither. Newer processors put the image configuration under `image_processor`
- * in processor_config.json instead. Carry it under the same prefix, filling only keys absent
- * from preprocessor_config.json so a separately saved image processor remains authoritative. */
+ * text model has neither. Newer processors put their sub-processors in processor_config.json.
+ * Keep that complete namespace and alias its image configuration under `preprocessor`, filling
+ * only keys absent from preprocessor_config.json so a separately saved image processor wins. */
 int meta_merge_preprocessor_configs(const std::string& dir, MetaOwn* out) {
-    static const struct { const char* file; const char* prefix; const char* member; } kFiles[] = {
-        { "preprocessor_config.json", "preprocessor", nullptr },
-        { "video_preprocessor_config.json", "video_preprocessor", nullptr },
-        { "processor_config.json", "preprocessor", "image_processor" },
+    /* processor_config.json is the newer single file: one object a sub-processor
+     * (`image_processor`, `video_processor`, `feature_extractor`) beside the processor's own keys
+     * -- EmbeddingGemma 2's image budget and its audio token rate are only there. */
+    static const struct { const char* file; const char* prefix; } kFiles[] = {
+        { "preprocessor_config.json", "preprocessor" },
+        { "video_preprocessor_config.json", "video_preprocessor" },
+        { "processor_config.json", "processor" },
+        /* sentence-transformers' own: an embedding model's named prompts and its default. */
+        { "config_sentence_transformers.json", "sentence_transformers" },
     };
     for (const auto& f : kFiles) {
         const std::string path = dir + "/" + f.file;
@@ -166,10 +171,11 @@ int meta_merge_preprocessor_configs(const std::string& dir, MetaOwn* out) {
             continue;
         }
         if (!j.is_object()) continue;
-        if (!f.member) flatten_json(j, f.prefix, out);
-        else if (j.contains(f.member) && j[f.member].is_object()) {
+        flatten_json(j, f.prefix, out);
+        if (std::strcmp(f.prefix, "processor") == 0 &&
+            j.contains("image_processor") && j["image_processor"].is_object()) {
             MetaOwn nested;
-            flatten_json(j[f.member], f.prefix, &nested);
+            flatten_json(j["image_processor"], "preprocessor", &nested);
             for (size_t i = 0; i < nested.keys.size(); ++i)
                 if (!out->has(nested.keys[i])) out->kv(nested.keys[i], nested.vals[i]);
         }
@@ -837,23 +843,30 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
                                       " holds none of them");
     }
 
-    /* THE LOGICAL SHAPE: the pieces joined along concat_dim, every other extent agreeing. */
+    /* THE LOGICAL SHAPE: the pieces joined along concat_dim, every other extent agreeing. A
+     * rank-0 tensor is one element and is read as shape [1]: safetensors stores a scalar
+     * parameter (Gemma 4's clipped-linear bounds) with an empty shape. */
     const SrcTensor& p0 = *out->pieces[0];
     const int d = out->concat_dim;
-    if (p0.shape.empty() || p0.shape.size() > RAD_MAX_RANK || d < 0 || d >= (int)p0.shape.size())
+    auto shape_of = [](const SrcTensor& t) {
+        return t.shape.empty() ? std::vector<int64_t>{ 1 } : t.shape;
+    };
+    const std::vector<int64_t> s0 = shape_of(p0);
+    if (s0.size() > RAD_MAX_RANK || d < 0 || d >= (int)s0.size())
         return refuse(RAD_E_SHAPE, "'" + p0.name + "' cannot be joined along dim " +
                                    std::to_string(d));
-    out->rank = (uint32_t)p0.shape.size();
-    for (uint32_t i = 0; i < out->rank; ++i) out->shape[i] = p0.shape[i];
+    out->rank = (uint32_t)s0.size();
+    for (uint32_t i = 0; i < out->rank; ++i) out->shape[i] = s0[i];
     for (size_t k = 1; k < out->pieces.size(); ++k) {
         const SrcTensor& pk = *out->pieces[k];
-        bool fits = pk.shape.size() == p0.shape.size();
+        const std::vector<int64_t> sk = shape_of(pk);
+        bool fits = sk.size() == s0.size();
         for (uint32_t i = 0; fits && i < out->rank; ++i)
-            if ((int)i != d && pk.shape[i] != p0.shape[i]) fits = false;
+            if ((int)i != d && sk[i] != s0[i]) fits = false;
         if (!fits)
             return refuse(RAD_E_SHAPE, "'" + pk.name + "' and '" + p0.name +
                                        "' do not join along dim " + std::to_string(d));
-        out->shape[d] += pk.shape[(size_t)d];
+        out->shape[d] += sk[(size_t)d];
     }
     rad_enc_view(out->rank, out->shape, &out->rows, &out->cols);
 

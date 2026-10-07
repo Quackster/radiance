@@ -310,6 +310,7 @@ int ref_embed_lookup(const RadArgs* a, RadStream) {
     const int64_t n_embd = p_int(a, "n_embd", wte->rank >= 2 ? wte->shape[wte->rank - 1] : 0);
     const int64_t n_vocab = p_int(a, "n_vocab", wte->rank >= 2 ? wte->shape[wte->rank - 2] : 0);
     const int64_t voff = p_int(a, "vocab_offset", 0);
+    const float mult = p_f32(a, "mult", 1.0f);
     if (n_embd <= 0 || n_vocab <= 0 || voff < 0) return RAD_E_SHAPE;
     const int64_t M = numel(x) / n_embd;
     if (M <= 0 || numel(tok) < M || numel(wte) < n_vocab * n_embd) return RAD_E_SHAPE;
@@ -338,7 +339,7 @@ int ref_embed_lookup(const RadArgs* a, RadStream) {
         const int64_t xb = rowoff(x, m, n_embd), xs = laststride(x);
         const bool have_row = id >= 0 && id < n_vocab;
         for (int64_t i = 0; i < n_embd; ++i)
-            stt(x, xb + i * xs, have_row ? ldt(wte, id * ws + i * wc) : 0.0f);
+            stt(x, xb + i * xs, have_row ? ldt(wte, id * ws + i * wc) * mult : 0.0f);
     }
     return RAD_OK;
 }

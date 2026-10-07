@@ -75,11 +75,13 @@
 #define ARR(a)  (a), (int)(sizeof(a) / sizeof((a)[0]))
 
 /* ---- elementwise and norms ---------------------------------------------------------------- */
-static const RadParamSpec pRmsnorm[]   = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
-                                           P_F64O("wadd"), P_INTO("round_before_weight") };
+/* rmsnorm_add has no `mult`: it is the fused pair, and nothing fuses a scaled branch. */
 static const RadParamSpec pRmsnormAdd[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
-                                           P_F64O("wadd") };
-static const RadOperandSpec oRmsnorm[] = { OPD("x"), WGT("w"), OUT("y") };
+                                          P_F64O("wadd") };
+static const RadParamSpec pRmsnorm[]   = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
+                                           P_F64O("wadd"), P_F64O("mult"), P_INTO("round_before_weight") };
+/* `w` optional: absent, the gain is one. */
+static const RadOperandSpec oRmsnorm[] = { OPD("x"), WGT_O("w"), OUT("y") };
 
 static const RadParamSpec pHcRead[]    = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("lowrank"),
                                            P_F64("eps"), P_STR("dtype"), P_F64O("wadd"),
@@ -133,9 +135,35 @@ static const RadParamSpec pGridEmbed[]   = { P_INT("M"), P_INT("n"), P_INT("side
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
 
 static const RadParamSpec pMnD[]      = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadParamSpec pMulWeight[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_INTO("scalar") };
 static const RadOperandSpec oBinary[] = { OPD("a"), OPD("b"), OUT("y") };
+static const RadOperandSpec oMulWeight[] = { OPD("x"), WGT("w"), OUT("y") };
+static const RadParamSpec pActMul[]   = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
+static const RadParamSpec pSegMean[]  = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oSegMean[] = { OPD("x"), OPD("cu_seqlens"), OUT("y") };
+static const RadParamSpec pPoolRows[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_F64O("mult"),
+                                          P_STR("dtype") };
 static const RadOperandSpec oGateUp[] = { OPD("gate_up"), OUT("y") };
 static const RadOperandSpec oUnary[]  = { OPD("x"), OUT("y") };
+/* The audio (USM conformer) tower's operators; libref's lists, field for field. */
+static const RadOperandSpec oClamp[]  = { OPD("x"), WGT("lo"), WGT("hi"), OUT("y") };
+static const RadParamSpec pConv2d[]   = { P_INT("M"), P_INT("width"), P_INT("cin"), P_INT("cout"),
+                                          P_INT("kh"), P_INT("kw"), P_INT("stride"), P_INT("pad"),
+                                          P_INTO("cu_div"), P_INTO("valid_stride"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oConv2d[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OPD_O("valid"),
+                                          OUT("y") };
+static const RadParamSpec pConv1dDw[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_INTO("cu_div"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oConv1dDw[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OUT("y") };
+static const RadParamSpec pRelSin[]   = { P_INT("M"), P_INT("n"), P_F64O("max_timescale"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oRelSin[] = { OUT("y") };
+static const RadParamSpec pAttnLocalRel[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
+                                              P_INT("left"), P_INT("right"), P_F64("softcap"),
+                                              P_INTO("cu_div"), P_STR("dtype") };
+static const RadOperandSpec oAttnLocalRel[] = { OPD("q"), OPD("k"), OPD("v"), OPD("relk"),
+                                                WGT("pds"), OPD("cu_seqlens"), OUT("out") };
 /* `fill` has no input: `value` is the whole of what it writes. */
 static const RadParamSpec pFill[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("value") };
 static const RadOperandSpec oFill[] = { OUT("y") };
@@ -213,7 +241,7 @@ static const RadConstraint cPagedBlock[] = { RAD_CGE("block_size", 1) };
 
 static const RadParamSpec pAttnDense[]   = { P_INT("M"), P_INT("head_dim"), P_INT("gqa"),
                                              P_INT("causal"), P_STR("dtype"), P_F64O("scale"),
-                                             P_INTO("max_seqlen") };
+                                             P_INTO("max_seqlen"), P_INTO("window") };
 static const RadOperandSpec oAttnDense[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
                                              OUT("out") };
 
@@ -251,7 +279,9 @@ static const RadOperandSpec oQsaBlockKey[] = { OPD("k"), WGT("w"), OPD_O("page")
 static const RadParamSpec pQkNormRope[]   = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
                                               P_INT("n_head_kv"), P_F64("theta"), P_F64("eps"),
                                               P_F64O("scale"), P_STRO("mode"),
-                                              P_INTO("rotary_dim"), P_F64O("wadd") };
+                                              P_INTO("rotary_dim"), P_F64O("wadd"),
+                                              P_INTO("v_norm"), P_STRO("sections"),
+                                              P_STRO("comps") };
 static const RadOperandSpec oQkNormRope[] = { INOUT("qkv"), OPD("positions"), WGT("q_w"),
                                               WGT("k_w") };
 
@@ -398,6 +428,9 @@ static const RadOperandSpec oAllGather[] = { OPD("x"), OUT("y") };
 static const RadParamSpec pEmbed[]    = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
                                           P_STR("dtype"), P_INTO("vocab_offset"),
                                           P_F64O("wscale") };
+static const RadParamSpec pEmbedM[]   = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
+                                          P_STR("dtype"), P_INTO("vocab_offset"),
+                                          P_F64O("wscale"), P_F64O("mult") };
 static const RadOperandSpec oEmbed[]  = { OPD("tokens"), WGT("wte"), OUT("x") };
 static const RadOperandSpec oEmbedQ[] = { OPD("tokens"), WGT("wte"), WGT_O("scale"), OUT("x"),
                                           OPD_O("ahead") };
@@ -474,6 +507,23 @@ static const RadOpSchema kSchemas[] = {
 { "add", ARR(pMnD), ARR(oBinary), "elementwise sum." },
 { "mul", ARR(pMnD), ARR(oBinary),
   "elementwise product; `b` may have extent 1 on any axis `a` does not and is broadcast along it." },
+{ "mul_weight", ARR(pMulWeight), ARR(oMulWeight),
+  "y = x * w, `w` a weight of one element or one row, broadcast; f32 product rounded once." },
+{ "act_mul", ARR(pActMul), ARR(oBinary),
+  "y = act(a) * b, act silu / gelu / gelu_tanh, the activation rounded to y's dtype first." },
+{ "seg_mean", ARR(pSegMean), ARR(oSegMean),
+  "y[s] = the mean of x's rows in cu_seqlens segment s, summed in double, rounded once." },
+{ "relu", ARR(pMnD), ARR(oUnary), "y = max(x, 0)." },
+{ "clamp", ARR(pMnD), ARR(oClamp), "y = min(max(x, lo), hi), lo and hi one-element weights." },
+{ "conv2d", ARR(pConv2d), ARR(oConv2d),
+  "segment-wise 2-D convolution over (time, width), channels innermost, optional row mask." },
+{ "conv1d_dw", ARR(pConv1dDw), ARR(oConv1dDw),
+  "segment-wise causal depthwise convolution over time." },
+{ "rel_sinusoid", ARR(pRelSin), ARR(oRelSin), "the sinusoidal relative-position table." },
+{ "attn_local_rel", ARR(pAttnLocalRel), ARR(oAttnLocalRel),
+  "local attention with a relative-position term and a softcap (Gemma 4's audio)." },
+{ "pool_rows", ARR(pPoolRows), ARR(oUnary),
+  "y[r] = the mean of x's rows [r*k, r*k + k), rounded to y's dtype, times mult, rounded again." },
 { "silu_mul", ARR(pMnD), ARR(oGateUp),
   "silu-gated product over a fused [M, 2n] gate_up: y = silu(gate) * up." },
 { "gelu", ARR(pMnD), ARR(oUnary), "exact erf gelu." },
@@ -580,7 +630,8 @@ static const RadOpSchema kSchemas[] = {
 { "all_reduce", ARR(pAllReduce), ARR(oAllReduce),
   "sum across ranks, f32, ascending rank order." },
 { "all_gather", ARR(pAllGather), ARR(oAllGather), "gather every rank's shard." },
-{ "embed_lookup", ARR(pEmbed), ARR(oEmbed), "embedding gather, vocab-parallel with an offset." },
+{ "embed_lookup", ARR(pEmbedM), ARR(oEmbed),
+  "embedding gather, vocab-parallel with an offset; `mult` multiplies every row (rounded once)." },
 { "embed_lookup_q", ARR(pEmbed), ARR(oEmbedQ),
   "embedding gather, one scale for the table; without a scale the table is read as it is." },
 { "logits_gemm", ARR(pLogits), ARR(oLogits), "the lm_head projection." },
@@ -660,6 +711,24 @@ SIMPLE("avx_grid_embed", "grid_embed", "elem",
        "bilinear resample of a learned position grid, added in", DT_FLOAT, L(grid_embed)),
 SIMPLE("avx_add", "add", "elem", "elementwise sum", DT_FLOAT, L(add)),
 SIMPLE("avx_mul", "mul", "elem", "elementwise product, broadcasting b", DT_FLOAT, L(mul)),
+SIMPLE("avx_act_mul", "act_mul", "elem", "act(a) * b over two operands", DT_FLOAT, L(act_mul)),
+SIMPLE("avx_mul_weight", "mul_weight", "elem", "x * a scalar or one-row weight", DT_FLOAT,
+       L(mul_weight)),
+SIMPLE("avx_seg_mean", "seg_mean", "elem", "mean of each cu_seqlens segment's rows", DT_FLOAT,
+       L(seg_mean)),
+SIMPLE("avx_pool_rows", "pool_rows", "elem", "mean of every k consecutive rows, then a multiplier",
+       DT_FLOAT, L(pool_rows)),
+SIMPLE("avx_relu", "relu", "elem", "max(x, 0)", DT_FLOAT, L(relu)),
+SIMPLE("avx_clamp", "clamp", "elem", "x clamped to two weight scalars", DT_FLOAT, L(clamp)),
+SIMPLE("avx_conv2d", "conv2d", "elem", "segment-wise 2-D convolution, channels innermost",
+       DT_FLOAT, L(conv2d)),
+SIMPLE("avx_conv1d_dw", "conv1d_dw", "elem", "segment-wise causal depthwise convolution",
+       DT_FLOAT, L(conv1d_dw)),
+SIMPLE("avx_rel_sinusoid", "rel_sinusoid", "elem", "sinusoidal relative-position table",
+       DT_FLOAT, L(rel_sinusoid)),
+SIMPLE("avx_attn_local_rel", "attn_local_rel", "attn",
+       "local attention with a relative-position term and a softcap", DT_FLOAT,
+       L(attn_local_rel)),
 SIMPLE("avx_silu_mul", "silu_mul", "elem", "silu-gated product over a fused gate_up", DT_FLOAT,
        L(silu_mul)),
 SIMPLE("avx_gelu", "gelu", "elem", "exact erf gelu", DT_FLOAT, L(gelu)),

@@ -304,11 +304,11 @@ public:
     bool     encodes_pending() const;
     void     take_encodes(std::vector<std::shared_ptr<mm::Item>>* out);
     /* An encoder pass over whole segments; see BatchBuilder::build_encoder. */
-    const RadBatch* build_encoder(const std::vector<BatchBuilder::EncoderPart>& parts, int step) {
+    const RadBatch* build_encoder(const std::vector<BatchBuilder::EncoderPart>& parts, int step,
+                                  const RadEncoderDecl& enc) {
         std::lock_guard<std::mutex> lk(mu_);
-        return builder_.build_encoder(parts, step);
+        return builder_.build_encoder(parts, step, enc);
     }
-    int64_t  encoder_patches() const { return builder_.encoder_patches(); }
     int reserve_media_rows(mm::Item& item) {
         std::lock_guard<std::mutex> lk(mu_);
         return builder_.reserve_media_rows(item);

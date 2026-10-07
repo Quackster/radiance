@@ -207,10 +207,16 @@ typedef struct RadBatch {
     const int32_t* mm_rows;            /* [n_mm_rows] device: index into this pass's tokens */
     const void*    mm_embd;            /* [n_mm_rows, n_embd] bf16 device */
 
-    /* THE ENCODER PASS. Non-zero `enc` runs the plugin's declared encoder (rad_declare_encoder)
-     * and nothing else: no token rows, no KV, no logits. Its input is a list of patches, already
-     * resized, normalised and cut by the processor, and its output is the encoder's declared
-     * `out` buffer, one row per `merge` patches, which the core reads back after the pass.
+    /* THE ENCODER PASS. Non-zero `enc` runs a declared encoder (rad_declare_encoder) and nothing
+     * else: no token rows, no KV, no logits. It is that encoder's `modalities` -- RAD_MM_AUDIO
+     * for an audio encoder, the image/video mask for the other -- so a program that declared two
+     * knows which to run. Its input is a list of patches, already resized, normalised and cut by
+     * the processor, and its output is the encoder's declared `out` buffer, one row per `merge`
+     * patches, which the core reads back after the pass.
+     *
+     * An AUDIO pass's patches are feature frames and its coordinates are 1-D: plane 0 the frame's
+     * index in its clip, plane 1 whether the frame is real (1) or the zero padding that makes the
+     * clip whole output rows (0), plane 2 the clip's real frames and plane 3 its staged ones.
      *
      * Patches are grouped into SEGMENTS -- one per image, and one per temporal group of a video
      * -- and attention runs within a segment. `enc_coord` gives each patch its place in its

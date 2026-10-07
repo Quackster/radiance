@@ -518,13 +518,32 @@ public:
 
 /* ================================================================== optional backends */
 
-/* /v1/embeddings. Absent, the endpoint is 501 naming that this model was not loaded with an
- * embedding head -- not an empty 200. */
+/* /v1/embeddings: WHAT THE LOADED MODEL EMBEDS, present only when it is an embedding model
+ * (rad_declare_pooled). Absent, the endpoint is 501 naming that -- not an empty 200.
+ *
+ * The vectors themselves come through the scheduler like any other request: the server submits
+ * one Request a input with Request::embed set, and each finishes at its one step with its pooled
+ * vector in its sink (Sink::embedding). So batching, admission, media encoding and cancellation
+ * are the scheduler's, exactly as they are for a completion. */
 class IEmbedder {
 public:
     virtual ~IEmbedder() = default;
-    virtual int     embed(const std::vector<int32_t>& tokens, std::vector<float>& out) = 0;
+    /* The width of a pooled vector. */
     virtual int64_t dim() const = 0;
+    /* The longest input one step carries: an input is never split, so a longer one is refused. */
+    virtual int64_t max_input() const = 0;
+    /* THE MODEL'S NAMED PROMPTS (sentence-transformers' `prompts`): the text a `prompt_name` puts
+     * in front of an input -- "query" -> "task: search result | query: ". False when the model
+     * states no prompt of that name. */
+    virtual bool prompt(const std::string& name, std::string* text) const {
+        (void)name; (void)text;
+        return false;
+    }
+    /* The prompt an input takes when the request names none, "" for none. */
+    virtual std::string default_prompt() const { return std::string(); }
+    /* The template a `messages` input renders through -- the model's chat template -- or null
+     * when it has none. */
+    virtual IChatTemplate* message_template() const { return nullptr; }
 };
 
 /* Multimodal preprocessing (spec §11). The server pulls the bytes out of a content part; the
@@ -539,6 +558,13 @@ enum class MediaKind { Image, Video, Audio };
  * the templates are the same templates. */
 #define RAD_MEDIA_MARKER "<__media__>"
 
+/* WHAT A REQUEST ASKED OF ITS MEDIA, beside the bytes. Zero is the server's default. */
+struct MediaOpts {
+    /* Soft tokens (encoder output rows) an image may become, for a processor that sizes images
+     * by a token budget (Gemma 4's: 70, 140, 280, 560 or 1120). */
+    int32_t image_tokens = 0;
+};
+
 class IMultimodal {
 public:
     virtual ~IMultimodal() = default;
@@ -546,7 +572,7 @@ public:
     /* Decode and process one part. `bytes` is the decoded file, not a URL: the server never
      * fetches a remote URL on a request's behalf. On success `*out` carries the patches and the
      * token run that replaces the marker; on failure `why` says what is wrong with the media. */
-    virtual int prepare(MediaKind k, const std::vector<uint8_t>& bytes,
+    virtual int prepare(MediaKind k, const std::vector<uint8_t>& bytes, const MediaOpts& opts,
                         std::shared_ptr<mm::Item>* out, std::string* why) = 0;
 };
 

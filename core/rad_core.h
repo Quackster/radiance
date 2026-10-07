@@ -347,6 +347,9 @@ public:
      * than discovering at the first step that there is nothing to sample. */
     rad_buf logits_buf = 0;
     bool token_scores = false;  /* architecture implements RadBatch's compact score pairs */
+    /* The buffer the plugin named as this step's pooled vectors (rad_declare_pooled): set only by
+     * an EMBEDDING program, which then has no logits buffer. */
+    rad_buf pooled_buf = 0;
 
     /* THE DRAFT HEAD THIS PLUGIN DECLARED (rad_declare_drafter). `kind == RAD_DRAFT_NONE` when
      * it declared none, which is the normal case -- the engine then speculates with the
@@ -360,6 +363,9 @@ public:
      * media (RadBuildCtx::max_enc_patches 0). `encoder_name` for the reason `drafter_name` is. */
     RadEncoderDecl encoder{};
     std::string    encoder_name;
+    /* ...and the audio encoder, the second a program may declare (RAD_MM_AUDIO). */
+    RadEncoderDecl audio_encoder{};
+    std::string    audio_encoder_name;
 
     /* Two arenas, because a host-site activation cannot index device memory. The buffer plan
      * colours the domains SEPARATELY -- a transient may share storage only with a transient in the
@@ -618,6 +624,12 @@ struct Request {
      * it; the logits buffer is sized for it there and nowhere else. */
     bool                 score = false;
 
+    /* AN EMBEDDING REQUEST: the whole prompt in ONE step, never split -- an encoder that attends
+     * both ways cannot be fed half its input -- and finished at that step with its pooled vector
+     * in the sink (Sink::embedding). Nothing is generated and nothing is emitted. Only an
+     * embedding program (rad_declare_pooled) serves these, and it serves nothing else. */
+    bool                 embed = false;
+
     std::string          finish_reason;
     void*                sink = nullptr;      /* the server's per-request stream sink */
 };
@@ -800,6 +812,9 @@ struct Config {
      * when the container carries a vision tower and 0 when it does not. 0 serves text only and
      * keeps a tower the container carries off the card. */
     int64_t mm_max_patches = -1;
+    /* The audio encoder's pass in frames, resolved at bring-up from the plugin's probe when the
+     * container carries an audio encoder; --mm-max-patches 0 (text only) turns it off too. */
+    int64_t mm_audio_frames = -1;
 
     std::string host = "0.0.0.0";
     /* The chat endpoint's default `reasoning_effort`, empty for the template's own default.
@@ -889,10 +904,12 @@ struct Config {
     std::optional<double>  video_fps;
     std::optional<int32_t> video_min_frames, video_max_frames, video_max_frame_tokens;
     std::optional<int64_t> max_source_pixels;
+    /* A token-budget processor's (Gemma 4's) soft tokens an image. */
+    std::optional<int32_t> image_tokens;
     bool media_flags_set() const {
         return image_min_pixels || image_max_pixels || video_min_pixels || video_max_pixels ||
                video_fps || video_min_frames || video_max_frames || video_max_frame_tokens ||
-               max_source_pixels;
+               max_source_pixels || image_tokens;
     }
 
     /* An operator-supplied generation_config.json, overriding the search described above. */

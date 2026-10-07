@@ -68,6 +68,10 @@ set(R4D_UNITS
   # head is replicated across a rank pair. Again four lines that set the ratio and include the body.
   "r4d_attn_paged_h256_gqa6_bs4|"
   "r4d_attn_vit_h72_bf16|"
+  # An encoder's dense attention (bidirectional, GQA in the workgroup, a two-sided window) and
+  # the small ops around it: act_mul, seg_mean, qk_norm_rope with a v norm, the f32 widening.
+  "r4d_attn_dense_bf16|"
+  "r4d_encoder_bf16|"
   # The vision tower's own small ops: layer norm, the learned-grid position embedding, and the
   # biased GEMM with a linear layer's activation and residual in its store.
   "r4d_vit_bf16|"

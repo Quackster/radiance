@@ -240,8 +240,8 @@ struct FakeGrammar : IGrammarCompiler {
  * server's own validation of them. */
 struct FakeMultimodal : IMultimodal {
     bool accepts(MediaKind) const override { return true; }
-    int prepare(MediaKind, const std::vector<uint8_t>&, std::shared_ptr<mm::Item>* out,
-                std::string*) override {
+    int prepare(MediaKind, const std::vector<uint8_t>&, const MediaOpts&,
+                std::shared_ptr<mm::Item>* out, std::string*) override {
         auto it = std::make_shared<mm::Item>();
         it->expand = { 0 };
         *out = std::move(it);
@@ -2804,6 +2804,75 @@ TEST(a_raw_prompt_parses_control_tokens_on_every_endpoint_that_takes_one) {
         f.tok.last_parse_special = false;
         CHECK_OK(parse_embeddings_request(body, f.odeps(), f.limits(), &r, &e));
         CHECK(f.tok.last_parse_special);
+    }
+}
+
+/* An embedding model's request fields: prompt_name puts the model's named prompt in front of text
+ * and content-part inputs and is refused on token ids and on a name the model does not state;
+ * dimensions must be a positive integer; image_tokens one of the trained budgets; a messages input
+ * renders through the model's template and excludes `input`. */
+struct FakeEmbedder final : IEmbedder {
+    IChatTemplate* tpl = nullptr;
+    int64_t dim() const override { return 768; }
+    int64_t max_input() const override { return 8192; }
+    bool prompt(const std::string& name, std::string* text) const override {
+        if (name != "query") return false;
+        *text = "task: search result | query: ";
+        return true;
+    }
+    IChatTemplate* message_template() const override { return tpl; }
+};
+
+TEST(embeddings_take_the_models_named_prompts_and_its_fields) {
+    Fixture f;
+    FakeEmbedder emb;
+    emb.tpl = &f.tmpl;
+    OaiDeps d = f.odeps();
+    d.embed = &emb;
+    {
+        OaiRequest r; ApiError e;
+        CHECK_OK(parse_embeddings_request(R"({"input":"capital?","prompt_name":"query"})", d,
+                                          f.limits(), &r, &e));
+        CHECK_EQ(r.prompts.size(), (size_t)1);
+        CHECK_EQ(r.prompts[0].text, std::string("task: search result | query: capital?"));
+    }
+    {
+        OaiRequest r; ApiError e;
+        CHECK_OK(parse_embeddings_request(R"({"input":["a","b"],"prompt_name":"query"})", d,
+                                          f.limits(), &r, &e));
+        CHECK_EQ(r.prompts.size(), (size_t)2);
+        CHECK_EQ(r.prompts[1].text, std::string("task: search result | query: b"));
+    }
+    {
+        OaiRequest r; ApiError e;
+        CHECK(parse_embeddings_request(R"({"input":"x","prompt_name":"nope"})", d, f.limits(),
+                                       &r, &e) < 0);
+        CHECK_EQ(e.param, std::string("prompt_name"));
+    }
+    {
+        OaiRequest r; ApiError e;
+        CHECK(parse_embeddings_request(R"({"input":[1,2,3],"prompt_name":"query"})", d,
+                                       f.limits(), &r, &e) < 0);
+    }
+    {
+        OaiRequest r; ApiError e;
+        CHECK_OK(parse_embeddings_request(R"({"input":"x","dimensions":256})", d, f.limits(), &r,
+                                          &e));
+        CHECK_EQ(r.dimensions, (int64_t)256);
+        CHECK(parse_embeddings_request(R"({"input":"x","dimensions":0})", d, f.limits(), &r,
+                                       &e) < 0);
+        CHECK(parse_embeddings_request(R"({"input":"x","image_tokens":300})", d, f.limits(), &r,
+                                       &e) < 0);
+    }
+    {
+        OaiRequest r; ApiError e;
+        CHECK_OK(parse_embeddings_request(
+            R"({"messages":[{"role":"user","content":"hello"}]})", d, f.limits(), &r, &e));
+        CHECK_EQ(r.prompts.size(), (size_t)1);
+        CHECK(!r.prompts[0].tokens.empty());
+        CHECK(parse_embeddings_request(
+                  R"({"input":"x","messages":[{"role":"user","content":"hello"}]})", d,
+                  f.limits(), &r, &e) < 0);
     }
 }
 

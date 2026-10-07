@@ -40,18 +40,34 @@ struct RadModelMeta;
 namespace rad {
 namespace mm {
 
-enum class Kind { Image, Video };
+enum class Kind { Image, Video, Audio };
 
-enum class VisionFamily { Qwen, Lfm2 };
+/* THE PROCESSOR FAMILY, from the container's vision_config.model_type. The families differ in how a
+ * picture is sized, what a patch value is, and how a video is sampled and spelled in the prompt;
+ * the Item they produce and everything after it is shared.
+ *
+ *   QwenVL  smart_resize into a pixel band; patches (channel, frame, y, x) normalised by the
+ *           configured mean and deviation; videos in temporal groups, each after a "<T seconds>".
+ *   Gemma4  the largest size whose sides are multiples of patch * pooling and whose patch count
+ *           fits the soft-token budget (budget * pooling^2), aspect ratio kept; patches (y, x,
+ *           channel) as 2 * (u / 255) - 1, the reference model's own input scaling; a video is
+ *           frames sampled at `fps` (at most `max_frames`, thinned evenly), each its own segment
+ *           at the per-frame budget, each spelled <boi> placeholders <eoi> with no timestamp.
+ *   Lfm2    RGB patches in merge-block order, independent variable-size tiles plus an optional
+ *           thumbnail, with ordinary sequential positions through all image tokens. */
+enum class Family { QwenVL, Gemma4, Lfm2 };
 
 struct VisionConfig {
-    VisionFamily family = VisionFamily::Qwen;
+    Family family = Family::QwenVL;
     int32_t min_tiles = 2, max_tiles = 10, tile_size = 512;
     bool split_images = true, use_thumbnail = true;
     double max_pixels_tolerance = 2.0;
     int64_t cap_image_pixels = 1048576;
     int64_t max_segment_patches = 1024;
     int32_t patch = 0, temporal = 0, merge = 0;
+    /* Gemma4: soft tokens (output rows) an image, and a video frame, may take. One of 70, 140,
+     * 280, 560, 1120 -- the budgets the model was trained at. */
+    int32_t image_soft_tokens = 0, video_soft_tokens = 0;
     int64_t image_min_pixels = 0, image_max_pixels = 0;
     int64_t video_min_pixels = 0, video_max_pixels = 0;
     double  fps = 2.0;
@@ -102,6 +118,37 @@ struct DeviceRows {
     ~DeviceRows() { if (release) release(); }
 };
 
+/* WHAT AN AUDIO CLIP BECOMES: Gemma 4's feature extractor (Gemma4AudioFeatureExtractor), read
+ * from the container's `preprocessor.*` (the checkpoint's preprocessor_config.json) and its
+ * audio_config. The samples are mono at `rate`, cut at `max_samples`; `frame_length / 2` zeros go
+ * in front; frame i is samples [i * hop, i * hop + frame_length) of that, pre-emphasised when the
+ * config says so, times a periodic Hann window, through a `fft`-point real FFT; its magnitudes go
+ * through an HTK mel bank (no area normalisation) and log(x + mel_floor), optionally standardised
+ * per bin. A frame is real when its last sample is a real one -- the reference's mask -- so a clip
+ * of n samples has floor((n - frame_length / 2 - 1) / hop) + 1 real frames and the reference's
+ * output keeps ceil(real / merge) rows of it: that many placeholders, between <boa> and <eoa>.
+ * The staged patches are the real frames then zero frames to a whole number of rows -- equal, for
+ * every row the reference keeps, to the frames past the end the reference zeroes. */
+struct AudioConfig {
+    int32_t rate = 0, frame_length = 0, hop = 0, fft = 0, n_mels = 0;
+    double  min_freq = 0.0, max_freq = 0.0, mel_floor = 0.0;
+    double  preemphasis = 0.0, input_scale = 1.0;
+    bool    preemphasis_htk = true;
+    std::vector<double> bin_mean, bin_std;      /* empty: no per-bin standardisation */
+    /* The longest clip in samples: Gemma 4's extractor truncates at 480000 (30 s at 16 kHz). */
+    int64_t max_samples = 0;
+    int32_t tok_audio = -1, tok_start = -1, tok_end = -1;
+
+    /* THE ENCODER'S: frames an output row, and the most frames a pass carries. */
+    int32_t merge = 0;
+    int64_t max_frames = 0;
+
+    /* Read from the container; refuses one that states no Gemma 4 audio tower. */
+    int from_meta(const RadModelMeta& m, std::string* why);
+    /* The real frames of an n-sample clip. */
+    int64_t real_frames(int64_t n_samples) const;
+};
+
 /* One media part after processing: its patches, its place in the prompt's token stream, and --
  * once the encoder has run -- its rows. Shared between the request that owns it and the engine
  * thread that encodes it; the engine writes `embd` once and nothing reads it before then. */
@@ -116,7 +163,7 @@ struct Item {
      * `rows_w` is a segment's width in output rows, which is where its rotary grid wraps. */
     int32_t n_seg = 0, seg_rows = 0, rows_w = 0, rows_h = 0;
     /* Optional variable-size segments, used by tiled images plus their thumbnail.
-     * Empty keeps the uniform Qwen image/video representation. */
+     * Empty keeps uniform image/video segments or a one-dimensional audio clip. */
     struct Segment { int32_t h = 0, w = 0; int64_t patch0 = 0; };
     std::vector<Segment> segments;
     bool linear_positions = false;
@@ -132,6 +179,9 @@ struct Item {
     int64_t segment_patches(int s) const { return patch_at(s + 1) - patch_at(s); }
     int64_t segment_rows(int s) const { return row_at(s + 1) - row_at(s); }
     int64_t n_rows() const { return row_at(n_seg); }
+    /* An audio clip's REAL feature frames; the rest of its `grid_h` are the zero frames that make
+     * it whole output rows. 0 for a picture or a video. */
+    int32_t valid = 0;
 
     /* THE TOKENS THAT REPLACE THE MEDIA MARKER, and where in them each segment's run of
      * placeholders starts. Placeholders are the checkpoint's own pad ids, not an arbitrary one:
@@ -227,24 +277,47 @@ struct PromptMedia {
 class Processor {
 public:
     /* `encode_text` tokenises the timestamp text between a video's groups: plain text, no
-     * special tokens added and none parsed. */
+     * special tokens added and none parsed. `encode_special` resolves LFM2 image markers. */
     int init(const VisionConfig& cfg,
              std::function<std::vector<int32_t>(const std::string&)> encode_text,
              std::function<std::vector<int32_t>(const std::string&)> encode_special = {});
     const VisionConfig& config() const { return cfg_; }
 
-    int image(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out, std::string* why) const;
+    /* `image_tokens` is a Gemma 4 soft-token budget for this image (0: the configured one); a
+     * processor that sizes images by pixels refuses a non-zero one. */
+    int image(const uint8_t* bytes, size_t n, int32_t image_tokens, std::shared_ptr<Item>* out,
+              std::string* why) const;
     int video(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out, std::string* why) const;
 
     /* The pieces, exposed for the test suite: an already-decoded picture or frame list. */
     int image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     int video_from(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
 
+    /* AUDIO, when the program declared an audio encoder: `merge` and `max_frames` are its. */
+    int  init_audio(const AudioConfig& cfg);
+    bool has_audio() const { return audio_on_; }
+    const AudioConfig& audio_config() const { return acfg_; }
+    int audio(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out, std::string* why) const;
+    /* ...and from samples already decoded (mono at the configured rate), for the test suite. */
+    int audio_from(const std::vector<float>& samples, std::shared_ptr<Item>* out,
+                   std::string* why) const;
+
 private:
     int image_lfm2(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
+    int image_gemma4(const Frame& f, int32_t soft, std::shared_ptr<Item>* out,
+                     std::string* why) const;
+    int video_gemma4(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
+
     VisionConfig cfg_{};
     int32_t tok_thumbnail_ = -1;
     std::vector<int32_t> tile_tokens_;
+    AudioConfig  acfg_{};
+    bool         audio_on_ = false;
+    std::vector<float>  hann_;          /* the window, float32 as the reference stores it */
+    std::vector<double> mel_;           /* [n_mels, fft/2 + 1]: filter b's weight on bin k */
+    std::vector<int32_t> mel_lo_, mel_hi_;  /* filter b's nonzero bins, [lo, hi) */
+    std::vector<double> tw_re_, tw_im_;     /* exp(-2 pi i k / fft), k < fft/2 */
+    std::vector<int32_t> brev_;             /* the FFT's bit-reversal permutation */
     std::function<std::vector<int32_t>(const std::string&)> encode_text_;
 };
 
@@ -257,6 +330,12 @@ int smart_resize_video(int64_t t, int64_t h, int64_t w, int32_t tfactor, int32_t
 /* Which frames a video keeps. */
 std::vector<int64_t> sample_frames(const VideoInfo& info, double fps, int32_t min_frames,
                                    int32_t max_frames);
+/* ...the Gemma 4 rule: one frame each 1 / fps seconds, thinned evenly to `max_frames`. */
+std::vector<int64_t> sample_frames_gemma4(const VideoInfo& info, double fps, int32_t max_frames);
+/* Gemma 4's target size: the largest (h, w), both multiples of `side`, whose patch count stays
+ * within `max_patches`, aspect ratio kept (get_aspect_ratio_preserving_size). */
+int gemma4_size(int64_t h, int64_t w, int32_t patch, int32_t pool, int64_t max_patches,
+                int64_t* oh, int64_t* ow, std::string* why);
 /* PIL's antialiased bicubic resample of packed RGB, bit for bit: fixed-point coefficients, a
  * horizontal pass into an 8-bit intermediate and then a vertical one. */
 void resize_bicubic(const Frame& in, int32_t w, int32_t h, Frame* out);

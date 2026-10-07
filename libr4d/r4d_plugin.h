@@ -91,6 +91,7 @@ int     r4d_rad_attn_decode_h128_bf16 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_scratch(const RadArgs*);
 int64_t r4d_rad_attn_decode_h128_scratch(const RadArgs*);
 int     r4d_rad_attn_vit              (const RadArgs*, RadStream);
+int     r4d_rad_attn_dense            (const RadArgs*, RadStream);
 /* Eight queries per KV head (r4d_attn_paged_gqa8.hip): the routed 35B-A3B at head_dim 256
  * and MiniCPM5-2B at 128. A decode workgroup holds 64 rows of q_len*gqa, so the verify
  * width is 8 here against the gqa6 leg's 10 -- which is the row's constraint value. */
@@ -412,6 +413,18 @@ int r4d_rad_gather_rows_describe(const RadArgs*, RadStream, RadLaunchDesc*, int,
 int r4d_rad_rmsnorm         (const RadArgs*, RadStream);
 int r4d_rad_add             (const RadArgs*, RadStream);
 int r4d_rad_mul             (const RadArgs*, RadStream);
+int r4d_rad_mul_weight      (const RadArgs*, RadStream);
+int r4d_rad_act_mul         (const RadArgs*, RadStream);
+int r4d_rad_seg_mean        (const RadArgs*, RadStream);
+int r4d_rad_qk_norm_rope    (const RadArgs*, RadStream);
+int r4d_rad_cast_widen      (const RadArgs*, RadStream);
+int r4d_rad_pool_rows       (const RadArgs*, RadStream);
+int r4d_rad_relu            (const RadArgs*, RadStream);
+int r4d_rad_clamp           (const RadArgs*, RadStream);
+int r4d_rad_conv2d          (const RadArgs*, RadStream);
+int r4d_rad_conv1d_dw       (const RadArgs*, RadStream);
+int r4d_rad_rel_sinusoid    (const RadArgs*, RadStream);
+int r4d_rad_attn_local_rel  (const RadArgs*, RadStream);
 int r4d_rad_sigmoid         (const RadArgs*, RadStream);
 int r4d_rad_silu            (const RadArgs*, RadStream);
 int r4d_rad_fill            (const RadArgs*, RadStream);
@@ -473,6 +486,7 @@ int r4d_shape_mtp_enter      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_hc_read        (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_hc_write       (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_binary         (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_mul_weight     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_scatter_rows_bf16(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_layernorm      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_grid_embed     (const RadParam*, int, int operand, RadOpdDesc*);

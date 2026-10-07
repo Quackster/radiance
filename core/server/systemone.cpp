@@ -284,7 +284,7 @@ int parse_d1_request(const std::string& body, const ITokenizer& tok,
             if (rc < 0) return rc;
             std::shared_ptr<mm::Item> item;
             std::string why;
-            rc = mm->prepare(MediaKind::Image, bytes, &item, &why);
+            rc = mm->prepare(MediaKind::Image, bytes, MediaOpts{}, &item, &why);
             if (rc < 0 || !item || item->expand.empty()) {
                 *err = err_bad(field, "the image could not be used: " +
                     (why.empty() ? std::string(rc < 0 ? rad_strerror(rc) : "empty image expansion") : why));

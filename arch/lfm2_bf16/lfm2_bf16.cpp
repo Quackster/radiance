@@ -354,10 +354,25 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     return RAD_OK;
 }
 
+/* Automatic encoder capacity must contain whole spatial merge blocks. */
+static int probe(const RadModelMeta* meta, RadArchProbe* out) {
+    if (!meta || !out) return RAD_E_INVAL;
+    if (std::strcmp(rad_meta_gets(meta, "model_type", "lfm2"), "lfm2_vl") == 0 &&
+        rad_meta_geti(meta, "vision_config.num_hidden_layers", 0) > 0) {
+        const int64_t factor = rad_meta_geti(meta, "downsample_factor", 0);
+        if (factor > 0 && factor <= 8) out->enc_merge = factor * factor;
+    }
+    return RAD_OK;
+}
+
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = models[rad_rank(c)];
     const Geom& g = m.g;
     if (batch->enc) {
+        if (batch->enc != RAD_MM_IMAGE) {
+            rad_step_fail(c, "lfm2_bf16 declares only an image encoder");
+            return;
+        }
         m.vision.step(c, batch);
         return;
     }
@@ -449,4 +464,5 @@ static void step(RadCtx* c, const RadBatch* batch) {
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PLUGIN(lfm2_bf16, "lfm2", "", "0.1.0",
                 "LFM2 BF16: short gated convolution, full attention and optional SigLIP2 vision")
+RAD_ARCH_PROBE(lfm2_bf16)
 #endif

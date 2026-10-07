@@ -3023,6 +3023,48 @@ TEST(a_sink_carries_its_requests_admission_and_draft_counts) {
     CHECK_EQ(sink.n_draft_accepted(), accepted);
 }
 
+TEST(embedding_inputs_refuse_causal_scoring_and_shared_prefixes) {
+    Fixture f;
+    f.build(4096, 64, 128);
+    CHECK_OK(f.start());
+    for (int mode = 1; mode <= 3; ++mode) {
+        auto r = std::make_unique<Request>();
+        r->id = f.next_id++;
+        r->prompt.assign(32, 7);
+        r->embed = true;
+        if (mode & 1) {
+            r->token_scores = std::make_shared<TokenScores>();
+            r->token_scores->tokens = {7};
+        }
+        if (mode & 2) {
+            auto prefix = std::make_shared<SharedPrefix>();
+            prefix->n_tokens = 16;
+            r->shared_prefix = std::move(prefix);
+        }
+        CHECK_EQ(f.sch.add(std::move(r)), RAD_E_INVAL);
+    }
+    auto r = std::make_unique<Request>();
+    r->id = f.next_id++;
+    r->prompt.assign(32, 7);
+    r->embed = true;
+    CHECK_OK(f.sch.add(std::move(r)));
+    REQUIRE(f.sch.step() != nullptr);
+    REQUIRE_EQ(f.sch.plan().e.size(), 1u);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 32);
+    CHECK(f.sch.plan().e[0].produces_token);
+    CHECK(!f.sch.plan().e[0].produces_score);
+    int32_t token = 7, accepted = 0;
+    uint8_t eos = 1;
+    Scheduler::StepResult result;
+    result.n_seq = 1;
+    result.token = &token;
+    result.n_accepted = &accepted;
+    result.eos = &eos;
+    CHECK_OK(f.sch.commit(result));
+    CHECK(f.sch.find(f.next_id - 1)->output.empty());
+    CHECK_EQ((int)f.sch.find(f.next_id - 1)->state, (int)ReqState::Finished);
+}
+
 TEST(score_only_requests_finish_after_chunked_prefill_without_a_token) {
     Fixture f;
     f.build(4096, 64, 128);
@@ -3422,6 +3464,13 @@ TEST(encoder_batch_stages_variable_tiles_and_rejects_invalid_segment_ranges) {
     f.prog.encoder.merge = 4;
     f.prog.encoder.max_patches = 64;
     f.prog.encoder.n_embd = 4;
+    // The audio pass has a different width and a larger staging requirement.
+    f.prog.audio_encoder.name = "test_audio";
+    f.prog.audio_encoder.modalities = RAD_MM_AUDIO;
+    f.prog.audio_encoder.patch_dim = 5;
+    f.prog.audio_encoder.merge = 4;
+    f.prog.audio_encoder.max_patches = 80;
+    f.prog.audio_encoder.n_embd = 4;
     ChunkGeometry geo;
     CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
     BatchBuilder bb;
@@ -3431,7 +3480,7 @@ TEST(encoder_batch_stages_variable_tiles_and_rejects_invalid_segment_ranges) {
     };
     REQUIRE_EQ(bb.init(f.prog, f.cfg, geo, KVGeom::of(f.prog.kv_groups), ranks), RAD_OK);
     CHECK(bb.has_encoder());
-    CHECK_EQ(bb.encoder_patches(), 64);
+    CHECK_EQ(bb.encoder_patches(), 80);
 
     auto item = [](std::initializer_list<std::pair<int32_t, int32_t>> grids, uint16_t seed) {
         mm::Item it;
@@ -3470,7 +3519,7 @@ TEST(encoder_batch_stages_variable_tiles_and_rejects_invalid_segment_ranges) {
                         coordinates.push_back({y + dy, x + dx, tile.h, tile.w});
             }
         }
-        const RadBatch* batch = bb.build_encoder(parts, step);
+        const RadBatch* batch = bb.build_encoder(parts, step, f.prog.encoder);
         CHECK(batch != nullptr);
         if (!batch) return false;
         for (int rank = 0; rank < 2; ++rank) {
@@ -3478,7 +3527,7 @@ TEST(encoder_batch_stages_variable_tiles_and_rejects_invalid_segment_ranges) {
             CHECK(staged != nullptr);
             if (!staged) return false;
             CHECK_EQ(staged->step, step);
-            CHECK_EQ(staged->enc, 1);
+            CHECK_EQ(staged->enc, RAD_MM_IMAGE);
             CHECK_EQ(staged->enc_n_patch, (int64_t)coordinates.size());
             CHECK_EQ(staged->enc_n_seg, (int64_t)boundaries.size() - 1);
             CHECK_EQ(staged->enc_max_seg, longest);
@@ -3499,14 +3548,48 @@ TEST(encoder_batch_stages_variable_tiles_and_rejects_invalid_segment_ranges) {
 
     for (auto [first, count] : std::vector<std::pair<int32_t, int32_t>>{
              {-1, 1}, {3, 1}, {2, 2}, {0, 4}, {0, 0}, {0, -1}, {INT32_MAX, 1}, {1, INT32_MAX}})
-        CHECK(bb.build_encoder({{&a, first, count}}, 19) == nullptr);
-    CHECK(bb.build_encoder({{nullptr, 0, 1}}, 19) == nullptr);
-    CHECK(bb.build_encoder({{&a, 1, 1}, {&b, -1, 1}}, 19) == nullptr);
+        CHECK(bb.build_encoder({{&a, first, count}}, 19, f.prog.encoder) == nullptr);
+    CHECK(bb.build_encoder({{nullptr, 0, 1}}, 19, f.prog.encoder) == nullptr);
+    CHECK(bb.build_encoder({{&a, 1, 1}, {&b, -1, 1}}, 19, f.prog.encoder) == nullptr);
     // Refused passes have not published a new batch or uploaded partially staged pixels.
     CHECK_EQ(bb.batch_for(0)->step, 18);
     CHECK_EQ(bb.batch_for(1)->enc_n_patch, 12);
     CHECK_EQ(static_cast<const uint16_t*>(bb.batch_for(0)->enc_pixels)[0], b.pixels[16 * 3]);
     REQUIRE(verify({{&a, 1, 1}}, 20, {0, 12}, 12));
+
+    // A uniform audio segment uses the same staging with its own geometry and modality.
+    mm::Item audio;
+    audio.kind = mm::Kind::Audio;
+    audio.grid_t = audio.grid_w = audio.n_seg = 1;
+    audio.grid_h = audio.n_patch = 80;
+    audio.rows_h = audio.seg_rows = 20;
+    audio.rows_w = 1;
+    audio.patch_dim = 5;
+    audio.valid = 73;
+    audio.pixels.resize(80 * 5);
+    for (size_t i = 0; i < audio.pixels.size(); ++i) audio.pixels[i] = (uint16_t)(2000 + i);
+    REQUIRE(bb.build_encoder({{&audio, 0, 1}}, 21, f.prog.audio_encoder) != nullptr);
+    for (int rank = 0; rank < 2; ++rank) {
+        const RadBatch* staged = bb.batch_for(rank);
+        REQUIRE(staged != nullptr);
+        CHECK_EQ(staged->enc, RAD_MM_AUDIO);
+        CHECK_EQ(staged->enc_n_patch, 80);
+        CHECK_EQ(staged->enc_n_seg, 1);
+        CHECK_EQ(staged->enc_max_seg, 80);
+        CHECK_EQ(staged->enc_cu[0], 0);
+        CHECK_EQ(staged->enc_cu[1], 80);
+        const auto* copied = static_cast<const uint16_t*>(staged->enc_pixels);
+        for (size_t i = 0; i < audio.pixels.size(); ++i) CHECK_EQ(copied[i], audio.pixels[i]);
+        for (int i = 0; i < 80; ++i) {
+            CHECK_EQ(staged->enc_coord[i], i);
+            CHECK_EQ(staged->enc_coord[80 + i], i < 73 ? 1 : 0);
+            CHECK_EQ(staged->enc_coord[160 + i], 73);
+            CHECK_EQ(staged->enc_coord[240 + i], 80);
+        }
+    }
+    CHECK(bb.build_encoder({{&audio, 0, 1}}, 22, f.prog.encoder) == nullptr);
+    CHECK_EQ(bb.batch_for(0)->step, 21);
+    REQUIRE(verify({{&b, 1, 1}}, 23, {0, 4}, 4));
 }
 
 namespace {

@@ -125,6 +125,32 @@ BufferInfo make_buf(const char* name, int64_t bytes, int kind, int32_t lo, int32
         return;                                                                       \
     }
 
+/* The output modes come from independent plugin APIs, but the engine must see one mode only. */
+TEST(pooled_outputs_and_compact_token_scores_are_mutually_exclusive_in_either_order) {
+    Registry reg;
+    const auto ctx = make_ctx();
+    for (const bool pooled_first : {false, true}) {
+        Builder b(reg, make_meta(), ctx);
+        RadBufDecl d{};
+        d.dtype = RAD_F32; d.domain = RAD_DOMAIN_DEVICE; d.rank = 2;
+        d.shape[0] = ctx.max_seqs; d.shape[1] = 64;
+        const rad_buf pooled = b.decl_buffer("pooled", &d);
+        REQUIRE(pooled != RAD_NULL_HANDLE);
+        if (pooled_first) {
+            REQUIRE_EQ(rad_declare_pooled(&b, pooled), RAD_OK);
+            CHECK_EQ(rad_declare_token_scores(&b), RAD_E_STATE);
+            CHECK_EQ(b.program().pooled_buf, pooled);
+            CHECK(!b.program().token_scores);
+        } else {
+            REQUIRE_EQ(rad_declare_token_scores(&b), RAD_OK);
+            CHECK_EQ(rad_declare_pooled(&b, pooled), RAD_E_STATE);
+            CHECK(b.program().token_scores);
+            CHECK_EQ(b.program().pooled_buf, (rad_buf)RAD_NULL_HANDLE);
+        }
+        CHECK_EQ(b.status(), RAD_E_STATE);
+    }
+}
+
 /* ================================================================== the bucket table */
 TEST(bucket_table_resolves_per_band) {
     NEED_PLUGIN(reg)

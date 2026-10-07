@@ -705,14 +705,17 @@ public:
         if (!p_ || !mm::decoder_available()) return false;
         if (k == MediaKind::Image) return (mod_ & RAD_MM_IMAGE) != 0;
         if (k == MediaKind::Video) return (mod_ & RAD_MM_VIDEO) != 0;
+        if (k == MediaKind::Audio) return (mod_ & RAD_MM_AUDIO) != 0 && p_->has_audio();
         return false;
     }
 
-    int prepare(MediaKind k, const std::vector<uint8_t>& bytes, std::shared_ptr<mm::Item>* out,
-                std::string* why) override {
+    int prepare(MediaKind k, const std::vector<uint8_t>& bytes, const MediaOpts& opts,
+                std::shared_ptr<mm::Item>* out, std::string* why) override {
         if (!accepts(k)) { if (why) *why = "this kind of media is not served"; return RAD_E_UNSUPPORTED; }
-        return k == MediaKind::Image ? p_->image(bytes.data(), bytes.size(), out, why)
-                                     : p_->video(bytes.data(), bytes.size(), out, why);
+        if (k == MediaKind::Audio) return p_->audio(bytes.data(), bytes.size(), out, why);
+        return k == MediaKind::Image
+                   ? p_->image(bytes.data(), bytes.size(), opts.image_tokens, out, why)
+                   : p_->video(bytes.data(), bytes.size(), out, why);
     }
 
 private:

@@ -56,5 +56,13 @@ struct Video {
 int decode_video(const uint8_t* data, size_t n, SampleFn sample, const void* user,
                  int64_t max_pixels, Video* out, std::string* why);
 
+/* AN AUDIO CLIP as mono float samples at `rate` Hz: the first audio stream, resampled with
+ * libswresample at the source's channel layout and then averaged across channels -- the plain
+ * mean every reference loader (librosa, torchaudio's to-mono) takes, where swresample's own
+ * downmix would weight a stereo pair by 0.707. At most `max_samples` are kept: a longer clip is
+ * cut there, as the reference feature extractor truncates. */
+int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_samples,
+                 std::vector<float>* out, std::string* why);
+
 }  /* namespace mm */
 }  /* namespace rad */

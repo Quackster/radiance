@@ -97,9 +97,10 @@ struct DecisionImages : IMultimodal {
     int prepares = 0;
     std::vector<std::vector<uint8_t>> received;
     bool accepts(MediaKind kind) const override { return support && kind == MediaKind::Image; }
-    int prepare(MediaKind kind, const std::vector<uint8_t>& bytes,
+    int prepare(MediaKind kind, const std::vector<uint8_t>& bytes, const MediaOpts& opts,
                 std::shared_ptr<mm::Item>* out, std::string* why) override {
         CHECK(kind == MediaKind::Image);
+        CHECK_EQ(opts.image_tokens, 0);
         ++prepares;
         received.push_back(bytes);
         if (fail) { *why = "fixture image decode failure"; return RAD_E_INVAL; }

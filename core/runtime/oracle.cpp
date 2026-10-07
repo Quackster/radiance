@@ -883,7 +883,7 @@ const IssuePlan* Ctx::oracle_before(rad_op h, int band, int n_opd) {
         static const IssuePlan kRepeatArmed{};
         return &kRepeatArmed;
     }
-    /* NOT GATED ON THE DEVICE DOMAIN. Under RADIANCE_HOST_DOMAIN the launch IS the host kernel,
+    /* NOT GATED ON THE DEVICE DOMAIN. On the host backend the launch IS the host kernel,
      * so the comparison is host against host and agrees by construction -- but the per-operand
      * lines are still the only ordered trace of what the graph computed, and diffing those
      * against another engine's is what the whole-model reference exists for. */

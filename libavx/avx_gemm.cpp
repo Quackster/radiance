@@ -367,6 +367,333 @@ static int gemm_drive(const Mat& ma, const Mat& mb, const Scales* SA, const Scal
     return RAD_OK;
 }
 
+/* ================================================================== the bf16 outer-product path
+ *
+ * AN ENCODER'S GEMM IS ALL PREFILL: M is the step's whole token count, thousands of rows, every
+ * launch. The driver above is shaped for decode -- it packs A on the calling thread one M block at
+ * a time and re-widens each weight row into f32 once per M block -- and at M = 3000, K = 2048 that
+ * is the weight widened a hundred times over, behind a single-threaded pack, for 0.14 TFLOPS on a
+ * 16-core part.
+ *
+ * Where both operands are bf16 with unit element stride and the CPU has AVX512_BF16 (Zen 4 on,
+ * Cooper Lake and Sapphire Rapids on), this path runs instead, and it is the OUTER-PRODUCT form
+ * this file otherwise argues against -- because here M is large enough to pay for the one thing
+ * that argument says it costs, a pack of B:
+ *
+ *   B is packed ONCE A CALL, in parallel, into panels of 48 columns in vdpbf16ps's pair layout,
+ *   Bp[panel][K/2][48][2]: one k-pair of 48 columns is three zmm, read contiguously. Columns past
+ *   N and the second half of an odd K's last pair are zeros.
+ *   The microkernel is 8 rows of A by one panel: per k-pair, three panel loads, eight 32-bit
+ *   broadcasts of A's (k, k+1) pair, 24 vdpbf16ps into 24 accumulators. NO HORIZONTAL REDUCTION
+ *   anywhere -- each accumulator lane is one output element -- and a row is stored as three
+ *   16-wide vectors.
+ *   Threads take tiles of (64 rows) x (up to four panels), dynamically. Within a tile the panel
+ *   loop is outer, so a panel (K x 96 bytes: 48 KiB at K = 512, 192 KiB at K = 2048) stays in L2
+ *   while the tile's row blocks stream through it.
+ *
+ * MEASURED on a 9950X3D, 16 threads, M = 2048: 6.9 TFLOPS at N = 4096, K = 512 and 6.1 at
+ * N = 512, K = 2048. The dot-product form -- vdpbf16ps along K straight out of both rows, 4 x 6
+ * blocks -- reached 1.5 at both: at K = 512 a block does sixteen k steps and then 24 sixteen-lane
+ * reductions, so the reductions were most of its instruction stream. Below 128 rows the per-call
+ * pack is not paid back, and that form (gemm_bf16_dot) still runs there.
+ *
+ * It is one instruction stream inside the AVX-512 object, compiled for the extra feature with a
+ * function attribute and entered only after __builtin_cpu_supports says the CPU has it: an
+ * AVX-512 part without BF16 takes the driver above, unchanged.
+ *
+ * THE ARITHMETIC: products of bf16 pairs in f32, accumulated per output in k order two at a time,
+ * with bf16 denormals read as zero (the instruction's DAZ); the bias is the accumulator's start
+ * and the store rounds to nearest even. A different summation order from the driver's, inside the
+ * checker's bf16 tolerance like every vectorised reduction here. Each output element is computed
+ * by one thread, so the result does not depend on the thread count. */
+#if AVX_LEVEL == 3
+#define AVX_BF16_TARGET __attribute__((target("avx512f,avx512bw,avx512vl,avx512bf16")))
+
+constexpr int64_t BP_COLS = 48;     /* columns a panel: three zmm of f32 accumulators */
+constexpr int64_t BP_MR   = 8;      /* rows of A a microkernel */
+
+/* f32 -> bf16 round-to-nearest-even, sixteen lanes, a NaN kept a (quiet) NaN: the scalar
+ * converter's arithmetic, vectorised. */
+AVX_BF16_TARGET static inline __m256i bf16_rne16(__m512 x) {
+    const __m512i u = _mm512_castps_si512(x);
+    const __m512i lsb = _mm512_and_si512(_mm512_srli_epi32(u, 16), _mm512_set1_epi32(1));
+    __m512i r = _mm512_srli_epi32(_mm512_add_epi32(_mm512_add_epi32(u, _mm512_set1_epi32(0x7fff)),
+                                                   lsb), 16);
+    const __mmask16 nan = _mm512_cmpgt_epu32_mask(_mm512_and_si512(u, _mm512_set1_epi32(0x7fffffff)),
+                                                  _mm512_set1_epi32(0x7f800000));
+    r = _mm512_mask_mov_epi32(r, nan, _mm512_or_si512(_mm512_srli_epi32(u, 16),
+                                                      _mm512_set1_epi32(0x40)));
+    return _mm512_cvtepi32_epi16(r);
+}
+
+/* MR_ rows of A against one packed panel, over all of K, stored to the panel's `cols` columns of
+ * Y rows 0..MR_-1 (Y already offset to the block's first element). `bv` starts the accumulators:
+ * the bias, or zeros. */
+template <int MR_>
+AVX_BF16_TARGET static inline void op_block(const uint16_t* A, int64_t lda, const uint16_t* panel,
+                                            int64_t K, const __m512* bv, void* Y, int64_t ys_r,
+                                            bool yb, int64_t cols) {
+    __m512 acc[MR_][3];
+#pragma GCC unroll 8
+    for (int i = 0; i < MR_; ++i) {
+        acc[i][0] = bv[0];
+        acc[i][1] = bv[1];
+        acc[i][2] = bv[2];
+    }
+    const int64_t kp_full = K / 2;
+    const uint16_t* bp = panel;
+    for (int64_t kp = 0; kp < kp_full; ++kp, bp += 2 * BP_COLS) {
+        const __m512bh b0 = (__m512bh)_mm512_loadu_si512((const void*)bp);
+        const __m512bh b1 = (__m512bh)_mm512_loadu_si512((const void*)(bp + 32));
+        const __m512bh b2 = (__m512bh)_mm512_loadu_si512((const void*)(bp + 64));
+#pragma GCC unroll 8
+        for (int i = 0; i < MR_; ++i) {
+            uint32_t pr;
+            std::memcpy(&pr, A + i * lda + 2 * kp, 4);
+            const __m512bh av = (__m512bh)_mm512_set1_epi32((int)pr);
+            acc[i][0] = _mm512_dpbf16_ps(acc[i][0], av, b0);
+            acc[i][1] = _mm512_dpbf16_ps(acc[i][1], av, b1);
+            acc[i][2] = _mm512_dpbf16_ps(acc[i][2], av, b2);
+        }
+    }
+    if (K & 1) {
+        /* The odd last k: A's element alone in the pair's low half, never the one past the row. */
+        const __m512bh b0 = (__m512bh)_mm512_loadu_si512((const void*)bp);
+        const __m512bh b1 = (__m512bh)_mm512_loadu_si512((const void*)(bp + 32));
+        const __m512bh b2 = (__m512bh)_mm512_loadu_si512((const void*)(bp + 64));
+#pragma GCC unroll 8
+        for (int i = 0; i < MR_; ++i) {
+            const __m512bh av = (__m512bh)_mm512_set1_epi32((int)(uint32_t)A[i * lda + K - 1]);
+            acc[i][0] = _mm512_dpbf16_ps(acc[i][0], av, b0);
+            acc[i][1] = _mm512_dpbf16_ps(acc[i][1], av, b1);
+            acc[i][2] = _mm512_dpbf16_ps(acc[i][2], av, b2);
+        }
+    }
+    /* Every accumulator index is a constant, so the block never leaves the registers. */
+    auto mask = [&](int64_t c0) {
+        const int64_t w = cols - c0 <= 0 ? 0 : (cols - c0 < 16 ? cols - c0 : 16);
+        return (__mmask16)((1u << w) - 1);
+    };
+    const __mmask16 m0 = mask(0), m1 = mask(16), m2 = mask(32);
+#pragma GCC unroll 8
+    for (int i = 0; i < MR_; ++i) {
+        if (yb) {
+            uint16_t* yr = (uint16_t*)Y + i * ys_r;
+            _mm256_mask_storeu_epi16(yr, m0, bf16_rne16(acc[i][0]));
+            _mm256_mask_storeu_epi16(yr + 16, m1, bf16_rne16(acc[i][1]));
+            _mm256_mask_storeu_epi16(yr + 32, m2, bf16_rne16(acc[i][2]));
+        } else {
+            float* yr = (float*)Y + i * ys_r;
+            _mm512_mask_storeu_ps(yr, m0, acc[i][0]);
+            _mm512_mask_storeu_ps(yr + 16, m1, acc[i][1]);
+            _mm512_mask_storeu_ps(yr + 32, m2, acc[i][2]);
+        }
+    }
+}
+
+/* THE SMALL-M FORM: vdpbf16ps along K straight out of both rows, 4 x 6 blocks, no pack. The pack
+ * in gemm_bf16_dp touches every weight once a call -- 250 MB a forward pass for EmbeddingGemma
+ * 2 -- which an encoder step of thousands of rows amortises and a single 16-token query does not:
+ * there the outer-product path took a query from 13 to 17 ms. The pack pays for itself where the rows it
+ * serves are many; by the measured rates (1.5 against 6 TFLOPS, the pack streaming at memory
+ * speed) that is from about 75 rows, and 128 is the switch. */
+template <int MB_, int NB_>
+AVX_BF16_TARGET static inline void dp_block(const uint16_t* A, int64_t lda, const uint16_t* B,
+                                            int64_t ldb, int64_t K, float out[MB_][NB_]) {
+    __m512 acc[MB_][NB_];
+    for (int i = 0; i < MB_; ++i)
+        for (int j = 0; j < NB_; ++j) acc[i][j] = _mm512_setzero_ps();
+    int64_t k = 0;
+    for (; k + 32 <= K; k += 32) {
+        __m512bh av[MB_];
+        for (int i = 0; i < MB_; ++i)
+            av[i] = (__m512bh)_mm512_loadu_si512((const void*)(A + i * lda + k));
+        for (int j = 0; j < NB_; ++j) {
+            const __m512bh bv = (__m512bh)_mm512_loadu_si512((const void*)(B + j * ldb + k));
+            for (int i = 0; i < MB_; ++i) acc[i][j] = _mm512_dpbf16_ps(acc[i][j], av[i], bv);
+        }
+    }
+    if (k < K) {
+        const __mmask32 mk = (__mmask32)((1ull << (K - k)) - 1);
+        __m512bh av[MB_];
+        for (int i = 0; i < MB_; ++i)
+            av[i] = (__m512bh)_mm512_maskz_loadu_epi16(mk, (const void*)(A + i * lda + k));
+        for (int j = 0; j < NB_; ++j) {
+            const __m512bh bv = (__m512bh)_mm512_maskz_loadu_epi16(mk, (const void*)(B + j * ldb + k));
+            for (int i = 0; i < MB_; ++i) acc[i][j] = _mm512_dpbf16_ps(acc[i][j], av[i], bv);
+        }
+    }
+    for (int i = 0; i < MB_; ++i)
+        for (int j = 0; j < NB_; ++j) out[i][j] = _mm512_reduce_add_ps(acc[i][j]);
+}
+
+static inline uint16_t f32_bf16_rne(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    if ((u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu)) return (uint16_t)((u >> 16) | 0x40u);
+    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
+AVX_BF16_TARGET static void gemm_bf16_dot(const uint16_t* A, int64_t lda, const uint16_t* B,
+                                          int64_t ldb, const RadTensor* Y, int64_t ys_r,
+                                          const RadTensor* bias, int64_t M, int64_t N, int64_t K) {
+    const bool yb = Y->dtype == RAD_BF16;
+    /* The tile grid: 64 rows of A by a column count chosen so there are at least four tiles a
+     * thread, capped at 192 columns. */
+    constexpr int64_t BMR = 4, BNR = 6, MC = 64;
+    const int64_t mt = (M + MC - 1) / MC;
+#ifdef _OPENMP
+    const int64_t nth = (int64_t)avx_team_size();
+#else
+    const int64_t nth = 1;
+#endif
+    int64_t want_nt = (4 * nth + mt - 1) / mt;
+    if (want_nt < 1) want_nt = 1;
+    int64_t NC = (N + want_nt - 1) / want_nt;
+    NC = ((NC + BNR - 1) / BNR) * BNR;
+    if (NC > 192) NC = 192;
+    if (NC < BNR) NC = BNR;
+    const int64_t ntl = (N + NC - 1) / NC;
+
+    auto store = [&](int64_t m, int64_t n, float v) {
+        if (bias) v += ldt(bias, n * laststride(bias));
+        if (yb) ((uint16_t*)Y->data)[m * ys_r + n] = f32_bf16_rne(v);
+        else    ((float*)Y->data)[m * ys_r + n] = v;
+    };
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) num_threads(avx_team_size())
+#endif
+    for (int64_t t = 0; t < mt * ntl; ++t) {
+        const int64_t m_lo = (t / ntl) * MC, n_lo = (t % ntl) * NC;
+        const int64_t m_hi = m_lo + MC < M ? m_lo + MC : M;
+        const int64_t n_hi = n_lo + NC < N ? n_lo + NC : N;
+        for (int64_t n0 = n_lo; n0 < n_hi; n0 += BNR) {
+            const int64_t nn = n_hi - n0 < BNR ? n_hi - n0 : BNR;
+            for (int64_t m0 = m_lo; m0 < m_hi; m0 += BMR) {
+                const int64_t mm = m_hi - m0 < BMR ? m_hi - m0 : BMR;
+                if (mm == BMR && nn == BNR) {
+                    float o[BMR][BNR];
+                    dp_block<BMR, BNR>(A + m0 * lda, lda, B + n0 * ldb, ldb, K, o);
+                    for (int i = 0; i < BMR; ++i)
+                        for (int j = 0; j < BNR; ++j) store(m0 + i, n0 + j, o[i][j]);
+                } else {
+                    for (int64_t i = 0; i < mm; ++i)
+                        for (int64_t j = 0; j < nn; ++j) {
+                            float o[1][1];
+                            dp_block<1, 1>(A + (m0 + i) * lda, lda, B + (n0 + j) * ldb, ldb, K, o);
+                            store(m0 + i, n0 + j, o[0][0]);
+                        }
+                }
+            }
+        }
+    }
+}
+
+/* A bf16 x bf16 product into Y, or false when this path does not apply and the driver should run. */
+AVX_BF16_TARGET static bool gemm_bf16_dp(const Mat& ma, const Mat& mb, const RadTensor* Y,
+                                         const RadTensor* bias, int64_t M, int64_t N, int64_t K) {
+    static const bool have = __builtin_cpu_supports("avx512bf16");
+    if (!have || M < 16) return false;
+    if (ma.t->dtype != RAD_BF16 || mb.t->dtype != RAD_BF16 || ma.cs != 1 || mb.cs != 1) return false;
+    if (Y->dtype != RAD_BF16 && Y->dtype != RAD_F32) return false;
+    const int64_t ys_r = row_stride(Y, N);
+    const int64_t ys_c = Y->rank >= 2 ? Y->stride[Y->rank - 1] : 1;
+    if (ys_c != 1) return false;
+
+    const uint16_t* A = (const uint16_t*)ma.t->data;
+    const uint16_t* B = (const uint16_t*)mb.t->data;
+    const int64_t lda = ma.rs, ldb = mb.rs;
+    if (M < 128) {
+        gemm_bf16_dot(A, lda, B, ldb, Y, ys_r, bias, M, N, K);
+        return true;
+    }
+    const bool yb = Y->dtype == RAD_BF16;
+    const size_t yel = yb ? 2 : 4;
+
+    /* ---- the pack, into the calling thread's arena before any worker reads it */
+    const int64_t np = (N + BP_COLS - 1) / BP_COLS;
+    const int64_t kp_n = (K + 1) / 2;
+    const int64_t pstride = kp_n * 2 * BP_COLS;              /* uint16 a panel */
+    uint16_t* Bp = (uint16_t*)scratch_raw((size_t)(np * pstride) * sizeof(uint16_t) + 64);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(avx_team_size()) if(np * pstride >= 65536)
+#endif
+    for (int64_t p = 0; p < np; ++p) {
+        uint32_t* dst = (uint32_t*)(Bp + p * pstride);
+        const int64_t n0 = p * BP_COLS;
+        for (int64_t c = 0; c < BP_COLS; ++c) {
+            const int64_t n = n0 + c;
+            if (n >= N) {
+                for (int64_t kp = 0; kp < kp_n; ++kp) dst[kp * BP_COLS + c] = 0;
+                continue;
+            }
+            const uint16_t* row = B + n * ldb;
+            for (int64_t kp = 0; kp < K / 2; ++kp) {
+                uint32_t pr;
+                std::memcpy(&pr, row + 2 * kp, 4);
+                dst[kp * BP_COLS + c] = pr;
+            }
+            if (K & 1) dst[(kp_n - 1) * BP_COLS + c] = (uint32_t)row[K - 1];
+        }
+    }
+
+    /* ---- the tile grid: 64-row M blocks by groups of panels, at least four tiles a thread */
+    constexpr int64_t MC = 64;
+    const int64_t mt = (M + MC - 1) / MC;
+#ifdef _OPENMP
+    const int64_t nth = (int64_t)avx_team_size();
+#else
+    const int64_t nth = 1;
+#endif
+    int64_t groups = (4 * nth + mt - 1) / mt;
+    if (groups < 1) groups = 1;
+    int64_t PG = (np + groups - 1) / groups;
+    if (PG > 4) PG = 4;
+    if (PG < 1) PG = 1;
+    const int64_t ng = (np + PG - 1) / PG;
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) num_threads(avx_team_size())
+#endif
+    for (int64_t t = 0; t < mt * ng; ++t) {
+        const int64_t m_lo = (t / ng) * MC, p_lo = (t % ng) * PG;
+        const int64_t m_hi = m_lo + MC < M ? m_lo + MC : M;
+        const int64_t p_hi = p_lo + PG < np ? p_lo + PG : np;
+        for (int64_t p = p_lo; p < p_hi; ++p) {
+            const int64_t n0 = p * BP_COLS;
+            const int64_t cols = N - n0 < BP_COLS ? N - n0 : BP_COLS;
+            __m512 bv[3];
+            for (int v = 0; v < 3; ++v) {
+                alignas(64) float bb[16];
+                for (int e = 0; e < 16; ++e) {
+                    const int64_t n = n0 + 16 * v + e;
+                    bb[e] = (bias && n < N) ? ldt(bias, n * laststride(bias)) : 0.0f;
+                }
+                bv[v] = _mm512_load_ps(bb);
+            }
+            const uint16_t* panel = Bp + p * pstride;
+            for (int64_t m0 = m_lo; m0 < m_hi; m0 += BP_MR) {
+                const int64_t mm = m_hi - m0 < BP_MR ? m_hi - m0 : BP_MR;
+                const uint16_t* Ar = A + m0 * lda;
+                void* Yr = (char*)Y->data + (size_t)(m0 * ys_r + n0) * yel;
+                switch (mm) {
+                    case 8: op_block<8>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
+                    case 7: op_block<7>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
+                    case 6: op_block<6>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
+                    case 5: op_block<5>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
+                    case 4: op_block<4>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
+                    case 3: op_block<3>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
+                    case 2: op_block<2>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
+                    default: op_block<1>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
+                }
+            }
+        }
+    }
+    return true;
+}
+#endif
+
 /* Shared entry for gemm_nt / gemm_nt_bias / logits_gemm. `nkey`/`kkey` name which parameters carry
  * N and K, because logits_gemm spells them n_vocab and n_embd. */
 /* gemm_nt_bias's epilogue (docs/OPS.md): an activation of the stored product, then a residual,
@@ -409,8 +736,13 @@ static int gemm_nt_impl(const RadArgs* a, bool bias_operand, const char* nkey, c
     if (res && numel(res) < M * N) return RAD_E_SHAPE;
 
     const Mat ma = as_mat(A, K), mb = as_mat(B, K);
-    const int st = gemm_drive(ma, mb, nullptr, nullptr, Y, bias, M, N, K);
-    if (st < 0) return st;
+#if AVX_LEVEL == 3
+    if (!gemm_bf16_dp(ma, mb, Y, bias, M, N, K))
+#endif
+    {
+        const int st = gemm_drive(ma, mb, nullptr, nullptr, Y, bias, M, N, K);
+        if (st < 0) return st;
+    }
     if (act || res) gemm_epilogue(Y, res, act, M, N);
     return RAD_OK;
 }
@@ -584,8 +916,10 @@ static int embed_impl(const RadArgs* a) {
     if (n_embd <= 0 || n_vocab <= 0 || voff < 0) return RAD_E_SHAPE;
     const int64_t M = numel(x) / n_embd;
     if (M <= 0 || numel(tok) < M || numel(wte) < n_vocab * n_embd) return RAD_E_SHAPE;
-    /* An absent scale is one (ref_embed_lookup_q says why the op allows it). */
-    const float scale = QUANT && sc->data && numel(sc) >= 1 ? ldt(sc, 0) : 1.0f;
+    /* An absent scale is one (ref_embed_lookup_q says why the op allows it). embed_lookup's
+     * `mult` is the same multiply, a parameter instead of a table scale. */
+    const float scale = QUANT ? (sc->data && numel(sc) >= 1 ? ldt(sc, 0) : 1.0f)
+                              : p_f32(a, "mult", 1.0f);
 
     /* Validated before the loop, because an OpenMP body cannot return. */
     if (voff == 0)
@@ -597,7 +931,8 @@ static int embed_impl(const RadArgs* a) {
     /* A ROW COPY WHEN NOTHING HAS TO CHANGE, which for the unquantised gather is the usual case:
      * the table and the activation are the same dtype and a memcpy moves the row at the width of
      * the machine instead of through an f32 round trip that would also re-round it. */
-    const bool copy = !QUANT && wte->dtype == x->dtype && wc == 1 && laststride(x) == 1;
+    const bool copy = !QUANT && scale == 1.0f && wte->dtype == x->dtype && wc == 1 &&
+                      laststride(x) == 1;
     const size_t rowb = copy ? (size_t)((rad_dtype_bits(x->dtype) * n_embd) / 8) : 0;
 
     AVX_PARALLEL_FOR_IF(M * n_embd >= AVX_PAR_MIN)
@@ -616,7 +951,7 @@ static int embed_impl(const RadArgs* a) {
             for (int64_t i = 0; i < n_embd; ++i) s[i] = 0.0f;
         } else if (wc == 1) {
             row_to_f32(wte->dtype, byte_at(wte->data, wte->dtype, id * ws), s, n_embd);
-            if (QUANT) {
+            if (scale != 1.0f) {
                 const vf vs = vf_set1(scale);
                 int64_t i = 0;
                 for (; i + VF_N <= n_embd; i += VF_N) vf_storeu(s + i, vf_mul(vf_loadu(s + i), vs));

@@ -936,4 +936,29 @@ TEST(libr4d_resolves_the_four_rank_fused_writes_on_the_exact_wire_only) {
     }
 }
 
+/* THE VISION TOWER'S ATTENTION RESOLVES AS rad_block_vit.h DECLARES IT: head_dim 72, no `window`.
+ * `window` is optional in attn_dense's schema and a constraint on a key the geometry lacks does not
+ * hold, so a row that constrains it is unreachable for a caller that leaves it out -- which is how
+ * every Qwen image request on a card came to stop the engine with "no device kernel for this
+ * band". rad-kbench cannot see that: its cases always name the window. */
+TEST(libr4d_resolves_the_vision_attention_without_a_window) {
+    const std::string so = home() + "/kernels/libr4d.so";
+    if (access(so.c_str(), R_OK) != 0) {
+        fprintf(stderr, "  SKIP %s: no %s (a build without HIP)\n", ::radtest::current(),
+                so.c_str());
+        return;
+    }
+    Registry r;
+    CHECK(r.load_plugin(so, 0) >= 0);
+    Geometry g;
+    g.set_i("head_dim", 72);
+    g.set_i("gqa", 1);
+    g.set_i("causal", 0);
+    g.set_s("dtype", "bf16");
+    g.set_i("max_seqlen", 16384);
+    const std::vector<Band> b = r.build_bands("attn_dense", "M", 1, 16384, g);
+    CHECK(!b.empty());
+    for (const Band& x : b) CHECK_EQ(picked(x.dom[RAD_DOMAIN_DEVICE].row), "attn_vit_h72_bf16");
+}
+
 RAD_TEST_MAIN()

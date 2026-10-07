@@ -1036,6 +1036,12 @@ int Builder::declare_logits(rad_buf b) {
             prog_.buffers[prog_.logits_buf].name.c_str(), prog_.buffers[b].name.c_str());
         return RAD_E_STATE;
     }
+    if (prog_.pooled_buf != RAD_NULL_HANDLE) {
+        err(RAD_E_STATE, "declare_logits: this program already declared '%s' as its pooled "
+                         "output; a program generates or embeds, not both",
+            prog_.buffers[prog_.pooled_buf].name.c_str());
+        return RAD_E_STATE;
+    }
     prog_.logits_buf = b;
     return RAD_OK;
 }
@@ -1045,7 +1051,49 @@ int Builder::declare_token_scores() {
         err(RAD_E_STATE, "declare_token_scores requires an unfinished main model declaration");
         return RAD_E_STATE;
     }
+    if (prog_.pooled_buf != RAD_NULL_HANDLE) {
+        err(RAD_E_STATE, "declare_token_scores: a pooled embedding program has no vocabulary head");
+        return RAD_E_STATE;
+    }
     prog_.token_scores = true;
+    return RAD_OK;
+}
+
+/* The embedding program's output (rad_declare_pooled). Checked here for the logits buffer's
+ * reasons, and for shape: the core reads `n_seq` f32 rows of it from the device after every step,
+ * so a buffer narrower than a step's sequences, or in another dtype or domain, is refused now
+ * rather than read past or misread at the first request. */
+int Builder::declare_pooled(rad_buf b) {
+    if (finished_) { err(RAD_E_STATE, "declare_pooled after declare finished"); return RAD_E_STATE; }
+    if (b == RAD_NULL_HANDLE || (size_t)b >= prog_.buffers.size()) {
+        err(RAD_E_INVAL, "declare_pooled: %u is not a declared buffer", (unsigned)b);
+        return RAD_E_INVAL;
+    }
+    if (prog_.pooled_buf != RAD_NULL_HANDLE && prog_.pooled_buf != b) {
+        err(RAD_E_STATE, "declare_pooled: '%s' was already named as the pooled output; '%s' is a "
+                         "second one", prog_.buffers[prog_.pooled_buf].name.c_str(),
+            prog_.buffers[b].name.c_str());
+        return RAD_E_STATE;
+    }
+    if (prog_.logits_buf != RAD_NULL_HANDLE) {
+        err(RAD_E_STATE, "declare_pooled: this program already declared '%s' as its logits; a "
+                         "program generates or embeds, not both",
+            prog_.buffers[prog_.logits_buf].name.c_str());
+        return RAD_E_STATE;
+    }
+    if (prog_.token_scores) {
+        err(RAD_E_STATE, "declare_pooled: this program already opted into vocabulary token scores");
+        return RAD_E_STATE;
+    }
+    const RadBufDecl& d = prog_.buffers[b].decl;
+    if (d.dtype != RAD_F32 || d.domain != RAD_DOMAIN_DEVICE || d.rank != 2 ||
+        d.shape[0] < prog_.ctx.max_seqs || d.shape[1] <= 0) {
+        err(RAD_E_INVAL, "declare_pooled: '%s' must be a device f32 buffer of [>= %lld, dim] -- "
+                         "one row a sequence of the step",
+            prog_.buffers[b].name.c_str(), (long long)prog_.ctx.max_seqs);
+        return RAD_E_INVAL;
+    }
+    prog_.pooled_buf = b;
     return RAD_OK;
 }
 
@@ -1063,30 +1111,36 @@ int Builder::declare_encoder(const RadEncoderDecl* d) {
     if (!d) { err(RAD_E_INVAL, "declare_encoder: null declaration"); return RAD_E_INVAL; }
     if (d->modalities == 0) return RAD_OK;   /* declaring nothing is declaring nothing */
     const char* nm = d->name && *d->name ? d->name : "(unnamed)";
-    if (prog_.encoder.modalities != 0) {
-        err(RAD_E_STATE, "declare_encoder: '%s' already declared this program's encoder; '%s' is "
-                         "a second one", prog_.encoder_name.c_str(), nm);
-        return RAD_E_STATE;
-    }
-    if ((d->modalities & ~(uint32_t)(RAD_MM_IMAGE | RAD_MM_VIDEO)) != 0) {
+    /* One vision encoder (images and video) and one audio encoder, each at most once. */
+    const bool audio = d->modalities == RAD_MM_AUDIO;
+    if (!audio && (d->modalities & ~(uint32_t)(RAD_MM_IMAGE | RAD_MM_VIDEO)) != 0) {
         err(RAD_E_INVAL, "declare_encoder '%s': modalities 0x%x names a kind this engine has no "
-                         "processor for", nm, (unsigned)d->modalities);
+                         "processor for (an audio encoder serves audio alone)", nm,
+            (unsigned)d->modalities);
         return RAD_E_INVAL;
     }
+    RadEncoderDecl& slot = audio ? prog_.audio_encoder : prog_.encoder;
+    std::string& slot_name = audio ? prog_.audio_encoder_name : prog_.encoder_name;
+    if (slot.modalities != 0) {
+        err(RAD_E_STATE, "declare_encoder: '%s' already declared this program's %s encoder; '%s' "
+                         "is a second one", slot_name.c_str(), audio ? "audio" : "image and video",
+            nm);
+        return RAD_E_STATE;
+    }
+    const int64_t want = audio ? prog_.ctx.max_audio_frames : prog_.ctx.max_enc_patches;
     if (d->patch_dim <= 0 || d->merge <= 0 || d->n_embd <= 0) {
         err(RAD_E_INVAL, "declare_encoder '%s': patch_dim %lld, merge %lld, n_embd %lld -- all "
                          "three must be positive", nm, (long long)d->patch_dim,
             (long long)d->merge, (long long)d->n_embd);
         return RAD_E_INVAL;
     }
-    if (d->max_patches <= 0 || d->max_patches != prog_.ctx.max_enc_patches ||
-        d->max_patches % d->merge != 0) {
+    if (d->max_patches <= 0 || d->max_patches != want || d->max_patches % d->merge != 0) {
         err(RAD_E_INVAL, "declare_encoder '%s': max_patches %lld, but this program was declared "
-                         "with max_enc_patches %lld and a merge of %lld. The plugin sized its "
-                         "activations with max_enc_patches and the core stages up to that many "
-                         "patches a pass; they cannot differ, and a pass's patches must divide into "
-                         "whole output rows.", nm, (long long)d->max_patches,
-            (long long)prog_.ctx.max_enc_patches, (long long)d->merge);
+                         "with %s %lld and a merge of %lld. The plugin sized its activations with "
+                         "that and the core stages up to that many patches a pass; they cannot "
+                         "differ, and a pass's patches must divide into whole output rows.", nm,
+            (long long)d->max_patches, audio ? "max_audio_frames" : "max_enc_patches",
+            (long long)want, (long long)d->merge);
         return RAD_E_INVAL;
     }
     if (d->out == RAD_NULL_HANDLE || (size_t)d->out >= prog_.buffers.size()) {
@@ -1105,9 +1159,9 @@ int Builder::declare_encoder(const RadEncoderDecl* d) {
             (long long)d->n_embd);
         return RAD_E_INVAL;
     }
-    prog_.encoder = *d;
-    prog_.encoder_name = nm;
-    prog_.encoder.name = nullptr;   /* the plugin's storage; encoder_name is the copy */
+    slot = *d;
+    slot_name = nm;
+    slot.name = nullptr;   /* the plugin's storage; the name is the copy */
     return RAD_OK;
 }
 
@@ -1535,6 +1589,8 @@ void Builder::finish_buffer_liveness() {
          * empty and nothing that shared with logits before is prevented from doing so. The
          * undeclared-use guard in core/runtime/issue.cpp is what refuses the untruthful version. */
         if ((rad_buf)i == prog_.logits_buf && last_op > b.last_use) b.last_use = last_op;
+        /* The pooled output for the same reason: the engine reads it after the last op. */
+        if ((rad_buf)i == prog_.pooled_buf && last_op > b.last_use) b.last_use = last_op;
     }
 }
 
@@ -1700,6 +1756,11 @@ int rad_declare_logits(RadBuilder* b, rad_buf logits) {
 int rad_declare_token_scores(RadBuilder* b) {
     if (!b) return RAD_E_INVAL;
     return B(b)->declare_token_scores();
+}
+
+int rad_declare_pooled(RadBuilder* b, rad_buf pooled) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->declare_pooled(pooled);
 }
 
 int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {

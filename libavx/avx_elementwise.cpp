@@ -80,6 +80,366 @@ static int elementwise2(const RadArgs* a) {
 AVX_KERNEL(add) { return elementwise2<false>(a); }
 AVX_KERNEL(mul) { return elementwise2<true>(a); }
 
+/* y = x * w, `w` a weight of one element or one row (libref's mul_weight). */
+AVX_KERNEL(mul_weight) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *W = &a->t[1], *Y = &a->t[2];
+    const int64_t n = p_int(a, "n", numel(Y));
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n);
+    if (rows <= 0 || numel(X) < rows * n) return RAD_E_SHAPE;
+    const bool scalar = numel(W) == 1;
+    if (!scalar && numel(W) != n) return RAD_E_SHAPE;
+    /* The gain, widened once: it is the same row for every row of x. */
+    float* wrow = (float*)scratch_raw((size_t)n * sizeof(float) + 64);
+    if (scalar) { const float v = ldt(W, 0); for (int64_t i = 0; i < n; ++i) wrow[i] = v; }
+    else for (int64_t i = 0; i < n; ++i) wrow[i] = ldt(W, i * laststride(W));
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* sa = scratch_f32((size_t)n);
+        float* sy = scratch_f32_c((size_t)n);
+        const float* x = in_row(X, rowoff(X, r, n), n, sa);
+        int64_t i = 0;
+        for (; i + VF_N <= n; i += VF_N)
+            vf_storeu(sy + i, vf_mul(vf_loadu(x + i), vf_loadu(wrow + i)));
+        for (; i < n; ++i) sy[i] = x[i] * wrow[i];
+        out_row(Y, rowoff(Y, r, n), n, sy);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ act_mul */
+/* y = act(a) * b over two operands, libref's contract: the activation is rounded to y's dtype
+ * before the product, because the unfused pair stores it.
+ *
+ * silu and gelu_tanh are VECTORISED on vf_exp. An encoder's gated FFN puts this op on every token
+ * of every layer, and the scalar libm form was 9% of an EmbeddingGemma 2 step on a 9950X3D -- a
+ * per-element tanhf behind 2048 columns. gelu_tanh keeps the reference's own structure,
+ *
+ *     0.5 g (1 + tanh z),   z = sqrt(2/pi) (g + 0.044715 g^3),   tanh z = (1 - e^(-2z)) / (1 + e^(-2z))
+ *
+ * and not the algebraically equal g / (1 + e^(-2z)): the two differ by an ulp or two of f32, and
+ * after the bf16 rounding the rearranged form moved an EmbeddingGemma 2 embedding measurably
+ * further from transformers' (cosine 0.999919 -> 0.999894 on one input; torch computes this same
+ * 0.5 g (1 + tanh) in f32). vf_exp saturates rather than overflowing, so the large-|g| limits come
+ * out as g and 0. erf has no vector form in this plugin, so gelu stays scalar. */
+static inline float act_of(int act, float g) {
+    if (act == 0) return g / (1.0f + std::exp(-g));
+    if (act == 1) return 0.5f * g * (1.0f + std::erf(g * 0.70710678118654752f));
+    if (act == 3) return 1.0f / (1.0f + std::exp(-g));
+    const float k0 = 0.7978845608028654f, k1 = 0.044715f;
+    return 0.5f * g * (1.0f + std::tanh(k0 * (g + k1 * g * g * g)));
+}
+
+/* sy[0..n) = act(g[0..n)) for silu (0) and gelu_tanh (2); the tail is the scalar form. */
+static inline void act_row(int act, const float* g, float* sy, int64_t n) {
+    int64_t i = 0;
+    const vf one = vf_set1(1.0f);
+    if (act == 0) {
+        for (; i + VF_N <= n; i += VF_N) {
+            const vf x = vf_loadu(g + i);
+            vf_storeu(sy + i, vf_div(x, vf_add(one, vf_exp(vf_sub(vf_zero(), x)))));
+        }
+    } else if (act == 2) {
+        const vf m2k0 = vf_set1(-2.0f * 0.7978845608028654f), k1 = vf_set1(0.044715f);
+        const vf half = vf_set1(0.5f);
+        for (; i + VF_N <= n; i += VF_N) {
+            const vf x = vf_loadu(g + i);
+            const vf inner = vf_fma(vf_mul(k1, x), vf_mul(x, x), x);     /* g + k1 g^3 */
+            const vf e = vf_exp(vf_mul(m2k0, inner));                     /* e^(-2z) */
+            const vf t = vf_div(vf_sub(one, e), vf_add(one, e));           /* tanh z */
+            vf_storeu(sy + i, vf_mul(vf_mul(half, x), vf_add(one, t)));
+        }
+    }
+    for (; i < n; ++i) sy[i] = act_of(act, g[i]);
+}
+
+AVX_KERNEL(act_mul) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *A = &a->t[0], *B = &a->t[1], *Y = &a->t[2];
+    const int64_t n = p_int(a, "n", numel(Y));
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n);
+    if (rows <= 0 || numel(A) < rows * n || numel(B) < rows * n) return RAD_E_SHAPE;
+    static const char* kActs[] = { "silu", "gelu", "gelu_tanh", "sigmoid" };
+    const int act = p_enum(a, "act", kActs, 4, -1);
+    if (act < 0) return RAD_E_INVAL;
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* sa = scratch_f32((size_t)n);
+        float* sb = scratch_f32_b((size_t)n);
+        float* sy = scratch_f32_c((size_t)n);
+        const float* g = in_row(A, rowoff(A, r, n), n, sa);
+        const float* u = in_row(B, rowoff(B, r, n), n, sb);
+        act_row(act, g, sy, n);
+        /* sa is free once the activation is taken (g is either sa or the tensor itself); sb may
+         * hold u, which the product still reads. */
+        roundtrip(Y->dtype, sy, n, sa);
+        for (int64_t i = 0; i < n; ++i) sy[i] *= u[i];
+        out_row(Y, rowoff(Y, r, n), n, sy);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ relu / clamp */
+/* y = max(x, 0), and y = min(max(x, lo), hi) with lo and hi WEIGHTS of one element each (a
+ * clipped linear's range). Row-wise at each operand's own pitch, like the libref forms. */
+AVX_KERNEL(relu) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Y = &a->t[1];
+    const int64_t n = p_int(a, "n", numel(Y));
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n);
+    if (rows <= 0 || numel(X) < rows * n) return RAD_E_SHAPE;
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* sx = scratch_f32((size_t)n);
+        float* sy = scratch_f32_b((size_t)n);
+        const float* v = in_row(X, rowoff(X, r, n), n, sx);
+        int64_t i = 0;
+        for (; i + VF_N <= n; i += VF_N) vf_storeu(sy + i, vf_max(vf_loadu(v + i), vf_zero()));
+        for (; i < n; ++i) sy[i] = v[i] > 0.0f ? v[i] : 0.0f;
+        out_row(Y, rowoff(Y, r, n), n, sy);
+    }
+    return RAD_OK;
+}
+
+AVX_KERNEL(clamp) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *L = &a->t[1], *H = &a->t[2], *Y = &a->t[3];
+    const int64_t n = p_int(a, "n", numel(Y));
+    if (n <= 0 || numel(L) < 1 || numel(H) < 1) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n);
+    if (rows <= 0 || numel(X) < rows * n) return RAD_E_SHAPE;
+    const float lo = ldt(L, 0), hi = ldt(H, 0);
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* sx = scratch_f32((size_t)n);
+        float* sy = scratch_f32_b((size_t)n);
+        const float* v = in_row(X, rowoff(X, r, n), n, sx);
+        for (int64_t i = 0; i < n; ++i) {
+            float t = v[i] < lo ? lo : v[i];
+            sy[i] = t > hi ? hi : t;
+        }
+        out_row(Y, rowoff(Y, r, n), n, sy);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ conv2d */
+/* libref's segment-wise convolution over (time, width), channels innermost. The weight is turned
+ * once a launch from PyTorch's [cout, cin, kh, kw] into [kh][kw][cin][cout], so each input value is
+ * broadcast against a contiguous run of output channels: the inner loop is a vector FMA over cout
+ * rather than a dot product over cin. Same sum (in a different order), one rounding. */
+AVX_KERNEL(conv2d) {
+    if (!a || a->n_t < 5 || !a->t[0].data || !a->t[1].data || !a->t[2].data || !a->t[4].data)
+        return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Wt = &a->t[1], *cu = &a->t[2], *Y = &a->t[4];
+    const RadTensor* V = a->t[3].data ? &a->t[3] : nullptr;
+    const int64_t W = p_int(a, "width", 0), cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0);
+    const int64_t kh = p_int(a, "kh", 0), kw = p_int(a, "kw", 0);
+    const int64_t st = p_int(a, "stride", 1), pad = p_int(a, "pad", 0);
+    const int64_t cdiv = p_int(a, "cu_div", 1), vst = p_int(a, "valid_stride", 1);
+    if (W <= 0 || cin <= 0 || cout <= 0 || kh <= 0 || kw <= 0 || st <= 0 || pad < 0 || cdiv <= 0 ||
+        vst <= 0)
+        return RAD_E_SHAPE;
+    const int64_t Wo = (W + 2 * pad - kw) / st + 1;
+    if (Wo <= 0 || numel(Wt) < cout * cin * kh * kw) return RAD_E_SHAPE;
+    const int64_t S = numel(cu) - 1;
+    if (S <= 0) return RAD_E_SHAPE;
+    const int64_t rin = W * cin, rout = Wo * cout;
+    const int64_t Min = rows_of(X, rin), Mout = rows_of(Y, rout);
+
+    float* wt = (float*)scratch_raw((size_t)(kh * kw * cin * cout) * sizeof(float) + 64);
+    const int64_t ws = laststride(Wt);
+    for (int64_t co = 0; co < cout; ++co)
+        for (int64_t ci = 0; ci < cin; ++ci)
+            for (int64_t i = 0; i < kh; ++i)
+                for (int64_t j = 0; j < kw; ++j)
+                    wt[((i * kw + j) * cin + ci) * cout + co] =
+                        ldt(Wt, (((co * cin + ci) * kh + i) * kw + j) * ws);
+
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t c0 = ldi(cu, offlin(cu, s)), c1 = ldi(cu, offlin(cu, s + 1));
+        if (c0 % cdiv || c1 % cdiv || (c0 / cdiv) % st || c1 < c0) return RAD_E_SHAPE;
+        const int64_t t0 = c0 / cdiv, T = c1 / cdiv - t0;
+        if (T <= 0) continue;
+        const int64_t To = (T + 2 * pad - kh) / st + 1, o0 = t0 / st;
+        if (To <= 0) continue;
+        if (t0 + T > Min || o0 + To > Mout) return RAD_E_SHAPE;
+        if (V && numel(V) < (t0 + T - 1) * vst + 1) return RAD_E_SHAPE;
+
+        AVX_PARALLEL_FOR_IF(To * rout * cin * kh * kw >= AVX_PAR_MIN)
+        for (int64_t to = 0; to < To; ++to) {
+            float* acc = scratch_f32((size_t)rout);
+            float* sx = scratch_f32_b((size_t)rin);
+            for (int64_t e = 0; e < rout; ++e) acc[e] = 0.0f;
+            for (int64_t i = 0; i < kh; ++i) {
+                const int64_t ti = to * st - pad + i;
+                if (ti < 0 || ti >= T) continue;
+                const int64_t tg = t0 + ti;
+                if (V && ldi(V, offlin(V, tg * vst)) == 0) continue;
+                const float* xr = in_row(X, rowoff(X, tg, rin), rin, sx);
+                for (int64_t wo = 0; wo < Wo; ++wo) {
+                    float* ar = acc + wo * cout;
+                    for (int64_t j = 0; j < kw; ++j) {
+                        const int64_t wi = wo * st - pad + j;
+                        if (wi < 0 || wi >= W) continue;
+                        const float* xv = xr + wi * cin;
+                        const float* wb = wt + (i * kw + j) * cin * cout;
+                        for (int64_t ci = 0; ci < cin; ++ci) {
+                            const vf b = vf_set1(xv[ci]);
+                            const float* wr = wb + ci * cout;
+                            int64_t c = 0;
+                            for (; c + VF_N <= cout; c += VF_N)
+                                vf_storeu(ar + c, vf_fma(b, vf_loadu(wr + c), vf_loadu(ar + c)));
+                            for (; c < cout; ++c) ar[c] += xv[ci] * wr[c];
+                        }
+                    }
+                }
+            }
+            out_row(Y, rowoff(Y, o0 + to, rout), rout, acc);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ conv1d_dw */
+/* libref's causal depthwise convolution over time, the weight turned to [k][C] once a launch so
+ * a row is a vector FMA per tap. */
+AVX_KERNEL(conv1d_dw) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Wt = &a->t[1], *cu = &a->t[2], *Y = &a->t[3];
+    const int64_t C = p_int(a, "n", 0), K = p_int(a, "k", 0), cdiv = p_int(a, "cu_div", 1);
+    if (C <= 0 || K <= 0 || cdiv <= 0 || numel(Wt) < C * K) return RAD_E_SHAPE;
+    const int64_t S = numel(cu) - 1;
+    if (S <= 0) return RAD_E_SHAPE;
+    const int64_t Mx = rows_of(X, C), My = rows_of(Y, C);
+
+    float* wt = (float*)scratch_raw((size_t)(K * C) * sizeof(float) + 64);
+    for (int64_t c = 0; c < C; ++c)
+        for (int64_t j = 0; j < K; ++j) wt[j * C + c] = ldt(Wt, (c * K + j) * laststride(Wt));
+
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t c0 = ldi(cu, offlin(cu, s)), c1 = ldi(cu, offlin(cu, s + 1));
+        if (c0 % cdiv || c1 % cdiv || c1 < c0) return RAD_E_SHAPE;
+        const int64_t t0 = c0 / cdiv, t1 = c1 / cdiv;
+        if (t1 > Mx || t1 > My) return RAD_E_SHAPE;
+
+        AVX_PARALLEL_FOR_IF((t1 - t0) * C * K >= AVX_PAR_MIN)
+        for (int64_t t = t0; t < t1; ++t) {
+            float* acc = scratch_f32((size_t)C);
+            float* sx = scratch_f32_b((size_t)C);
+            for (int64_t c = 0; c < C; ++c) acc[c] = 0.0f;
+            for (int64_t j = 0; j < K; ++j) {
+                const int64_t tt = t - (K - 1) + j;
+                if (tt < t0) continue;
+                const float* xr = in_row(X, rowoff(X, tt, C), C, sx);
+                const float* wr = wt + j * C;
+                int64_t c = 0;
+                for (; c + VF_N <= C; c += VF_N)
+                    vf_storeu(acc + c, vf_fma(vf_loadu(xr + c), vf_loadu(wr + c), vf_loadu(acc + c)));
+                for (; c < C; ++c) acc[c] += xr[c] * wr[c];
+            }
+            out_row(Y, rowoff(Y, t, C), C, acc);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ rel_sinusoid */
+/* libref's table, to the operation: the same f32 steps and the same libm calls. */
+AVX_KERNEL(rel_sinusoid) {
+    if (!rad_args_have(a, 1)) return RAD_E_INVAL;
+    const RadTensor* Y = &a->t[0];
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0 || n % 2) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n);
+    if (rows <= 0) return RAD_E_SHAPE;
+    const int64_t h = n / 2;
+    const double mt = (double)p_f32(a, "max_timescale", 10000.0f);
+    const float inc = (float)(std::log(mt / 1.0) / (double)(h - 1 > 1 ? h - 1 : 1));
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t d = 0; d < rows; ++d) {
+        float* sy = scratch_f32((size_t)n);
+        for (int64_t i = 0; i < h; ++i) {
+            const float inv = std::exp((float)i * -inc);
+            const float ang = (float)d * inv;
+            sy[i] = std::sin(ang);
+            sy[h + i] = std::cos(ang);
+        }
+        out_row(Y, rowoff(Y, d, n), n, sy);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ seg_mean */
+/* One row a cu_seqlens segment: the mean of its rows, summed in double and rounded once, which is
+ * libref's arithmetic -- a pooled embedding should not depend on which host kernel pooled it. */
+AVX_KERNEL(seg_mean) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *cu = &a->t[1], *Y = &a->t[2];
+    const int64_t n = p_int(a, "n", 0);
+    const int64_t S = numel(cu) - 1;
+    if (n <= 0 || S <= 0 || numel(Y) < S * n) return RAD_E_SHAPE;
+    const int64_t total = ldi(cu, offlin(cu, S));
+    if (total < 0 || numel(X) < total * n) return RAD_E_SHAPE;
+
+    AVX_PARALLEL_FOR_IF(S >= 2)
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t b0 = ldi(cu, offlin(cu, s)), b1 = ldi(cu, offlin(cu, s + 1));
+        double* acc = (double*)scratch_raw((size_t)n * sizeof(double) + 64);
+        float* sx = scratch_f32_b((size_t)n);
+        float* sy = scratch_f32_c((size_t)n);
+        for (int64_t i = 0; i < n; ++i) acc[i] = 0.0;
+        for (int64_t r = b0; r < b1; ++r) {
+            const float* x = in_row(X, rowoff(X, r, n), n, sx);
+            for (int64_t i = 0; i < n; ++i) acc[i] += x[i];
+        }
+        const double inv = b1 > b0 ? 1.0 / (double)(b1 - b0) : 0.0;
+        for (int64_t i = 0; i < n; ++i) sy[i] = b1 > b0 ? (float)(acc[i] * inv) : 0.0f;
+        out_row(Y, rowoff(Y, s, n), n, sy);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ pool_rows */
+/* libref's: the mean of each k consecutive rows summed in f32 and rounded to y's dtype, then the
+ * multiplier and a second rounding -- the unfused pair. Parallel over output rows. */
+AVX_KERNEL(pool_rows) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Y = &a->t[1];
+    const int64_t n = p_int(a, "n", 0), k = p_int(a, "k", 0);
+    const float mult = p_f32(a, "mult", 1.0f);
+    if (n <= 0 || k <= 0) return RAD_E_SHAPE;
+    const int64_t rows_in = rows_of(X, n);
+    if (rows_in <= 0 || rows_in % k) return RAD_E_SHAPE;
+    const int64_t rows = rows_in / k;
+    if (numel(Y) < rows * n) return RAD_E_SHAPE;
+    const float inv = 1.0f / (float)k;
+
+    AVX_PARALLEL_FOR_IF(rows * n * k >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* acc = scratch_f32((size_t)n);
+        float* sx = scratch_f32_b((size_t)n);
+        for (int64_t i = 0; i < n; ++i) acc[i] = 0.0f;
+        for (int64_t j = 0; j < k; ++j) {
+            const float* v = in_row(X, rowoff(X, r * k + j, n), n, sx);
+            for (int64_t i = 0; i < n; ++i) acc[i] += v[i];
+        }
+        for (int64_t i = 0; i < n; ++i) acc[i] *= inv;
+        roundtrip(Y->dtype, acc, n, sx);
+        for (int64_t i = 0; i < n; ++i) acc[i] *= mult;
+        out_row(Y, rowoff(Y, r, n), n, acc);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ scale_rows */
 /* y[m, i] = x[m, i] * act(s[m]), then + add[m, i] if the optional residual is passed.
  *

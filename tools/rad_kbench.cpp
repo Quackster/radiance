@@ -1495,6 +1495,9 @@ void usage() {
         "                     filter does not change any other case's inputs\n"
         "      --tol X        override every tolerance with X (for bisecting, not for passing)\n"
         "      --max-tok N    the max_tok declare is run at (default 512; small on purpose)\n"
+        "      --mm-max-patches N  the encoder pass declare is run at, so a media tower's\n"
+        "                     kernels are in the graph: default 2048 (rounded to whole output\n"
+        "                     rows) when the container carries an encoder, 0 to leave it out\n"
         "      --no-fusion    skip the fusion oracle: a kernel that declares the chain it\n"
         "                     replaces is otherwise run against that chain, out of its own\n"
         "                     plugin, and the outputs compared BYTE for byte\n"
@@ -1539,6 +1542,11 @@ int main(int argc, char** argv) {
     uint64_t seed = 20260904;
     double   tol_override = -1;
     int64_t  max_tok = 512;
+    /* THE ENCODER PASS. A program declared with no pass has no media tower in it, and none of the
+     * tower's kernels would ever be checked. -1 is auto: a pass when the container carries an
+     * encoder (radiance.encoder), smaller than a serve's -- the tower's ops are the same kernels
+     * at every pass size, and the cases are capped per geometry anyway. */
+    int64_t  mm_max_patches = -1;
     /* THE DEEPEST CONTEXT AN ATTENTION CASE IS BUILT AT. A paged KV cache at this depth is
      * allocated per case, so it is a memory budget as much as a coverage choice: at 16384 the
      * 27B's cache is 67 MB a case, at 262144 it would be a gigabyte. The sweep takes 2048 and
@@ -1610,6 +1618,7 @@ int main(int argc, char** argv) {
         else if (a == "--tol")     tol_override = std::strtod(next("--tol"), nullptr);
         else if (a == "--max-tok") max_tok = std::atoll(next("--max-tok"));
         else if (a == "--max-ctx") max_ctx_flag = std::atoll(next("--max-ctx"));
+        else if (a == "--mm-max-patches") mm_max_patches = std::atoll(next("--mm-max-patches"));
         else if (a == "--kv-cache-dtype") {
             const std::string v = next("--kv-cache-dtype");
             if (v == "fp8")       kv_dtype = RAD_F8E4M3;
@@ -1757,6 +1766,20 @@ int main(int argc, char** argv) {
     RadArchProbe probe{};
     (void)rad_tools_probe(plugins, meta, &probe);
     ctx.max_spec = n_spec >= 0 ? n_spec : probe.draft_depth;
+    if (mm_max_patches < 0) {
+        const char* enc = rad_meta_gets(&meta, "radiance.encoder", "");
+        mm_max_patches = (enc && *enc) ? 2048 : 0;
+    }
+    if (mm_max_patches > 0 && probe.enc_merge > 1)
+        mm_max_patches -= mm_max_patches % probe.enc_merge;
+    ctx.max_enc_patches = mm_max_patches > 0 ? mm_max_patches : 0;
+    {
+        const char* enc = rad_meta_gets(&meta, "radiance.encoder", "");
+        if (mm_max_patches != 0 && enc && std::strstr(enc, "audio") && probe.audio_frames > 0)
+            ctx.max_audio_frames = probe.audio_frames;
+    }
+    if (ctx.max_enc_patches > 0)
+        RAD_INFO("  encoder pass %lld patches (--mm-max-patches)", (long long)ctx.max_enc_patches);
     ctx.max_seqs = 8;
     ctx.max_ctx = max_ctx_flag > 0 ? max_ctx_flag : meta.n_ctx_train;
     ctx.kv_dtype = kv_dtype;
@@ -2089,6 +2112,21 @@ int main(int argc, char** argv) {
                                        "operands, and opshapes.h has no recipe)"]++;
                     ++st.skipped;
                     continue;
+                }
+                /* AN OPTIONAL WEIGHT THE DECLARATION LEAVES UNBOUND IS ABSENT, as it is at every
+                 * launch: a norm with no gain, a LayerNorm with no bias. The description names
+                 * the operand because the op can take it; this call does not, so both sides get
+                 * a null tensor. The weight list is positional over WEIGHT-role operands, so an
+                 * unbound one still takes its place in it. */
+                {
+                    size_t wpos = 0;
+                    for (size_t k = 0; k < sh.size() && k < (size_t)o.schema->n_operands; ++k) {
+                        const RadOperandSpec& os = o.schema->operands[k];
+                        if (os.role != RAD_OPD_WEIGHT) continue;
+                        const rad_weight h = wpos < o.weights.size() ? o.weights[wpos] : 0;
+                        ++wpos;
+                        if (!h && os.optional) sh[k].absent = true;
+                    }
                 }
 
                 /* TWO LIBRARIES CAN DISAGREE ABOUT WHAT AN OP IS, AND THAT IS NOT A FAILING

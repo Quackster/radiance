@@ -40,8 +40,49 @@
 
 #ifdef _OPENMP
 #include <omp.h>
+#include <sched.h>
+#include <cstdio>
+#include <cstdlib>
+/* THE TEAM IS ONE THREAD A PHYSICAL CORE, not one a logical CPU. These kernels are FMA- or
+ * bandwidth-bound, so an SMT sibling adds next to nothing to them -- and the engine runs threads
+ * of its own beside the team (a worker per stream, the scheduler, the HTTP server). A team as
+ * wide as the logical CPU count leaves those nowhere to run but on a core a team thread is
+ * spinning on, and a team barrier then waits for a descheduled thread: measured on a 16-core,
+ * 32-thread part, an encoder step of 576 tokens took 0.75 s at 32 threads and 0.09 s at 16.
+ * Counted over the process's affinity mask, so a pinned or containerised engine sizes its team to
+ * what it was given; OMP_NUM_THREADS, when set, is the operator's and wins, and a thread that
+ * asked OpenMP for fewer (omp_set_num_threads) gets fewer. */
+static inline int avx_team_size() {
+    /* The physical core count is a property of the process and counted once; the OpenMP request
+     * is the calling thread's and read every time, so a caller that asks for fewer threads
+     * (omp_set_num_threads, as the benchmark does for its single-thread figures) gets them. */
+    static const int cores = [] {
+        if (const char* e = std::getenv("OMP_NUM_THREADS"); e && *e) return 0;
+        cpu_set_t set;
+        if (sched_getaffinity(0, sizeof set, &set) != 0) return 0;
+        int n = 0;
+        for (int c = 0; c < CPU_SETSIZE; ++c) {
+            if (!CPU_ISSET(c, &set)) continue;
+            /* A CPU counts when it is the first of its core's siblings that is in the mask. */
+            char path[96];
+            std::snprintf(path, sizeof path,
+                          "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c);
+            int first = c;
+            if (FILE* f = std::fopen(path, "r")) {
+                int v = -1;
+                if (std::fscanf(f, "%d", &v) == 1 && v >= 0 && v < CPU_SETSIZE && CPU_ISSET(v, &set))
+                    first = v;
+                std::fclose(f);
+            }
+            n += first == c;
+        }
+        return n;
+    }();
+    const int asked = omp_get_max_threads();
+    return cores > 0 && cores < asked ? cores : asked;
+}
 #define AVX_PRAGMA(x) _Pragma(#x)
-#define AVX_PARALLEL_FOR AVX_PRAGMA(omp parallel for schedule(static))
+#define AVX_PARALLEL_FOR AVX_PRAGMA(omp parallel for schedule(static) num_threads(avx_team_size()))
 /* THE OUTER LOOP IS WORTH A TEAM ONLY WHEN THERE IS ENOUGH WORK TO PAY FOR STARTING ONE, and the
  * `if` clause is how that is said without writing the serial loop twice. A fork/join costs a few
  * microseconds; an op below the threshold spends more time in the barrier than in the arithmetic,
@@ -49,7 +90,8 @@
  * measured by `rad-avx-bench --threads`.
  *
  * `cond` is pasted into the pragma text, so it must contain no comma. */
-#define AVX_PARALLEL_FOR_IF(cond) AVX_PRAGMA(omp parallel for schedule(static) if(cond))
+#define AVX_PARALLEL_FOR_IF(cond) \
+    AVX_PRAGMA(omp parallel for schedule(static) if(cond) num_threads(avx_team_size()))
 #else
 #define AVX_PARALLEL_FOR
 #define AVX_PARALLEL_FOR_IF(cond)

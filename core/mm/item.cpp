@@ -7,6 +7,18 @@ namespace rad {
 namespace mm {
 
 void Item::coords(int64_t first, int64_t count, int32_t* planes) const {
+    /* AN AUDIO CLIP IS 1-D (RadBatch::enc): the frame's index, whether it is real, the clip's real
+     * frames and its staged ones. */
+    if (kind == Kind::Audio) {
+        for (int64_t k = 0; k < count; ++k) {
+            const int64_t f = first + k;
+            planes[k]             = (int32_t)f;
+            planes[count + k]     = f < valid ? 1 : 0;
+            planes[2 * count + k] = valid;
+            planes[3 * count + k] = grid_h;
+        }
+        return;
+    }
     /* Merge-block order inverted: a patch's index within its segment is
      * ((block_row * blocks_w + block_col) * merge + in_row) * merge + in_col. */
     const int32_t merge = merge_size();

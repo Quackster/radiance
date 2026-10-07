@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <ctime>
@@ -59,29 +60,48 @@ std::string base64_encode(const void* data, size_t len) {
 }
 
 bool base64_decode(const std::string& in, std::vector<uint8_t>* out) {
-    auto val = [](char c) -> int {
-        if (c >= 'A' && c <= 'Z') return c - 'A';
-        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-        if (c >= '0' && c <= '9') return c - '0' + 52;
-        if (c == '+') return 62;
-        if (c == '/') return 63;
-        return -1;
-    };
+    /* One table lookup a character: 0..63 a digit, -2 padding or whitespace (skipped wherever it
+     * stands), -1 anything else. A media part is megabytes of this, and a branch ladder a
+     * character decoded a 30 s clip at about 120 MB/s. */
+    static const auto kVal = [] {
+        std::array<int8_t, 256> t{};
+        t.fill(-1);
+        for (int i = 0; i < 26; ++i) { t[(size_t)('A' + i)] = (int8_t)i; t[(size_t)('a' + i)] = (int8_t)(26 + i); }
+        for (int i = 0; i < 10; ++i) t[(size_t)('0' + i)] = (int8_t)(52 + i);
+        t[(size_t)'+'] = 62;
+        t[(size_t)'/'] = 63;
+        for (char c : { '=', '\n', '\r', ' ', '\t' }) t[(size_t)(uint8_t)c] = -2;
+        return t;
+    }();
+    out->resize(in.size() * 3 / 4 + 3);
+    uint8_t* o = out->data();
+    const uint8_t* p = (const uint8_t*)in.data();
+    const uint8_t* const end = p + in.size();
     uint32_t acc = 0;
     int bits = 0;
-    out->clear();
-    out->reserve(in.size() * 3 / 4);
-    for (char c : in) {
-        if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
-        int v = val(c);
-        if (v < 0) return false;
+    while (p < end) {
+        /* Four digits at once while they are four digits: the body of any real payload. */
+        if (bits == 0 && end - p >= 4) {
+            const int a = kVal[p[0]], b = kVal[p[1]], c = kVal[p[2]], d = kVal[p[3]];
+            if ((a | b | c | d) >= 0) {
+                const uint32_t v = ((uint32_t)a << 18) | ((uint32_t)b << 12) | ((uint32_t)c << 6) | (uint32_t)d;
+                o[0] = (uint8_t)(v >> 16); o[1] = (uint8_t)(v >> 8); o[2] = (uint8_t)v;
+                o += 3;
+                p += 4;
+                continue;
+            }
+        }
+        const int v = kVal[*p++];
+        if (v == -2) continue;
+        if (v < 0) { out->clear(); return false; }   /* nothing of a refused payload is left */
         acc = (acc << 6) | (uint32_t)v;
         bits += 6;
         if (bits >= 8) {
             bits -= 8;
-            out->push_back((uint8_t)((acc >> bits) & 0xFF));
+            *o++ = (uint8_t)((acc >> bits) & 0xFF);
         }
     }
+    out->resize((size_t)(o - out->data()));
     return true;
 }
 
@@ -209,7 +229,8 @@ const char* kAcceptedChat[] = {
 
 const char* kAcceptedCompletion[] = { "prompt", "echo" };
 
-const char* kAcceptedEmbedding[] = { "model", "input", "encoding_format", "dimensions" };
+const char* kAcceptedEmbedding[] = { "model", "input", "messages", "encoding_format",
+                                      "dimensions", "image_tokens", "prompt_name" };
 
 /* Inert by definition in the OpenAI schema: routing and bookkeeping labels the server is free to
  * ignore. Named explicitly so that "we ignore it" is a decision in the source and not an
@@ -945,6 +966,103 @@ static int check_template_json(const json& msg, const std::string& role, ApiErro
 /* Rewrite content parts in place: text stays, media becomes the marker and its bytes are handed
  * to the encoder. `media` collects (kind, bytes) in the order they appear, which is the order the
  * markers appear in the rendered prompt. */
+/* ONE MEDIA CONTENT PART, read and decoded: 1 with `*kind` and `*bytes` set when `part` is an
+ * image, video or audio part, 0 when it is some other type (the caller's to judge), negative with
+ * `*err` set when it is a media part that cannot be served. `field` prefixes the error's field
+ * name -- "messages[].content[]" for chat, "input[]" for embeddings.
+ *
+ * IMAGE AND VIDEO PARTS, in the two spellings clients send: OpenAI's
+ * {"type":"image_url","image_url":{"url":...}} (and the bare-string form), the Responses API's
+ * "input_image", and the video equivalents vLLM's clients use -- {"type":"video_url",
+ * "video_url":{"url":...}} and "input_video". AUDIO is OpenAI's {"type":"input_audio",
+ * "input_audio":{"data": base64, "format": "wav"|"mp3"}} -- and the other formats the decoder
+ * admits by the same spelling -- or vLLM's {"type":"audio_url","audio_url":{"url": data URL}}. */
+static int read_media_part(const json& part, const std::string& type, const std::string& field,
+                           const OaiDeps& d, const OaiLimits& lim, MediaKind* kind,
+                           std::vector<uint8_t>* bytes, ApiError* err) {
+    const bool is_image = type == "image_url" || type == "input_image";
+    const bool is_video = type == "video_url" || type == "input_video";
+    if (is_image || is_video) {
+        *kind = is_image ? MediaKind::Image : MediaKind::Video;
+        const char* what = is_image ? "image" : "video";
+        const bool allowed = is_image ? lim.allow_image : lim.allow_video;
+        if (!allowed || !d.mm || !d.mm->accepts(*kind)) {
+            *err = err_not_implemented(
+                std::string(what) + " input requires a vision encoder (spec 11); this "
+                "model was loaded without one");
+            return RAD_E_UNSUPPORTED;
+        }
+        const std::string key = is_image ? "image_url" : "video_url";
+        const std::string fld = field + "." + key;
+        std::string url;
+        auto iu = part.find(key);
+        if (iu == part.end() && type == "input_image") iu = part.find("image_url");
+        if (iu == part.end() && type == "input_video") iu = part.find("video_url");
+        if (iu != part.end() && iu->is_object() && iu->contains("url") &&
+            iu->at("url").is_string())
+            url = iu->at("url").get<std::string>();
+        else if (iu != part.end() && iu->is_string())
+            url = iu->get<std::string>();
+        else {
+            *err = err_bad(fld, "expected {\"url\": ...}");
+            return RAD_E_INVAL;
+        }
+        RAD_TRY(decode_media_url(url, fld + ".url", bytes, err));
+        return 1;
+    }
+    if (type == "input_audio" || type == "audio_url") {
+        *kind = MediaKind::Audio;
+        if (!lim.allow_audio || !d.mm || !d.mm->accepts(MediaKind::Audio)) {
+            *err = err_not_implemented(
+                "audio input requires an audio encoder (spec 11); this model was loaded "
+                "without one");
+            return RAD_E_UNSUPPORTED;
+        }
+        if (type == "audio_url") {
+            const std::string fld = field + ".audio_url";
+            auto au = part.find("audio_url");
+            std::string url;
+            if (au != part.end() && au->is_object() && au->contains("url") &&
+                au->at("url").is_string())
+                url = au->at("url").get<std::string>();
+            else if (au != part.end() && au->is_string())
+                url = au->get<std::string>();
+            else {
+                *err = err_bad(fld, "expected {\"url\": ...}");
+                return RAD_E_INVAL;
+            }
+            RAD_TRY(decode_media_url(url, fld + ".url", bytes, err));
+            return 1;
+        }
+        auto ia = part.find("input_audio");
+        if (ia == part.end() || !ia->is_object() || !ia->contains("data") ||
+            !ia->at("data").is_string()) {
+            *err = err_bad(field + ".input_audio", "expected {\"data\": ..., \"format\": ...}");
+            return RAD_E_INVAL;
+        }
+        auto fit = ia->find("format");
+        const std::string fmt =
+            fit != ia->end() && fit->is_string() ? fit->get<std::string>() : std::string();
+        /* The decoder recognises the container by its bytes; the format is checked against
+         * what it admits so a typo is named here rather than as an undecodable clip. */
+        static const char* const kAudioFormats[] = { "wav", "mp3", "flac", "ogg", "opus",
+                                                     "m4a", "aac", "webm", "aiff" };
+        bool known = false;
+        for (const char* f : kAudioFormats) known = known || fmt == f;
+        if (!known) {
+            *err = err_bad(field + ".input_audio.format",
+                           "must be one of wav, mp3, flac, ogg, opus, m4a, aac, webm, aiff");
+            return RAD_E_INVAL;
+        }
+        if (!base64_decode(ia->at("data").get<std::string>(), bytes)) {
+            *err = err_bad(field + ".input_audio.data", "invalid base64");
+            return RAD_E_INVAL;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static int lower_content_parts(json& messages, const OaiDeps& d, const OaiLimits& lim,
                                std::vector<std::pair<MediaKind, std::vector<uint8_t>>>* media,
                                ApiError* err) {
@@ -997,82 +1115,28 @@ static int lower_content_parts(json& messages, const OaiDeps& d, const OaiLimits
                 }
                 continue;
             }
-            /* IMAGE AND VIDEO PARTS, in the two spellings clients send: OpenAI's
-             * {"type":"image_url","image_url":{"url":...}} (and the bare-string form), the
-             * Responses API's "input_image", and the video equivalents vLLM's clients use --
-             * {"type":"video_url","video_url":{"url":...}} and "input_video". */
-            const bool is_image = type == "image_url" || type == "input_image";
-            const bool is_video = type == "video_url" || type == "input_video";
-            if (is_image || is_video) {
-                const MediaKind kind = is_image ? MediaKind::Image : MediaKind::Video;
-                const char* what = is_image ? "image" : "video";
-                const bool allowed = is_image ? lim.allow_image : lim.allow_video;
-                if (!allowed || !d.mm || !d.mm->accepts(kind)) {
-                    *err = err_not_implemented(
-                        std::string(what) + " input requires a vision encoder (spec 11); this "
-                        "model was loaded without one");
-                    return RAD_E_UNSUPPORTED;
-                }
-                const std::string key = is_image ? "image_url" : "video_url";
-                const std::string field = "messages[].content[]." + key;
-                std::string url;
-                auto iu = part.find(key);
-                if (iu == part.end() && type == "input_image") iu = part.find("image_url");
-                if (iu == part.end() && type == "input_video") iu = part.find("video_url");
-                if (iu != part.end() && iu->is_object() && iu->contains("url") &&
-                    iu->at("url").is_string())
-                    url = iu->at("url").get<std::string>();
-                else if (iu != part.end() && iu->is_string())
-                    url = iu->get<std::string>();
-                else {
-                    *err = err_bad(field, "expected {\"url\": ...}");
-                    return RAD_E_INVAL;
-                }
+            /* IMAGE, VIDEO AND AUDIO PARTS (read_media_part). A MEDIA MARKER, NOT TEXT, takes the
+             * part's place: the chat layer flattens a message's parts into one string and joins
+             * TEXT parts with a newline; it joins a marker to its neighbours with nothing, which
+             * is what the model's own template does with an image part (<|vision_end|> runs
+             * straight into the text after it). Joined as text, every picture would cost one
+             * '\n' token the model's own prompt does not have. */
+            {
+                MediaKind kind;
                 std::vector<uint8_t> bytes;
-                RAD_TRY(decode_media_url(url, field + ".url", &bytes, err));
-                media->emplace_back(kind, std::move(bytes));
-                /* A MEDIA MARKER, NOT TEXT. The chat layer flattens a message's parts into one
-                 * string and joins TEXT parts with a newline; it joins a marker to its neighbours
-                 * with nothing, which is what the model's own template does with an image part
-                 * (<|vision_end|> runs straight into the text after it). Joined as text, every
-                 * picture would cost one '\n' token the model's own prompt does not have. */
-                part.erase(key);
-                part["type"] = "media_marker";
-                part["text"] = MEDIA_MARKER;
-                continue;
-            }
-            if (type == "input_audio") {
-                if (!lim.allow_audio || !d.mm || !d.mm->accepts(MediaKind::Audio)) {
-                    *err = err_not_implemented(
-                        "audio input requires an audio encoder (spec 11); this model was loaded "
-                        "without one");
-                    return RAD_E_UNSUPPORTED;
+                const int mr = read_media_part(part, type, "messages[].content[]", d, lim, &kind,
+                                               &bytes, err);
+                if (mr < 0) return mr;
+                if (mr > 0) {
+                    media->emplace_back(kind, std::move(bytes));
+                    part.erase(type == "input_audio" ? "input_audio"
+                               : type == "audio_url" ? "audio_url"
+                               : (type == "image_url" || type == "input_image") ? "image_url"
+                                                                                : "video_url");
+                    part["type"] = "media_marker";
+                    part["text"] = MEDIA_MARKER;
+                    continue;
                 }
-                auto ia = part.find("input_audio");
-                if (ia == part.end() || !ia->is_object() || !ia->contains("data") ||
-                    !ia->at("data").is_string()) {
-                    *err = err_bad("messages[].content[].input_audio",
-                                   "expected {\"data\": ..., \"format\": ...}");
-                    return RAD_E_INVAL;
-                }
-                auto fit = ia->find("format");
-                const std::string fmt =
-                    fit != ia->end() && fit->is_string() ? fit->get<std::string>() : std::string();
-                if (fmt != "wav" && fmt != "mp3") {
-                    *err = err_bad("messages[].content[].input_audio.format",
-                                   "must be \"wav\" or \"mp3\"");
-                    return RAD_E_INVAL;
-                }
-                std::vector<uint8_t> bytes;
-                if (!base64_decode(ia->at("data").get<std::string>(), &bytes)) {
-                    *err = err_bad("messages[].content[].input_audio.data", "invalid base64");
-                    return RAD_E_INVAL;
-                }
-                media->emplace_back(MediaKind::Audio, std::move(bytes));
-                part.erase("input_audio");
-                part["type"] = "media_marker";
-                part["text"] = MEDIA_MARKER;
-                continue;
             }
             *err = err_bad("messages[].content[].type",
                            "unsupported content part type \"" + type + "\"");
@@ -1093,7 +1157,7 @@ static int lower_content_parts(json& messages, const OaiDeps& d, const OaiLimits
  * scheduler's thread, where every other request's step would wait on it. */
 static int tokenize_with_media(const std::string& rendered, const OaiDeps& d,
                                std::vector<std::pair<MediaKind, std::vector<uint8_t>>>& media,
-                               PromptInput* out, ApiError* err) {
+                               const MediaOpts& opts, PromptInput* out, ApiError* err) {
     out->text = rendered;
     auto pm = std::make_shared<mm::PromptMedia>();
     const std::string marker = MEDIA_MARKER;
@@ -1117,7 +1181,7 @@ static int tokenize_with_media(const std::string& rendered, const OaiDeps& d,
         }
         std::shared_ptr<mm::Item> item;
         std::string why;
-        const int s = d.mm->prepare(media[mi].first, media[mi].second, &item, &why);
+        const int s = d.mm->prepare(media[mi].first, media[mi].second, opts, &item, &why);
         if (s < 0 || !item) {
             *err = err_bad("messages[].content[]", "the media could not be used: " +
                                                        (why.empty() ? std::string(rad_strerror(s))
@@ -1536,7 +1600,7 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
         p.tokens = d.tok->encode(rendered, false, /*parse_special=*/true);
         p.text = rendered;
     } else {
-        RAD_TRY(tokenize_with_media(rendered, d, media, &p, err));
+        RAD_TRY(tokenize_with_media(rendered, d, media, MediaOpts{}, &p, err));
     }
     if (p.tokens.empty()) {
         *err = err_bad("messages", "the rendered prompt tokenised to nothing");
@@ -1702,16 +1766,109 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
     out->base64_embeddings = (enc == "base64");
 
     if (b.contains("dimensions") && !b.at("dimensions").is_null()) {
-        *err = err_unsupported("dimensions",
-                               "Matryoshka truncation is not implemented; the model's embedding "
-                               "dimension is fixed");
-        return RAD_E_UNSUPPORTED;
+        const json& dv = b.at("dimensions");
+        if (!dv.is_number_integer() || dv.get<int64_t>() <= 0) {
+            *err = err_bad("dimensions", "must be a positive integer");
+            return RAD_E_INVAL;
+        }
+        /* Bounded by the model's width in the handler, which knows it. */
+        out->dimensions = dv.get<int64_t>();
+    }
+    /* A soft-token budget for this request's images (Gemma 4's processor); the processor refuses
+     * it on a model that sizes images otherwise. */
+    if (b.contains("image_tokens") && !b.at("image_tokens").is_null()) {
+        const json& iv = b.at("image_tokens");
+        const int64_t n = iv.is_number_integer() ? iv.get<int64_t>() : 0;
+        if (n != 70 && n != 140 && n != 280 && n != 560 && n != 1120) {
+            *err = err_bad("image_tokens", "must be one of 70, 140, 280, 560, 1120");
+            return RAD_E_INVAL;
+        }
+        out->image_tokens = (int32_t)n;
+    }
+
+    /* THE NAMED PROMPT: sentence-transformers' `prompt_name`, the model's own text in front of
+     * each text or content-part input. A model that states a default prompt applies it to a
+     * request that names none, as its reference library does. */
+    std::string prefix;
+    const bool prompt_named = b.contains("prompt_name") && !b.at("prompt_name").is_null();
+    {
+        std::string pname;
+        const bool named = prompt_named;
+        if (named) {
+            if (!b.at("prompt_name").is_string()) {
+                *err = err_bad("prompt_name", "expected a string");
+                return RAD_E_INVAL;
+            }
+            pname = b.at("prompt_name").get<std::string>();
+        } else if (d.embed) {
+            pname = d.embed->default_prompt();
+        }
+        if (!pname.empty() && (!d.embed || !d.embed->prompt(pname, &prefix))) {
+            *err = err_bad("prompt_name", "this model states no prompt named \"" + pname + "\"");
+            return RAD_E_INVAL;
+        }
+    }
+
+    /* THE MESSAGES FORM, vLLM's chat embedding: one input rendered through the model's own chat
+     * template (EmbeddingGemma 2's concatenates the system text and then every message's text and
+     * media placeholders), the tokenizer's special tokens around the whole as for an input. */
+    if (b.contains("messages") && !b.at("messages").is_null()) {
+        if (b.contains("input") && !b.at("input").is_null()) {
+            *err = err_bad("messages", "a request takes `input` or `messages`, not both");
+            return RAD_E_INVAL;
+        }
+        if (b.contains("prompt_name") && !b.at("prompt_name").is_null()) {
+            *err = err_bad("prompt_name", "a `messages` input is rendered by the chat template "
+                                          "and takes no prompt");
+            return RAD_E_INVAL;
+        }
+        IChatTemplate* tpl = d.embed ? d.embed->message_template() : nullptr;
+        if (!tpl) {
+            *err = err_bad("messages", "this model has no chat template to render messages with");
+            return RAD_E_INVAL;
+        }
+        json messages = b.at("messages");
+        std::vector<std::pair<MediaKind, std::vector<uint8_t>>> media;
+        RAD_TRY(lower_content_parts(messages, d, lim, &media, err));
+        ChatRenderOptions opt;
+        opt.add_generation_prompt = false;
+        ChatRender render;
+        std::string why;
+        if (tpl->apply(messages, json::array(), opt, &render, &why) < 0 || render.prompt.empty()) {
+            *err = err_bad("messages", "the chat template did not render the messages" +
+                                           (why.empty() ? std::string() : ": " + why));
+            return RAD_E_INVAL;
+        }
+        PromptInput p;
+        if (media.empty()) {
+            p.text = render.prompt;
+            p.tokens = d.tok->encode(render.prompt, true, /*parse_special=*/true);
+        } else {
+            MediaOpts mo;
+            mo.image_tokens = out->image_tokens;
+            RAD_TRY(tokenize_with_media(render.prompt, d, media, mo, &p, err));
+            const ITokenizer::VocabInfo vi = d.tok->vocab_info();
+            if (vi.add_bos && vi.bos >= 0) {
+                p.tokens.insert(p.tokens.begin(), vi.bos);
+                for (auto& pl : p.media->items) pl.tok += 1;
+                p.media->layout();
+            }
+            if (vi.add_eos && vi.eos >= 0) p.tokens.push_back(vi.eos);
+        }
+        out->prompts.push_back(std::move(p));
+        return RAD_OK;
     }
 
     auto it = b.find("input");
     if (it == b.end() || it->is_null()) { *err = err_bad("input", "is required"); return RAD_E_INVAL; }
 
     auto push_ids = [&](const json& arr, ApiError* e) -> bool {
+        /* A prompt is text; token ids take none, and asking for one by name is refused rather
+         * than dropped. A model's default prompt applies to text inputs only. */
+        if (prompt_named && !prefix.empty()) {
+            *e = err_bad("prompt_name", "a prompt is text and cannot go in front of token ids");
+            return false;
+        }
         PromptInput p;
         for (const auto& v : arr) {
             if (!v.is_number_integer()) {
@@ -1729,33 +1886,108 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
         return true;
     };
 
+    /* ONE INPUT OF CONTENT PARTS -- text, images, video, audio, in order -- the same parts a chat
+     * message carries, and one vector for the lot. The parts are joined with nothing between
+     * them and each media part becomes its processor's token run, which is what an embedding
+     * model's own template does (EmbeddingGemma 2's concatenates text and placeholders), and the
+     * tokenizer's own special tokens go around the whole: what HuggingFace's processor feeds the
+     * model. */
+    auto push_parts = [&](const json& parts, ApiError* e) -> int {
+        std::vector<std::pair<MediaKind, std::vector<uint8_t>>> media;
+        std::string rendered = prefix;
+        for (const auto& part : parts) {
+            if (!part.is_object()) {
+                *e = err_bad("input[]", "a content part must be an object");
+                return RAD_E_INVAL;
+            }
+            auto tit = part.find("type");
+            if (tit == part.end() || !tit->is_string()) {
+                *e = err_bad("input[].type", "expected a string");
+                return RAD_E_INVAL;
+            }
+            const std::string type = tit->get<std::string>();
+            if (type == "text") {
+                if (!part.contains("text") || !part.at("text").is_string()) {
+                    *e = err_bad("input[].text", "expected a string");
+                    return RAD_E_INVAL;
+                }
+                const std::string t = part.at("text").get<std::string>();
+                /* The marker is how a media part's position survives into tokenisation, so text
+                 * that spells it would be taken for one. */
+                if (t.find(MEDIA_MARKER) != std::string::npos) {
+                    *e = err_bad("input[].text", std::string("contains \"") + MEDIA_MARKER +
+                                                     "\", which this server reserves for media");
+                    return RAD_E_INVAL;
+                }
+                rendered += t;
+                continue;
+            }
+            MediaKind kind;
+            std::vector<uint8_t> bytes;
+            const int mr = read_media_part(part, type, "input[]", d, lim, &kind, &bytes, e);
+            if (mr < 0) return mr;
+            if (mr == 0) {
+                *e = err_bad("input[].type", "unsupported content part type \"" + type + "\"");
+                return RAD_E_INVAL;
+            }
+            media.emplace_back(kind, std::move(bytes));
+            rendered += MEDIA_MARKER;
+        }
+        PromptInput p;
+        if (media.empty()) {
+            p.text = rendered;
+            p.tokens = d.tok->encode(rendered, true, /*parse_special=*/true);
+        } else {
+            MediaOpts mo;
+            mo.image_tokens = out->image_tokens;
+            RAD_TRY(tokenize_with_media(rendered, d, media, mo, &p, e));
+            /* tokenize_with_media adds no special tokens (a chat template renders its own);
+             * this input has no template, so the tokenizer's own rule applies around it. */
+            const ITokenizer::VocabInfo vi = d.tok->vocab_info();
+            if (vi.add_bos && vi.bos >= 0) {
+                p.tokens.insert(p.tokens.begin(), vi.bos);
+                for (auto& pl : p.media->items) pl.tok += 1;
+                p.media->layout();
+            }
+            if (vi.add_eos && vi.eos >= 0) p.tokens.push_back(vi.eos);
+        }
+        out->prompts.push_back(std::move(p));
+        return RAD_OK;
+    };
+    auto is_parts = [](const json& a) { return a.is_array() && !a.empty() && a.front().is_object(); };
+
     /* Parsed like a /v1/completions prompt, and for the same reason: the input is the client's
      * own text with no template around it. */
     if (it->is_string()) {
         PromptInput p;
-        p.text = it->get<std::string>();
+        p.text = prefix + it->get<std::string>();
         p.tokens = d.tok->encode(p.text, true, /*parse_special=*/true);
         out->prompts.push_back(std::move(p));
     } else if (it->is_array()) {
         if (it->empty()) { *err = err_bad("input", "must not be empty"); return RAD_E_INVAL; }
-        if (it->front().is_string()) {
-            for (const auto& s : *it) {
-                if (!s.is_string()) { *err = err_bad("input", "expected all strings"); return RAD_E_INVAL; }
-                PromptInput p;
-                p.text = s.get<std::string>();
-                p.tokens = d.tok->encode(p.text, true, /*parse_special=*/true);
-                out->prompts.push_back(std::move(p));
-            }
-        } else if (it->front().is_number_integer()) {
+        if (it->front().is_number_integer()) {
             if (!push_ids(*it, err)) return RAD_E_INVAL;
-        } else if (it->front().is_array()) {
-            for (const auto& a : *it) {
-                if (!a.is_array()) { *err = err_bad("input", "expected arrays"); return RAD_E_INVAL; }
-                if (!push_ids(a, err)) return RAD_E_INVAL;
-            }
+        } else if (is_parts(*it)) {
+            RAD_TRY(push_parts(*it, err));
         } else {
-            *err = err_bad("input", "expected a string, an array of strings, or token ids");
-            return RAD_E_INVAL;
+            /* A BATCH: each element its own input -- a string, a token array or an array of
+             * content parts. */
+            for (const auto& el : *it) {
+                if (el.is_string()) {
+                    PromptInput p;
+                    p.text = prefix + el.get<std::string>();
+                    p.tokens = d.tok->encode(p.text, true, /*parse_special=*/true);
+                    out->prompts.push_back(std::move(p));
+                } else if (is_parts(el)) {
+                    RAD_TRY(push_parts(el, err));
+                } else if (el.is_array()) {
+                    if (!push_ids(el, err)) return RAD_E_INVAL;
+                } else {
+                    *err = err_bad("input", "expected strings, token arrays or arrays of content "
+                                            "parts");
+                    return RAD_E_INVAL;
+                }
+            }
         }
     } else {
         *err = err_bad("input", "expected a string or an array");

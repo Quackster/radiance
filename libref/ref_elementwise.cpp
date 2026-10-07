@@ -27,21 +27,27 @@ static inline int64_t rows_of(const RadTensor* t, int64_t n) {
  * r4d_rmsnorm_had_quant_i8 says the same). It defaults to 0, so a plain RMS norm is the plain
  * call. */
 int ref_rmsnorm(const RadArgs* a, RadStream) {
-    if (!have(a, 3)) return RAD_E_INVAL;
-    const RadTensor *x = &a->t[0], *w = &a->t[1], *y = &a->t[2];
-    const int64_t n = p_int(a, "n", w->rank ? w->shape[w->rank - 1] : 0);
+    if (!a || a->n_t < 3 || !a->t[0].data || !a->t[2].data) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *y = &a->t[2];
+    /* An absent gain is one, and `wadd` belongs to a gain, so it is refused without one. */
+    const RadTensor* w = a->t[1].data ? &a->t[1] : nullptr;
+    const int64_t n = p_int(a, "n", w && w->rank ? w->shape[w->rank - 1] : 0);
     const float eps = p_f32(a, "eps", 1e-6f);
     const float wadd = p_f32(a, "wadd", 0.0f);
     const int64_t round_before_weight = p_int(a, "round_before_weight", 0);
     if (round_before_weight != 0 && round_before_weight != 1) return RAD_E_INVAL;
+    /* `mult` scales the normed row before its one rounding: a residual branch weighted by a
+     * constant (Gemma 4's audio feed-forward, a half) without a second pass over the row. */
+    const float mult = p_f32(a, "mult", 1.0f);
     if (n <= 0) return RAD_E_SHAPE;
+    if (!w && wadd != 0.0f) return RAD_E_INVAL;
     const int64_t rows = rows_of(x, n);
-    if (rows <= 0 || numel(y) < rows * n || numel(w) < n) return RAD_E_SHAPE;
+    if (rows <= 0 || numel(y) < rows * n || (w && numel(w) < n)) return RAD_E_SHAPE;
 
     #pragma omp parallel for schedule(static)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t xb = rowoff(x, r, n), yb = rowoff(y, r, n);
-        const int64_t xs = laststride(x), ys = laststride(y), ws = laststride(w);
+        const int64_t xs = laststride(x), ys = laststride(y), ws = w ? laststride(w) : 0;
         float ss = 0.0f;
         for (int64_t i = 0; i < n; ++i) { float v = ldt(x, xb + i * xs); ss += v * v; }
         const float s = 1.0f / std::sqrt(ss / (float)n + eps);
@@ -52,7 +58,7 @@ int ref_rmsnorm(const RadArgs* a, RadStream) {
                 st_dt(x->dtype, narrowed, 0, value);
                 value = ld_dt(x->dtype, narrowed, 0);
             }
-            stt(y, yb + i * ys, value * (ldt(w, i * ws) + wadd));
+            stt(y, yb + i * ys, value * (w ? ldt(w, i * ws) + wadd : 1.0f) * mult);
         }
     }
     return RAD_OK;
@@ -280,6 +286,33 @@ static int elementwise2(const RadArgs* a, bool mul) {
 int ref_add(const RadArgs* a, RadStream) { return elementwise2(a, false); }
 int ref_mul(const RadArgs* a, RadStream) { return elementwise2(a, true); }
 
+/* ------------------------------------------------------------------ mul_weight */
+/* y = x * w, `w` a WEIGHT of one element or of one row: a learned gain on an activation -- a
+ * per-layer scalar on the residual stream (Gemma 4's layer_scalar), or a per-channel one (a
+ * vision tower's layer scale). Its own op and not a form of `mul` because an op's operand is a
+ * weight or an activation by its schema, and `mul`'s `b` is an activation. The product is f32,
+ * rounded once to y's dtype. */
+int ref_mul_weight(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *W = &a->t[1], *Y = &a->t[2];
+    const int64_t n = p_int(a, "n", numel(Y));
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n);
+    if (rows <= 0 || numel(X) < rows * n) return RAD_E_SHAPE;
+    const bool scalar = numel(W) == 1;
+    if (!scalar && numel(W) != n) return RAD_E_SHAPE;
+    const int64_t ws = scalar ? 0 : laststride(W);
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t xb = rowoff(X, r, n), yb = rowoff(Y, r, n);
+        const int64_t xs = laststride(X), ys = laststride(Y);
+        for (int64_t i = 0; i < n; ++i)
+            stt(Y, yb + i * ys, ldt(X, xb + i * xs) * ldt(W, i * ws));
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ scale_rows */
 /* y[m, i] = x[m, i] * act(s[m]) -- one scalar per ROW, broadcast across the row.
  *
@@ -347,6 +380,281 @@ int ref_silu_mul(const RadArgs* a, RadStream) {
         const int64_t gs = laststride(gu), ys = laststride(y);
         for (int64_t i = 0; i < n; ++i)
             stt(y, yb + i * ys, act_silu(ldt(gu, gb + i * gs)) * ldt(gu, gb + (n + i) * gs));
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ act_mul */
+/* y = act(a) * b, the gated product with its two halves in two operands. `silu_mul` reads one
+ * fused gate_up row; this reads the gate and the multiplier from wherever they are, which covers
+ * a fused gate_up as two column slices of it AND a gate whose multiplier is some other tensor --
+ * Gemma's per-layer-input block multiplies gelu(gate(x)) by a per-layer embedding.
+ *
+ * THE ACTIVATION IS ROUNDED TO y's DTYPE BEFORE THE PRODUCT, which is what the unfused pair does:
+ * `act(gate)` is a tensor, and the product reads it back. */
+static float gelu_tanh_f(float x) {
+    const float k0 = 0.7978845608028654f, k1 = 0.044715f;
+    return 0.5f * x * (1.0f + std::tanh(k0 * (x + k1 * x * x * x)));
+}
+
+int ref_act_mul(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *A = &a->t[0], *B = &a->t[1], *Y = &a->t[2];
+    const int64_t n = p_int(a, "n", numel(Y));
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n);
+    if (rows <= 0 || numel(A) < rows * n || numel(B) < rows * n) return RAD_E_SHAPE;
+    static const char* kActs[] = { "silu", "gelu", "gelu_tanh", "sigmoid" };
+    const int act = p_enum(a, "act", kActs, 4, -1);
+    if (act < 0) return RAD_E_INVAL;
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t ab = rowoff(A, r, n), bb = rowoff(B, r, n), yb = rowoff(Y, r, n);
+        const int64_t as = laststride(A), bs = laststride(B), ys = laststride(Y);
+        for (int64_t i = 0; i < n; ++i) {
+            const float g = ldt(A, ab + i * as);
+            const float v = act == 0 ? act_silu(g) : act == 1 ? act_gelu(g)
+                          : act == 2 ? gelu_tanh_f(g) : act_sigmoid(g);
+            stt(Y, yb + i * ys, round_to(Y->dtype, v) * ldt(B, bb + i * bs));
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ seg_mean */
+/* y[s, :] = the mean of x's rows [cu[s], cu[s+1]): one row a segment, which is a sentence
+ * embedding's mean pooling over a ragged batch. The sum is taken in DOUBLE and divided once, so the
+ * pooled row does not depend on how many rows a segment has beyond the one rounding to y's dtype.
+ * An empty segment writes zeros. */
+int ref_seg_mean(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *cu = &a->t[1], *Y = &a->t[2];
+    const int64_t n = p_int(a, "n", 0);
+    const int64_t S = numel(cu) - 1;
+    if (n <= 0 || S <= 0 || numel(Y) < S * n) return RAD_E_SHAPE;
+    const int64_t total = ld_int(cu->dtype, cu->data, offlin(cu, S));
+    if (total < 0 || numel(X) < total * n) return RAD_E_SHAPE;
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t b0 = ld_int(cu->dtype, cu->data, offlin(cu, s));
+        const int64_t b1 = ld_int(cu->dtype, cu->data, offlin(cu, s + 1));
+        const int64_t yb = rowoff(Y, s, n), ys = laststride(Y), xs = laststride(X);
+        for (int64_t i = 0; i < n; ++i) {
+            double acc = 0.0;
+            for (int64_t r = b0; r < b1; ++r) acc += ldt(X, rowoff(X, r, n) + i * xs);
+            stt(Y, yb + i * ys, b1 > b0 ? (float)(acc / (double)(b1 - b0)) : 0.0f);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ pool_rows */
+/* Row r of y is the mean of x's rows [r*k, r*k + k), summed in f32 and rounded to y's dtype, then
+ * multiplied by `mult` and rounded again -- the unfused pair, which stores the mean. A vision
+ * pooler whose processor lays each k-patch window out consecutively pools with this. */
+int ref_pool_rows(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Y = &a->t[1];
+    const int64_t n = p_int(a, "n", 0), k = p_int(a, "k", 0);
+    const float mult = p_f32(a, "mult", 1.0f);
+    if (n <= 0 || k <= 0) return RAD_E_SHAPE;
+    const int64_t rows_in = rows_of(X, n);
+    if (rows_in <= 0 || rows_in % k) return RAD_E_SHAPE;
+    const int64_t rows = rows_in / k;
+    if (numel(Y) < rows * n) return RAD_E_SHAPE;
+    const float inv = 1.0f / (float)k;
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t yb = rowoff(Y, r, n), ys = laststride(Y), xs = laststride(X);
+        for (int64_t i = 0; i < n; ++i) {
+            float acc = 0.0f;
+            for (int64_t j = 0; j < k; ++j) acc += ldt(X, rowoff(X, r * k + j, n) + i * xs);
+            stt(Y, yb + i * ys, acc * inv);
+            stt(Y, yb + i * ys, ldt(Y, yb + i * ys) * mult);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ relu */
+/* y = max(x, 0) over [M, n], each operand at its own row pitch. */
+int ref_relu(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Y = &a->t[1];
+    const int64_t n = p_int(a, "n", numel(Y));
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n);
+    if (rows <= 0 || numel(X) < rows * n) return RAD_E_SHAPE;
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t xb = rowoff(X, r, n), yb = rowoff(Y, r, n);
+        const int64_t xs = laststride(X), ys = laststride(Y);
+        for (int64_t i = 0; i < n; ++i) {
+            const float v = ldt(X, xb + i * xs);
+            stt(Y, yb + i * ys, v > 0.0f ? v : 0.0f);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ clamp */
+/* y = min(max(x, lo), hi), the bounds WEIGHTS of one element each: a clipped linear's input or
+ * output range (Gemma 4's audio tower), which the checkpoint states per projection. */
+int ref_clamp(const RadArgs* a, RadStream) {
+    if (!have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *L = &a->t[1], *H = &a->t[2], *Y = &a->t[3];
+    const int64_t n = p_int(a, "n", numel(Y));
+    if (n <= 0 || numel(L) < 1 || numel(H) < 1) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n);
+    if (rows <= 0 || numel(X) < rows * n) return RAD_E_SHAPE;
+    const float lo = ldt(L, 0), hi = ldt(H, 0);
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t xb = rowoff(X, r, n), yb = rowoff(Y, r, n);
+        const int64_t xs = laststride(X), ys = laststride(Y);
+        for (int64_t i = 0; i < n; ++i) {
+            float v = ldt(X, xb + i * xs);
+            v = v < lo ? lo : v;
+            v = v > hi ? hi : v;
+            stt(Y, yb + i * ys, v);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ conv2d */
+/* A 2-D convolution over (time, width) with channels innermost, segment by segment.
+ *
+ * x is [M, W * cin]: row t is time t, element (t, w, c) at column w * cin + c. Each cu_seqlens
+ * segment [cu[s] / cu_div, cu[s+1] / cu_div) is convolved ON ITS OWN, zero-padded by `pad` at its
+ * edges on both axes -- two clips in one pass must not see each other -- and its output rows start
+ * at cu[s] / (cu_div * stride). `w` is PyTorch's [cout, cin, kh, kw]. With the optional `valid`
+ * operand, input row t (pass-global) is read as zeros unless valid[t * valid_stride] != 0: the
+ * frame mask Gemma 4's subsampler multiplies in before each convolution. f32 accumulation, one
+ * rounding. */
+int ref_conv2d(const RadArgs* a, RadStream) {
+    if (!a || a->n_t < 5 || !a->t[0].data || !a->t[1].data || !a->t[2].data || !a->t[4].data)
+        return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Wt = &a->t[1], *cu = &a->t[2], *Y = &a->t[4];
+    const RadTensor* V = a->t[3].data ? &a->t[3] : nullptr;
+    const int64_t W = p_int(a, "width", 0), cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0);
+    const int64_t kh = p_int(a, "kh", 0), kw = p_int(a, "kw", 0);
+    const int64_t st = p_int(a, "stride", 1), pad = p_int(a, "pad", 0);
+    const int64_t cdiv = p_int(a, "cu_div", 1), vst = p_int(a, "valid_stride", 1);
+    if (W <= 0 || cin <= 0 || cout <= 0 || kh <= 0 || kw <= 0 || st <= 0 || pad < 0 || cdiv <= 0 ||
+        vst <= 0)
+        return RAD_E_SHAPE;
+    const int64_t Wo = (W + 2 * pad - kw) / st + 1;
+    if (Wo <= 0 || numel(Wt) < cout * cin * kh * kw) return RAD_E_SHAPE;
+    const int64_t S = numel(cu) - 1;
+    if (S <= 0) return RAD_E_SHAPE;
+    const int64_t rin = W * cin, rout = Wo * cout;
+    const int64_t Min = rows_of(X, rin), Mout = rows_of(Y, rout);
+
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t c0 = ld_int(cu->dtype, cu->data, offlin(cu, s));
+        const int64_t c1 = ld_int(cu->dtype, cu->data, offlin(cu, s + 1));
+        if (c0 % cdiv || c1 % cdiv || (c0 / cdiv) % st || c1 < c0) return RAD_E_SHAPE;
+        const int64_t t0 = c0 / cdiv, T = c1 / cdiv - t0;
+        if (T <= 0) continue;
+        const int64_t To = (T + 2 * pad - kh) / st + 1, o0 = t0 / st;
+        if (To <= 0) continue;
+        if (t0 + T > Min || o0 + To > Mout) return RAD_E_SHAPE;
+        if (V && numel(V) < (t0 + T - 1) * vst + 1) return RAD_E_SHAPE;
+
+        #pragma omp parallel for schedule(static)
+        for (int64_t to = 0; to < To; ++to) {
+            const int64_t yb = rowoff(Y, o0 + to, rout), ys = laststride(Y), xs = laststride(X);
+            for (int64_t wo = 0; wo < Wo; ++wo)
+                for (int64_t co = 0; co < cout; ++co) {
+                    float acc = 0.0f;
+                    for (int64_t i = 0; i < kh; ++i) {
+                        const int64_t ti = to * st - pad + i;
+                        if (ti < 0 || ti >= T) continue;
+                        const int64_t tg = t0 + ti;
+                        if (V && ld_int(V->dtype, V->data, offlin(V, tg * vst)) == 0) continue;
+                        const int64_t xb = rowoff(X, tg, rin);
+                        for (int64_t j = 0; j < kw; ++j) {
+                            const int64_t wi = wo * st - pad + j;
+                            if (wi < 0 || wi >= W) continue;
+                            for (int64_t ci = 0; ci < cin; ++ci)
+                                acc += ldt(X, xb + (wi * cin + ci) * xs) *
+                                       ldt(Wt, ((co * cin + ci) * kh + i) * kw + j);
+                        }
+                    }
+                    stt(Y, yb + (wo * cout + co) * ys, acc);
+                }
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ conv1d_dw */
+/* A causal depthwise convolution over time: y[t, c] = sum_j w[c, j] * x[t - (k-1) + j, c], the
+ * rows before the segment's start (cu[s] / cu_div) read as zeros. `w` is PyTorch's depthwise
+ * [C, 1, k]. f32 accumulation, one rounding. */
+int ref_conv1d_dw(const RadArgs* a, RadStream) {
+    if (!have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Wt = &a->t[1], *cu = &a->t[2], *Y = &a->t[3];
+    const int64_t C = p_int(a, "n", 0), K = p_int(a, "k", 0), cdiv = p_int(a, "cu_div", 1);
+    if (C <= 0 || K <= 0 || cdiv <= 0 || numel(Wt) < C * K) return RAD_E_SHAPE;
+    const int64_t S = numel(cu) - 1;
+    if (S <= 0) return RAD_E_SHAPE;
+    const int64_t Mx = rows_of(X, C), My = rows_of(Y, C);
+
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t c0 = ld_int(cu->dtype, cu->data, offlin(cu, s));
+        const int64_t c1 = ld_int(cu->dtype, cu->data, offlin(cu, s + 1));
+        if (c0 % cdiv || c1 % cdiv || c1 < c0) return RAD_E_SHAPE;
+        const int64_t t0 = c0 / cdiv, t1 = c1 / cdiv;
+        if (t1 > Mx || t1 > My) return RAD_E_SHAPE;
+
+        #pragma omp parallel for schedule(static)
+        for (int64_t t = t0; t < t1; ++t) {
+            const int64_t yb = rowoff(Y, t, C), ys = laststride(Y), xs = laststride(X);
+            for (int64_t c = 0; c < C; ++c) {
+                float acc = 0.0f;
+                for (int64_t j = 0; j < K; ++j) {
+                    const int64_t tt = t - (K - 1) + j;
+                    if (tt < t0) continue;
+                    acc += ldt(X, rowoff(X, tt, C) + c * xs) * ldt(Wt, c * K + j);
+                }
+                stt(Y, yb + c * ys, acc);
+            }
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ rel_sinusoid */
+/* The sinusoidal relative-position table, row d for distance d: sin(d * inv[i]) in the first
+ * half, cos(d * inv[i]) in the second, inv[i] = exp(i * -log(max_timescale) / max(n/2 - 1, 1)).
+ * Computed in f32 step by step the way the reference's torch expressions are, then rounded. */
+int ref_rel_sinusoid(const RadArgs* a, RadStream) {
+    if (!have(a, 1)) return RAD_E_INVAL;
+    const RadTensor* Y = &a->t[0];
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0 || n % 2) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n);
+    if (rows <= 0) return RAD_E_SHAPE;
+    const int64_t h = n / 2;
+    const double mt = (double)p_f32(a, "max_timescale", 10000.0f);
+    const float inc = (float)(std::log(mt / 1.0) / (double)(h - 1 > 1 ? h - 1 : 1));
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t d = 0; d < rows; ++d) {
+        const int64_t yb = rowoff(Y, d, n), ys = laststride(Y);
+        for (int64_t i = 0; i < h; ++i) {
+            const float inv = std::exp((float)i * -inc);
+            const float ang = (float)d * inv;
+            stt(Y, yb + i * ys, std::sin(ang));
+            stt(Y, yb + (h + i) * ys, std::cos(ang));
+        }
     }
     return RAD_OK;
 }

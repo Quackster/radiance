@@ -486,8 +486,9 @@ void read_config_json(const std::string& dir, VocabBuild& out) {
     out.unk = out.unk >= 0 ? out.unk : token_id("unk_token");
     out.sep = token_id("sep_token");
     out.eot = out.eos;
-    out.add_bos = bool_or(c, "add_bos_token", false);
-    out.add_eos = bool_or(c, "add_eos_token", false);
+    /* The default is what tokenizer.json's post-processor already said (interpret_tokenizer_json). */
+    out.add_bos = bool_or(c, "add_bos_token", out.add_bos);
+    out.add_eos = bool_or(c, "add_eos_token", out.add_eos);
 
     const json* ct = get(c, "chat_template");
     if (ct && ct->is_string()) out.chat_template = ct->get<std::string>();
@@ -562,6 +563,25 @@ int interpret_tokenizer_json(const json& j, uint64_t id_limit, const char* origi
     out.steps.insert(out.steps.end(), dec.begin(),  dec.end());
 
     if (const json* a = get(j, "added_tokens")) RAD_TRY(read_added(*a, out, origin, id_limit));
+
+    /* WHAT `add_special_tokens` ADDS, when the file says it in its post-processor rather than in
+     * tokenizer_config.json. HuggingFace's encode runs the post-processor, so a TemplateProcessing
+     * whose single-sequence template is `<bos> $A <eos>` IS the model's add-BOS-and-EOS rule --
+     * Gemma states it there and nowhere else, and an embedding model fed its input without the
+     * <eos> it was trained to pool over computes a different vector. Only the two shapes that map
+     * onto add_bos / add_eos are read: one special token before the sequence, one after. The
+     * config's own add_bos_token / add_eos_token, read later, win where present. */
+    if (const json* pp = get(j, "post_processor")) {
+        if (str_or(*pp, "type", "") == "TemplateProcessing") {
+            const json* single = get(*pp, "single");
+            if (single && single->is_array() && !single->empty()) {
+                auto special = [](const json& e) -> bool { return e.is_object() && e.contains("SpecialToken"); };
+                const bool seq_in_middle = single->size() >= 2;
+                if (special(single->front()) && seq_in_middle) out.add_bos = true;
+                if (special(single->back()) && seq_in_middle) out.add_eos = true;
+            }
+        }
+    }
 
     if (pre.empty() && out.kind == RAD_TOK_BPE) {
         RAD_ERR("%s: a BPE model with no pre_tokenizer would tokenise the whole prompt as one "

@@ -1,0 +1,15 @@
+# EmbeddingGemma 2 (google/embeddinggemma-2) in bf16 as the checkpoint ships it: one vector a text,
+# image, video, audio clip or any mix of them, on /v1/embeddings. The model is small (a 270M text
+# model and its two towers) and runs on one card, RADIANCE_GPU in .env (default 0). An input is one
+# step, so --max-num-batched-tokens is the longest input as well as the batch.
+name: radiance-embeddinggemma2
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-embeddinggemma2
+    environment:
+      ROCR_VISIBLE_DEVICES: "${RADIANCE_GPU:-0}"
+    command: >
+      --model /models/embeddinggemma2-bf16.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 1 --max-num-seqs 64 --max-num-batched-tokens 8192

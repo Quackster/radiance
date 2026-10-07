@@ -90,7 +90,9 @@ int         avx_isa_force(int level);
     X(mul)                  X(silu_mul)             X(gelu)                 X(silu)               \
     X(sigmoid)              X(gather_rows)          X(scatter_rows)         X(ngram_ids)          \
     X(ple_gate)             X(ple_conv)             X(cast)                 X(softmax)            \
-    X(scale_rows)           X(fill)                 X(causal_conv1d)                              \
+    X(scale_rows)           X(fill)                 X(act_mul)              X(seg_mean)           \
+    X(mul_weight)           X(pool_rows)            X(relu)                 X(clamp)              \
+    X(conv2d)               X(conv1d_dw)            X(rel_sinusoid)         X(causal_conv1d)                               \
     /* ---- quantisation and rotation */                                                          \
     X(quant_act_i8)         X(had_quant_act_i8)     X(quant_act_fp8)        X(had_quant_act_fp8)  \
     X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8)   X(dequant)            \
@@ -101,7 +103,7 @@ int         avx_isa_force(int level);
     X(logits_select)                                                                              \
     /* ---- attention */                                                                          \
     X(attn_paged)           X(attn_dense)           X(kv_store)             X(rope)               \
-    X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)                              \
+    X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)        X(attn_local_rel)     \
     /* ---- mixture of experts */                                                                 \
     X(router_topk)          X(moe_scatter)          X(moe_gemm)             X(moe_gemm_q)         \
     X(moe_gather)           X(row_topk)             X(row_topk_merge)       X(logit_rerank)     \

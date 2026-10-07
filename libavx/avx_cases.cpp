@@ -62,6 +62,30 @@ std::vector<Case> build_cases() {
             EB(6, 645, w, 1));
         add("softmax",     { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("gather_rows", { HI("M", 6), HI("n", 640), HS("dtype", dt) }, EB(6, 640, w, 2));
+        for (const char* act : { "silu", "gelu", "gelu_tanh", "sigmoid" })
+            add("act_mul", { HI("M", 6), HI("n", 645), HS("act", act), HS("dtype", dt) },
+                EB(6, 645, w, 3));
+        add("mul_weight",  { HI("M", 9), HI("n", 645), HS("dtype", dt) }, EB(9, 645, w, 2));
+        add("mul_weight",  { HI("M", 9), HI("n", 645), HS("dtype", dt), HI("scalar", 1) },
+            EB(9, 645, w, 2));
+        add("seg_mean",    { HI("M", 23), HI("n", 645), HS("dtype", dt) }, EB(23, 645, w, 1));
+        add("relu",        { HI("M", 7), HI("n", 645), HS("dtype", dt) }, EB(7, 645, w, 2));
+        add("clamp",       { HI("M", 7), HI("n", 645), HS("dtype", dt) }, EB(7, 645, w, 2));
+        add("rmsnorm",     { HI("M", 5), HI("n", 645), HF("eps", 1e-6), HS("dtype", dt),
+                             HF("wadd", 0), HF("mult", 0.5) }, EB(5, 645, w, 2));
+        /* The audio subsampler's two geometries, scaled down in time, with and without the
+         * frame mask, and a segment boundary (cu_div 2: the cu counts finer than the rows). */
+        add("conv2d", { HI("M", 24), HI("width", 16), HI("cin", 1), HI("cout", 24), HI("kh", 3),
+                        HI("kw", 3), HI("stride", 2), HI("pad", 1), HS("dtype", dt) });
+        add("conv2d", { HI("M", 24), HI("width", 8), HI("cin", 20), HI("cout", 12), HI("kh", 3),
+                        HI("kw", 3), HI("stride", 2), HI("pad", 1), HI("cu_div", 2),
+                        HI("valid_stride", 2), HS("dtype", dt) });
+        add("conv1d_dw", { HI("M", 26), HI("n", 645), HI("k", 5), HS("dtype", dt) });
+        add("conv1d_dw", { HI("M", 24), HI("n", 64), HI("k", 5), HI("cu_div", 4), HS("dtype", dt) });
+        add("rel_sinusoid", { HI("M", 13), HI("n", 1024), HF("max_timescale", 10000.0),
+                              HS("dtype", dt) });
+        add("pool_rows",   { HI("M", 27), HI("n", 645), HI("k", 9), HF("mult", 27.712812921102035),
+                             HS("dtype", dt) }, EB(27, 645, w, 1));
         add("scatter_rows", { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("scale_rows",  { HI("M", 6), HI("n", 645), HS("act", "sigmoid"), HS("dtype", dt) },
                            EB(6, 645, w, 2));
@@ -157,6 +181,18 @@ std::vector<Case> build_cases() {
                                          HI("n_embd", 259), HS("dtype", dt),
                                          HI("round_bf16", rounding) }, 0, 2.0 * M * 259);
         }
+    /* Encoder-sized M at a width that is not a whole number of 48-column panels, with K odd and
+     * even: 37 rows take the bf16 dot-product path, 133 the outer-product one -- its column edge,
+     * its zero-paired last k and its five-row tail. */
+    for (const char* dt : { "f32", "bf16" })
+        for (int M : { 37, 133 })
+            for (int K : { 259, 64 }) {
+                const double fl = 2.0 * M * 100 * K;
+                add("gemm_nt",      { HI("M", M), HI("N", 100), HI("K", K), HS("dtype", dt) },
+                    0, fl);
+                add("gemm_nt_bias", { HI("M", M), HI("N", 100), HI("K", K), HS("dtype", dt),
+                                      HS("act", "gelu_tanh") }, 0, fl);
+            }
     /* fp8a8 and fp8a16 ARE THE ONLY TWO libref CAN DESCRIBE, and that is a real limit rather than
      * a gap in this table: `gemm_nt_q` is one op over six weight formats and the SCALE GRID is
      * what differs between them -- per row, per row-group, per output-row-block, an e8m0 exponent
@@ -183,7 +219,9 @@ std::vector<Case> build_cases() {
                              HS("dtype", "fp8a8"), HS("act", "silu") }, 0, 2.0 * 7 * 512 * 256);
     for (const char* dt : { "f32", "bf16" }) {
         add("embed_lookup",   { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64), HS("dtype", dt),
-                                HI("vocab_offset", 0), HF("wscale", 0) });
+                                HI("vocab_offset", 0), HF("mult", 1) });
+        add("embed_lookup",   { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64), HS("dtype", dt),
+                                HI("vocab_offset", 0), HF("mult", 22.625) });
         add("embed_lookup_q", { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64), HS("dtype", dt),
                                 HI("vocab_offset", 0), HF("wscale", 0.01) });
     }
@@ -202,7 +240,20 @@ std::vector<Case> build_cases() {
         for (int causal : { 0, 1 })
             add("attn_dense", { HI("M", 24), HI("head_dim", 64), HI("gqa", 2),
                                 HI("causal", causal), HS("dtype", dt), HF("scale", 0.125),
-                                HI("max_seqlen", 24) });
+                                HI("max_seqlen", 24), HI("window", 0) });
+    /* The sliding window both ways: bidirectional |i - j| < 5 and causal i - j < 5, over
+     * segments longer than the window so both bounds bite. */
+    for (const char* dt : { "f32", "bf16" })
+        for (int causal : { 0, 1 })
+            add("attn_dense", { HI("M", 24), HI("head_dim", 64), HI("gqa", 2),
+                                HI("causal", causal), HS("dtype", dt), HF("scale", 0.125),
+                                HI("max_seqlen", 24), HI("window", 5) });
+    /* Gemma 4's audio attention: left 12 over segments longer than the window. */
+    for (const char* dt : { "f32", "bf16" })
+        for (int cd : { 1, 4 })
+            add("attn_local_rel", { HI("M", 40), HI("head_dim", 32), HI("n_head", 3),
+                                    HI("left", 12), HI("right", 0), HF("softcap", 50.0),
+                                    HI("cu_div", cd), HS("dtype", dt) });
     for (const char* dt : { "f32", "bf16" })
         add("kv_store", { HI("M", 12), HI("head_dim", 64), HI("n_head_kv", 2),
                           HI("block_size", 16), HS("kv_dtype", dt), HF("k_scale", 1.0),
@@ -214,6 +265,18 @@ std::vector<Case> build_cases() {
         add("qk_norm_rope", { HI("M", 12), HI("head_dim", 64), HI("n_head", 4), HI("n_head_kv", 2),
                               HF("theta", 10000.0), HF("eps", 1e-6), HF("scale", 1.0),
                               HS("mode", mode), HI("rotary_dim", 64), HF("wadd", 0) });
+        add("qk_norm_rope", { HI("M", 12), HI("head_dim", 64), HI("n_head", 4), HI("n_head_kv", 2),
+                              HF("theta", 10000.0), HF("eps", 1e-6), HF("scale", 1.0),
+                              HS("mode", mode), HI("rotary_dim", 64), HF("wadd", 0),
+                              HI("v_norm", 1) });
+    }
+    /* `blocks`, the two-component vision form: x over the first half, y over the second, the
+     * components named in the other order from the planes. */
+    for (const char* dt : { "f32", "bf16" }) {
+        add("qk_norm_rope", { HI("M", 12), HI("head_dim", 64), HI("n_head", 4), HI("n_head_kv", 4),
+                              HF("theta", 100.0), HF("eps", 1e-6), HS("mode", "blocks"),
+                              HS("sections", "16 16"), HS("comps", "1 0"), HI("v_norm", 1),
+                              HS("dtype", dt) });
     }
     add("rope_table", { HI("M", 12), HI("rot", 64), HF("theta", 10000.0), HF("scale", 1.0),
                         HS("dtype", "f32") });
@@ -396,6 +459,13 @@ std::vector<Case> build_cases() {
               0, 2.0 * M * 2048 * 2048);
         speed("gemm_nt", { HI("M", M), HI("N", 5632), HI("K", 2048), HS("dtype", "bf16") },
               0, 2.0 * M * 5632 * 2048);
+    }
+    /* An encoder step: every token of the batch at once, at EmbeddingGemma 2's two FFN shapes. */
+    for (int M : { 2048 }) {
+        speed("gemm_nt", { HI("M", M), HI("N", 4096), HI("K", 512), HS("dtype", "bf16") },
+              0, 2.0 * M * 4096 * 512);
+        speed("gemm_nt", { HI("M", M), HI("N", 512), HI("K", 2048), HS("dtype", "bf16") },
+              0, 2.0 * M * 512 * 2048);
         speed("rmsnorm", { HI("M", M), HI("n", 2048), HF("eps", 1e-6), HS("dtype", "bf16"),
                            HF("wadd", 0) }, (double)M * 2048 * 2 * 2, 0);
         speed("silu_mul", { HI("M", M), HI("n", 5632), HS("dtype", "bf16") },

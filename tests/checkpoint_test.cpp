@@ -144,7 +144,7 @@ TEST(lfm2_vl_keeps_text_geometry_schedule_and_the_checkpoint_norm_epsilon) {
     remove_checkpoint(dir);
 }
 
-TEST(nested_image_processor_metadata_uses_the_shared_preprocessor_namespace) {
+TEST(nested_processors_keep_their_namespace_and_image_aliases) {
     const std::string dir = write_checkpoint({bf16("x", {2, 2}, 0)}, "{}");
     auto put = [&](const char* name, const char* json) {
         FILE* f = std::fopen((dir + "/" + name).c_str(), "wb");
@@ -155,7 +155,10 @@ TEST(nested_image_processor_metadata_uses_the_shared_preprocessor_namespace) {
     put("processor_config.json",
         "{\"processor_class\":\"Lfm2VlProcessor\",\"image_processor\":{"
         "\"image_processor_type\":\"Lfm2VlImageProcessor\",\"do_image_splitting\":true,"
-        "\"image_mean\":[0.5,0.5,0.5],\"size\":{\"height\":512,\"width\":512},\"max_tiles\":10}}");
+        "\"image_mean\":[0.5,0.5,0.5],\"size\":{\"height\":512,\"width\":512},\"max_tiles\":10},"
+        "\"feature_extractor\":{\"sampling_rate\":16000},\"audio_seq_length\":750}");
+    put("config_sentence_transformers.json",
+        "{\"prompts\":{\"query\":\"query: \"},\"default_prompt_name\":\"query\"}");
     {
         Checkpoint ck;
         REQUIRE_EQ(ck.open(dir), RAD_OK);
@@ -164,6 +167,13 @@ TEST(nested_image_processor_metadata_uses_the_shared_preprocessor_namespace) {
         CHECK_EQ(std::string(ck.meta().get("preprocessor.image_mean")), std::string("0.5 0.5 0.5"));
         CHECK_EQ(std::string(ck.meta().get("preprocessor.size.height")), std::string("512"));
         CHECK(!ck.meta().has("preprocessor.image_processor.size.height"));
+        CHECK_EQ(std::string(ck.meta().get("processor.processor_class")), std::string("Lfm2VlProcessor"));
+        CHECK_EQ(std::string(ck.meta().get("processor.image_processor.size.height")), std::string("512"));
+        CHECK_EQ(std::string(ck.meta().get("processor.feature_extractor.sampling_rate")), std::string("16000"));
+        CHECK_EQ(std::string(ck.meta().get("processor.audio_seq_length")), std::string("750"));
+        CHECK(!ck.meta().has("preprocessor.sampling_rate"));
+        CHECK_EQ(std::string(ck.meta().get("sentence_transformers.prompts.query")), std::string("query: "));
+        CHECK_EQ(std::string(ck.meta().get("sentence_transformers.default_prompt_name")), std::string("query"));
     }
     put("preprocessor_config.json", "{\"max_tiles\":4}");
     {
@@ -171,9 +181,12 @@ TEST(nested_image_processor_metadata_uses_the_shared_preprocessor_namespace) {
         REQUIRE_EQ(ck.open(dir), RAD_OK);
         CHECK_EQ(std::string(ck.meta().get("preprocessor.max_tiles")), std::string("4"));
         CHECK_EQ(std::string(ck.meta().get("preprocessor.size.width")), std::string("512"));
+        CHECK_EQ(std::string(ck.meta().get("processor.image_processor.max_tiles")), std::string("10"));
+        CHECK_EQ(std::string(ck.meta().get("processor.feature_extractor.sampling_rate")), std::string("16000"));
     }
     std::remove((dir + "/processor_config.json").c_str());
     std::remove((dir + "/preprocessor_config.json").c_str());
+    std::remove((dir + "/config_sentence_transformers.json").c_str());
     remove_checkpoint(dir);
 }
 

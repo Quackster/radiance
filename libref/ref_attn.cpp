@@ -34,6 +34,8 @@
 #include "ref_gemm.h"
 #include "ref_ops.h"
 
+#include <algorithm>
+
 using namespace ref;
 
 namespace {
@@ -222,7 +224,10 @@ int ref_attn_dense(const RadArgs* a, RadStream) {
     const int64_t head_dim = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
     const int64_t gqa      = p_int(a, "gqa", 1);
     const int     causal   = (int)p_int(a, "causal", 0);
-    if (head_dim <= 0 || gqa <= 0) return RAD_E_SHAPE;
+    /* `window` is attn_paged's rule over a segment's own positions: causal, key j is visible to
+     * query i when i - j < window; non-causal, when |i - j| < window. 0 is no window. */
+    const int64_t window   = p_int(a, "window", 0);
+    if (head_dim <= 0 || gqa <= 0 || window < 0) return RAD_E_SHAPE;
     if (head_dim > REF_HD_MAX) return RAD_E_UNSUPPORTED;
 
     /* [tokens, heads, head_dim], or [tokens, heads * head_dim] -- a column slice of a fused
@@ -260,9 +265,13 @@ int ref_attn_dense(const RadArgs* a, RadStream) {
         const int64_t b1 = ld_int(cu->dtype, cu->data, offlin(cu, s + 1));
         for (int64_t i = b0; i < b1; ++i) {
             const int64_t qb = i * q_rs + h * q_hs, ob = i * o_rs + h * o_hs;
-            const int64_t jend = causal ? (i + 1) : b1;
+            int64_t jbeg = b0, jend = causal ? (i + 1) : b1;
+            if (window > 0) {
+                jbeg = std::max<int64_t>(b0, i - window + 1);
+                if (!causal) jend = std::min<int64_t>(b1, i + window);
+            }
             float mx = -INFINITY;
-            for (int64_t j = b0; j < jend; ++j) {
+            for (int64_t j = jbeg; j < jend; ++j) {
                 const int64_t kb = j * k_rs + kh * k_hs;
                 float dot = 0.0f;
                 for (int64_t d = 0; d < head_dim; ++d)
@@ -277,7 +286,7 @@ int ref_attn_dense(const RadArgs* a, RadStream) {
                 continue;
             }
             float sum = 0.0f;
-            for (int64_t j = b0; j < jend; ++j) {
+            for (int64_t j = jbeg; j < jend; ++j) {
                 const int64_t kb = j * k_rs + kh * k_hs, vb = j * v_rs + kh * v_hs;
                 float dot = 0.0f;
                 for (int64_t d = 0; d < head_dim; ++d)
@@ -507,7 +516,9 @@ int ref_rope(const RadArgs* a, RadStream) {
 
 /* ------------------------------------------------------------------ qk_norm_rope */
 /* The QK-norm preamble and the rotation in one op: an RMS norm over each 128-wide (or whatever
- * head_dim is) q and k head against its own gain vector, then RoPE.
+ * head_dim is) q and k head against its own gain vector, then RoPE. `v_norm` 1 also RMS-norms
+ * each v head with a UNIT gain and no rotation -- Gemma 4's value norm, which has no weight. The
+ * v heads are otherwise left alone.
  *
  * THE NORM OUTPUT IS ROUNDED TO THE TENSOR'S DTYPE BEFORE THE ROTATION. That is not an accident of
  * writing it back in place -- it is what the unfused pair does, because the norm stores a tensor
@@ -525,26 +536,65 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
     const float   eps       = p_f32(a, "eps", 1e-6f);
     const float   rscale    = p_f32(a, "scale", 1.0f);
     const float   wadd      = p_f32(a, "wadd", 0.0f);
-    static const char* kModes[] = { "neox", "gptj" };
-    const int mode = p_enum(a, "mode", kModes, 2, ROPE_NEOX);
+    const int     v_norm    = (int)p_int(a, "v_norm", 0);
+    static const char* kModes[] = { "neox", "gptj", "blocks" };
+    const int mode = p_enum(a, "mode", kModes, 3, 0);
+    if (mode < 0) return RAD_E_UNSUPPORTED;
+    const bool blocks = mode == 2;
     int64_t rot = p_int(a, "rotary_dim", head_dim);
     if (head_dim <= 0 || n_head <= 0 || rot <= 0 || rot > head_dim || (rot & 1)) return RAD_E_SHAPE;
     if (numel(qw) < head_dim || numel(kw) < head_dim) return RAD_E_SHAPE;
 
+    /* BLOCKS: section c is `sec[c]` rotary pairs over its own run of 2 * sec[c] channels, paired
+     * (start + j, start + sec[c] + j) and turned by position component comps[c] at
+     * theta^(-j / sec[c]) -- each section a complete neox rotary of its own width. The sections
+     * fill the rotated prefix exactly. Positions are [C, M], component-major. */
+    int64_t sec[8] = {}, comp[8] = {};
+    int n_sec = 0;
+    if (blocks) {
+        n_sec = rope_sections(a, sec);
+        if (n_sec <= 0) return RAD_E_SHAPE;
+        int64_t total = 0;
+        for (int c = 0; c < n_sec; ++c) { total += sec[c]; comp[c] = c; }
+        if (2 * total != rot) return RAD_E_SHAPE;
+        if (const char* cs = p_str(a, "comps", nullptr)) {
+            int k = 0;
+            for (const char* v = cs; *v && k < 8; ) {
+                char* end = nullptr;
+                const long long x = std::strtoll(v, &end, 10);
+                if (end == v) break;
+                comp[k++] = x;
+                v = end;
+            }
+            if (k != n_sec) return RAD_E_SHAPE;
+        }
+    }
+    const bool multi = pos->rank >= 2;
+    const int64_t n_comp = multi ? pos->shape[0] : 1;
+    const int64_t M = multi ? pos->shape[1] : numel(pos);
+    if (multi && !blocks) return RAD_E_SHAPE;
+    for (int c = 0; c < n_sec; ++c)
+        if (comp[c] < 0 || comp[c] >= n_comp) return RAD_E_SHAPE;
+    const int64_t pcs = multi ? pos->stride[0] : 0, pms = multi ? pos->stride[1] : 0;
+
     const int64_t stride_row = (n_head + 2 * n_head_kv) * head_dim;
-    const int64_t M = numel(pos);
     if (M <= 0 || numel(qkv) < M * stride_row) return RAD_E_SHAPE;
     const int64_t rs = qkv->rank >= 2 ? qkv->stride[qkv->rank - 2] : stride_row;
     const int64_t ds = laststride(qkv);
     RopeFreq f;
-    RAD_REF_TRY(rope_freqs(mode, rot, theta, nullptr, 0, &f));
+    if (!blocks) RAD_REF_TRY(rope_freqs(mode, rot, theta, nullptr, 0, &f));
 
     #pragma omp parallel for schedule(static)
     for (int64_t m = 0; m < M; ++m) {
         float p[8];
-        const float one = (float)ld_int(pos->dtype, pos->data, offlin(pos, m)) /
-                          (rscale != 0.0f ? rscale : 1.0f);
-        for (int c = 0; c < 8; ++c) p[c] = one;
+        const float div = rscale != 0.0f ? rscale : 1.0f;
+        if (multi) {
+            for (int64_t c = 0; c < n_comp && c < 8; ++c)
+                p[c] = (float)ld_int(pos->dtype, pos->data, c * pcs + m * pms) / div;
+        } else {
+            const float one = (float)ld_int(pos->dtype, pos->data, offlin(pos, m)) / div;
+            for (int c = 0; c < 8; ++c) p[c] = one;
+        }
         const int64_t row = m * rs;
         for (int64_t h = 0; h < n_head + n_head_kv; ++h) {
             const RadTensor* w = h < n_head ? qw : kw;
@@ -557,7 +607,128 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
             const float sc = 1.0f / std::sqrt(ss / (float)head_dim + eps);
             for (int64_t d = 0; d < head_dim; ++d)
                 stt(qkv, base + d * ds, ldt(qkv, base + d * ds) * sc * (ldt(w, d * ws) + wadd));
-            rope_head(qkv, base, ds, rot, mode, f, p);
+            if (!blocks) {
+                rope_head(qkv, base, ds, rot, mode, f, p);
+                continue;
+            }
+            int64_t start = 0;
+            for (int c = 0; c < n_sec; ++c) {
+                for (int64_t j = 0; j < sec[c]; ++j) {
+                    const float inv = 1.0f / std::pow(theta, (float)j / (float)sec[c]);
+                    const float ang = p[comp[c]] * inv;
+                    const float cs = std::cos(ang), sn = std::sin(ang);
+                    const int64_t i0 = start + j, i1 = start + sec[c] + j;
+                    const float x0 = ldt(qkv, base + i0 * ds), x1 = ldt(qkv, base + i1 * ds);
+                    stt(qkv, base + i0 * ds, x0 * cs - x1 * sn);
+                    stt(qkv, base + i1 * ds, x0 * sn + x1 * cs);
+                }
+                start += 2 * sec[c];
+            }
+        }
+        for (int64_t h = 0; v_norm && h < n_head_kv; ++h) {
+            const int64_t base = row + (n_head + n_head_kv + h) * head_dim * ds;
+            float ss = 0.0f;
+            for (int64_t d = 0; d < head_dim; ++d) {
+                float x = ldt(qkv, base + d * ds);
+                ss += x * x;
+            }
+            const float sc = 1.0f / std::sqrt(ss / (float)head_dim + eps);
+            for (int64_t d = 0; d < head_dim; ++d)
+                stt(qkv, base + d * ds, ldt(qkv, base + d * ds) * sc);
+        }
+    }
+    return RAD_OK;
+}
+
+/* A value as a tensor of `dt` holds it: rounded through the dtype's own store and load. */
+static inline float round_dt(uint32_t dt, float v) {
+    uint64_t buf = 0;
+    st_dt(dt, &buf, 0, v);
+    return ld_dt(dt, &buf, 0);
+}
+static inline int64_t rows_n(const RadTensor* t, int64_t n) { return n > 0 ? numel(t) / n : 0; }
+
+/* ------------------------------------------------------------------ attn_local_rel */
+/* Local attention with a relative-position term: Gemma 4's audio (USM conformer) attention.
+ *
+ * Query row i of a cu_seqlens segment sees the key rows j of the same segment with
+ * 0 <= i - j <= left (`right` must be 0). Per head:
+ *
+ *   qf[d]  = q[i,d] * (head_dim^-0.5 / ln 2) * softplus(pds[d])
+ *   logit  = sum_d qf[d] * k[j,d] * (ln(1 + e) / ln 2)  +  sum_d qf[d] * relk[i - j, d]
+ *   logit  = softcap * tanh(logit / softcap)
+ *
+ * then a softmax over those keys and the weighted sum of v, all in f32 and rounded once. `relk`
+ * is [left + 1, n_head * head_dim]: row d is the projected relative position for distance d.
+ *
+ * The reference computes this in 12-query blocks over 24-key context windows and shifts the
+ * relative term into place (Transformer-XL's rel_shift); every key outside 0 <= i - j <= left
+ * carries a -1e9 logit there and a zero weight after the softmax, so the sliding form below is
+ * the same function. softplus(pds) is rounded to the weight's dtype before use, as the reference
+ * evaluates it on the bf16 parameter. */
+int ref_attn_local_rel(const RadArgs* a, RadStream) {
+    if (!have(a, 7)) return RAD_E_INVAL;
+    const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *rk = &a->t[3];
+    const RadTensor *pds = &a->t[4], *cu = &a->t[5], *o = &a->t[6];
+    const int64_t D = p_int(a, "head_dim", 0), H = p_int(a, "n_head", 0);
+    const int64_t L = p_int(a, "left", 0), R = p_int(a, "right", 0);
+    const int64_t cdiv = p_int(a, "cu_div", 1);
+    const float cap = p_f32(a, "softcap", 0.0f);
+    if (D <= 0 || H <= 0 || L < 0 || cdiv <= 0 || !(cap > 0.0f)) return RAD_E_SHAPE;
+    if (R != 0) return RAD_E_UNSUPPORTED;
+    if (D > REF_HD_MAX || L + 1 > REF_HD_MAX) return RAD_E_UNSUPPORTED;
+    const int64_t W = H * D;
+    if (numel(pds) < D || numel(rk) < (L + 1) * W) return RAD_E_SHAPE;
+    const int64_t S = numel(cu) - 1;
+    if (S <= 0) return RAD_E_SHAPE;
+    const int64_t Mq = rows_n(q, W), Mk = rows_n(k, W), Mv = rows_n(v, W), Mo = rows_n(o, W);
+
+    const float qs = (float)(1.0 / std::sqrt((double)D) / std::log(2.0));
+    const float ks = (float)(std::log(1.0 + std::exp(1.0)) / std::log(2.0));
+    float spd[REF_HD_MAX];
+    for (int64_t d = 0; d < D; ++d)
+        spd[d] = round_dt(pds->dtype, act_softplus(ldt(pds, d * laststride(pds)), 20.0f));
+
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t c0 = ld_int(cu->dtype, cu->data, offlin(cu, s));
+        const int64_t c1 = ld_int(cu->dtype, cu->data, offlin(cu, s + 1));
+        if (c0 % cdiv || c1 % cdiv || c1 < c0) return RAD_E_SHAPE;
+        const int64_t t0 = c0 / cdiv, t1 = c1 / cdiv;
+        if (t1 > Mq || t1 > Mk || t1 > Mv || t1 > Mo) return RAD_E_SHAPE;
+
+        #pragma omp parallel for schedule(static)
+        for (int64_t ih = 0; ih < (t1 - t0) * H; ++ih) {
+            const int64_t i = t0 + ih / H, h = ih % H;
+            float qf[REF_HD_MAX], lg[REF_HD_MAX], acc[REF_HD_MAX];
+            const int64_t qb = rowoff(q, i, W) + h * D * laststride(q);
+            for (int64_t d = 0; d < D; ++d) qf[d] = ldt(q, qb + d * laststride(q)) * qs * spd[d];
+            const int64_t j0 = i - L > t0 ? i - L : t0;
+            float mx = -INFINITY;
+            for (int64_t j = j0; j <= i; ++j) {
+                const int64_t kb = rowoff(k, j, W) + h * D * laststride(k);
+                const int64_t rb = rowoff(rk, i - j, W) + h * D * laststride(rk);
+                float ac = 0.0f, bd = 0.0f;
+                for (int64_t d = 0; d < D; ++d) {
+                    ac += qf[d] * (ldt(k, kb + d * laststride(k)) * ks);
+                    bd += qf[d] * ldt(rk, rb + d * laststride(rk));
+                }
+                const float x = cap * std::tanh((ac + bd) / cap);
+                lg[j - j0] = x;
+                mx = x > mx ? x : mx;
+            }
+            float sum = 0.0f;
+            for (int64_t j = j0; j <= i; ++j) {
+                lg[j - j0] = std::exp(lg[j - j0] - mx);
+                sum += lg[j - j0];
+            }
+            for (int64_t d = 0; d < D; ++d) acc[d] = 0.0f;
+            for (int64_t j = j0; j <= i; ++j) {
+                const float p = lg[j - j0] / sum;
+                const int64_t vb = rowoff(v, j, W) + h * D * laststride(v);
+                for (int64_t d = 0; d < D; ++d) acc[d] += p * ldt(v, vb + d * laststride(v));
+            }
+            const int64_t ob = rowoff(o, i, W) + h * D * laststride(o);
+            for (int64_t d = 0; d < D; ++d) stt(o, ob + d * laststride(o), acc[d]);
         }
     }
     return RAD_OK;

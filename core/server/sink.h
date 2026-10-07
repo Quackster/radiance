@@ -142,6 +142,13 @@ public:
     /* The engine's request id, so a dropped connection can reach IScheduler::cancel. */
     uint64_t id = 0;
 
+    /* AN EMBEDDING REQUEST'S ANSWER: the pooled vector, written once by the engine before the
+     * step's commit finishes the request, and read by the consumer only after done(). finish()
+     * publishes with a release store and done() reads with an acquire load, so the vector is
+     * visible to anyone who has seen the request finish. Empty for every generating request. */
+    void set_embedding(const float* v, int64_t n) { embd_.assign(v, v + n); }
+    const std::vector<float>& embedding() const { return embd_; }
+
 private:
     void notify();
 
@@ -168,6 +175,7 @@ private:
     std::atomic<int32_t>  n_prompt_{0};
     std::atomic<int32_t>  n_cached_{0};
     bool                  has_logprobs_ = false;
+    std::vector<float>    embd_;
 
     std::mutex              m_;
     std::condition_variable cv_;
@@ -195,6 +203,9 @@ inline void sink_admitted(void* s) {
 }
 inline void sink_drafts(void* s, int32_t n, int32_t accepted) {
     if (s) static_cast<Sink*>(s)->add_drafts(n, accepted);
+}
+inline void sink_embedding(void* s, const float* v, int64_t n) {
+    if (s) static_cast<Sink*>(s)->set_embedding(v, n);
 }
 
 }  /* namespace server */

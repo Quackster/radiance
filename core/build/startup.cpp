@@ -376,7 +376,9 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
      * the same resolution as the plugin's. A sampler op that does not resolve is deliberately NOT
      * a declare failure -- a deployment that never sends `typical_p` does not need a typical
      * kernel -- so this returning negative means something structural, not a miss. */
-    if (also) {
+    /* NOT FOR AN EMBEDDING PROGRAM (rad_declare_pooled): it samples nothing, so a sampler chain
+     * in it would be ops and buffers no step ever issues. */
+    if (also && b.program().pooled_buf == RAD_NULL_HANDLE) {
         /* THE WIDTH THE PLUGIN ACTUALLY DECLARED, handed over rather than re-derived. The sampler
          * needs to know how much vocabulary THIS RANK produces, and the one place that is a fact
          * is the logits buffer the plugin just named. Computing it a second time from n_vocab and

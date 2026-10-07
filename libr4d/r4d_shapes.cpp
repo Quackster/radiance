@@ -381,7 +381,7 @@ extern "C" int r4d_shape_cast(const RadParam* p, int n_p, int operand,
 
     const int64_t M = pi(p, n_p, "M");
     const int64_t n = pi(p, n_p, "n");
-    /* The same shim serves a bf16 row copy and the two f32/bf16 conversions. */
+    /* The registered rows serve a bf16 copy and both f32/bf16 conversions. */
     const uint32_t f = dt_par(p, n_p, "from"), t = dt_par(p, n_p, "to");
     if (!((f == RAD_BF16 && (t == RAD_BF16 || t == RAD_F32)) ||
           (f == RAD_F32 && t == RAD_BF16))) return RAD_E_UNSUPPORTED;
@@ -523,6 +523,17 @@ extern "C" int r4d_shape_binary(const RadParam* p, int n_p, int operand,
     const int64_t n = pi(p, n_p, "n");
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = { opd(D, M, n), opd(D, M, n), opd(D, M, n) };
+    R4D_PICK(l);
+}
+
+/* mul_weight: the one-row form of the weight (a per-channel gain), or with `scalar` the
+ * one-element form. */
+extern "C" int r4d_shape_mul_weight(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const int64_t wn = pi(p, n_p, "scalar") ? 1 : n;
+    const RadOpdDesc l[] = { opd(D, M, n), opd(D, 1, wn), opd(D, M, n) };
     R4D_PICK(l);
 }
 

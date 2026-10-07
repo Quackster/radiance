@@ -91,9 +91,12 @@ struct RadBuilder {
     rad_buf logits = 0;
     bool token_scores = false;
 
-    /* The vision tower's declaration (rad_declare_encoder), when the plugin made one. */
+    /* The vision tower's declaration (rad_declare_encoder), when the plugin made one, and the
+     * audio encoder's. */
     RadEncoderDecl encoder{};
     std::string    encoder_name;
+    RadEncoderDecl audio_encoder{};
+    std::string    audio_encoder_name;
 
     /* What rad_weight_encoding answers: the first entry whose key the source name contains. Empty
      * is a builder with no model behind it, where every weight is plain in its declared dtype. */
@@ -254,6 +257,11 @@ extern "C" int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {
 }
 extern "C" int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
     if (!b || !d || !d->name || !d->modalities) return RAD_E_INVAL;
+    if (d->modalities == RAD_MM_AUDIO) {
+        b->audio_encoder = *d;
+        b->audio_encoder_name = d->name;
+        return RAD_OK;
+    }
     b->encoder = *d;
     b->encoder_name = d->name;
     return RAD_OK;
@@ -3366,6 +3374,27 @@ TEST(lfm2_siglip2_declares_biases_position_resampling_and_spatial_projector) {
              std::string("model.multi_modal_projector.linear_1.weight"));
 }
 
+TEST(lfm2_probe_aligns_encoder_capacity_to_the_declared_spatial_merge) {
+    auto meta = lfm2_vision_meta();
+    RadArchProbe probe{};
+    REQUIRE_EQ(lfm2_bf16::probe(&meta, &probe), RAD_OK);
+    REQUIRE_EQ(probe.enc_merge, (int64_t)4);
+    CHECK_EQ(probe.audio_frames, (int64_t)0);
+    auto ctx = build_ctx();
+    ctx.max_enc_patches = 1027;
+    RadBuilder unaligned;
+    CHECK_EQ(lfm2_bf16::declare(&unaligned, &meta, &ctx), RAD_E_SHAPE);
+    ctx.max_enc_patches -= ctx.max_enc_patches % probe.enc_merge;
+    RadBuilder aligned;
+    REQUIRE_EQ(lfm2_bf16::declare(&aligned, &meta, &ctx), RAD_OK);
+    CHECK_EQ(aligned.encoder.merge, probe.enc_merge);
+    CHECK_EQ(aligned.encoder.max_patches, (int64_t)1024);
+    meta = lfm2_meta();
+    probe = {};
+    REQUIRE_EQ(lfm2_bf16::probe(&meta, &probe), RAD_OK);
+    CHECK_EQ(probe.enc_merge, (int64_t)0);  /* no vision tower, no image capacity */
+}
+
 TEST(lfm2_siglip2_encoder_issues_segment_attention_merges_and_separate_residuals) {
     RadBuilder b;
     auto meta = lfm2_vision_meta();
@@ -3419,6 +3448,14 @@ TEST(lfm2_siglip2_encoder_issues_segment_attention_merges_and_separate_residuals
     CHECK_EQ(residuals, 4);
     CHECK_EQ(c.issues.back().op, v.project2);
     CHECK_EQ(c.issues.back().opd.back().handle, b.encoder.out);
+
+    /* The same well-formed buffers cannot turn an audio pass into an image pass. */
+    batch.enc = RAD_MM_AUDIO;
+    c.issues.clear();
+    lfm2_bf16::step(&c, &batch);
+    CHECK(!c.step_fail.empty());
+    CHECK(c.issues.empty());
+    c.step_fail.clear();
 
     /* The decoder receives only completed projector rows, after embedding lookup. */
     batch = decode_batch(); batch.n_mm_rows = 2;

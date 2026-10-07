@@ -158,7 +158,7 @@ adding a kernel plugin; "refused at load" names one op and leaves you to find th
 
 | op | params | operands |
 |---|---|---|
-| `rmsnorm` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt `round_before_weight`/opt | `x`, `w`w → `y` |
+| `rmsnorm` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt `round_before_weight`/opt | `x`, `w`w? → `y` (no gain operand: a gain of one) |
 | `rmsnorm_add` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`, `w`w → `y`, `residual_out` |
 | `hc_enter` | `M`(range) `n` `hc` `dtype` | `x` → `h` |
 | `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`? |
@@ -168,6 +168,15 @@ adding a kernel plugin; "refused at load" names one op and leaves you to find th
 | `add` | `M`(range) `n` `dtype` | `a`, `b` → `y` |
 | `mul` | `M`(range) `n` `dtype` | `a`, `b` → `y` |
 | `silu_mul` | `M`(range) `n` `dtype` | `gate_up` → `y` (splits `[M,2n]` into gate·up) |
+| `mul_weight` | `M`(range) `n` `dtype` `scalar`/opt | `x`, `w`w → `y` (w one element or one row) |
+| `act_mul` | `M`(range) `n` `act` `dtype` | `a`, `b` → `y` (act(a)·b, two operands) |
+| `seg_mean` | `M`(range) `n` `dtype` | `x`, `cu_seqlens` → `y` (one mean row a segment) |
+| `pool_rows` | `M`(range) `n` `k` `mult`:f64/opt `dtype` | `x` → `y` (one mean row a window of k rows) |
+| `relu` | `M`(range) `n` `dtype` | `x` → `y` |
+| `clamp` | `M`(range) `n` `dtype` | `x`, `lo`w, `hi`w → `y` |
+| `conv2d` | `M`(range) `width` `cin` `cout` `kh` `kw` `stride` `pad` `cu_div`/opt `valid_stride`/opt `dtype` | `x`, `w`w, `cu_seqlens`, `valid`? → `y` |
+| `conv1d_dw` | `M`(range) `n` `k` `cu_div`/opt `dtype` | `x`, `w`w, `cu_seqlens` → `y` |
+| `rel_sinusoid` | `M`(range) `n` `max_timescale`:f64/opt `dtype` | → `y` |
 | `gelu` / `silu` | `M`(range) `n` `dtype` | `x` → `y` |
 | `cast` | `M`(range) `n` `from` `to` | `x` → `y` |
 | `softmax` | `M`(range) `n` `dtype` | `x` → `y` |
@@ -178,9 +187,10 @@ adding a kernel plugin; "refused at load" names one op and leaves you to find th
 `gelu` and `silu` are two ops with one schema, and `silu` carries a row of its own because a row
 names one op.
 
-`rmsnorm` normally narrows only after applying `(w + wadd)`. Its optional integer
+`rmsnorm` normally narrows only after applying `(w + wadd)` and the scalar `mult` (default `1`).
+Without a gain operand, the gain is one and `wadd` must be zero. Its optional integer
 `round_before_weight=1` first rounds `x * rsqrt(mean(x²) + eps)` to the activation dtype, then
-applies the gain. The default is `0`. This preserves checkpoints that require the intermediate
+applies the gain and `mult`. The default is `0`. This preserves checkpoints that require the intermediate
 rounding; it is not an option on `rmsnorm_add` or the quantizing norm fusions.
 
 `rmsnorm_add` exists because the residual add and the next norm are one pass in every real
@@ -228,6 +238,54 @@ where it computes nothing and a reader downstream still expects a defined buffer
 attention-zero rank's block (`docs/TP3.md`) is one `fill` of its output wire before the all-reduce.
 A wire shared across layers cannot be zeroed once a step, and a memset knows neither the row pitch
 nor the dtype; this does.
+
+**`mul_weight`** is a learned gain on an activation: `w` is a WEIGHT of one element, a scalar for
+the whole output -- Gemma 4's per-layer `layer_scalar` on the residual stream -- or of one row,
+broadcast down the rows (a per-channel layer scale). Its own op rather than a form of `mul`
+because an operand is a weight or an activation by its schema, and `mul`'s `b` is an activation.
+`scalar` 1 states the one-element form; kernels read the form off the operand, and the parameter
+is what lets a shape description (rad-kbench's) build the right weight.
+
+**`act_mul`** is `silu_mul` with its two halves in two operands, so the multiplier can be any
+tensor -- the two column slices of a fused `gate_up`, or a gate and a separate per-layer input
+(EmbeddingGemma 2's per-layer-embedding block multiplies `gelu_tanh(gate(x))` by one). `act` is
+`silu`, `gelu` (exact erf), `gelu_tanh` or `sigmoid` (a GLU's gate: `a` the gate half, `b` the
+value half); the activation is rounded to `y`'s dtype before the product, which is what the
+unfused pair stores.
+
+**`seg_mean`** is a sentence embedding's mean pooling over a ragged batch: row `s` of `y` is the
+mean of `x`'s rows `[cu[s], cu[s+1])`, summed in double and rounded once. `M` is the step's token
+count and bands the op; the segment count is `cu_seqlens`' length less one. An empty segment is a
+zero row.
+
+**`pool_rows`** is a vision pooler over windows its processor laid out consecutively: row `r` of `y`
+is the mean of `x`'s rows `[r*k, r*k + k)`, summed in f32 and rounded to `y`'s dtype, then times
+`mult` and rounded again (the unfused pair stores the mean). `M` is the input row count and a
+multiple of `k`.
+
+**`rmsnorm`'s `mult`** scales the normed row before its one rounding: a residual branch weighted by
+a constant -- Gemma 4's audio feed-forward adds half of its output -- with no second pass. For a
+power of two it is exactly the reference's norm-then-scale, since scaling by one commutes with the
+rounding.
+
+**The audio tower's operators** (Gemma 4's USM conformer):
+
+- **`relu`** is `max(x, 0)` at each operand's own row pitch.
+- **`clamp`** is `min(max(x, lo), hi)` with `lo` and `hi` WEIGHTS of one element each -- a clipped
+  linear's input or output range, which the checkpoint states per projection.
+- **`conv2d`** convolves over (time, width) with channels innermost: element `(t, w, c)` of `x` is
+  at row `t`, column `w * cin + c`, and `w` is PyTorch's `[cout, cin, kh, kw]`. Each `cu_seqlens`
+  segment -- rows `[cu[s] / cu_div, cu[s+1] / cu_div)` -- is convolved on its own with zero padding
+  `pad` at its edges on both axes, so two clips in one pass never see each other, and its output
+  rows start at `cu[s] / (cu_div * stride)` (a segment whose start does not divide is refused).
+  With the optional `valid`, input row `t` reads as zeros unless `valid[t * valid_stride] != 0`:
+  the frame mask the subsampler multiplies in before each convolution. f32 sum, one rounding.
+- **`conv1d_dw`** is a causal depthwise convolution over time, `y[t, c] = sum_j w[c, 0, j] *
+  x[t - (k - 1) + j, c]`, with the rows before the segment's start reading as zeros.
+- **`rel_sinusoid`** writes the sinusoidal relative-position table, row `d` for distance `d`:
+  `sin(d * inv[i])` over the first half and `cos(d * inv[i])` over the second, `inv[i] = exp(i *
+  -log(max_timescale) / max(n/2 - 1, 1))`, each step in f32 as the reference's torch expressions
+  are, then rounded.
 
 ## Quantisation and rotation
 
@@ -374,11 +432,22 @@ that folds dequantisation into its epilogue still receives them.
 | op | params | operands |
 |---|---|---|
 | `attn_paged` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out` |
-| `attn_dense` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt `max_seqlen`/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
+| `attn_dense` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt `max_seqlen`/opt `window`/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
+| `attn_local_rel` | `M`(range) `head_dim` `n_head` `left` `right` `softcap`:f64 `cu_div`/opt `dtype` | `q`, `k`, `v`, `relk`, `pds`w, `cu_seqlens` → `out` |
 | `kv_store` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout |
 | `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt | `qkv`:inout, `positions` |
 | `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt | `positions` → `cos_sin` |
-| `qk_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `wadd`:f64/opt | `qkv`:inout, `positions`, `q_w`w, `k_w`w |
+| `qk_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `wadd`:f64/opt `v_norm`/opt `sections`/opt `comps`/opt | `qkv`:inout, `positions`, `q_w`w, `k_w`w |
+
+**`attn_local_rel`** is Gemma 4's audio attention: local, with a relative-position term and a
+softcap. Query row `i` of a segment sees the key rows `j` of the same segment with `0 <= i - j <=
+left` (`right` must be 0). Per head, `qf = q * (head_dim^-0.5 / ln 2) * softplus(pds)` -- softplus
+rounded to `pds`'s dtype, as the reference evaluates it on the parameter -- and `logit = qf . k *
+(ln(1 + e) / ln 2) + qf . relk[i - j]`, then `softcap * tanh(logit / softcap)`, a softmax over the
+visible keys and the weighted sum of `v`, all in f32 and rounded once. `relk` is `[left + 1,
+n_head * head_dim]`, row `d` the projected position for distance `d`. The reference computes this
+in 12-query blocks over 24-key windows with a Transformer-XL shift; every key outside the window
+carries a `-1e9` logit there, so the sliding form is the same function.
 
 `attn_paged` is the ranged op whose band is `q_len`, not `M`: one query row at decode, up to 64 at
 a speculative verify, thousands in a prefill chunk, and libr4d has a different kernel for each
@@ -393,10 +462,23 @@ row each — is what the scheduler builds whenever prefill and decode coexist, a
 satisfy the uniform form. `q_len` is then the batch MAXIMUM, which is what selects the band; the
 per-sequence lengths come from `cu_seqlens` alone.
 
-`attn_dense` is the vision tower's: non-causal, nothing paged, `cu_seqlens` bounding one image per
-entry so a whole batch is one launch. `q`, `k` and `v` may each be `[tokens, heads, head_dim]` or
+`attn_dense` is the vision tower's and an encoder's: nothing paged, `cu_seqlens` bounding one
+image or one input per entry so a whole batch is one launch. `window` is `attn_paged`'s rule over a
+segment's own positions -- causal, key `j` is visible to query `i` when `i - j < window`;
+non-causal, when `|i - j| < window` -- and 0 is no window. A bidirectional encoder's sliding layer
+of radius `r` (`|i - j| <= r`) is `window = r + 1`. `q`, `k` and `v` may each be `[tokens, heads, head_dim]` or
 `[tokens, heads * head_dim]`, and the second form may be a column slice of a fused projection read
 at that projection's row pitch -- which is how a tower's `[q|k|v]` row reaches it without a copy.
+
+**`qk_norm_rope`'s `v_norm`** set to 1 also RMS-norms every v head of the fused row with a UNIT
+gain and does not rotate it: Gemma 4's value norm, which has no weight to name.
+
+**`qk_norm_rope`'s `blocks` mode** rotates each section as its own block of channels: section `c`
+is `sections[c]` pairs over the next `2 * sections[c]` channels, paired `(start + j, start +
+sections[c] + j)` -- NeoX inside the block -- and turned by position component `comps[c]` (default
+`c`) at `theta^(-j / sections[c])`. The sections fill `rotary_dim` exactly and `positions` is
+`[C, M]`. It is Gemma 4's vision rotary: x over the first half of each head and y over the second,
+each half a complete rotary of its own; `mode` `axial` of `rope` pairs across the halves instead.
 
 **`rope`'s multi-component modes.** `mrope`, `imrope` and `axial` rotate with NeoX pairing and let
 several position components drive different frequencies. `positions` is then `[C, M]`,
@@ -834,7 +916,7 @@ form exists, as for `ar_hc_write`.
 
 | op | params | operands |
 |---|---|---|
-| `embed_lookup` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt | `tokens`, `wte`w → `x` |
+| `embed_lookup` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt `mult`:f64/opt | `tokens`, `wte`w → `x` |
 | `embed_lookup_q` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt | `tokens`, `wte`w, `scale`w? → `x`, `ahead`? |
 | `logits_gemm` | `M`(range) `n_vocab` `n_embd` `dtype` | `x`, `lm_head`w → `logits` |
 | `logits_select` | `M`(range) `n_rows` `n_vocab` `n_embd` `dtype` `round_bf16`/opt | `x`, `lm_head`w, `rows`, `tokens` → `values` |
@@ -900,6 +982,14 @@ rather than widening the bf16 one. What moves is whatever the attention kernel w
 bf16 would matter, because `libref` is the oracle for every op here and its bf16 path loads through
 float, which is not guaranteed to return a NaN payload unchanged. At u8 every value is 0..255,
 float carries it exactly, and oracle and kernel agree bit for bit on any payload at all.
+
+### `embed_lookup`'s `mult`
+
+Every gathered row multiplied by `mult` and rounded once to `x`'s dtype; absent, the gather is a
+plain copy. Gemma scales its embedding by `sqrt(hidden)` held in a bf16 buffer, so the plugin
+passes that value rounded to bf16 (22.625 at a hidden of 512, not 22.6274) and the product is the
+reference's to the bit. `wscale` is not this: it is the scale `embed_lookup_q`'s layout quantises
+with, and `embed_lookup` reads none.
 
 ### `embed_lookup`'s `vocab_offset`
 

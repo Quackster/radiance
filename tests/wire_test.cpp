@@ -183,6 +183,25 @@ TEST(base64_decode_rejects_a_character_outside_the_alphabet) {
     CHECK_EQ(out.size(), 0u);
 }
 
+/* Every length mod 3 round-trips; padding and whitespace are skipped wherever they stand, which
+ * splits the four-digit blocks the decoder takes at once; anything else is refused. */
+TEST(base64_round_trips_and_refuses_stray_bytes) {
+    std::vector<uint8_t> bytes(1000);
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (uint8_t)((i * 2654435761u) >> 13);
+    for (size_t n : { 0, 1, 2, 3, 4, 5, 999, 1000 }) {
+        std::vector<uint8_t> got;
+        CHECK(base64_decode(base64_encode(bytes.data(), n), &got));
+        CHECK(got == std::vector<uint8_t>(bytes.begin(), bytes.begin() + (long)n));
+    }
+    std::string e = base64_encode(bytes.data(), 100), spaced;
+    for (size_t i = 0; i < e.size(); ++i) { spaced += e[i]; if (i % 7 == 3) spaced += (i % 2 ? "\n" : " "); }
+    std::vector<uint8_t> got;
+    CHECK(base64_decode(spaced, &got));
+    CHECK(got == std::vector<uint8_t>(bytes.begin(), bytes.begin() + 100));
+    CHECK(!base64_decode("QUJD*REVG", &got));
+    CHECK(!base64_decode("QUJDREVG\x80", &got));
+}
+
 /* ================================================================== ids and errors */
 
 TEST(a_random_id_carries_its_prefix_and_does_not_repeat) {

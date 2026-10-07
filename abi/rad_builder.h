@@ -134,6 +134,15 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int64_t  max_out_rows;
+
+    /* THE MOST FRAMES ONE AUDIO ENCODER PASS MAY CARRY, and 0 means this deployment serves no
+     * audio: the plugin declares no audio encoder. An audio encoder's `max_tok`, the way
+     * max_enc_patches is a vision tower's -- its activations are sized against it -- and it bounds
+     * the longest clip, since one clip is one segment. The engine takes it from
+     * RadArchProbe::audio_frames, which is the plugin's statement of its longest clip.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    int64_t  max_audio_frames;
 } RadBuildCtx;
 
 /* ================================================================== weights */
@@ -444,8 +453,28 @@ int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
 int rad_declare_logits(RadBuilder* b, rad_buf logits);
 
 /* Opt in to RadBatch's compact token-score projection. Ordinary logits remain declared
- * and available for generation or an engine that supplies no compact score pairs. */
+ * and available for generation or an engine that supplies no compact score pairs.
+ * A pooled embedding program cannot opt in. */
 int rad_declare_token_scores(RadBuilder* b);
+
+/* WHICH BUFFER HOLDS THIS STEP'S POOLED VECTORS: what an EMBEDDING model returns instead of logits,
+ * one row a sequence of the step -- row s is sequence s's whole input pooled into one vector,
+ * whatever pooling the model was trained with (a mean, the last token, a CLS row). The core reads
+ * rows [0, n_seq) back after the step and hands each to its request; it does not normalise them,
+ * because that is the API's choice and not the model's.
+ *
+ * DECLARING IT MAKES THE PROGRAM AN EMBEDDING PROGRAM, and that changes what a step is:
+ *
+ *   - every sequence in a step is a WHOLE input. The scheduler never splits one across steps,
+ *     because an encoder that attends both ways cannot be fed half of its input, and it refuses
+ *     an input longer than one step's tokens rather than truncating it;
+ *   - there is no sampler, no drafter and no prefix cache, and nothing is generated: a request
+ *     ends at the step that carried it.
+ *
+ * f32, device, [>= max_seqs, dim]: `dim` is the vector's width and the extent the core reads. A
+ * Program declares this or logits, never both -- a model that both generates and embeds is two
+ * deployments. */
+int rad_declare_pooled(RadBuilder* b, rad_buf pooled);
 
 
 /* ================================================================== the drafter */
@@ -535,17 +564,21 @@ int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d);
  * the processor's (core/mm), which reads its geometry from the container: the two agree through
  * `patch_dim` and `merge`, and the core refuses a program whose encoder disagrees with the
  * processor about either. */
+/* A PROGRAM DECLARES AT MOST TWO: one serving images and video, one serving audio. An audio
+ * encoder's "patch" is one feature frame (a mel row), its `merge` is frames per output row, and
+ * its `max_patches` is RadBuildCtx::max_audio_frames. RadBatch::enc names which one a pass runs. */
 enum {
     RAD_MM_IMAGE = 1u << 0,
     RAD_MM_VIDEO = 1u << 1,
+    RAD_MM_AUDIO = 1u << 2,
 };
 
 typedef struct RadEncoderDecl {
     const char* name;            /* "vision" -- for messages */
-    uint32_t    modalities;      /* RAD_MM_* this encoder serves */
+    uint32_t    modalities;      /* RAD_MM_* this encoder serves: IMAGE|VIDEO, or AUDIO alone */
     int64_t     patch_dim;       /* elements in one input patch row */
     int64_t     merge;           /* input patches per output row */
-    int64_t     max_patches;     /* must equal RadBuildCtx::max_enc_patches */
+    int64_t     max_patches;     /* must equal RadBuildCtx::max_enc_patches (max_audio_frames) */
     int64_t     n_embd;          /* the width of an output row, the model's embedding width */
     /* [max_patches / merge, n_embd] bf16: where a pass leaves its rows. The core reads it after
      * the pass and before any other pass runs, so the planner may share its bytes with buffers
@@ -616,6 +649,17 @@ typedef struct RadArchProbe {
      * function reads untouched. Zero -- what a plugin that never heard of it leaves -- means the
      * core does not ask, and the activation arena is not lent. */
     int shape_probe_ok;
+
+    /* THE ENCODER'S MERGE: input patches a output row (RadEncoderDecl::merge), when the plugin
+     * declares an encoder. A pass carries whole output rows, so the core rounds the pass size it
+     * picks itself (`--mm-max-patches auto`) down to a multiple of this; a size the operator
+     * names is the operator's, and a plugin refuses one that does not divide. 0 is no opinion. */
+    int64_t enc_merge;
+
+    /* THE LONGEST AUDIO CLIP THE PLUGIN'S AUDIO ENCODER TAKES, in feature frames (a whole
+     * number of its merge), when it declares one: the engine sizes the audio pass with it
+     * (RadBuildCtx::max_audio_frames). 0 is no audio. */
+    int64_t audio_frames;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

@@ -53,6 +53,10 @@ struct Deps {
 
 struct ServerOptions {
     std::string model_id = "radiance";
+    /* AN EMBEDDING MODEL (rad_declare_pooled) GENERATES NOTHING: /v1/chat/completions and
+     * /v1/completions answer 501 naming /v1/embeddings, rather than queueing a request the engine
+     * would finish after one step with no text. */
+    bool        embedding_model = false;
     std::string host = "0.0.0.0";
     int         port = 8000;
     int         n_threads = 0;

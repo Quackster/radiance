@@ -842,6 +842,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
     bc.scope      = "";
     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
+    bc.max_audio_frames = cfg_.mm_audio_frames > 0 ? cfg_.mm_audio_frames : 0;
     /* A row at every token of the step and the sampler's row a sequence before them
      * (core/kld.h); the KL mode has no speculation, so a sequence samples one. */
     bc.max_out_rows = cfg_.kld() ? max_tok + cfg_.max_seqs : 0;
@@ -901,10 +902,26 @@ int Engine::declare() {
      * vision_config is a tower whose weights are in it. 16384 patches is a 2048 x 2048 image, the
      * largest one pass takes; the reference processor allows sixteen times that area, which would
      * need an activation region sixteen times as large on every card for one picture. */
+    /* THE AUDIO ENCODER'S PASS: the plugin's longest clip, when the model file carries an audio
+     * encoder (`radiance.encoder` names one) and the deployment did not ask for text only. */
+    if (cfg_.mm_audio_frames < 0) {
+        const char* enc = rad_meta_gets(&meta_, "radiance.encoder", "");
+        const bool named = enc && std::strstr(enc, "audio") != nullptr;
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb);
+        const bool text_only = cfg_.mm_max_patches == 0;
+        cfg_.mm_audio_frames = !text_only && pb.audio_frames > 0 && (named || !file_)
+                                   ? pb.audio_frames : 0;
+    }
     if (cfg_.mm_max_patches < 0) {
         const char* enc = rad_meta_gets(&meta_, "radiance.encoder", "");
         const bool tower = rad_meta_geti(&meta_, "vision_config.patch_size", 0) > 0;
         cfg_.mm_max_patches = (enc && *enc) || (!file_ && tower) ? 16384 : 0;
+        /* Whole output rows a pass: the plugin's merge, when it states one. */
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb);
+        if (cfg_.mm_max_patches > 0 && pb.enc_merge > 1)
+            cfg_.mm_max_patches -= cfg_.mm_max_patches % pb.enc_merge;
         if (cfg_.mm_max_patches == 0 && tower)
             RAD_INFO("media: off -- the checkpoint has a vision tower but this container was "
                      "converted without its weights; convert again to serve images and video");
@@ -3336,32 +3353,6 @@ int Engine::start() {
             r->ctx.set_stager(&r->fstager);
         }
 
-        /* RADIANCE_HOST_DOMAIN puts EVERY op on the host domain, which is how you run the whole
-         * model on libref. The oracle the entire correctness story leans on is a per-op
-         * one -- it compares one kernel against ref on the operands the device handed it -- and
-         * that can never answer "is the GRAPH right", because both sides read the same graph. A
-         * whole forward pass on the reference implementation can, and it is the only thing that
-         * can be diffed against another engine's.
-         *
-         * The site is a per-op property already (spec §5.1) and set_op_domain refuses by name
-         * where a band has no host kernel, so this is the existing seam and not a new one. It
-         * belongs with HIP_VISIBLE_DEVICES=-1, which drops the backend to host so the arena is
-         * host memory a host kernel may dereference; without that this asks ref to read VRAM. */
-        if (std::getenv("RADIANCE_HOST_DOMAIN")) {
-            if (!device_is_host())
-                RAD_WARN("RADIANCE_HOST_DOMAIN on the %s backend: the arena is device memory and "
-                         "a host kernel cannot read it. Set HIP_VISIBLE_DEVICES=-1 as well.",
-                         device_backend_name());
-            int moved = 0;
-            for (size_t i = 1; i < r->program.ops.size(); ++i) {
-                const int st = r->ctx.set_op_domain((rad_op)i, RAD_DOMAIN_HOST);
-                if (st < 0) return st;
-                ++moved;
-            }
-            RAD_WARN("RADIANCE_HOST_DOMAIN: %d op(s) on the host. This is the reference "
-                     "implementation running the whole model, and it is as slow as that sounds.",
-                     moved);
-        }
     }
     /* ---- THE LOAN: the cache's idle blocks, lent to the expert slab in place ----------------
      *

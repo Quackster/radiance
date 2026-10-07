@@ -270,6 +270,15 @@ private:
         ~Readback();
     };
     Readback             readback_;
+    /* AN EMBEDDING PROGRAM (rad_declare_pooled): no sampler, and a step's answer is the pooled
+     * buffer's first n_seq rows rather than sampled ids. `pooled_host_` is their pinned landing
+     * place, [max_seqs, pooled_dim_] f32; collect_pooled copies them there behind the step and
+     * hands each row to its request's sink after the step's one wait. */
+    bool                 embedding_ = false;
+    int64_t              pooled_dim_ = 0;
+    float*               pooled_host_ = nullptr;
+    int  collect_pooled_issue(const RadBatch* b, StepOut& so);
+    int  collect_pooled(const RadBatch* b, StepOut& so);
     bool serial_drafting() const;
     int  advance_all(int mode, int round, bool from_proposal, int rows = -1);
     int  issue_serial_drafter(int step, const RadBatch* b, StepOut& so);

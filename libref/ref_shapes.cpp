@@ -468,6 +468,131 @@ int ref_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return binary_shape(p, n_p, operand, "mul", out);
 }
 
+int ref_mul_weight_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    Opd o;
+    o.t(D, { M, n });          /* x */
+    if (gi(p, n_p, "scalar", 0)) o.t(D, { 1 });   /* w -- the scalar form */
+    else                          o.t(D, { n });   /* w -- one row */
+    o.t(D, { M, n });          /* y */
+    return o.finish("mul_weight", operand, out);
+}
+
+int ref_act_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return binary_shape(p, n_p, operand, "act_mul", out);
+}
+
+int ref_seg_mean_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t S = n_seq_of(p, n_p);
+    Opd o;
+    o.t(D, { M, n });                                         /* x */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* cu_seqlens */
+    o.t(D, { S, n });                                         /* y */
+    return o.finish("seg_mean", operand, out);
+}
+
+int ref_pool_rows_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t n = gi(p, n_p, "n", 0), k = gi(p, n_p, "k", 0);
+    /* A band's bound need not be whole windows; the rows a pass issues always are, so the
+     * description takes the whole windows under it. */
+    int64_t M = gi(p, n_p, "M", 0);
+    if (k > 0) M -= M % k;
+    if (M <= 0 || n <= 0 || k <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M, n });          /* x */
+    o.t(D, { M / k, n });      /* y */
+    return o.finish("pool_rows", operand, out);
+}
+
+int ref_relu_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    Opd o;
+    o.t(D, { M, n });          /* x */
+    o.t(D, { M, n });          /* y */
+    return o.finish("relu", operand, out);
+}
+
+int ref_clamp_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    Opd o;
+    o.t(D, { M, n });          /* x */
+    o.t(D, { 1 });             /* lo */
+    o.t(D, { 1 });             /* hi */
+    o.t(D, { M, n });          /* y */
+    return o.finish("clamp", operand, out);
+}
+
+/* THE AUDIO TOWER'S SEGMENTED OPS ARE DESCRIBED AS ONE SEGMENT. `cu_seqlens` counts in units
+ * `cu_div` times finer than the operand's rows (a subsampled layer reads the pass's frame
+ * boundaries), so the description's rows are M / cu_div and a band that does not divide -- or,
+ * for a strided convolution, does not divide into whole output rows -- is declined rather than
+ * described into a refusal. */
+int ref_conv2d_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), W = gi(p, n_p, "width", 0);
+    const int64_t cin = gi(p, n_p, "cin", 0), cout = gi(p, n_p, "cout", 0);
+    const int64_t kh = gi(p, n_p, "kh", 0), kw = gi(p, n_p, "kw", 0);
+    const int64_t st = gi(p, n_p, "stride", 1), pad = gi(p, n_p, "pad", 0);
+    const int64_t cdiv = gi(p, n_p, "cu_div", 1), vst = gi(p, n_p, "valid_stride", 1);
+    if (M <= 0 || W <= 0 || st <= 0 || cdiv <= 0 || vst <= 0 || M % (cdiv * st))
+        return RAD_E_UNSUPPORTED;
+    const int64_t T = M / cdiv;
+    const int64_t To = (T + 2 * pad - kh) / st + 1, Wo = (W + 2 * pad - kw) / st + 1;
+    Opd o;
+    o.t(D, { T, W * cin });                                   /* x */
+    o.t(D, { cout, cin, kh, kw });                            /* w */
+    o.t_idx({ 2 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu_seqlens */
+    o.t_idx({ T * vst }, 2, -1, 0);                           /* valid: 0 or 1 a row */
+    o.t(D, { To, Wo * cout });                                /* y */
+    return o.finish("conv2d", operand, out);
+}
+
+int ref_conv1d_dw_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), C = gi(p, n_p, "n", 0), K = gi(p, n_p, "k", 0);
+    const int64_t cdiv = gi(p, n_p, "cu_div", 1);
+    if (M <= 0 || cdiv <= 0 || M % cdiv) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M / cdiv, C });                                  /* x */
+    o.t(D, { C, 1, K });                                      /* w */
+    o.t_idx({ 2 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu_seqlens */
+    o.t(D, { M / cdiv, C });                                  /* y */
+    return o.finish("conv1d_dw", operand, out);
+}
+
+int ref_rel_sinusoid_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    Opd o;
+    o.t(D, { M, n });          /* y */
+    return o.finish("rel_sinusoid", operand, out);
+}
+
+int ref_attn_local_rel_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), hd = gi(p, n_p, "head_dim", 0);
+    const int64_t H = gi(p, n_p, "n_head", 0), L = gi(p, n_p, "left", 0);
+    const int64_t cdiv = gi(p, n_p, "cu_div", 1);
+    if (M <= 0 || cdiv <= 0 || M % cdiv || L < 0) return RAD_E_UNSUPPORTED;
+    const int64_t T = M / cdiv;
+    Opd o;
+    o.t(D, { T, H * hd });                                    /* q */
+    o.t(D, { T, H * hd });                                    /* k */
+    o.t(D, { T, H * hd });                                    /* v */
+    o.t(D, { L + 1, H * hd });                                /* relk */
+    o.t(D, { hd });                                           /* pds */
+    o.t_idx({ 2 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu_seqlens */
+    o.t(D, { T, H * hd });                                    /* out */
+    return o.finish("attn_local_rel", operand, out);
+}
+
 int ref_silu_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
@@ -1033,7 +1158,34 @@ int ref_qk_norm_rope_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* 
      * the parameters could know it. The vocabulary's `qk_norm_rope` takes the same contiguous fused
      * [q|k|v] row `rope` does, so it is describable and is described. */
     o.t(D, { M, (nh + 2 * nkv) * hd });              /* qkv, INOUT */
-    o.t_idx({ M }, 0, -1, 0);                        /* positions */
+    /* `blocks` takes a position per component, [C, M] component-major, C being one past the
+     * largest component `comps` names (the section count when it names none). */
+    const char* mode = gs(p, n_p, "mode");
+    if (mode && !std::strcmp(mode, "blocks")) {
+        int64_t nc = 0;
+        for (const char* q = gs(p, n_p, "sections"); q && *q; ) {
+            char* e = nullptr;
+            (void)std::strtoll(q, &e, 10);
+            if (e == q) break;
+            ++nc;
+            q = e;
+        }
+        if (const char* cs = gs(p, n_p, "comps")) {
+            int64_t mx = -1;
+            for (const char* q = cs; *q; ) {
+                char* e = nullptr;
+                const long long x = std::strtoll(q, &e, 10);
+                if (e == q) break;
+                mx = x > mx ? x : mx;
+                q = e;
+            }
+            nc = mx + 1;
+        }
+        if (nc <= 0) return RAD_E_UNSUPPORTED;
+        o.t_idx({ nc, M }, M, -1, 0);                /* positions */
+    } else {
+        o.t_idx({ M }, 0, -1, 0);                    /* positions */
+    }
     o.t(D, { hd });                                  /* q_w -- one gain per head channel */
     o.t(D, { hd });                                  /* k_w */
     return o.finish("qk_norm_rope", operand, out);

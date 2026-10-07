@@ -912,13 +912,14 @@ static void rmsnorm_rounding_case(const Plugin& pl) {
             T(dy, RAD_BF16, {M, n}),
         };
         ts[0].stride[0] = xld; ts[2].stride[0] = yld;
-        auto evaluate = [&](void* weight, float add, int flag) {
+        auto evaluate = [&](void* weight, float add, int flag, float mult = 1.0f) {
             std::vector<uint16_t> out((size_t)M * yld, h_to_bf16(-7.0f));
             st_memcpy(dy, out.data(), out.size() * 2, hipMemcpyHostToDevice);
             ts[1].data = weight;
             std::vector<RadParam> ps = {
                 PI("M", M), PI("n", n), PF("eps", 1e-6), PS("dtype", "bf16"), PF("wadd", add),
             };
+            ps.push_back(PF("mult", mult));
             if (flag >= 0) ps.push_back(PI("round_before_weight", flag));
             run_case(row, ts, ps, flag > 1 ? RAD_E_INVAL : RAD_OK);
             st_memcpy(out.data(), dy, out.size() * 2, hipMemcpyDeviceToHost);
@@ -941,6 +942,20 @@ static void rmsnorm_rounding_case(const Plugin& pl) {
         ok("rmsnorm rounds before gain, preserves pitched padding", rounded == expected, detail);
         ok("rmsnorm fixture distinguishes rounding modes", changed > 0, detail);
         evaluate(dw, wadd, 2);
+        // Preserve the upstream optional gain and scale when the new rounding is enabled.
+        for (void* weight : {dw, (void*)nullptr}) {
+            const float add = weight ? wadd : 0.0f, mult = 0.7f;
+            const auto scaled = evaluate(weight, add, 1, mult);
+            auto want = normalized;
+            for (int r = 0; r < M; ++r) for (int c = 0; c < n; ++c) {
+                const size_t i = (size_t)r * yld + c;
+                const float g = weight ? (wf32 ? gain32[c] : h_bf16(gain16[c])) + add : 1.0f;
+                want[i] = h_to_bf16(h_bf16(normalized[i]) * g * mult);
+            }
+            ok("rmsnorm rounding composes with optional gain and mult", scaled == want,
+               detail + (weight ? " gain" : " no gain"));
+            evaluate(weight, add, 2, mult);
+        }
     }
 }
 
@@ -11458,6 +11473,431 @@ static void device_phase(const Plugin& pl) {
                 PI("M", total), PI("head_dim", hd), PI("gqa", 1), PI("causal", 0),
                 PS("dtype", "bf16"), PI("max_seqlen", 32),
             };
+            run_case(r, ts, ps);
+        }
+    }
+    /* The encoder attention rows: a fused [q|k|v] projection read through column slices, at each
+     * compiled (head_dim, gqa), with and without a window. Numerics are rad-kbench's (libref is
+     * the oracle); this is the launch at every geometry. */
+    {
+        struct G { const char* name; int64_t hd, nh, nkv; };
+        for (const G& g : { G{ "attn_dense_h64_bf16", 64, 4, 4 },
+                            G{ "attn_dense_h256_gqa2_bf16", 256, 4, 2 },
+                            G{ "attn_dense_h512_gqa4_bf16", 512, 4, 1 } }) {
+            if (!sel(g.name)) continue;
+            const RadKernelInfo* r = find(pl, g.name);
+            if (!r) { ok(g.name, false, "row absent"); continue; }
+            for (const int64_t window : { (int64_t)0, (int64_t)9 }) {
+                const int64_t total = 48, wq = g.nh * g.hd, wkv = g.nkv * g.hd;
+                const int64_t width = wq + 2 * wkv;
+                void* qkv = dalloc((size_t)(total * width * 2));
+                auto col = [&](int64_t first, int64_t w) {
+                    RadTensor t = T(qkv, RAD_BF16, { total, w });
+                    t.data = (void*)((uint16_t*)qkv + first);
+                    t.stride[0] = width;
+                    return t;
+                };
+                std::vector<RadTensor> ts = {
+                    col(0, wq), col(wq, wkv), col(wq + wkv, wkv),
+                    T(nullptr, RAD_I32, { 3 }), T(nullptr, RAD_BF16, { total, wq }),
+                };
+                std::vector<RadParam> ps = {
+                    PI("M", total), PI("head_dim", g.hd), PI("gqa", g.nh / g.nkv),
+                    PI("causal", 0), PS("dtype", "bf16"), PF("scale", 1.0),
+                    PI("max_seqlen", 32), PI("window", window),
+                };
+                run_case(r, ts, ps);
+            }
+        }
+    }
+    if (sel("act_mul_bf16")) {
+        const RadKernelInfo* r = find(pl, "act_mul_bf16");
+        if (!r) ok("act_mul_bf16", false, "row absent");
+        else
+            for (const char* act : { "silu", "gelu", "gelu_tanh" }) {
+                std::vector<RadTensor> ts = { T(nullptr, RAD_BF16, { 5, 645 }),
+                                              T(nullptr, RAD_BF16, { 5, 645 }),
+                                              T(nullptr, RAD_BF16, { 5, 645 }) };
+                std::vector<RadParam> ps = { PI("M", 5), PI("n", 645), PS("act", act),
+                                             PS("dtype", "bf16") };
+                run_case(r, ts, ps);
+            }
+    }
+    if (sel("seg_mean_bf16")) {
+        const RadKernelInfo* r = find(pl, "seg_mean_bf16");
+        if (!r) ok("seg_mean_bf16", false, "row absent");
+        else {
+            std::vector<RadTensor> ts = { T(nullptr, RAD_BF16, { 23, 645 }),
+                                          T(nullptr, RAD_I32, { 4 }),
+                                          T(nullptr, RAD_BF16, { 3, 645 }) };
+            std::vector<RadParam> ps = { PI("M", 23), PI("n", 645), PS("dtype", "bf16") };
+            run_case(r, ts, ps);
+        }
+    }
+    if (sel("qk_norm_rope_bf16")) {
+        const RadKernelInfo* r = find(pl, "qk_norm_rope_bf16");
+        if (!r) ok("qk_norm_rope_bf16", false, "row absent");
+        else
+            for (const int64_t hd : { (int64_t)256, (int64_t)512 }) {
+                std::vector<RadTensor> ts = { T(nullptr, RAD_BF16, { 7, 8 * hd }),
+                                              T(nullptr, RAD_I32, { 7 }),
+                                              T(nullptr, RAD_BF16, { hd }),
+                                              T(nullptr, RAD_BF16, { hd }) };
+                std::vector<RadParam> ps = { PI("M", 7), PI("head_dim", hd), PI("n_head", 4),
+                                             PI("n_head_kv", 2), PF("theta", 10000.0),
+                                             PF("eps", 1e-6), PS("mode", "neox"),
+                                             PI("v_norm", 1) };
+                run_case(r, ts, ps);
+            }
+    }
+    if (sel("mul_weight_bf16")) {
+        const RadKernelInfo* r = find(pl, "mul_weight_bf16");
+        if (!r) ok("mul_weight_bf16", false, "row absent");
+        else
+            for (const int64_t wn : { (int64_t)1, (int64_t)512 }) {
+                std::vector<RadTensor> ts = { T(nullptr, RAD_BF16, { 5, 512 }),
+                                              T(nullptr, RAD_BF16, { wn }),
+                                              T(nullptr, RAD_BF16, { 5, 512 }) };
+                std::vector<RadParam> ps = { PI("M", 5), PI("n", 512), PS("dtype", "bf16"),
+                                             PI("scalar", wn == 1) };
+                run_case(r, ts, ps);
+            }
+    }
+    if (sel("qk_norm_rope_bf16")) {
+        const RadKernelInfo* r = find(pl, "qk_norm_rope_bf16");
+        if (r) {
+            /* blocks, the vision form: 12 heads of 64, x and y halves, components (row, col). */
+            std::vector<RadTensor> ts = { T(nullptr, RAD_BF16, { 9, 36 * 64 }),
+                                          T(nullptr, RAD_I32, { 2, 9 }),
+                                          T(nullptr, RAD_BF16, { 64 }),
+                                          T(nullptr, RAD_BF16, { 64 }) };
+            std::vector<RadParam> ps = { PI("M", 9), PI("head_dim", 64), PI("n_head", 12),
+                                         PI("n_head_kv", 12), PF("theta", 100.0), PF("eps", 1e-6),
+                                         PS("mode", "blocks"), PS("sections", "16 16"),
+                                         PS("comps", "1 0"), PI("v_norm", 1) };
+            run_case(r, ts, ps);
+        }
+    }
+    if (sel("pool_rows_bf16")) {
+        const RadKernelInfo* r = find(pl, "pool_rows_bf16");
+        if (!r) ok("pool_rows_bf16", false, "row absent");
+        else {
+            std::vector<RadTensor> ts = { T(nullptr, RAD_BF16, { 27, 768 }),
+                                          T(nullptr, RAD_BF16, { 3, 768 }) };
+            std::vector<RadParam> ps = { PI("M", 27), PI("n", 768), PI("k", 9),
+                                         PF("mult", 27.712812921102035), PS("dtype", "bf16") };
+            run_case(r, ts, ps);
+        }
+    }
+    /* --- the audio tower's ops, NUMERICALLY: each kernel against the formula libref implements,
+     * computed here on the host from the same bf16 inputs. rad-kbench's replay fixture predates
+     * these ops and a container-driven run needs the model, so this is where a wrong index in
+     * one of them shows up without either. Relative L2 against a bf16 rounding of the answer. */
+    {
+        uint64_t seed = 0x5eedull;
+        auto rnd = [&]() {
+            seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+            return (float)((int64_t)(seed >> 40) % 2001 - 1000) / 1000.0f;
+        };
+        auto up = [&](std::vector<float>& h) {
+            std::vector<uint16_t> b(h.size());
+            for (size_t i = 0; i < h.size(); ++i) { b[i] = h_to_bf16(h[i]); h[i] = h_bf16(b[i]); }
+            void* d = dalloc(b.size() * 2);
+            if (d) st_memcpy(d, b.data(), b.size() * 2, hipMemcpyHostToDevice);
+            return d;
+        };
+        auto down = [&](void* d, size_t n) {
+            std::vector<uint16_t> b(n);
+            st_memcpy(b.data(), d, n * 2, hipMemcpyDeviceToHost);
+            std::vector<float> f(n);
+            for (size_t i = 0; i < n; ++i) f[i] = h_bf16(b[i]);
+            return f;
+        };
+        auto rel = [](const std::vector<float>& got, const std::vector<float>& want) {
+            double e = 0, r = 0;
+            for (size_t i = 0; i < want.size(); ++i) {
+                const double w = h_bf16(h_to_bf16(want[i]));
+                e += (got[i] - w) * (got[i] - w);
+                r += w * w;
+            }
+            return r > 0 ? std::sqrt(e / r) : std::sqrt(e);
+        };
+        auto check = [&](const char* name, const std::vector<float>& got,
+                         const std::vector<float>& want, double tol) {
+            const double r = rel(got, want);
+            char d[96];
+            std::snprintf(d, sizeof d, "rel_l2 %.3g", r);
+            ok(name, r <= tol, d);
+        };
+        auto randv = [&](size_t n, float scale) {
+            std::vector<float> v(n);
+            for (auto& x : v) x = rnd() * scale;
+            return v;
+        };
+
+        if (sel("relu_bf16") || sel("silu_bf16") || sel("clamp_bf16")) {
+            const int64_t M = 5, n = 300;
+            std::vector<float> x = randv((size_t)(M * n), 2.0f);
+            void* dx = up(x);
+            void* dy = dalloc((size_t)(M * n) * 2);
+            if (const RadKernelInfo* r = find(pl, "relu_bf16")) {
+                std::vector<RadTensor> ts = { T(dx, RAD_BF16, { M, n }), T(dy, RAD_BF16, { M, n }) };
+                std::vector<RadParam> ps = { PI("M", M), PI("n", n), PS("dtype", "bf16") };
+                run_case(r, ts, ps);
+                std::vector<float> want(x.size());
+                for (size_t i = 0; i < x.size(); ++i) want[i] = x[i] > 0 ? x[i] : 0;
+                check("relu_bf16 numerics", down(dy, x.size()), want, 0.0);
+            } else ok("relu_bf16", false, "row absent");
+            if (const RadKernelInfo* r = find(pl, "silu_bf16")) {
+                std::vector<RadTensor> ts = { T(dx, RAD_BF16, { M, n }), T(dy, RAD_BF16, { M, n }) };
+                std::vector<RadParam> ps = { PI("M", M), PI("n", n), PS("dtype", "bf16") };
+                run_case(r, ts, ps);
+                std::vector<float> want(x.size());
+                for (size_t i = 0; i < x.size(); ++i) {
+                    const float v = h_bf16(h_to_bf16(x[i]));
+                    want[i] = v * (1.0f / (1.0f + std::exp(-v)));
+                }
+                /* expf on the card and std::exp here may differ by an ulp of f32, which can move
+                 * a bf16 rounding; anything beyond that is a wrong kernel. */
+                check("silu_bf16 numerics", down(dy, x.size()), want, 1e-3);
+            } else ok("silu_bf16", false, "row absent");
+            /* PAST THE GRID'S Y LIMIT: the audio subsampler's rectifier runs over 96000 rows of
+             * 128, and a launch of one grid row a matrix row stops at 65535. */
+            if (const RadKernelInfo* r = find(pl, "relu_bf16")) {
+                const int64_t Mb = 70000, nb = 32;
+                std::vector<float> xb = randv((size_t)(Mb * nb), 2.0f);
+                void* dxb = up(xb);
+                void* dyb = dalloc((size_t)(Mb * nb) * 2);
+                std::vector<RadTensor> ts = { T(dxb, RAD_BF16, { Mb, nb }), T(dyb, RAD_BF16, { Mb, nb }) };
+                std::vector<RadParam> ps = { PI("M", Mb), PI("n", nb), PS("dtype", "bf16") };
+                run_case(r, ts, ps);
+                std::vector<float> want(xb.size());
+                for (size_t i = 0; i < xb.size(); ++i) want[i] = xb[i] > 0 ? xb[i] : 0;
+                check("relu_bf16 numerics past 65535 rows", down(dyb, xb.size()), want, 0.0);
+            }
+            if (const RadKernelInfo* r = find(pl, "clamp_bf16")) {
+                std::vector<float> lo = { -0.5f }, hi = { 0.7f };
+                void* dl = up(lo);
+                void* dh = up(hi);
+                std::vector<RadTensor> ts = { T(dx, RAD_BF16, { M, n }), T(dl, RAD_BF16, { 1 }),
+                                              T(dh, RAD_BF16, { 1 }), T(dy, RAD_BF16, { M, n }) };
+                std::vector<RadParam> ps = { PI("M", M), PI("n", n), PS("dtype", "bf16") };
+                run_case(r, ts, ps);
+                std::vector<float> want(x.size());
+                for (size_t i = 0; i < x.size(); ++i)
+                    want[i] = x[i] < lo[0] ? lo[0] : (x[i] > hi[0] ? hi[0] : x[i]);
+                check("clamp_bf16 numerics", down(dy, x.size()), want, 0.0);
+            } else ok("clamp_bf16", false, "row absent");
+        }
+        if (sel("act_mul_bf16")) {
+            const RadKernelInfo* r = find(pl, "act_mul_bf16");
+            const int64_t M = 4, n = 200;
+            std::vector<float> g = randv((size_t)(M * n), 4.0f), u = randv((size_t)(M * n), 1.0f);
+            void* dg = up(g);
+            void* du = up(u);
+            void* dy = dalloc((size_t)(M * n) * 2);
+            std::vector<RadTensor> ts = { T(dg, RAD_BF16, { M, n }), T(du, RAD_BF16, { M, n }),
+                                          T(dy, RAD_BF16, { M, n }) };
+            std::vector<RadParam> ps = { PI("M", M), PI("n", n), PS("act", "sigmoid"),
+                                         PS("dtype", "bf16") };
+            if (r) run_case(r, ts, ps);
+            std::vector<float> want(g.size());
+            for (size_t i = 0; i < g.size(); ++i)
+                want[i] = h_bf16(h_to_bf16(1.0f / (1.0f + std::exp(-g[i])))) * u[i];
+            check("act_mul_bf16 sigmoid numerics", down(dy, g.size()), want, 1e-2);
+        }
+        if (sel("rmsnorm_bf16")) {
+            const RadKernelInfo* r = find(pl, "rmsnorm_bf16");
+            const int64_t M = 3, n = 1024;
+            std::vector<float> x = randv((size_t)(M * n), 3.0f), w = randv((size_t)n, 1.0f);
+            void* dx = up(x);
+            void* dw = up(w);
+            void* dy = dalloc((size_t)(M * n) * 2);
+            std::vector<RadTensor> ts = { T(dx, RAD_BF16, { M, n }), T(dw, RAD_BF16, { n }),
+                                          T(dy, RAD_BF16, { M, n }) };
+            std::vector<RadParam> ps = { PI("M", M), PI("n", n), PF("eps", 1e-6),
+                                         PS("dtype", "bf16"), PF("mult", 0.5) };
+            if (r) run_case(r, ts, ps);
+            std::vector<float> want(x.size());
+            for (int64_t m = 0; m < M; ++m) {
+                double ss = 0;
+                for (int64_t i = 0; i < n; ++i) ss += (double)x[(size_t)(m * n + i)] * x[(size_t)(m * n + i)];
+                const float s = 1.0f / std::sqrt((float)(ss / n) + 1e-6f);
+                for (int64_t i = 0; i < n; ++i)
+                    want[(size_t)(m * n + i)] = x[(size_t)(m * n + i)] * s * w[(size_t)i] * 0.5f;
+            }
+            check("rmsnorm_bf16 mult numerics", down(dy, x.size()), want, 1e-2);
+        }
+        if (sel("conv2d_bf16")) {
+            const RadKernelInfo* r = find(pl, "conv2d_bf16");
+            if (!r) ok("conv2d_bf16", false, "row absent");
+            /* The subsampler's two layers, two segments each, with a masked row. */
+            struct G { int64_t M, W, cin, cout, cdiv, vst; };
+            for (const G& g : { G{ 24, 128, 1, 128, 1, 1 }, G{ 12, 64, 128, 32, 2, 2 } }) {
+                if (!r) break;
+                const int64_t kh = 3, kw = 3, st = 2, pad = 1;
+                const int64_t Wo = (g.W + 2 * pad - kw) / st + 1;
+                const int64_t T0 = g.M / 2;                         /* rows a segment */
+                const int64_t To = (T0 + 2 * pad - kh) / st + 1, Mo = 2 * To;
+                std::vector<float> x = randv((size_t)(g.M * g.W * g.cin), 1.0f);
+                std::vector<float> w = randv((size_t)(g.cout * g.cin * kh * kw), 0.3f);
+                std::vector<int32_t> cu = { 0, (int32_t)(T0 * g.cdiv), (int32_t)(g.M * g.cdiv) };
+                std::vector<int32_t> valid((size_t)(g.M * g.vst), 1);
+                valid[(size_t)(3 * g.vst)] = 0;
+                void* dx = up(x);
+                void* dw = up(w);
+                void* dcu = dalloc(cu.size() * 4);
+                void* dv = dalloc(valid.size() * 4);
+                fill_i32(dcu, cu);
+                fill_i32(dv, valid);
+                void* dy = dalloc((size_t)(Mo * Wo * g.cout) * 2);
+                std::vector<RadTensor> ts = { T(dx, RAD_BF16, { g.M, g.W * g.cin }),
+                                              T(dw, RAD_BF16, { g.cout, g.cin, kh, kw }),
+                                              T(dcu, RAD_I32, { 3 }),
+                                              T(dv, RAD_I32, { g.M * g.vst }),
+                                              T(dy, RAD_BF16, { Mo, Wo * g.cout }) };
+                std::vector<RadParam> ps = { PI("M", g.M), PI("width", g.W), PI("cin", g.cin),
+                                             PI("cout", g.cout), PI("kh", kh), PI("kw", kw),
+                                             PI("stride", st), PI("pad", pad), PI("cu_div", g.cdiv),
+                                             PI("valid_stride", g.vst), PS("dtype", "bf16") };
+                run_case(r, ts, ps);
+                std::vector<float> want((size_t)(Mo * Wo * g.cout), 0.0f);
+                for (int64_t s = 0; s < 2; ++s)
+                    for (int64_t to = 0; to < To; ++to)
+                        for (int64_t wo = 0; wo < Wo; ++wo)
+                            for (int64_t co = 0; co < g.cout; ++co) {
+                                float acc = 0.0f;
+                                for (int64_t i = 0; i < kh; ++i) {
+                                    const int64_t ti = to * st - pad + i;
+                                    if (ti < 0 || ti >= T0) continue;
+                                    const int64_t tg = s * T0 + ti;
+                                    if (!valid[(size_t)(tg * g.vst)]) continue;
+                                    for (int64_t j = 0; j < kw; ++j) {
+                                        const int64_t wi = wo * st - pad + j;
+                                        if (wi < 0 || wi >= g.W) continue;
+                                        for (int64_t ci = 0; ci < g.cin; ++ci)
+                                            acc += x[(size_t)((tg * g.W + wi) * g.cin + ci)] *
+                                                   w[(size_t)(((co * g.cin + ci) * kh + i) * kw + j)];
+                                    }
+                                }
+                                want[(size_t)(((s * To + to) * Wo + wo) * g.cout + co)] = acc;
+                            }
+                check(g.cin == 1 ? "conv2d_bf16 layer0 numerics" : "conv2d_bf16 layer1 numerics",
+                      down(dy, want.size()), want, 1e-2);
+            }
+        }
+        if (sel("conv1d_dw_bf16")) {
+            const RadKernelInfo* r = find(pl, "conv1d_dw_bf16");
+            const int64_t M = 20, C = 1024, K = 5;
+            std::vector<float> x = randv((size_t)(M * C), 1.0f), w = randv((size_t)(C * K), 0.5f);
+            std::vector<int32_t> cu = { 0, 7, 20 };
+            void* dx = up(x);
+            void* dw = up(w);
+            void* dcu = dalloc(12);
+            fill_i32(dcu, cu);
+            void* dy = dalloc((size_t)(M * C) * 2);
+            std::vector<RadTensor> ts = { T(dx, RAD_BF16, { M, C }), T(dw, RAD_BF16, { C, 1, K }),
+                                          T(dcu, RAD_I32, { 3 }), T(dy, RAD_BF16, { M, C }) };
+            std::vector<RadParam> ps = { PI("M", M), PI("n", C), PI("k", K), PS("dtype", "bf16") };
+            if (r) run_case(r, ts, ps);
+            std::vector<float> want((size_t)(M * C));
+            for (int64_t t = 0; t < M; ++t) {
+                const int64_t t0 = t < 7 ? 0 : 7;
+                for (int64_t c = 0; c < C; ++c) {
+                    float acc = 0.0f;
+                    for (int64_t j = 0; j < K; ++j) {
+                        const int64_t tt = t - (K - 1) + j;
+                        if (tt >= t0) acc += x[(size_t)(tt * C + c)] * w[(size_t)(c * K + j)];
+                    }
+                    want[(size_t)(t * C + c)] = acc;
+                }
+            }
+            check("conv1d_dw_bf16 numerics", down(dy, want.size()), want, 1e-2);
+        }
+        if (sel("rel_sinusoid_bf16")) {
+            const RadKernelInfo* r = find(pl, "rel_sinusoid_bf16");
+            const int64_t M = 13, n = 1024, h = n / 2;
+            void* dy = dalloc((size_t)(M * n) * 2);
+            std::vector<RadTensor> ts = { T(dy, RAD_BF16, { M, n }) };
+            std::vector<RadParam> ps = { PI("M", M), PI("n", n), PF("max_timescale", 10000.0),
+                                         PS("dtype", "bf16") };
+            if (r) run_case(r, ts, ps);
+            const float inc = (float)(std::log(10000.0) / (double)(h - 1));
+            std::vector<float> want((size_t)(M * n));
+            for (int64_t d = 0; d < M; ++d)
+                for (int64_t i = 0; i < h; ++i) {
+                    const float ang = (float)d * std::exp((float)i * -inc);
+                    want[(size_t)(d * n + i)] = std::sin(ang);
+                    want[(size_t)(d * n + h + i)] = std::cos(ang);
+                }
+            check("rel_sinusoid_bf16 numerics", down(dy, want.size()), want, 1e-2);
+        }
+        if (sel("attn_local_rel_bf16")) {
+            const RadKernelInfo* r = find(pl, "attn_local_rel_bf16");
+            const int64_t M = 40, H = 8, D = 128, L = 12, W = H * D;
+            const float cap = 50.0f;
+            std::vector<float> q = randv((size_t)(M * W), 2.0f), k = randv((size_t)(M * W), 2.0f);
+            std::vector<float> v = randv((size_t)(M * W), 1.0f);
+            std::vector<float> rk = randv((size_t)((L + 1) * W), 1.0f), pds = randv((size_t)D, 3.0f);
+            std::vector<int32_t> cu = { 0, 17, 40 };
+            void* dq = up(q);
+            void* dk = up(k);
+            void* dv = up(v);
+            void* drk = up(rk);
+            void* dp = up(pds);
+            void* dcu = dalloc(12);
+            fill_i32(dcu, cu);
+            void* dout = dalloc((size_t)(M * W) * 2);
+            std::vector<RadTensor> ts = { T(dq, RAD_BF16, { M, W }), T(dk, RAD_BF16, { M, W }),
+                                          T(dv, RAD_BF16, { M, W }), T(drk, RAD_BF16, { L + 1, W }),
+                                          T(dp, RAD_BF16, { D }), T(dcu, RAD_I32, { 3 }),
+                                          T(dout, RAD_BF16, { M, W }) };
+            std::vector<RadParam> ps = { PI("M", M), PI("head_dim", D), PI("n_head", H),
+                                         PI("left", L), PI("right", 0), PF("softcap", cap),
+                                         PS("dtype", "bf16") };
+            if (r) run_case(r, ts, ps);
+            const float qs = (float)(1.0 / std::sqrt((double)D) / std::log(2.0));
+            const float ks = (float)(std::log(1.0 + std::exp(1.0)) / std::log(2.0));
+            std::vector<float> want((size_t)(M * W));
+            for (int64_t i = 0; i < M; ++i)
+                for (int64_t hh = 0; hh < H; ++hh) {
+                    const int64_t t0 = i < 17 ? 0 : 17, j0 = std::max(t0, i - L);
+                    std::vector<float> lg;
+                    float mx = -1e30f;
+                    for (int64_t j = j0; j <= i; ++j) {
+                        float ss = 0.0f;
+                        for (int64_t d = 0; d < D; ++d) {
+                            const float x = pds[(size_t)d];
+                            const float sp = h_bf16(h_to_bf16(
+                                x > 20.0f ? x : (x > 0 ? x + std::log1p(std::exp(-x))
+                                                       : std::log1p(std::exp(x)))));
+                            const float qf = q[(size_t)(i * W + hh * D + d)] * qs * sp;
+                            ss += qf * (k[(size_t)(j * W + hh * D + d)] * ks) +
+                                  qf * rk[(size_t)((i - j) * W + hh * D + d)];
+                        }
+                        lg.push_back(cap * std::tanh(ss / cap));
+                        mx = std::max(mx, lg.back());
+                    }
+                    float sum = 0.0f;
+                    for (float& l : lg) { l = std::exp(l - mx); sum += l; }
+                    for (int64_t d = 0; d < D; ++d) {
+                        float acc = 0.0f;
+                        for (int64_t j = j0; j <= i; ++j)
+                            acc += lg[(size_t)(j - j0)] / sum * v[(size_t)(j * W + hh * D + d)];
+                        want[(size_t)(i * W + hh * D + d)] = acc;
+                    }
+                }
+            check("attn_local_rel_bf16 numerics", down(dout, want.size()), want, 1e-2);
+        }
+    }
+    if (sel("cast_bf16_f32")) {
+        const RadKernelInfo* r = find(pl, "cast_bf16_f32");
+        if (!r) ok("cast_bf16_f32", false, "row absent");
+        else {
+            std::vector<RadTensor> ts = { T(nullptr, RAD_BF16, { 3, 768 }),
+                                          T(nullptr, RAD_F32, { 3, 768 }) };
+            std::vector<RadParam> ps = { PI("M", 3), PI("n", 768), PS("from", "bf16"),
+                                         PS("to", "f32") };
             run_case(r, ts, ps);
         }
     }

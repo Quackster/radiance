@@ -415,15 +415,12 @@ extern "C" int r4d_fuse_gated_quant_fp8(const RadParam* p, int n_p, uint64_t pre
  * half-of-an-operand problem. Three launches an attention layer becoming one is what the fusion
  * bought; the three are named here.
  *
- * `act` silu IS DECLINED, and not because the arithmetic differs -- `silu` is an op of the
- * vocabulary and `f2bf(gv / (1.0f + expf(-gv)))` is what a silu step would have to compute. It is
- * declined because THIS PLUGIN HAS NO `silu` ROW: libr4d declares `sigmoid` (sigmoid_bf16) and
- * `silu_mul` (silu_mul_bf16) and no bare `silu`, so the only implementation a caller could reach
- * is libref's, whose `act_silu(x)` is `x * act_sigmoid(x)` -- two f32 roundings where this
- * kernel does one divide. A chain that resolved there would report a difference in the last bit of
- * every element and call it a fault in the kernel, and a false failure is worse than a skip. A
- * libr4d `silu` row spelled `x / (1 + expf(-x))` would close the gap; without one the decline
- * stands. Nothing in the tree issues this row with silu -- the gated attention's gate is a
+ * `act` silu IS DECLINED because the arithmetic differs in the last bit. The chain's `silu` step
+ * resolves to silu_bf16 or libref, and both compute libref's `act_silu(x)`, `x * act_sigmoid(x)`
+ * -- two f32 roundings where this kernel does one divide, `f2bf(gv / (1.0f + expf(-gv)))`. A
+ * chain checked against it would report a difference in the last bit of many elements and call it
+ * a fault in the kernel, and a false failure is worse than a skip. Accepting silu needs this
+ * kernel to take the sigmoid first as well. Nothing in the tree issues this row with silu -- the gated attention's gate is a
  * sigmoid, which is why the shim's `mode` defaults to 1.
  *
  * TMP(0) is act(gate): an [M, n] bf16 plane the fusion genuinely never writes, so it is a

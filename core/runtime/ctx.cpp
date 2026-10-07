@@ -401,9 +401,21 @@ int Ctx::bind_ops() {
         /* Execution site. Site is a property of the weights (spec §5.1), so an op whose every
          * weight operand was placed on the host runs its host kernel and everything else runs on
          * the device. An op with no weights stays on the device; the planner overrides through
-         * set_op_domain, which is where the "contiguous host runs" objective actually lands. */
+         * set_op_domain, which is where the "contiguous host runs" objective actually lands.
+         *
+         * ON THE HOST BACKEND (no card visible: CPU-only serving) the device domain is the host's
+         * own memory and an op with no device kernel in any band runs its host kernel -- the
+         * whole model on libavx (or libref) with no switch to set. An op that does carry device
+         * rows there is a test registering fakes, and keeps them. */
         int dom = RAD_DOMAIN_DEVICE;
-        if (!oi.weights.empty()) {
+        if (device_is_host()) {
+            bool any_device = false;
+            for (int b = 0; b < p.n_bands && !any_device; ++b)
+                any_device = issue_table_[(size_t)p.plan_off + (size_t)b * RAD_N_DOMAINS +
+                                          RAD_DOMAIN_DEVICE].launch != nullptr;
+            if (!any_device) dom = RAD_DOMAIN_HOST;
+        }
+        if (dom == RAD_DOMAIN_DEVICE && !oi.weights.empty()) {
             bool all_host = true;
             for (rad_weight w : oi.weights) {
                 const WeightInfo* wi = P.weight(w);

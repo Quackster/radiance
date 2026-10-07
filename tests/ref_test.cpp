@@ -257,14 +257,15 @@ TEST(plugin_surface) {
 TEST(op_vocabulary) {
     static const char* kOps[] = {
         "rmsnorm", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "mtp_enter",
-        "layernorm", "add", "mul", "silu_mul", "gelu", "silu",
+        "layernorm", "add", "mul", "mul_weight", "silu_mul", "act_mul", "seg_mean", "pool_rows",
+        "relu", "clamp", "conv2d", "conv1d_dw", "rel_sinusoid", "attn_local_rel", "gelu", "silu",
         "sigmoid", "fill", "gather_rows", "scatter_rows", "ngram_ids", "ple_gate", "ple_conv",
         "embed_lookup_q", "cast", "causal_conv1d",
         "scale_rows",
         "softmax",
         "quant_act_i8", "quant_act_fp8", "had_quant_act_fp8", "had_quant_act_i8", "gram_accum",
         /* The fused fp8 forms. A host run needs EVERY op covered, so these are what stands
-         * between RADIANCE_HOST_DOMAIN and "site 'host' is unavailable for this band". */
+         * between a host-backend run and "site 'host' is unavailable for this band". */
         "rmsnorm_quant_fp8", "gated_quant_fp8", "gemm_nt_q_gated", "dflash_select",
         "rmsnorm_had_quant_i8",
         "gated_had_quant_i8",
@@ -460,6 +461,20 @@ TEST(op_rmsnorm_rounds_normalized_activation_only_when_requested) {
     // 3/sqrt(7.5) rounds to 1.09375 before multiplication by the exact BF16 gain.
     CHECK_EQ(legacy.at(2), 0.8828125f);
     CHECK_EQ(rounded.at(2), 0.87890625f);
+}
+
+TEST(op_rmsnorm_rounding_composes_with_optional_gain_and_mult) {
+    T x(RAD_BF16, {1, 4}); x.f({1, 2, 3, 4});
+    T w(RAD_F32, {4}); w.f({0.8046875f, 0.8046875f, 0.8046875f, 0.8046875f});
+    T y(RAD_BF16, {1, 4});
+    A weighted; weighted.t(x).t(w).t(y).i("M", 1).i("n", 4).d("eps", 0)
+        .s("dtype", "bf16").i("round_before_weight", 1).d("mult", 0.5);
+    CHECK_OK(run("rmsnorm", weighted));
+    CHECK_EQ(y.at(2), 0.439453125f);
+    A unit; unit.t(x).tnull().t(y).i("M", 1).i("n", 4).d("eps", 0)
+        .s("dtype", "bf16").i("round_before_weight", 1).d("mult", 0.5);
+    CHECK_OK(run("rmsnorm", unit));
+    CHECK_EQ(y.at(2), 0.546875f);
 }
 
 TEST(op_rmsnorm_add) {
@@ -1725,6 +1740,266 @@ TEST(op_attn_dense) {
     CHECK_NEAR(o.at(1), w0 / sum, 1e-6);
     CHECK_NEAR(o.at(2), w0 / sum, 1e-6);
     CHECK_NEAR(o.at(3), 1.0f / sum, 1e-6);
+}
+
+/* THE WINDOW IS TWO-SIDED WHEN THE ATTENTION IS: with window 2 a key one position away either
+ * side is visible and one two away is not. Three tokens, unit queries and keys, values that say
+ * which key they came from -- token 0 sees keys 0..1, token 1 sees 0..2, token 2 sees 1..2. */
+TEST(op_attn_dense_window) {
+    T q(RAD_F32, {3, 1, 1}); q.f({0, 0, 0});           /* zero scores: a plain mean of the keys */
+    T k(RAD_F32, {3, 1, 1}); k.f({0, 0, 0});
+    T v(RAD_F32, {3, 1, 1}); v.f({1, 10, 100});
+    T cu(RAD_I32, {2});      cu.n({0, 3});
+    T o(RAD_F32, {3, 1, 1});
+    A a; a.t(q).t(k).t(v).t(cu).t(o)
+          .i("M", 3).i("head_dim", 1).i("gqa", 1).i("causal", 0).i("window", 2)
+          .s("dtype", "f32");
+    CHECK_OK(run("attn_dense", a));
+    CHECK_NEAR(o.at(0), 11.0f / 2, 1e-5);
+    CHECK_NEAR(o.at(1), 111.0f / 3, 1e-5);
+    CHECK_NEAR(o.at(2), 110.0f / 2, 1e-5);
+    /* Causal with the same window: token 2 sees keys 1..2 and nothing after itself. */
+    T o2(RAD_F32, {3, 1, 1});
+    A c; c.t(q).t(k).t(v).t(cu).t(o2)
+          .i("M", 3).i("head_dim", 1).i("gqa", 1).i("causal", 1).i("window", 2)
+          .s("dtype", "f32");
+    CHECK_OK(run("attn_dense", c));
+    CHECK_NEAR(o2.at(0), 1.0f, 1e-5);
+    CHECK_NEAR(o2.at(1), 11.0f / 2, 1e-5);
+    CHECK_NEAR(o2.at(2), 110.0f / 2, 1e-5);
+}
+
+/* act_mul over two column slices of one fused row, the way an MLP's gate_up reaches it. */
+TEST(op_act_mul) {
+    T gu(RAD_F32, {2, 4}); gu.f({ 1, -2, 3, 4,   0.5f, 0, -1, 2 });
+    T g(RAD_F32, {2, 2}), u(RAD_F32, {2, 2});
+    g.t.data = gu.t.data;                         g.t.stride[0] = 4;
+    u.t.data = (void*)((float*)gu.t.data + 2);    u.t.stride[0] = 4;
+    T y(RAD_F32, {2, 2});
+    auto gt = [](float x) { return 0.5f * x * (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x))); };
+    A a; a.t(g).t(u).t(y).i("M", 2).i("n", 2).s("act", "gelu_tanh").s("dtype", "f32");
+    CHECK_OK(run("act_mul", a));
+    CHECK_NEAR(y.at(0), gt(1) * 3, 1e-5);
+    CHECK_NEAR(y.at(1), gt(-2) * 4, 1e-5);
+    CHECK_NEAR(y.at(2), gt(0.5f) * -1, 1e-5);
+    CHECK_NEAR(y.at(3), 0.0f, 1e-6);
+    A bad; bad.t(g).t(u).t(y).i("M", 2).i("n", 2).s("act", "relu").s("dtype", "f32");
+    CHECK(run("act_mul", bad) < 0);
+}
+
+/* seg_mean: one row a segment, an empty segment a zero row. */
+TEST(op_seg_mean) {
+    T x(RAD_F32, {4, 2}); x.f({ 1, 2,  3, 4,  5, 6,  7, 9 });
+    T cu(RAD_I32, {4});    cu.n({0, 3, 3, 4});
+    T y(RAD_F32, {3, 2});
+    A a; a.t(x).t(cu).t(y).i("M", 4).i("n", 2).s("dtype", "f32");
+    CHECK_OK(run("seg_mean", a));
+    CHECK_NEAR(y.at(0), 3.0f, 1e-6); CHECK_NEAR(y.at(1), 4.0f, 1e-6);
+    CHECK_EQ(y.at(2), 0.0f);         CHECK_EQ(y.at(3), 0.0f);
+    CHECK_NEAR(y.at(4), 7.0f, 1e-6); CHECK_NEAR(y.at(5), 9.0f, 1e-6);
+}
+
+/* relu and clamp: the plain element rules. */
+TEST(op_relu_clamp) {
+    T x(RAD_F32, {1, 3}); x.f({ -3.0f, 0.5f, 4.0f });
+    T y(RAD_F32, {1, 3});
+    A a; a.t(x).t(y).i("M", 1).i("n", 3).s("dtype", "f32");
+    CHECK_OK(run("relu", a));
+    CHECK_EQ(y.at(0), 0.0f); CHECK_EQ(y.at(1), 0.5f); CHECK_EQ(y.at(2), 4.0f);
+    T lo(RAD_F32, {1}); lo.f({ -1.0f });
+    T hi(RAD_F32, {1}); hi.f({ 2.0f });
+    A c; c.t(x).t(lo).t(hi).t(y).i("M", 1).i("n", 3).s("dtype", "f32");
+    CHECK_OK(run("clamp", c));
+    CHECK_EQ(y.at(0), -1.0f); CHECK_EQ(y.at(1), 0.5f); CHECK_EQ(y.at(2), 2.0f);
+}
+
+/* rmsnorm's mult scales the normed row; act_mul's sigmoid is a GLU gate. */
+TEST(op_rmsnorm_mult_act_sigmoid) {
+    T x(RAD_F32, {1, 2}); x.f({ 3, 4 });
+    T y(RAD_F32, {1, 2});
+    A a; a.t(x).tnull().t(y).i("M", 1).i("n", 2).d("eps", 0.0).d("mult", 0.5).s("dtype", "f32");
+    CHECK_OK(run("rmsnorm", a));
+    const float r = 0.5f / std::sqrt(12.5f);
+    CHECK_NEAR(y.at(0), 3.0f * r, 1e-6); CHECK_NEAR(y.at(1), 4.0f * r, 1e-6);
+    T g(RAD_F32, {1, 2}); g.f({ 0.0f, 2.0f });
+    T u(RAD_F32, {1, 2}); u.f({ 3.0f, 1.0f });
+    A b; b.t(g).t(u).t(y).i("M", 1).i("n", 2).s("act", "sigmoid").s("dtype", "f32");
+    CHECK_OK(run("act_mul", b));
+    CHECK_NEAR(y.at(0), 1.5f, 1e-6);
+    CHECK_NEAR(y.at(1), 1.0f / (1.0f + std::exp(-2.0f)), 1e-6);
+}
+
+/* conv2d: a 3x3 stride-2 window of ones over (time, width), each segment padded at its own
+ * edges, and the row mask. */
+TEST(op_conv2d) {
+    T x(RAD_F32, {4, 2}); x.f({ 1, 2,  3, 4,  5, 6,  7, 8 });
+    T w(RAD_F32, {1, 1, 3, 3}); w.f({ 1, 1, 1, 1, 1, 1, 1, 1, 1 });
+    T cu(RAD_I32, {2}); cu.n({ 0, 4 });
+    T y(RAD_F32, {2, 1});
+    auto args = [&](A& a) {
+        a.i("M", 4).i("width", 2).i("cin", 1).i("cout", 1).i("kh", 3).i("kw", 3).i("stride", 2)
+         .i("pad", 1).s("dtype", "f32");
+    };
+    A a; a.t(x).t(w).t(cu).tnull().t(y); args(a);
+    CHECK_OK(run("conv2d", a));
+    CHECK_NEAR(y.at(0), 1 + 2 + 3 + 4, 1e-6);          /* rows -1..1, cols -1..1 */
+    CHECK_NEAR(y.at(1), 3 + 4 + 5 + 6 + 7 + 8, 1e-6);  /* rows 1..3 */
+    T valid(RAD_I32, {4}); valid.n({ 1, 1, 0, 1 });
+    A b; b.t(x).t(w).t(cu).t(valid).t(y); args(b);
+    CHECK_OK(run("conv2d", b));
+    CHECK_NEAR(y.at(1), 3 + 4 + 7 + 8, 1e-6);          /* row 2 masked */
+    T cu2(RAD_I32, {3}); cu2.n({ 0, 2, 4 });
+    A c; c.t(x).t(w).t(cu2).tnull().t(y); args(c);
+    CHECK_OK(run("conv2d", c));
+    CHECK_NEAR(y.at(0), 1 + 2 + 3 + 4, 1e-6);
+    CHECK_NEAR(y.at(1), 5 + 6 + 7 + 8, 1e-6);          /* row 1 is the other segment's */
+}
+
+/* conv1d_dw: causal, the taps before a segment's start read as zero. */
+TEST(op_conv1d_dw) {
+    T x(RAD_F32, {4, 1}); x.f({ 1, 1, 1, 1 });
+    T w(RAD_F32, {1, 1, 3}); w.f({ 1, 2, 3 });
+    T cu(RAD_I32, {3}); cu.n({ 0, 2, 4 });
+    T y(RAD_F32, {4, 1});
+    A a; a.t(x).t(w).t(cu).t(y).i("M", 4).i("n", 1).i("k", 3).s("dtype", "f32");
+    CHECK_OK(run("conv1d_dw", a));
+    CHECK_NEAR(y.at(0), 3.0f, 1e-6); CHECK_NEAR(y.at(1), 5.0f, 1e-6);
+    CHECK_NEAR(y.at(2), 3.0f, 1e-6); CHECK_NEAR(y.at(3), 5.0f, 1e-6);
+}
+
+/* rel_sinusoid: sin then cos over the timescales. */
+TEST(op_rel_sinusoid) {
+    T y(RAD_F32, {2, 4});
+    A a; a.t(y).i("M", 2).i("n", 4).d("max_timescale", 10000.0).s("dtype", "f32");
+    CHECK_OK(run("rel_sinusoid", a));
+    const float inv1 = std::exp(-std::log(10000.0f));
+    CHECK_EQ(y.at(0), 0.0f); CHECK_EQ(y.at(2), 1.0f);
+    CHECK_NEAR(y.at(4), std::sin(1.0f), 1e-6); CHECK_NEAR(y.at(5), std::sin(inv1), 1e-9);
+    CHECK_NEAR(y.at(6), std::cos(1.0f), 1e-6); CHECK_NEAR(y.at(7), std::cos(inv1), 1e-6);
+}
+
+/* attn_local_rel: the window, the relative term and the softcap, against the formula. */
+TEST(op_attn_local_rel) {
+    const int Tn = 3, D = 2, L = 1;
+    T q(RAD_F32, {Tn, D}); q.f({ 0.5f, -1.0f, 1.0f, 0.25f, -0.5f, 2.0f });
+    T k(RAD_F32, {Tn, D}); k.f({ 1.0f, 0.0f, 0.5f, 0.5f, -1.0f, 1.5f });
+    T v(RAD_F32, {Tn, D}); v.f({ 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f });
+    T rk(RAD_F32, {L + 1, D}); rk.f({ 0.1f, 0.2f, -0.3f, 0.4f });
+    T pds(RAD_F32, {D}); pds.f({ 0.0f, 1.0f });
+    T cu(RAD_I32, {2}); cu.n({ 0, Tn });
+    T o(RAD_F32, {Tn, D});
+    A a; a.t(q).t(k).t(v).t(rk).t(pds).t(cu).t(o).i("M", Tn).i("head_dim", D).i("n_head", 1)
+          .i("left", L).i("right", 0).d("softcap", 5.0).s("dtype", "f32");
+    CHECK_OK(run("attn_local_rel", a));
+    const float qs = (float)(1.0 / std::sqrt((double)D) / std::log(2.0));
+    const float ks = (float)(std::log(1.0 + std::exp(1.0)) / std::log(2.0));
+    for (int i = 0; i < Tn; ++i) {
+        float lg[2], p[2], qf[2];
+        for (int d = 0; d < D; ++d) {
+            const float x = pds.at(d);
+            qf[d] = q.at(i * D + d) * qs * std::log1p(std::exp(x));
+        }
+        const int j0 = i - L > 0 ? i - L : 0;
+        float mx = -1e30f, sum = 0.0f;
+        for (int j = j0; j <= i; ++j) {
+            float s = 0.0f;
+            for (int d = 0; d < D; ++d)
+                s += qf[d] * k.at(j * D + d) * ks + qf[d] * rk.at((i - j) * D + d);
+            lg[j - j0] = 5.0f * std::tanh(s / 5.0f);
+            mx = lg[j - j0] > mx ? lg[j - j0] : mx;
+        }
+        for (int j = j0; j <= i; ++j) { p[j - j0] = std::exp(lg[j - j0] - mx); sum += p[j - j0]; }
+        for (int d = 0; d < D; ++d) {
+            float acc = 0.0f;
+            for (int j = j0; j <= i; ++j) acc += p[j - j0] / sum * v.at(j * D + d);
+            CHECK_NEAR(o.at(i * D + d), acc, 1e-5);
+        }
+    }
+}
+
+/* pool_rows: the mean of every k rows, rounded, then the multiplier. */
+TEST(op_pool_rows) {
+    T x(RAD_F32, {4, 2}); x.f({ 1, 2,  3, 4,  5, 6,  7, 9 });
+    T y(RAD_F32, {2, 2});
+    A a; a.t(x).t(y).i("M", 4).i("n", 2).i("k", 2).d("mult", 2.0).s("dtype", "f32");
+    CHECK_OK(run("pool_rows", a));
+    CHECK_NEAR(y.at(0), 4.0f, 1e-6);  CHECK_NEAR(y.at(1), 6.0f, 1e-6);
+    CHECK_NEAR(y.at(2), 12.0f, 1e-6); CHECK_NEAR(y.at(3), 15.0f, 1e-6);
+    A bad; bad.t(x).t(y).i("M", 4).i("n", 2).i("k", 3).s("dtype", "f32");
+    CHECK(run("pool_rows", bad) < 0);
+}
+
+/* rmsnorm with no gain: a unit gain. */
+TEST(op_rmsnorm_no_gain) {
+    T x(RAD_F32, {1, 2}); x.f({ 3, 4 });
+    T y(RAD_F32, {1, 2});
+    A a; a.t(x).tnull().t(y).i("M", 1).i("n", 2).d("eps", 0.0).s("dtype", "f32");
+    CHECK_OK(run("rmsnorm", a));
+    const float r = 1.0f / std::sqrt(12.5f);
+    CHECK_NEAR(y.at(0), 3.0f * r, 1e-6); CHECK_NEAR(y.at(1), 4.0f * r, 1e-6);
+}
+
+/* qk_norm_rope `blocks`: each section rotates its own channel block by its own component. */
+TEST(op_qk_norm_rope_blocks) {
+    /* one token, one q head and one k head of 8 channels; sections "2 2", comps "1 0". */
+    T qkv(RAD_F32, {1, 24});
+    std::vector<float> v(24);
+    for (int i = 0; i < 24; ++i) v[(size_t)i] = 0.1f * (float)(i + 1);
+    qkv.f(v);
+    T pos(RAD_I32, {2, 1}); pos.n({ 3, 5 });
+    T qw(RAD_F32, {8}); qw.f({ 1, 1, 1, 1, 1, 1, 1, 1 });
+    T kw(RAD_F32, {8}); kw.f({ 1, 1, 1, 1, 1, 1, 1, 1 });
+    A a; a.t(qkv).t(pos).t(qw).t(kw).i("M", 1).i("head_dim", 8).i("n_head", 1).i("n_head_kv", 1)
+          .d("theta", 100.0).d("eps", 0.0).s("mode", "blocks").s("sections", "2 2").s("comps", "1 0");
+    CHECK_OK(run("qk_norm_rope", a));
+    /* The q head: normed, then block 0 (channels 0..3) turned by component 1 (5) and block 1
+     * (channels 4..7) by component 0 (3), pairs (j, j+2) at theta^(-j/2). */
+    float h[8], ss = 0.0f;
+    for (int i = 0; i < 8; ++i) { h[i] = 0.1f * (float)(i + 1); ss += h[i] * h[i]; }
+    const float sc = 1.0f / std::sqrt(ss / 8.0f);
+    for (int i = 0; i < 8; ++i) h[i] *= sc;
+    const float p[2] = { 5.0f, 3.0f };
+    for (int c = 0; c < 2; ++c)
+        for (int j = 0; j < 2; ++j) {
+            const float ang = p[c] / std::pow(100.0f, (float)j / 2.0f);
+            const float x0 = h[4 * c + j], x1 = h[4 * c + 2 + j];
+            CHECK_NEAR(qkv.at(4 * c + j), x0 * std::cos(ang) - x1 * std::sin(ang), 1e-5);
+            CHECK_NEAR(qkv.at(4 * c + 2 + j), x0 * std::sin(ang) + x1 * std::cos(ang), 1e-5);
+        }
+}
+
+/* mul_weight: a one-element weight scales every element, a one-row weight every column. */
+TEST(op_mul_weight) {
+    T x(RAD_F32, {2, 3}); x.f({ 1, 2, 3, 4, 5, 6 });
+    T s(RAD_F32, {1});    s.f({ 0.5f });
+    T y(RAD_F32, {2, 3});
+    A a; a.t(x).t(s).t(y).i("M", 2).i("n", 3).s("dtype", "f32");
+    CHECK_OK(run("mul_weight", a));
+    for (int i = 0; i < 6; ++i) CHECK_NEAR(y.at(i), 0.5f * (float)(i + 1), 1e-6);
+    T r(RAD_F32, {3});    r.f({ 1, 10, 100 });
+    A b; b.t(x).t(r).t(y).i("M", 2).i("n", 3).s("dtype", "f32");
+    CHECK_OK(run("mul_weight", b));
+    CHECK_NEAR(y.at(4), 50.0f, 1e-6);
+    T bad(RAD_F32, {2});  bad.f({ 1, 2 });
+    A c; c.t(x).t(bad).t(y).i("M", 2).i("n", 3).s("dtype", "f32");
+    CHECK(run("mul_weight", c) < 0);
+}
+
+/* v_norm: the v heads are RMS-normed with unit gain and not rotated; q and k as before. */
+TEST(op_qk_norm_rope_v_norm) {
+    T qkv(RAD_F32, {1, 6}); qkv.f({ 3, 4,   1, 1,   6, 8 });   /* one q, one k, one v head of 2 */
+    T pos(RAD_I32, {1});    pos.n({ 0 });                       /* position 0: no rotation */
+    T qw(RAD_F32, {2});     qw.f({ 1, 1 });
+    T kw(RAD_F32, {2});     kw.f({ 2, 2 });
+    A a; a.t(qkv).t(pos).t(qw).t(kw)
+          .i("M", 1).i("head_dim", 2).i("n_head", 1).i("n_head_kv", 1)
+          .d("theta", 10000.0).d("eps", 0.0).i("v_norm", 1);
+    CHECK_OK(run("qk_norm_rope", a));
+    const float r = 1.0f / std::sqrt(12.5f);
+    CHECK_NEAR(qkv.at(0), 3 * r, 1e-5);   CHECK_NEAR(qkv.at(1), 4 * r, 1e-5);
+    CHECK_NEAR(qkv.at(2), 2.0f, 1e-5);    CHECK_NEAR(qkv.at(3), 2.0f, 1e-5);
+    const float rv = 1.0f / std::sqrt(50.0f);
+    CHECK_NEAR(qkv.at(4), 6 * rv, 1e-5);  CHECK_NEAR(qkv.at(5), 8 * rv, 1e-5);
 }
 
 TEST(op_kv_store) {

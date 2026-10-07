@@ -170,7 +170,10 @@ public:
         const mm::Item* item = nullptr;
         int32_t         seg0 = 0, n_seg = 0;
     };
-    const RadBatch* build_encoder(const std::vector<EncoderPart>& parts, int step);
+    /* `enc` is the encoder the pass runs: its patch width, pass size and merge bound the parts,
+     * and its modalities are RadBatch::enc. */
+    const RadBatch* build_encoder(const std::vector<EncoderPart>& parts, int step,
+                                  const RadEncoderDecl& enc);
     bool    has_encoder() const { return mm_on_; }
     int64_t encoder_patches() const { return enc_patches_; }
     /* Reserve retained encoder rows from the accounted pool. A full pool leaves
@@ -380,9 +383,10 @@ private:
     std::vector<RadCopyRange> mm_host_ranges_;
     struct MediaCopy { const void* src; int64_t dst, bytes; };
     std::vector<MediaCopy> mm_device_copies_;
-    /* ...and the encoder's inputs: patches, their coordinates and the segment boundaries, the
-     * largest pass the plugin declared. One copy a rank, since each runs the tower itself. */
-    int64_t                enc_patches_ = 0, enc_dim_ = 0, enc_segs_ = 0;
+    /* ...and the encoders' inputs: patches, their coordinates and the segment boundaries, sized
+     * for the larger of the passes the plugin declared (a vision tower's and an audio encoder's
+     * run one at a time and share it). One copy a rank, since each runs the tower itself. */
+    int64_t                enc_patches_ = 0, enc_pix_elems_ = 0, enc_segs_ = 0;
     std::vector<void*>     enc_pix_dev_, enc_coord_dev_, enc_cu_dev_;
     uint16_t*              enc_pix_host_ = nullptr;
     int32_t*               enc_coord_host_ = nullptr;

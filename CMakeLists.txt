@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 # VERSION is what /version reports and what a client checks compatibility against. It is NOT the
 # ABI version -- that lives in abi/rad_abi.h and is read out of the header below, because
 # a plugin contract and a server release do not move together.
-project(radiance VERSION 1.2.3 LANGUAGES C CXX)
+project(radiance VERSION 1.2.4 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,7 +18,7 @@ endif()
 # cache STRING.
 set(RAD_WITH_HIP "AUTO" CACHE STRING "ON | OFF | AUTO -- build the HIP backend and device kernels")
 set_property(CACHE RAD_WITH_HIP PROPERTY STRINGS ON OFF AUTO)
-set(RAD_WITH_FFMPEG "AUTO" CACHE STRING "ON | OFF | AUTO -- decode image and video parts with libavformat/libavcodec/libswscale")
+set(RAD_WITH_FFMPEG "AUTO" CACHE STRING "ON | OFF | AUTO -- decode image, video and audio parts with libavformat/libavcodec/libswscale/libswresample")
 set_property(CACHE RAD_WITH_FFMPEG PROPERTY STRINGS ON OFF AUTO)
 option(RAD_BUILD_TESTS "Build the test suite"                            ON)
 option(RAD_ASAN        "Build with AddressSanitizer"                     OFF)
@@ -316,22 +316,23 @@ endif()
 find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------- media decoding
-# An image or video part of a chat request is decoded by libavformat/libavcodec and converted by
-# libswscale (core/mm/media.cpp). Without them the engine builds and serves text, and refuses a
+# An image, video or audio part of a request is decoded by libavformat/libavcodec and converted by
+# libswscale or libswresample (core/mm/media.cpp). Without them the engine builds and serves text, and refuses a
 # media part by name -- the same tri-state as HIP, because a machine that has the libraries should
 # not silently build without them.
 set(RAD_FFMPEG_FOUND OFF)
 if(NOT RAD_WITH_FFMPEG STREQUAL "OFF")
   find_package(PkgConfig QUIET)
   if(PkgConfig_FOUND)
-    pkg_check_modules(RAD_FFMPEG QUIET IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
+    pkg_check_modules(RAD_FFMPEG QUIET IMPORTED_TARGET libavformat libavcodec libavutil libswscale
+                      libswresample)
   endif()
   if(RAD_FFMPEG_FOUND)
     message(STATUS "radiance: media decoding via libavformat ${RAD_FFMPEG_libavformat_VERSION}")
   elseif(RAD_WITH_FFMPEG STREQUAL "ON")
-    message(FATAL_ERROR "RAD_WITH_FFMPEG=ON but libavformat/libavcodec/libavutil/libswscale were not found.")
+    message(FATAL_ERROR "RAD_WITH_FFMPEG=ON but libavformat/libavcodec/libavutil/libswscale/libswresample were not found.")
   else()
-    message(STATUS "radiance: no libavformat -- image and video input will be refused")
+    message(STATUS "radiance: no libavformat -- image, video and audio input will be refused")
   endif()
 endif()
 

@@ -469,7 +469,7 @@ int ref_gram_accum(const RadArgs* a, RadStream) {
  *
  * THREE OPS THAT EXIST SO THAT A HOST RUN IS POSSIBLE AT ALL. libr4d fuses the fp8 activation
  * quantiser into whichever kernel already has the row in registers, and declares the fused form as
- * its own op. Without a host kernel for those names, `RADIANCE_HOST_DOMAIN` -- the only thing that
+ * its own op. Without a host kernel for those names, a host-backend run -- the only thing that
  * can answer "is the GRAPH right", because the per-op oracle reads the same graph both sides --
  * cannot start on an fp8 model ("site 'host' is unavailable for this band").
  *

@@ -191,6 +191,8 @@ static const RadParamSpec pAttnDense[] = {
      * cu_seqlens segments. Absent, the shim passes the total token count, which is a valid bound
      * and picks the tall arm -- a speed choice, never a correctness one. */
     P_INTO("max_seqlen"),
+    /* attn_paged's window over a segment's own positions (docs/OPS.md); 0 is none. */
+    P_INTO("window"),
 };
 static const RadOperandSpec oAttnDense[] = {
     { "q",          RAD_OPD_IN,  0 },
@@ -1520,11 +1522,13 @@ static const RadParamSpec pRmsNorm[] = {
     P_F64("eps"),
     { "dtype", RAD_P_STR, RAD_REQUIRED },
     P_F64O("wadd"),
+    P_F64O("mult"),          /* scales the row before its one rounding */
     P_INTO("round_before_weight"),
 };
+/* `w` optional: absent, the gain is one. */
 static const RadOperandSpec oRmsNorm[] = {
     { "x", RAD_OPD_IN,     0 },
-    { "w", RAD_OPD_WEIGHT, 0 },
+    { "w", RAD_OPD_WEIGHT, 1 },
     { "y", RAD_OPD_OUT,    0 },
 };
 
@@ -1537,6 +1541,90 @@ static const RadOperandSpec oBinary[] = {
     { "a", RAD_OPD_IN,  0 },
     { "b", RAD_OPD_IN,  0 },
     { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pActMul[] = {
+    P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype"),
+};
+/* `M` is the step's token count and bands the op; the segment count is cu_seqlens' length. */
+static const RadParamSpec pSegMean[] = {
+    P_INT("M"), P_INT("n"), P_STR("dtype"),
+};
+static const RadOperandSpec oSegMean[] = {
+    { "x",          RAD_OPD_IN,  0 },
+    { "cu_seqlens", RAD_OPD_IN,  0 },
+    { "y",          RAD_OPD_OUT, 0 },
+};
+/* docs/OPS.md's `qk_norm_rope`: a fused [q | k | v] row in place, theta and not a table. */
+static const RadParamSpec pQkNormRope[] = {
+    P_INT("M"), P_INT("head_dim"), P_INT("n_head"), P_INT("n_head_kv"), P_F64("theta"),
+    P_F64("eps"), P_F64O("scale"), P_STRO("mode"), P_INTO("rotary_dim"), P_F64O("wadd"),
+    P_INTO("v_norm"), P_STRO("sections"), P_STRO("comps"),
+};
+/* `M` is the INPUT row count, a multiple of `k`. */
+static const RadParamSpec pPoolRows[] = {
+    P_INT("M"), P_INT("n"), P_INT("k"), P_F64O("mult"), P_STR("dtype"),
+};
+static const RadOperandSpec oQkNormRope[] = {
+    { "qkv",       RAD_OPD_INOUT,  0 },
+    { "positions", RAD_OPD_IN,     0 },
+    { "q_w",       RAD_OPD_WEIGHT, 0 },
+    { "k_w",       RAD_OPD_WEIGHT, 0 },
+};
+/* `scalar` 1 says `w` is one element rather than one row -- for the shape description; the shim
+ * reads it off the operand. */
+static const RadParamSpec pMulWeight[] = {
+    P_INT("M"), P_INT("n"), P_STR("dtype"), P_INTO("scalar"),
+};
+/* The audio (USM conformer) tower's operators; libref's lists, field for field. */
+static const RadOperandSpec oClamp[] = {
+    { "x",  RAD_OPD_IN,     0 },
+    { "lo", RAD_OPD_WEIGHT, 0 },
+    { "hi", RAD_OPD_WEIGHT, 0 },
+    { "y",  RAD_OPD_OUT,    0 },
+};
+static const RadParamSpec pConv2d[] = {
+    P_INT("M"), P_INT("width"), P_INT("cin"), P_INT("cout"), P_INT("kh"), P_INT("kw"),
+    P_INT("stride"), P_INT("pad"), P_INTO("cu_div"), P_INTO("valid_stride"), P_STR("dtype"),
+};
+static const RadOperandSpec oConv2d[] = {
+    { "x",          RAD_OPD_IN,     0 },
+    { "w",          RAD_OPD_WEIGHT, 0 },
+    { "cu_seqlens", RAD_OPD_IN,     0 },
+    { "valid",      RAD_OPD_IN,     1 },
+    { "y",          RAD_OPD_OUT,    0 },
+};
+static const RadParamSpec pConv1dDw[] = {
+    P_INT("M"), P_INT("n"), P_INT("k"), P_INTO("cu_div"), P_STR("dtype"),
+};
+static const RadOperandSpec oConv1dDw[] = {
+    { "x",          RAD_OPD_IN,     0 },
+    { "w",          RAD_OPD_WEIGHT, 0 },
+    { "cu_seqlens", RAD_OPD_IN,     0 },
+    { "y",          RAD_OPD_OUT,    0 },
+};
+static const RadParamSpec pRelSin[] = {
+    P_INT("M"), P_INT("n"), P_F64O("max_timescale"), P_STR("dtype"),
+};
+static const RadOperandSpec oRelSin[] = {
+    { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pAttnLocalRel[] = {
+    P_INT("M"), P_INT("head_dim"), P_INT("n_head"), P_INT("left"), P_INT("right"),
+    P_F64("softcap"), P_INTO("cu_div"), P_STR("dtype"),
+};
+static const RadOperandSpec oAttnLocalRel[] = {
+    { "q",          RAD_OPD_IN,     0 },
+    { "k",          RAD_OPD_IN,     0 },
+    { "v",          RAD_OPD_IN,     0 },
+    { "relk",       RAD_OPD_IN,     0 },
+    { "pds",        RAD_OPD_WEIGHT, 0 },
+    { "cu_seqlens", RAD_OPD_IN,     0 },
+    { "out",        RAD_OPD_OUT,    0 },
+};
+static const RadOperandSpec oMulWeight[] = {
+    { "x", RAD_OPD_IN,     0 },
+    { "w", RAD_OPD_WEIGHT, 0 },
+    { "y", RAD_OPD_OUT,    0 },
 };
 static const RadOperandSpec oGateUp[] = {
     { "gate_up", RAD_OPD_IN,  0 },
@@ -1654,6 +1742,17 @@ static const RadParamSpec pEmbed[] = {
     /* The scale embed_lookup_q's layout quantises with. That op shares this parameter list and
      * libref fixes it for both, so it is spelled here to match; embed_lookup reads no scale. */
     { "wscale",  RAD_P_F64, RAD_OPTIONAL },
+};
+/* embed_lookup's own: pEmbed and `mult`, the factor every gathered row is multiplied by (Gemma's
+ * sqrt(hidden)); libref's list, which embed_lookup_q does not share. */
+static const RadParamSpec pEmbedM[] = {
+    { "M",       RAD_P_INT, RAD_REQUIRED },
+    { "n_embd",  RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab", RAD_P_INT, RAD_REQUIRED },
+    { "dtype",   RAD_P_STR, RAD_REQUIRED },
+    { "vocab_offset", RAD_P_INT, RAD_OPTIONAL },
+    { "wscale",  RAD_P_F64, RAD_OPTIONAL },
+    { "mult",    RAD_P_F64, RAD_OPTIONAL },
 };
 static const RadOperandSpec oEmbed[] = {
     { "tokens", RAD_OPD_IN,     0 },
@@ -1863,11 +1962,45 @@ static const RadOpSchema kSchemas[] = {
            "y = a + b. `b` carrying exactly n elements against an output of M rows broadcasts "
            "along rows, and nothing else broadcasts at all."),
     SCHEMA("mul", pMnDtype, oBinary, "y = a * b, with the same one broadcast rule as `add`."),
+    SCHEMA("mul_weight", pMulWeight, oMulWeight,
+           "y = x * w, `w` a WEIGHT of one element (a scalar for the whole output) or of one row "
+           "(broadcast down the rows): a learned gain on an activation. f32 product, rounded once."),
     SCHEMA("silu_mul", pMnDtype, oGateUp,
            "y[.., i] = silu(gate_up[.., i]) * gate_up[.., n + i]. The GATE IS THE FIRST HALF, "
            "which is the order rad-convert fuses gate_proj and up_proj in."),
+    SCHEMA("act_mul", pActMul, oBinary,
+           "y = act(a) * b, the activation (silu, gelu, gelu_tanh) rounded to y's dtype before "
+           "the product: silu_mul with its two halves in two operands."),
+    SCHEMA("seg_mean", pSegMean, oSegMean,
+           "Row s of y is the mean of x's rows [cu_seqlens[s], cu_seqlens[s+1]), summed in f64 "
+           "and rounded once; an empty segment is zeros."),
+    SCHEMA("qk_norm_rope", pQkNormRope, oQkNormRope,
+           "In place over a fused [q | k | v] row: each q and k head RMS-normed against its gain "
+           "(plus wadd) and rounded, then rotated (neox or gptj, rotary_dim of head_dim); with "
+           "v_norm each v head is RMS-normed with a unit gain and not rotated."),
+    SCHEMA("pool_rows", pPoolRows, oUnary,
+           "Row r of y is the mean of x's rows [r*k, r*k + k), summed in f32 and rounded, then "
+           "times `mult` and rounded again."),
     SCHEMA("sigmoid", pMnDtype, oUnary, "y = 1 / (1 + exp(-x))."),
+    SCHEMA("relu", pMnDtype, oUnary, "y = max(x, 0)."),
     SCHEMA("silu", pMnDtype, oUnary, "y = x * sigmoid(x)."),
+    SCHEMA("clamp", pMnDtype, oClamp,
+           "y = min(max(x, lo), hi), lo and hi WEIGHTS of one element each: a clipped linear's range."),
+    SCHEMA("conv2d", pConv2d, oConv2d,
+           "A 2-D convolution over (time, width), channels innermost, w [cout, cin, kh, kw]. Each "
+           "cu_seqlens segment (rows cu/cu_div) is convolved on its own with zero padding at its "
+           "edges; its output rows start at cu/(cu_div*stride). With `valid`, input row t reads "
+           "as zeros unless valid[t * valid_stride] != 0. f32 sum, one rounding."),
+    SCHEMA("conv1d_dw", pConv1dDw, oConv1dDw,
+           "Causal depthwise convolution over time, w [C, 1, k], rows before the segment's start "
+           "(cu/cu_div) reading as zeros. f32 sum, one rounding."),
+    SCHEMA("rel_sinusoid", pRelSin, oRelSin,
+           "The sinusoidal relative-position table: row d is sin(d * inv[i]) then cos(d * inv[i]), "
+           "inv[i] = exp(i * -log(max_timescale) / max(n/2 - 1, 1)), in f32, rounded once."),
+    SCHEMA("attn_local_rel", pAttnLocalRel, oAttnLocalRel,
+           "Local attention with a relative-position term and a softcap (Gemma 4's audio): query i "
+           "of a segment sees keys j with 0 <= i - j <= left; qf = q * head_dim^-0.5/ln2 * "
+           "softplus(pds); logit = qf.k * ln(1+e)/ln2 + qf.relk[i-j], softcapped; softmax; .v."),
     SCHEMA("fill", pFill, oFill,
            "y = value, every element of an [M, n] extent (default 0). The op a rank issues where "
            "it computes nothing and a reader downstream -- an all-reduce, a residual -- still "
@@ -1903,7 +2036,7 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("kv_store", pKvStore, oKvStore,
            "scatter k and v into kv_cache[n_blocks, kv_heads, block_size, 2*head_dim] -- K at "
            "[.., d] and V at [.., head_dim + d]. A negative slot stores nothing."),
-    SCHEMA("embed_lookup", pEmbed, oEmbed,
+    SCHEMA("embed_lookup", pEmbedM, oEmbed,
            "the embedding gather. A negative token id writes a zero row, and so does one outside "
            "[vocab_offset, vocab_offset + n_vocab) -- which is what makes the table shardable "
            "across the vocabulary, the symmetry lm_head already had. Ids stay GLOBAL; summing the "
@@ -1996,7 +2129,8 @@ static const RadOpSchema kSchemas[] = {
            "merged (token, head) row is gated, rounded, written to `out` and quantised to E4M3 "
            "with one scale per 128 columns into `q8` / `q8_scale`."),
     SCHEMA("attn_dense", pAttnDense, oAttnDense,
-           "dense non-causal attention over cu_seqlens segments -- the vision tower's."),
+           "dense attention over cu_seqlens segments, with attn_paged's window rule over a "
+           "segment's positions."),
     SCHEMA("qk_norm_rope_gate", pQkNormRopeGate, oQkNormRopeGate,
            "split [q|gate] per head, QK RMS norm over the head, partial NeoX RoPE and the gate "
            "copy, in one pass. Not docs/OPS.md's qk_norm_rope: different operands, and a "
@@ -2444,6 +2578,10 @@ static const RadConstraint cAttnDecodeH128G8Bf16[] = {
 /* KEY RENAME. libr4d writes C_IN("q_dtype","bf16") and C_IN("kv_dtype","bf16"); docs/OPS.md's
  * `attn_dense` has one `dtype` because nothing about a dense bf16 tower is mixed-precision. The
  * predicate -- "bf16, and nothing else" -- is unchanged. */
+/* NO CONSTRAINT ON `window`. It is optional in the schema, a tower without one does not pass it,
+ * and a constraint whose key the geometry lacks does not hold -- so C_EQ("window", 0) here made
+ * this row unreachable for every Qwen vision tower. The kernel attends to the whole segment and
+ * refuses a non-zero window at launch instead (r4d_rad_attn_vit). */
 static const RadConstraint cAttnVit[] = {
     C_EQ("head_dim", 72), C_EQ("gqa", 1), C_EQ("causal", 0), C_IN("dtype", "bf16"),
 };
@@ -2463,8 +2601,30 @@ static const RadConstraint cCastBf16[] = {
 static const RadConstraint cCastF32Bf16[] = {
     C_IN("from", "f32"), C_IN("to", "bf16"),
 };
-static const RadConstraint cCastBf16F32[] = {
+/* `cast` widening bf16 -> f32: an exact conversion, the form a pooled embedding leaves the
+ * device in. */
+/* The audio attention's window: a query's keys are held in LDS, 64 of them at most. */
+static const RadConstraint cAttnLocalRel[] = {
+    C_IN("dtype", "bf16"), C_LE("left", 63), C_EQ("right", 0),
+};
+static const RadConstraint cCastWiden[] = {
     C_IN("from", "bf16"), C_IN("to", "f32"),
+};
+/* The encoder's dense attention: bidirectional, any window, at the (head_dim, gqa) pairs
+ * r4d_attn_dense_bf16.hip compiles. */
+static const RadConstraint cAttnDenseH64[] = {
+    C_EQ("head_dim", 64), C_EQ("gqa", 1), C_EQ("causal", 0), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cAttnDenseH256G2[] = {
+    C_EQ("head_dim", 256), C_EQ("gqa", 2), C_EQ("causal", 0), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cAttnDenseH512G4[] = {
+    C_EQ("head_dim", 512), C_EQ("gqa", 4), C_EQ("causal", 0), C_IN("dtype", "bf16"),
+};
+/* A head in a wave's registers with a rotary pair in one lane: head_dim a multiple of 32 up to
+ * 1024. The shim refuses a rotary_dim whose half is not a multiple of 32 (neox) by name. */
+static const RadConstraint cQkNormRope[] = {
+    C_LE("head_dim", 1024), C_DIV("head_dim", 32),
 };
 
 /* ---- gated delta net ----------------------------------------------------------------------- */
@@ -3409,13 +3569,109 @@ static const RadKernelInfo kKernels[] = {
   r4d_shape_cast },
 
 { "cast_bf16_f32", "cast", "elem",
-  "widen bf16 activations exactly to f32",
-  "any M and n; independent source and destination row pitches",
-  "bf16 in, f32 out",
+  "y = x, bf16 widened to f32",
+  "any M and n; both row pitches are read off the operands",
+  "bf16 in, f32 out, exact",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cCastBf16F32), NOTUNE,
-  nullptr, nullptr, r4d_rad_cast, nullptr, nullptr, nullptr,
+  ROW(cCastWiden), NOTUNE,
+  nullptr, nullptr, r4d_rad_cast_widen, nullptr, nullptr, nullptr,
   r4d_shape_cast },
+
+{ "act_mul_bf16", "act_mul", "elem",
+  "gated activation over two operands: act(a) rounded, times b",
+  "any n; a, b and y each at their own row pitch, so both may be column slices of one buffer",
+  "bf16 in and out, f32 arithmetic, libm silu / erf / tanh",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_act_mul, nullptr, nullptr, nullptr,
+  r4d_shape_binary },
+
+{ "seg_mean_bf16", "seg_mean", "elem",
+  "mean pooling: one row a cu_seqlens segment",
+  "any n; 32 columns by 8 row lanes a workgroup, one workgroup row a segment",
+  "bf16 in and out, f64 sum, one rounding",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_seg_mean, nullptr, nullptr, nullptr },
+
+{ "qk_norm_rope_bf16", "qk_norm_rope", "attn",
+  "per-head RMS norm of q and k (and optionally v, unit gain) with rotary on q and k, in place",
+  "head_dim a multiple of 32 up to 1024, neox (rotary_dim / 2 a multiple of 32), gptj, or "
+  "blocks (sections of 16 or a multiple of 32 pairs, each starting on a 32-channel slice); one "
+  "workgroup a token and a wave a head, sin/cos computed once for all its heads",
+  "bf16 qkv and gains, i32 positions, f32 arithmetic, the norm rounded before the rotation",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQkNormRope), NOTUNE,
+  nullptr, nullptr, r4d_rad_qk_norm_rope, nullptr, nullptr, nullptr },
+
+{ "relu_bf16", "relu", "elem",
+  "max(x, 0)",
+  "any n; both row pitches read off the operands",
+  "bf16 in and out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_relu, nullptr, nullptr, nullptr,
+  r4d_shape_unary },
+
+{ "silu_bf16", "silu", "elem",
+  "x * sigmoid(x), the sigmoid rounded nowhere: libref's act_silu",
+  "any n; both row pitches read off the operands",
+  "bf16 in and out, fp32 arithmetic",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_silu, nullptr, nullptr, nullptr,
+  r4d_shape_unary },
+
+{ "clamp_bf16", "clamp", "elem",
+  "x clamped to two one-element weights: a clipped linear's range",
+  "any n; bf16 or f32 bounds",
+  "bf16 in and out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_clamp, nullptr, nullptr, nullptr },
+
+{ "conv2d_bf16", "conv2d", "elem",
+  "segment-wise 2-D convolution over (time, width), channels innermost, optional row mask",
+  "any geometry; a workgroup an output time row, a thread an output element; sized for an audio "
+  "subsampler (a few thousand frames, kernels of 3)",
+  "bf16 x / w / y, i32 cu_seqlens and mask, f32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_conv2d, nullptr, nullptr, nullptr },
+
+{ "conv1d_dw_bf16", "conv1d_dw", "elem",
+  "segment-wise causal depthwise convolution over time",
+  "any channels and taps; a thread a (row, channel)",
+  "bf16 x / w / y, i32 cu_seqlens, f32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_conv1d_dw, nullptr, nullptr, nullptr },
+
+{ "rel_sinusoid_bf16", "rel_sinusoid", "elem",
+  "the sinusoidal relative-position table",
+  "any rows and even width; a workgroup a row",
+  "bf16 out, f32 libm sin / cos / exp",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_rel_sinusoid, nullptr, nullptr, nullptr },
+
+{ "attn_local_rel_bf16", "attn_local_rel", "attn",
+  "local attention with a relative-position term and a softcap (Gemma 4's audio)",
+  "any head_dim and heads, left <= 63, right 0; a workgroup a (row, head), each logit a "
+  "workgroup sum",
+  "bf16 q / k / v / relk / out, bf16 or f32 per-dim scale, f32 softmax",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnLocalRel), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_local_rel, nullptr, nullptr, nullptr },
+
+{ "pool_rows_bf16", "pool_rows", "elem",
+  "mean of every k consecutive rows, then a multiplier: a vision pooler over windows its "
+  "processor laid out consecutively",
+  "any n and k; a workgroup an output row, a thread a column",
+  "bf16 in and out, f32 sum, two roundings",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_pool_rows, nullptr, nullptr, nullptr },
 
 { "rmsnorm_bf16", "rmsnorm", "norm",
   "root-mean-square norm with a gain, two passes over the row",
@@ -3472,6 +3728,15 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_mul, nullptr, nullptr, nullptr,
   r4d_shape_binary },
 
+{ "mul_weight_bf16", "mul_weight", "elem",
+  "activation times a learned scalar or one-row gain",
+  "any n; the weight is one element or exactly n",
+  "bf16 in, weight and out, fp32 arithmetic",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_mul_weight, nullptr, nullptr, nullptr,
+  r4d_shape_mul_weight },
+
 { "fill_bf16", "fill", "elem",
   "constant fill, a row a workgroup",
   "any M, n; a row pitch is honoured",
@@ -3488,15 +3753,6 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r4d_rad_sigmoid, nullptr, nullptr, nullptr,
-  r4d_shape_unary },
-
-{ "silu_bf16", "silu", "elem",
-  "SiLU activation, x * sigmoid(x), with a bf16 result",
-  "any M and n; independent input and output row pitches, including gate_up slices",
-  "bf16 in and out, fp32 arithmetic",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cBf16Row), NOTUNE,
-  nullptr, nullptr, r4d_rad_silu, nullptr, nullptr, nullptr,
   r4d_shape_unary },
 
 { "silu_mul_bf16", "silu_mul", "elem",
@@ -4006,6 +4262,31 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cAttnVit), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_vit, nullptr, nullptr, nullptr },
+
+{ "attn_dense_h64_bf16", "attn_dense", "attn",
+  "dense bidirectional encoder attention, varlen over cu_seqlens, optional two-sided window",
+  "head_dim 64, multi-head (no GQA), q/k/v/o at their own token pitches (column slices of a "
+  "fused projection allowed)",
+  "bf16 query / key / value / out, f16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH64), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense, nullptr, nullptr, nullptr },
+
+{ "attn_dense_h256_gqa2_bf16", "attn_dense", "attn",
+  "dense bidirectional encoder attention, varlen over cu_seqlens, optional two-sided window",
+  "head_dim 256, two query heads a KV head in one workgroup, the key range cut to the window",
+  "bf16 query / key / value / out, f16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH256G2), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense, nullptr, nullptr, nullptr },
+
+{ "attn_dense_h512_gqa4_bf16", "attn_dense", "attn",
+  "dense bidirectional encoder attention, varlen over cu_seqlens, optional two-sided window",
+  "head_dim 512 split across two waves, four query heads a KV head in one workgroup",
+  "bf16 query / key / value / out, f16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH512G4), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense, nullptr, nullptr, nullptr },
 
 /* -------------------------------------------------------------------------- gated delta net */
 { "gdn_chunk_scan_k128_v128_c64_bf16", "gdn_chunk_scan", "gdn",

@@ -563,6 +563,14 @@ void on_queue_error(hsa_status_t st, hsa_queue_t*, void* data) {
  * Nothing on the step path takes that long, so a wait that does is a queue stuck on a packet --
  * a barrier on a signal nothing will decrement, or a kernel that faulted without a report -- and
  * the packet at the read index is the answer. */
+/* Every queue's read index, summed: it only grows, so an unchanged sum is "no queue moved". */
+uint64_t read_progress() {
+    std::lock_guard<std::mutex> lk(G().streams_mu);
+    uint64_t n = 0;
+    for (Stream* s : G().streams) n += hsa_queue_load_read_index_scacquire(s->q);
+    return n;
+}
+
 void dump_queues(const char* where) {
     std::lock_guard<std::mutex> lk(G().streams_mu);
     RAD_ERR("device: %s has waited 5 s; the queues:", where);
@@ -599,22 +607,40 @@ void dump_queues(const char* where) {
 constexpr uint32_t kStallMs = 5000;
 
 /* A spin that notices when it has gone on too long. Checked every 64k iterations, so the clock
- * is read a few thousand times a second at most. */
+ * is read a few thousand times a second at most.
+ *
+ * SLOW OR STUCK: the dump alone cannot say. A long prefill at a deep context can hold one wait past
+ * five seconds while the queue drains packet after packet, and a hung kernel holds it with the
+ * read index frozen. So the read indices are noted with the dump and looked at once more a stall
+ * period later: advanced is a long wait, unchanged is a queue the GPU is not running. */
 struct Stall {
     const char* where;
     uint32_t n = 0;
-    bool told = false;
+    int told = 0;                 /* 0 nothing said, 1 the dump, 2 the verdict */
+    uint64_t progress = 0;
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     explicit Stall(const char* w) : where(w) {}
     void tick() {
-        if (told || (++n & 0xffff)) return;
+        if (told == 2 || (++n & 0xffff)) return;
         check();
     }
     /* Every call, for a loop that sleeps between calls and so makes few of them. */
     void check() {
-        if (!told && std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(kStallMs)) {
-            told = true;
+        if (told == 2) return;
+        const auto waited = std::chrono::steady_clock::now() - t0;
+        if (told == 0 && waited > std::chrono::milliseconds(kStallMs)) {
+            told = 1;
+            progress = read_progress();
             dump_queues(where);
+        } else if (told == 1 && waited > std::chrono::milliseconds(2 * kStallMs)) {
+            told = 2;
+            if (read_progress() != progress)
+                RAD_WARN("device: the queues advanced in the %u s since; %s is long, not stuck",
+                         kStallMs / 1000, where);
+            else
+                RAD_ERR("device: no queue has advanced in the %u s since: the GPU is not running "
+                        "the packet named above -- a hung kernel, or a queue the driver evicted and "
+                        "could not restore (amdgpu cwsr_enable=0 is one cause)", kStallMs / 1000);
         }
     }
 };

@@ -67,11 +67,32 @@ static std::string device_inventory(const DeviceBackend* b) {
     return s;
 }
 
+/* COMPUTE WAVE SAVE/RESTORE OFF IS A GPU HANG WAITING FOR AN EVICTION. The driver evicts a
+ * process's queues whenever host memory the card maps is moved or reclaimed under memory pressure,
+ * and a serve with a host pool or a host KV tier maps gigabytes of it. With
+ * amdgpu.cwsr_enable=0 it cannot preempt a running queue and waits for it to drain, which a queue
+ * a serve keeps fed never does: the queue stops inside whatever kernel it was running, MES fails
+ * REMOVE_QUEUE, and the driver resets the card. Said at startup because nothing later can tell
+ * that hang from a kernel bug. */
+static void warn_cwsr_off() {
+    FILE* f = std::fopen("/sys/module/amdgpu/parameters/cwsr_enable", "r");
+    if (!f) return;
+    int v = -1;
+    const int got = std::fscanf(f, "%d", &v);
+    std::fclose(f);
+    if (got == 1 && v == 0)
+        RAD_WARN("device: amdgpu cwsr_enable is 0, so the driver cannot preempt a running queue: "
+                 "any queue eviction (host memory the card maps, moved under memory pressure) waits "
+                 "for a queue a serve never lets drain, and ends in a GPU hang and reset. Set "
+                 "amdgpu.cwsr_enable=1 (module option, then rebuild the initramfs and reboot)");
+}
+
 static const DeviceBackend* select_backend() {
 #if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
     if (const DeviceBackend* b = aql_backend_if_present()) {
         RAD_INFO("device: AQL backend, %d device(s) [%s]", b->count(),
                  device_inventory(b).c_str());
+        warn_cwsr_off();
         return b;
     }
     RAD_INFO("device: built with HIP but no device is visible -- using the host backend");

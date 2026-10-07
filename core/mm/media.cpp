@@ -10,8 +10,10 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
 #endif
@@ -33,6 +35,10 @@ int decode_image(const uint8_t*, size_t, int64_t, Frame*, std::string* why) {
     return no_decoder(why);
 }
 int decode_video(const uint8_t*, size_t, SampleFn, const void*, int64_t, Video*,
+                 std::string* why) {
+    return no_decoder(why);
+}
+int decode_audio(const uint8_t*, size_t, int32_t, int64_t, std::vector<float>*,
                  std::string* why) {
     return no_decoder(why);
 }
@@ -150,13 +156,19 @@ struct Input {
 
 /* One decoded frame to packed RGB24 at its own size. The YUV coefficients and range are the
  * frame's own, so a BT.709 video and a full-range JPEG both come out with the colours they were
- * encoded with; ACCURATE_RND and FULL_CHR_H_INT keep the conversion from truncating and from
- * sampling chroma at half resolution. */
+ * encoded with.
+ *
+ * THE SCALER FLAGS ARE THE REFERENCE PIPELINE'S: transformers decodes video through PyAV
+ * (`to_ndarray(format="rgb24")`, its default backend), which converts with plain SWS_BILINEAR.
+ * The flags decide how chroma is upsampled, and at a sharp colour edge two choices differ by up to
+ * 70 levels: measured on an EmbeddingGemma 2 clip, SWS_BICUBIC | ACCURATE_RND | FULL_CHR_H_INT
+ * left the embedding at cosine 0.9995 against the reference, these at 0.99998 with every patch
+ * within one level. */
 int to_rgb(const AVFrame* f, SwsContext** sws, Frame* out, std::string* why) {
     const AVPixelFormat src = (AVPixelFormat)f->format;
     *sws = sws_getCachedContext(*sws, f->width, f->height, src, f->width, f->height,
                                 AV_PIX_FMT_RGB24,
-                                SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT, nullptr,
+                                SWS_BILINEAR, nullptr,
                                 nullptr, nullptr);
     if (!*sws) { *why = "no colour conversion from this pixel format"; return RAD_E_UNSUPPORTED; }
     int cs = f->colorspace;
@@ -357,6 +369,148 @@ int decode_video(const uint8_t* data, size_t n, SampleFn sample, const void* use
      * last frame that was decoded, which is what a reader that clamps an index past the end
      * returns. */
     for (size_t k = next; k < out->index.size(); ++k) out->frames[k] = out->frames[(size_t)last_kept];
+    return RAD_OK;
+}
+
+/* ================================================================== audio */
+
+namespace {
+
+/* THE AUDIO DEMUXERS A REQUEST MAY REACH, chosen as the video list is: formats that hold one
+ * stream of samples and cannot name another file. */
+constexpr const char* kAudioFormats = "wav,w64,mp3,flac,ogg,mov,mp4,m4a,matroska,webm,aac,aiff";
+
+struct AudioIn {
+    MemIO            io;
+    AVIOContext*     avio = nullptr;
+    AVFormatContext* fmt = nullptr;
+    AVCodecContext*  dec = nullptr;
+    SwrContext*      swr = nullptr;
+    int              stream = -1;
+
+    ~AudioIn() {
+        if (swr) swr_free(&swr);
+        if (dec) avcodec_free_context(&dec);
+        if (fmt) avformat_close_input(&fmt);
+        if (avio) {
+            av_freep(&avio->buffer);
+            avio_context_free(&avio);
+        }
+    }
+
+    int open(const uint8_t* data, size_t n, std::string* why) {
+        io.p = data; io.n = n; io.at = 0;
+        constexpr int kBuf = 64 * 1024;
+        uint8_t* buf = static_cast<uint8_t*>(av_malloc(kBuf));
+        if (!buf) { *why = "out of memory"; return RAD_E_NOMEM; }
+        avio = avio_alloc_context(buf, kBuf, 0, &io, mem_read, nullptr, mem_seek);
+        if (!avio) { av_free(buf); *why = "out of memory"; return RAD_E_NOMEM; }
+        fmt = avformat_alloc_context();
+        if (!fmt) { *why = "out of memory"; return RAD_E_NOMEM; }
+        fmt->pb = avio;
+        fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+        AVDictionary* opts = nullptr;
+        av_dict_set(&opts, "format_whitelist", kAudioFormats, 0);
+        av_dict_set(&opts, "protocol_whitelist", "", 0);
+        int e = avformat_open_input(&fmt, nullptr, nullptr, &opts);
+        av_dict_free(&opts);
+        if (e < 0) {
+            fmt = nullptr;
+            *why = "not a recognised audio format (" + averr(e) + ")";
+            return RAD_E_INVAL;
+        }
+        e = avformat_find_stream_info(fmt, nullptr);
+        if (e < 0) { *why = "could not read the stream headers (" + averr(e) + ")"; return RAD_E_INVAL; }
+        const AVCodec* codec = nullptr;
+        stream = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
+        if (stream < 0 || !codec) { *why = "no sound in it: the media holds no audio stream"; return RAD_E_INVAL; }
+        dec = avcodec_alloc_context3(codec);
+        if (!dec) { *why = "out of memory"; return RAD_E_NOMEM; }
+        e = avcodec_parameters_to_context(dec, fmt->streams[stream]->codecpar);
+        if (e < 0) { *why = "decoder setup failed (" + averr(e) + ")"; return RAD_E_INVAL; }
+        dec->thread_count = 1;
+        e = avcodec_open2(dec, codec, nullptr);
+        if (e < 0) { *why = std::string("no decoder for ") + codec->name + " (" + averr(e) + ")"; return RAD_E_UNSUPPORTED; }
+        return RAD_OK;
+    }
+};
+
+}  /* namespace */
+
+int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_samples,
+                 std::vector<float>* out, std::string* why) {
+    std::string w;
+    if (!why) why = &w;
+    out->clear();
+    if (rate <= 0 || max_samples <= 0) { *why = "no sample rate or length to decode to"; return RAD_E_INVAL; }
+    AudioIn in;
+    RAD_TRY(in.open(data, n, why));
+    AVCodecContext* dec = in.dec;
+    const int channels = dec->ch_layout.nb_channels > 0 ? dec->ch_layout.nb_channels : 1;
+    if (dec->sample_rate <= 0) { *why = "the audio stream states no sample rate"; return RAD_E_INVAL; }
+
+    /* Resampled at the source's own layout, float interleaved; the mono mean is taken after. A
+     * layout the stream does not state is taken as `channels` unordered channels. */
+    AVChannelLayout layout{};
+    if (av_channel_layout_check(&dec->ch_layout)) av_channel_layout_copy(&layout, &dec->ch_layout);
+    else av_channel_layout_default(&layout, channels);
+    int e = swr_alloc_set_opts2(&in.swr, &layout, AV_SAMPLE_FMT_FLT, rate, &layout,
+                                (AVSampleFormat)dec->sample_fmt, dec->sample_rate, 0, nullptr);
+    av_channel_layout_uninit(&layout);
+    if (e < 0 || !in.swr || swr_init(in.swr) < 0) {
+        *why = "no resampler for this audio (" + averr(e) + ")";
+        return RAD_E_UNSUPPORTED;
+    }
+
+    std::vector<float> buf;
+    auto take = [&](const uint8_t** src, int n_in) -> int {
+        const int cap = swr_get_out_samples(in.swr, n_in);
+        if (cap <= 0) return 0;
+        buf.resize((size_t)cap * (size_t)channels);
+        uint8_t* dst = reinterpret_cast<uint8_t*>(buf.data());
+        const int got = swr_convert(in.swr, &dst, cap, src, n_in);
+        if (got < 0) { *why = "resampling failed (" + averr(got) + ")"; return RAD_E_INVAL; }
+        for (int i = 0; i < got && (int64_t)out->size() < max_samples; ++i) {
+            float s = 0.0f;
+            for (int c = 0; c < channels; ++c) s += buf[(size_t)i * channels + c];
+            out->push_back(channels == 1 ? s : s / (float)channels);
+        }
+        return 0;
+    };
+
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* f = av_frame_alloc();
+    if (!pkt || !f) {
+        av_packet_free(&pkt);
+        av_frame_free(&f);
+        *why = "out of memory";
+        return RAD_E_NOMEM;
+    }
+    int st = RAD_OK;
+    bool done = false;
+    while (!done && (int64_t)out->size() < max_samples) {
+        e = av_read_frame(in.fmt, pkt);
+        if (e < 0) {
+            avcodec_send_packet(dec, nullptr);   /* drain */
+            done = true;
+        } else {
+            if (pkt->stream_index == in.stream) e = avcodec_send_packet(dec, pkt);
+            av_packet_unref(pkt);
+            if (e < 0 && e != AVERROR(EAGAIN)) { *why = "the audio would not decode (" + averr(e) + ")"; st = RAD_E_INVAL; break; }
+        }
+        while ((e = avcodec_receive_frame(dec, f)) >= 0) {
+            if ((st = take(const_cast<const uint8_t**>(f->extended_data), f->nb_samples)) < 0) break;
+            av_frame_unref(f);
+        }
+        if (st < 0) break;
+        if (e != AVERROR(EAGAIN) && e != AVERROR_EOF) { *why = "the audio would not decode (" + averr(e) + ")"; st = RAD_E_INVAL; break; }
+    }
+    /* What the resampler still holds. */
+    if (st == RAD_OK && (int64_t)out->size() < max_samples) st = take(nullptr, 0);
+    av_packet_free(&pkt);
+    av_frame_free(&f);
+    if (st < 0) return st;
+    if (out->empty()) { *why = "the audio decoded to no samples"; return RAD_E_INVAL; }
     return RAD_OK;
 }
 

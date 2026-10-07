@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <thread>
 
@@ -77,6 +78,7 @@ Server::Server(const Deps& d, const ServerOptions& o)
     odeps_.chat = deps_.chat;
     odeps_.grammar = deps_.grammar;
     odeps_.mm = deps_.mm;
+    odeps_.embed = deps_.embed;
 
     queue_depth_ = opt_.queue_depth > 0 ? opt_.queue_depth : opt_.max_seqs * 8;
     started_at_ = unix_now();
@@ -958,6 +960,10 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
 HttpResponse Server::handle_chat(const HttpRequest& req) {
     if (!deps_.sched || !deps_.tok)
         return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+    if (opt_.embedding_model)
+        return error_response(err_not_implemented("this is an embedding model: it serves "
+                                                  "/v1/embeddings and generates no text"),
+                              req.peer);
 
     OaiRequest r;
     ApiError err;
@@ -979,6 +985,10 @@ HttpResponse Server::handle_chat(const HttpRequest& req) {
 HttpResponse Server::handle_completion(const HttpRequest& req) {
     if (!deps_.sched || !deps_.tok)
         return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+    if (opt_.embedding_model)
+        return error_response(err_not_implemented("this is an embedding model: it serves "
+                                                  "/v1/embeddings and generates no text"),
+                              req.peer);
 
     OaiRequest r;
     ApiError err;
@@ -998,35 +1008,138 @@ HttpResponse Server::handle_completion(const HttpRequest& req) {
 }
 
 HttpResponse Server::handle_embeddings(const HttpRequest& req) {
-    if (!deps_.tok)
-        return error_response(err_not_implemented("the server has no tokenizer attached"),
+    if (!deps_.sched || !deps_.tok)
+        return error_response(err_not_implemented("the server has no engine attached"),
                               req.peer);
     if (!deps_.embed)
         return error_response(err_not_implemented(
-            "/v1/embeddings requires an embedding head; this model was not loaded with one"),
-                req.peer);
+            "/v1/embeddings requires an embedding model; this one generates text"), req.peer);
 
     OaiRequest r;
     ApiError err;
     if (parse_embeddings_request(req.body, odeps_, lim_, &r, &err) < 0)
         return error_response(err, req.peer);
+    r.peer = req.peer;
 
-    std::vector<std::vector<float>> vecs;
-    UsageOut u;
-    vecs.reserve(r.prompts.size());
-    for (const auto& p : r.prompts) {
-        std::vector<float> v;
-        int s = deps_.embed->embed(p.tokens, v);
-        if (s < 0) {
+    const int64_t dim = deps_.embed->dim();
+    if (r.dimensions > dim)
+        return error_response(err_bad("dimensions", "this model's vectors are " +
+                                                        std::to_string(dim) + " wide"), req.peer);
+    /* AN INPUT IS NEVER SPLIT (Request::embed), so one longer than a step is refused here, with
+     * the number, rather than by the scheduler with none. */
+    for (size_t i = 0; i < r.prompts.size(); ++i) {
+        const int64_t n = (int64_t)r.prompts[i].tokens.size();
+        if (n > deps_.embed->max_input()) {
+            ApiError e = err_bad("input", "input " + std::to_string(i) + " is " +
+                                              std::to_string(n) + " tokens; this deployment "
+                                              "embeds at most " +
+                                              std::to_string(deps_.embed->max_input()) +
+                                              " (--max-num-batched-tokens)");
+            e.code = "context_length_exceeded";
+            return error_response(e, req.peer);
+        }
+    }
+
+    sweep_abandoned();
+    const int n_in = (int)r.prompts.size();
+    if (!admit(n_in)) {
+        metrics_.observe_rejected();
+        return error_response(err_overloaded(
+            "the admission queue is full; retry after " + std::to_string(opt_.retry_after_s) +
+            "s. The server refuses rather than queueing without bound"), req.peer);
+    }
+    log_admitted(r);
+
+    /* EVERY INPUT AT ONCE, so the scheduler can put them in one step. */
+    std::vector<Generation> gens;
+    std::vector<Request> rqs;
+    gens.reserve((size_t)n_in);
+    rqs.reserve((size_t)n_in);
+    for (int i = 0; i < n_in; ++i) {
+        Generation g;
+        g.index = i;
+        g.prompt_index = i;
+        g.sink = std::make_shared<Sink>(16);
+        Request rq;
+        rq.prompt = r.prompts[(size_t)i].tokens;
+        rq.media = r.prompts[(size_t)i].media;
+        rq.embed = true;
+        rq.max_tokens = 1;
+        rq.sp.temp = 0.0f;
+        rq.sink = g.sink.get();
+        rqs.push_back(std::move(rq));
+        gens.push_back(std::move(g));
+    }
+    std::vector<uint64_t> ids;
+    deps_.sched->submit_all(rqs, &ids);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        gens[i].id = ids[i];
+        gens[i].sink->id = ids[i];
+        if (!ids[i]) {
+            retire(gens);
+            release(n_in);
             ApiError e;
             e.status = 500;
             e.type = "internal_server_error";
-            e.message = std::string("the embedding pass failed: ") + rad_strerror(s);
+            e.message = "the scheduler refused input " + std::to_string(i);
             return error_response(e, req.peer);
         }
-        u.prompt += (int64_t)p.tokens.size();
-        vecs.push_back(std::move(v));
     }
+
+    for (;;) {
+        bool all = true;
+        for (auto& g : gens) {
+            if (!g.closed && g.sink->done()) { g.closed = true; g.finish = g.sink->finish_reason(); }
+            all = all && g.closed;
+        }
+        if (all) break;
+        if (req.peer_gone()) {
+            cancel_all(gens, true);
+            retire(gens);
+            release(n_in);
+            metrics_.observe_http(499);
+            return HttpResponse::text(499, "client closed request\n");
+        }
+        if (stopping_.load()) {
+            cancel_all(gens, false);
+            retire(gens);
+            release(n_in);
+            return error_response(err_overloaded("the server is shutting down"), req.peer);
+        }
+        for (auto& g : gens) if (!g.closed) { g.sink->wait(); break; }
+    }
+
+    /* THE VECTORS, truncated to `dimensions` and L2-normalised: what OpenAI's endpoint returns and
+     * what a sentence-transformers model's Normalize module does. Truncating a unit vector does
+     * not keep it unit, so the normalisation comes after. */
+    std::vector<std::vector<float>> vecs;
+    vecs.reserve((size_t)n_in);
+    UsageOut u;
+    const int64_t keep = r.dimensions > 0 ? r.dimensions : dim;
+    for (auto& g : gens) {
+        const std::vector<float>& v = g.sink->embedding();
+        if (g.finish == Finish::Error || g.finish == Finish::Cancelled || (int64_t)v.size() != dim) {
+            const std::string why = g.finish == Finish::Error ? engine_failure(*g.sink)
+                                    : std::string("the engine returned no vector for input ") +
+                                          std::to_string(g.index);
+            retire(gens);
+            release(n_in);
+            ApiError e;
+            e.status = 500;
+            e.type = "internal_server_error";
+            e.message = why;
+            return error_response(e, req.peer);
+        }
+        std::vector<float> out(v.begin(), v.begin() + keep);
+        double ss = 0.0;
+        for (float x : out) ss += (double)x * x;
+        const float inv = ss > 0.0 ? (float)(1.0 / std::sqrt(ss)) : 0.0f;
+        for (float& x : out) x *= inv;
+        u.prompt += (int64_t)r.prompts[(size_t)g.prompt_index].tokens.size();
+        vecs.push_back(std::move(out));
+    }
+    retire(gens);
+    release(n_in);
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, embeddings_body(r, vecs, u));
 }

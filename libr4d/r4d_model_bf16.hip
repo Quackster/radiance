@@ -100,9 +100,11 @@ __device__ __forceinline__ float block_sum(float v, float* lds) {
 // vocab-parallel: ids stay global, a rank subtracts the offset, and a token belonging to another
 // rank takes the same zero-row path the padding id takes.  Summing the ranks then reconstructs x.
 // At vocab_off = 0 this is the plain gather, to the bit.
+// `mult` multiplies every gathered entry, the product rounded once (Gemma's sqrt(hidden)); 1 is the
+// plain copy, to the bit.
 __global__ __launch_bounds__(kThreads) void embed_lookup_kernel(
     const int32_t* __restrict__ tok, const uint16_t* __restrict__ wte, uint16_t* __restrict__ x,
-    uint32_t n_embd, int32_t n_vocab, int32_t vocab_off, uint32_t x_ld) {
+    uint32_t n_embd, int32_t n_vocab, int32_t vocab_off, uint32_t x_ld, float mult) {
     const uint32_t m = blockIdx.x;
     const int32_t id = tok[m] - vocab_off;
     uint16_t* __restrict__ dst = x + (size_t)m * x_ld;
@@ -111,7 +113,11 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_kernel(
         return;
     }
     const uint16_t* __restrict__ src = wte + (size_t)id * n_embd;
-    for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = src[i];
+    if (mult == 1.0f) {
+        for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = src[i];
+        return;
+    }
+    for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = f32_to_bf16(bf2f(src[i]) * mult);
 }
 
 // ---------------------------------------------------------------------------- embed_lookup_q
@@ -233,17 +239,12 @@ __global__ __launch_bounds__(kThreads) void scatter_rows_u8_kernel(
 }
 
 // ---------------------------------------------------------------------------- cast
-template <bool TO_BF16>
-__global__ __launch_bounds__(kThreads) void cast_kernel(
-    const void* __restrict__ x, void* __restrict__ y, uint32_t n,
+__global__ __launch_bounds__(kThreads) void cast_narrow_kernel(
+    const float* __restrict__ x, uint16_t* __restrict__ y, uint32_t n,
     uint32_t x_ld, uint32_t y_ld) {
     const size_t xb = (size_t)blockIdx.x * x_ld, yb = (size_t)blockIdx.x * y_ld;
-    for (uint32_t i = threadIdx.x; i < n; i += kThreads) {
-        if constexpr (TO_BF16)
-            ((uint16_t*)y)[yb + i] = f32_to_bf16(((const float*)x)[xb + i]);
-        else
-            ((float*)y)[yb + i] = bf2f(((const uint16_t*)x)[xb + i]);
-    }
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads)
+        y[yb + i] = f32_to_bf16(x[xb + i]);
 }
 
 // ---------------------------------------------------------------------------- rmsnorm
@@ -267,7 +268,7 @@ __global__ __launch_bounds__(kThreads) void cast_kernel(
 template <bool WF32, bool ROUND_BEFORE_WEIGHT, uint32_t THR>
 __global__ __launch_bounds__(THR) void rmsnorm_kernel(
     const uint16_t* __restrict__ x, const void* __restrict__ w, uint16_t* __restrict__ y,
-    uint32_t n, float eps, float wadd, uint32_t x_ld, uint32_t y_ld) {
+    uint32_t n, float eps, float wadd, float mult, uint32_t x_ld, uint32_t y_ld) {
     __shared__ float lds[THR / kWave];
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
@@ -278,10 +279,10 @@ __global__ __launch_bounds__(THR) void rmsnorm_kernel(
     ss = block_sum<THR / kWave>(ss, lds);
     const float s = rsqrtf(ss / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += THR) {
-        const float g = WF32 ? ((const float*)w)[i] : bf2f(((const uint16_t*)w)[i]);
+        const float g = !w ? 1.0f : WF32 ? ((const float*)w)[i] : bf2f(((const uint16_t*)w)[i]);
         float v = bf2f(xr[i]) * s;
         if constexpr (ROUND_BEFORE_WEIGHT) v = bf2f(f32_to_bf16(v));
-        yr[i] = f32_to_bf16(v * (g + wadd));
+        yr[i] = f32_to_bf16(v * (g + wadd) * mult);
     }
 }
 
@@ -290,15 +291,16 @@ __global__ __launch_bounds__(THR) void rmsnorm_kernel(
 // against an output of rows*n broadcasts along rows, and nothing else broadcasts at all.  That is
 // what makes a bias add this op instead of a second one, and the narrowness is the point -- silent
 // broadcasting of an arbitrary shape is how a shape bug becomes a plausible number.
+// `b_step` 0 reads one element for the whole row -- with b_ld 0 too, a scalar for the whole op.
 __global__ __launch_bounds__(kThreads) void binary_kernel(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, uint16_t* __restrict__ y,
-    uint32_t n, uint32_t a_ld, uint32_t b_ld, uint32_t y_ld, int mul) {
+    uint32_t n, uint32_t a_ld, uint32_t b_ld, uint32_t y_ld, int mul, uint32_t b_step) {
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ ar = a + (size_t)m * a_ld;
     const uint16_t* __restrict__ br = b + (size_t)m * b_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
     for (uint32_t i = threadIdx.x; i < n; i += kThreads) {
-        const float u = bf2f(ar[i]), v = bf2f(br[i]);
+        const float u = bf2f(ar[i]), v = bf2f(br[i * b_step]);
         yr[i] = f32_to_bf16(mul ? u * v : u + v);
     }
 }
@@ -319,18 +321,6 @@ __global__ __launch_bounds__(kThreads) void sigmoid_kernel(
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
     for (uint32_t i = threadIdx.x; i < n; i += kThreads)
         yr[i] = f32_to_bf16(1.0f / (1.0f + expf(-bf2f(xr[i]))));
-}
-
-// ---------------------------------------------------------------------------- silu
-__global__ __launch_bounds__(kThreads) void silu_kernel(
-    const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
-    uint32_t n, uint32_t x_ld, uint32_t y_ld) {
-    const uint16_t* __restrict__ xr = x + (size_t)blockIdx.x * x_ld;
-    uint16_t* __restrict__ yr = y + (size_t)blockIdx.x * y_ld;
-    for (uint32_t i = threadIdx.x; i < n; i += kThreads) {
-        const float v = bf2f(xr[i]);
-        yr[i] = f32_to_bf16(v * (1.0f / (1.0f + expf(-v))));
-    }
 }
 
 // ---------------------------------------------------------------------------- silu_mul
@@ -609,20 +599,20 @@ __global__ __launch_bounds__(kThreads) void kv_store_fp8_kernel(
  * the launch has to be describable, and writing the geometry twice is the one thing ABI v10's
  * contract says not to do. One body, two ways in. */
 static int embed_lookup_bf16_emit(long tok, long wte, long x, int M, int n_embd, int n_vocab,
-                                  int vocab_off, int x_ld, const R4dSink& sk) {
+                                  int vocab_off, int x_ld, float mult, const R4dSink& sk) {
     if (!tok || !wte || !x) return -1;
     if (M <= 0 || n_embd <= 0 || n_vocab <= 0 || vocab_off < 0) return -2;
     if (!x_ld) x_ld = n_embd;
     return R4D_EMIT(sk, embed_lookup_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
                     (const int32_t*)tok, (const uint16_t*)wte,
                     (uint16_t*)x, (uint32_t)n_embd, (int32_t)n_vocab, (int32_t)vocab_off,
-                    (uint32_t)x_ld) == RAD_OK ? 0 : -4;
+                    (uint32_t)x_ld, mult) == RAD_OK ? 0 : -4;
 }
 
 extern "C" int r4d_embed_lookup_bf16(long tok, long wte, long x, int M, int n_embd, int n_vocab,
                                      int vocab_off, int x_ld, long stream) {
     R4dSink sk; sk.stream = (RadStream)(uintptr_t)stream;
-    return embed_lookup_bf16_emit(tok, wte, x, M, n_embd, n_vocab, vocab_off, x_ld, sk);
+    return embed_lookup_bf16_emit(tok, wte, x, M, n_embd, n_vocab, vocab_off, x_ld, 1.0f, sk);
 }
 
 /* The quad walk when the width, the pitch and both bases allow its 4- and 8-byte accesses (a bf16
@@ -706,8 +696,8 @@ extern "C" int r4d_scatter_rows_u8(long v, long idx, long x, int M, int n, int d
 
 // `w_f32` says whether the gain is f32 (every norm gain the architecture plugins declare) or bf16.
 static int rmsnorm_bf16(long x, long w, long y, int M, int n, float eps, float wadd,
-                        int w_f32, int x_ld, int y_ld, long stream, bool round_before_weight) {
-    if (!x || !w || !y) return -1;
+                        float mult, int w_f32, int x_ld, int y_ld, long stream, bool round_before_weight) {
+    if (!x || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
@@ -721,7 +711,7 @@ static int rmsnorm_bf16(long x, long w, long y, int M, int n, float eps, float w
 #define R4D_RN_T(wf, rw, T)                                                                     \
     hipLaunchKernelGGL((rmsnorm_kernel<wf, rw, T>), dim3((uint32_t)M), dim3(T), 0,              \
                        (hipStream_t)stream, (const uint16_t*)x, (const void*)w, (uint16_t*)y,   \
-                       (uint32_t)n, eps, wadd, (uint32_t)x_ld, (uint32_t)y_ld)
+                       (uint32_t)n, eps, wadd, mult, (uint32_t)x_ld, (uint32_t)y_ld)
 #define R4D_RN(wf, rw)                                                                          \
     do { if (thr == 1024)     R4D_RN_T(wf, rw, 1024);                                           \
          else if (thr == 512) R4D_RN_T(wf, rw, 512);                                            \
@@ -738,23 +728,31 @@ static int rmsnorm_bf16(long x, long w, long y, int M, int n, float eps, float w
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+extern "C" int r4d_rmsnorm_mult_bf16(long x, long w, long y, int M, int n, float eps, float wadd,
+                                     float mult, int w_f32, int x_ld, int y_ld, long stream) {
+    return rmsnorm_bf16(x, w, y, M, n, eps, wadd, mult, w_f32, x_ld, y_ld, stream, false);
+}
+
 // Preserve the raw C entrypoint's single-rounding contract. The op shim exposes the opt-in.
 extern "C" int r4d_rmsnorm_bf16(long x, long w, long y, int M, int n, float eps, float wadd,
                                 int w_f32, int x_ld, int y_ld, long stream) {
-    return rmsnorm_bf16(x, w, y, M, n, eps, wadd, w_f32, x_ld, y_ld, stream, false);
+    return rmsnorm_bf16(x, w, y, M, n, eps, wadd, 1.0f, w_f32, x_ld, y_ld, stream, false);
 }
 
 // `op` is 0 for a sum and 1 for a product.  `b_ld` of 0 with the same n is the broadcast form: the
 // caller passes a b_ld of zero and every row reads the same n elements.
+// b_ld -1 is a ONE-ELEMENT b, the scalar broadcast; 0 is one row broadcast down the rows.
 extern "C" int r4d_binary_bf16(long a, long b, long y, int M, int n, int op,
                                int a_ld, int b_ld, int y_ld, long stream) {
     if (!a || !b || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (!a_ld) a_ld = n;
     if (!y_ld) y_ld = n;
+    const uint32_t b_step = b_ld < 0 ? 0u : 1u;
+    if (b_ld < 0) b_ld = 0;
     hipLaunchKernelGGL(binary_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
                        (const uint16_t*)a, (const uint16_t*)b, (uint16_t*)y, (uint32_t)n,
-                       (uint32_t)a_ld, (uint32_t)b_ld, (uint32_t)y_ld, op);
+                       (uint32_t)a_ld, (uint32_t)b_ld, (uint32_t)y_ld, op, b_step);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -1043,9 +1041,10 @@ static int rad_embed_lookup_body(const RadArgs* a, const R4dSink& sk) {
     if (x_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0 || r4d_numel(tok) < M) return R4D_NO(RAD_E_SHAPE);
 
+    const float mult = (float)r4d_getf(a, "mult", 1.0);
     return embed_lookup_bf16_emit(r4d_addr(tok), r4d_addr(wte), r4d_addr(x),
                                   (int)M, (int)n_embd, (int)n_vocab, (int)voff, (int)x_ld,
-                                  sk) == 0 ? RAD_OK : RAD_E_DEVICE;
+                                  mult, sk) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 R4D_ENTRY(r4d_rad_embed_lookup, rad_embed_lookup_body)
 
@@ -1218,8 +1217,7 @@ extern "C" int r4d_rad_cast(const RadArgs* a, RadStream s) {
     if (!x || !y) return R4D_NO(RAD_E_INVAL);
     const bool copy = x->dtype == RAD_BF16 && y->dtype == RAD_BF16;
     const bool narrow = x->dtype == RAD_F32 && y->dtype == RAD_BF16;
-    const bool widen = x->dtype == RAD_BF16 && y->dtype == RAD_F32;
-    if (!copy && !narrow && !widen) return R4D_NO(RAD_E_DTYPE);
+    if (!copy && !narrow) return R4D_NO(RAD_E_DTYPE);
 
     const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
     if (n <= 0) return R4D_NO(RAD_E_SHAPE);
@@ -1235,14 +1233,9 @@ extern "C" int r4d_rad_cast(const RadArgs* a, RadStream s) {
     if (copy)
         return r4d_p2p_copy2d(r4d_addr(y), r4d_addr(x), y_ld * 2, x_ld * 2, n * 2, M,
                               (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
-    if (narrow)
-        hipLaunchKernelGGL((cast_kernel<true>), dim3((uint32_t)M), dim3(kThreads), 0,
-                           (hipStream_t)s, (const void*)r4d_addr(x), (void*)r4d_addr(y),
-                           (uint32_t)n, (uint32_t)x_ld, (uint32_t)y_ld);
-    else
-        hipLaunchKernelGGL((cast_kernel<false>), dim3((uint32_t)M), dim3(kThreads), 0,
-                           (hipStream_t)s, (const void*)r4d_addr(x), (void*)r4d_addr(y),
-                           (uint32_t)n, (uint32_t)x_ld, (uint32_t)y_ld);
+    hipLaunchKernelGGL(cast_narrow_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+                       (hipStream_t)s, (const float*)r4d_addr(x), (uint16_t*)r4d_addr(y),
+                       (uint32_t)n, (uint32_t)x_ld, (uint32_t)y_ld);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
@@ -1251,12 +1244,30 @@ extern "C" int r4d_rad_cast(const RadArgs* a, RadStream s) {
 enum { RN_X = 0, RN_W, RN_Y };
 
 extern "C" int r4d_rad_rmsnorm(const RadArgs* a, RadStream s) {
+    const long long round_before_weight = r4d_geti_or(a, "round_before_weight", 0);
+    if (round_before_weight != 0 && round_before_weight != 1) return R4D_NO(RAD_E_INVAL);
     const RadTensor* x = r4d_opt(a, RN_X);
     const RadTensor* w = r4d_opt(a, RN_W);
     const RadTensor* y = r4d_opt(a, RN_Y);
-    if (!x || !w || !y) return R4D_NO(RAD_E_INVAL);
+    if (!x || !y) return R4D_NO(RAD_E_INVAL);
     R4D_NEED(dt_bf16(x));
     R4D_NEED(dt_bf16(y));
+    /* An ABSENT gain is one: a norm with no scale (Gemma 4's value norm, its multimodal
+     * embedder's pre-projection norm). `wadd` belongs to a gain and is refused without one. */
+    if (!w) {
+        const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
+        if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+        if (r4d_getf(a, "wadd", 0.0) != 0.0) return R4D_NO(RAD_E_INVAL);
+        long long M = 0, My = 0;
+        const long long x_ld = r4d_rows_pitch(x, n, &M);
+        const long long y_ld = r4d_rows_pitch(y, n, &My);
+        if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+        if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
+        return rmsnorm_bf16(r4d_addr(x), 0, r4d_addr(y), (int)M, (int)n,
+                                (float)r4d_getf(a, "eps", 1e-6), 0.0f,
+                                (float)r4d_getf(a, "mult", 1.0), 0, (int)x_ld, (int)y_ld,
+                                (long)(uintptr_t)s, round_before_weight != 0) == 0 ? RAD_OK : RAD_E_DEVICE;
+    }
     if (!r4d_contig(w)) return R4D_NO(RAD_E_STRIDE);
     /* THE GAIN IS THE ONE OPERAND THAT IS NOT bf16. Every architecture plugin here declares its
      * norm gains RAD_F32 -- a few thousand elements against gigabytes of weights, and the norm is
@@ -1276,10 +1287,8 @@ extern "C" int r4d_rad_rmsnorm(const RadArgs* a, RadStream s) {
 
     const float eps  = (float)r4d_getf(a, "eps", 1e-6);
     const float wadd = (float)r4d_getf(a, "wadd", 0.0);
-    const long long round_before_weight = r4d_geti_or(a, "round_before_weight", 0);
-    if (round_before_weight != 0 && round_before_weight != 1) return R4D_NO(RAD_E_INVAL);
     return rmsnorm_bf16(r4d_addr(x), r4d_addr(w), r4d_addr(y), (int)M, (int)n, eps, wadd,
-                        w_f32, (int)x_ld, (int)y_ld, (long)(uintptr_t)s,
+                        (float)r4d_getf(a, "mult", 1.0), w_f32, (int)x_ld, (int)y_ld, (long)(uintptr_t)s,
                         round_before_weight != 0) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
@@ -1327,6 +1336,32 @@ static int binary(const RadArgs* a, int mul, RadStream s) {
 extern "C" int r4d_rad_add(const RadArgs* a, RadStream s) { return binary(a, 0, s); }
 extern "C" int r4d_rad_mul(const RadArgs* a, RadStream s) { return binary(a, 1, s); }
 
+/* mul_weight: y = x * w, `w` a bf16 weight of one element (pitch -1, a scalar) or one row (pitch
+ * 0, broadcast down the rows) -- the binary kernel's two broadcast forms. */
+extern "C" int r4d_rad_mul_weight(const RadArgs* a, RadStream s) {
+    const RadTensor* X = r4d_opt(a, 0);
+    const RadTensor* W = r4d_opt(a, 1);
+    const RadTensor* Y = r4d_opt(a, 2);
+    if (!X || !W || !Y) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_bf16(X));
+    R4D_NEED(dt_bf16(W));
+    R4D_NEED(dt_bf16(Y));
+    const long long n = r4d_geti_or(a, "n", r4d_dim(Y, (int)Y->rank - 1));
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, Mx = 0;
+    const long long y_ld = r4d_rows_pitch(Y, n, &M);
+    const long long x_ld = r4d_rows_pitch(X, n, &Mx);
+    if (y_ld < 0 || x_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || Mx < M) return R4D_NO(RAD_E_SHAPE);
+    long long w_ld;
+    if (r4d_numel(W) == 1) w_ld = -1;
+    else if (r4d_numel(W) == n && r4d_contig(W)) w_ld = 0;
+    else return R4D_NO(RAD_E_SHAPE);
+    return r4d_binary_bf16(r4d_addr(X), r4d_addr(W), r4d_addr(Y), (int)M, (int)n, 1,
+                           (int)x_ld, (int)w_ld, (int)y_ld,
+                           (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+}
+
 /* ------------------------------------------------------------------ sigmoid */
 
 extern "C" int r4d_rad_sigmoid(const RadArgs* a, RadStream s) {
@@ -1350,27 +1385,6 @@ extern "C" int r4d_rad_sigmoid(const RadArgs* a, RadStream s) {
 
     return r4d_sigmoid_bf16(r4d_addr(x), r4d_addr(y), (int)M, (int)n, (int)x_ld, (int)y_ld,
                             (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
-}
-
-/* ------------------------------------------------------------------ silu */
-
-extern "C" int r4d_rad_silu(const RadArgs* a, RadStream s) {
-    const RadTensor* x = r4d_opt(a, 0);
-    const RadTensor* y = r4d_opt(a, 1);
-    if (!x || !y) return R4D_NO(RAD_E_INVAL);
-    R4D_NEED(dt_bf16(x));
-    R4D_NEED(dt_bf16(y));
-    const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
-    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
-    long long M = 0, My = 0;
-    const long long x_ld = r4d_rows_pitch(x, n, &M);
-    const long long y_ld = r4d_rows_pitch(y, n, &My);
-    if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
-    if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
-    hipLaunchKernelGGL(silu_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
-                       (hipStream_t)s, (const uint16_t*)r4d_addr(x), (uint16_t*)r4d_addr(y),
-                       (uint32_t)n, (uint32_t)x_ld, (uint32_t)y_ld);
-    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ fill */

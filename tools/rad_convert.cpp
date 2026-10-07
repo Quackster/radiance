@@ -516,7 +516,17 @@ int main(int argc, char** argv) {
     }
     ctx.max_spec = max_spec;
     /* AND THE ENCODER, for the draft head's reason. */
-    if (rad_meta_geti(&meta.m, "vision_config.patch_size", 0) > 0) ctx.max_enc_patches = 16384;
+    if (rad_meta_geti(&meta.m, "vision_config.patch_size", 0) > 0) {
+        ctx.max_enc_patches = 16384;
+        RadArchProbe probe{};
+        (void)rad_tools_probe(plugins, meta.m, &probe);
+        if (probe.enc_merge > 1) ctx.max_enc_patches -= ctx.max_enc_patches % probe.enc_merge;
+    }
+    {
+        RadArchProbe probe{};
+        (void)rad_tools_probe(plugins, meta.m, &probe);
+        ctx.max_audio_frames = probe.audio_frames > 0 ? probe.audio_frames : 0;
+    }
 
     /* THE ENCODING EVERY WEIGHT WILL HAVE, answered to declare as rad_weight_encoding: the
      * recipe's when a rule matches, the checkpoint's own when it is trivial. Remembered once
@@ -749,7 +759,14 @@ int main(int argc, char** argv) {
     w.meta_f("rope_theta",     meta.m.rope_theta);
     for (int i = 0; i < meta.m.n_kv; ++i) w.meta_s(meta.m.kv_key[i], meta.m.kv_val[i]);
     /* THE CONTAINER CARRIES AN ENCODER'S WEIGHTS: what `--mm-max-patches auto` keys on. */
-    if (prog.encoder.modalities != 0) w.meta_s("radiance.encoder", prog.encoder_name.c_str());
+    /* The encoders the container carries, by name: a vision tower, an audio encoder, or both. */
+    {
+        std::string enc;
+        if (prog.encoder.modalities != 0) enc = prog.encoder_name;
+        if (prog.audio_encoder.modalities != 0)
+            enc += (enc.empty() ? "" : ",") + prog.audio_encoder_name;
+        if (!enc.empty()) w.meta_s("radiance.encoder", enc.c_str());
+    }
 
     /* ---------------------------------------------------------------- the weights
      *

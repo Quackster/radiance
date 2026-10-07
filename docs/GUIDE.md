@@ -1096,7 +1096,8 @@ for a model that takes no images or video.
 | `--video-min-pixels N`, `--video-max-pixels N` | container's | the same for a video's sampled frames together |
 | `--video-fps F` | container's, else 2 | frames sampled per second of video |
 | `--video-min-frames N`, `--video-max-frames N` | container's, else 4 and 768 | the fewest and most frames sampled from a video |
-| `--video-max-frame-tokens N` | container's, else 768 | the most prompt tokens one frame may become; 0 is no cap |
+| `--video-max-frame-tokens N` | container's, else 768 | the most prompt tokens one frame may become; 0 is no cap. A token-budget processor (Gemma 4's) takes 70, 140, 280, 560 or 1120 |
+| `--image-tokens N` | container's | a token-budget processor's image budget (Gemma 4's: 70, 140, 280, 560, 1120); a request's `image_tokens` overrides it. The pixel-band flags are refused on such a model |
 | `--max-source-pixels N` | 67108864 | the largest image or frame the decoder accepts, before any resize |
 
 **Quality measurement** — instead of serving; see [TOOLS.md](TOOLS.md#the-kl-mode)
@@ -1305,6 +1306,45 @@ curl -s http://localhost:8000/detokenize -H 'Content-Type: application/json' \
 
 `/tokenize` takes `prompt` **or** `messages`, not both.
 
+**An embedding model** (EmbeddingGemma 2) serves `/v1/embeddings` and nothing else; completions and
+chat answer 501. One input is one vector, and an input is never split: it has to fit one step
+(`--max-num-batched-tokens`), and a longer one is refused with `context_length_exceeded`.
+
+```sh
+# text, a batch of texts, or token ids
+curl -s http://localhost:8000/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"input":["first document","second document"]}'
+
+# the model's named prompt in front ("query" -> "task: search result | query: ")
+curl -s http://localhost:8000/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"input":"what is the capital of France?","prompt_name":"query"}'
+
+# Matryoshka: the first 256 dimensions, renormalised
+curl -s http://localhost:8000/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"input":"hello","dimensions":256}'
+
+# one vector for text and media together: content parts, in order
+curl -s http://localhost:8000/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"input":[{"type":"text","text":"a photo of "},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}],
+       "image_tokens":560}'
+
+# or the chat form, rendered through the model's template
+curl -s http://localhost:8000/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":[{"type":"input_audio",
+        "input_audio":{"data":"<base64 wav>","format":"wav"}}]}]}'
+```
+
+`input` is a string, an array of token ids, one array of content parts, or a batch of any of
+those. A content part is `text`, `image_url`, `video_url`, `input_audio` (wav, mp3, flac, ogg,
+opus, m4a, aac, webm or aiff, base64) or `audio_url`; media comes as `data:` URLs, never fetched.
+An image becomes up to 280 tokens by default (`--image-tokens`, or a request's `image_tokens`: 70,
+140, 280, 560 or 1120), a video one frame a second, at most 32 frames of 140 tokens
+(`--video-fps`, `--video-max-frames`, `--video-max-frame-tokens`), and audio 25 tokens a second,
+cut at 30 seconds. `prompt_name` takes the names the model's sentence-transformers configuration
+states (`query`, `document`, `Retrieval-query`, `STS`, ...) and applies to text and content-part
+inputs; a model that states a default prompt applies it when the request names none.
+
 ### 5.7 Request fields
 
 | field | notes |
@@ -1335,7 +1375,8 @@ curl -s http://localhost:8000/detokenize -H 'Content-Type: application/json' \
 | `response_format` | chat only. Mutually exclusive with `grammar` |
 | `grammar` | a GBNF grammar directly. On chat it passes through the chat template and a template that drops it makes the request a refusal — see §5.5 |
 | `echo` | `/v1/completions` only |
-| `encoding_format` | `/v1/embeddings` only: `float` or `base64`. `dimensions` is refused — the embedding width is fixed |
+| `encoding_format` | `/v1/embeddings` only: `float` or `base64` |
+| `dimensions`, `prompt_name`, `image_tokens` | `/v1/embeddings` only (an embedding model, §5.6). `dimensions` truncates to the first N and renormalises; it cannot exceed the model's width |
 
 Any field the request omits keeps the deployment default (§4.9). A field the request names wins.
 
@@ -1605,6 +1646,7 @@ released until it does.
 | `out of memory` / `the carve reserved N of address space and the card would not back it` | Something else is holding VRAM | Check with `rocm-smi`; stop the other process. The budget is stated before allocation, so the log says what it asked for |
 | `pool allocation refused` with `backing allocation of … refused` on the second card, after the first card's pools succeeded | The VRAM budget is measured before any rank allocates. A card that refuses its weights pool lost that memory to another process in between (the line below the refusal says how much is free now). A refused `host_pool` is pinned memory: **every rank pins its own `--host-pool-mib`**, so `--tp 2` pins it twice, and the amdgpu driver caps pinned memory system-wide at `ttm.pages_limit`, half of RAM by default | Stop the other process (`rocm-smi --showpids`). For the host pool, keep `--tp` × `--host-pool-mib` under the cap the refusal names, or raise it with the kernel parameter `ttm.pages_limit` |
 | `host_pool: backing allocation of … refused: rad_dev_alloc(…): locking piece K of N`, and `failed to pin userptr` in `journalctl -k` | The IOMMU would not DMA-map one piece of the pinned host pool. Pinned host memory is locked in pieces of at most 1 GiB because an Intel VT-d host in scalable mode was seen to refuse any single pin above about 2.5 GiB; a piece failing means this machine refuses smaller pins still, or a total its IOMMU will not map | Keep IOMMU translation on: `iommu=pt` lets every pin through but on that host also removed peer access between the cards, which moves every all-reduce onto the slower host-memory path. Report the kernel version, the IOMMU mode and the refusal line |
+| `a synchronisation has waited 5 s` naming a kernel, then `no queue has advanced`, then `HW Exception … GPU Hang` and a reset in `journalctl -k` (`MES failed to respond to msg=REMOVE_QUEUE`, `MODE1 reset`) | The card stopped running the queue. The kernel named is where it stopped, not necessarily why. The driver resets the whole card, VRAM included, and the engine is aborted. The usual cause is compute wave save/restore being off: the driver evicts a process's queues whenever host memory the card maps is moved under memory pressure, and with `cwsr_enable=0` it cannot preempt a running queue, so the eviction waits for a queue a serve never lets drain. A voltage offset or other clock instability is the other cause seen on R9700s. If the stall line says the queues **advanced**, the wait was long rather than stuck, and nothing is wrong | `cat /sys/module/amdgpu/parameters/cwsr_enable` must print `1` (the engine warns at startup when it is `0`); set `amdgpu.cwsr_enable=1`, rebuild the initramfs and reboot. Remove any `OD_VDDGFX_OFFSET` (`pp_od_clk_voltage`). A reset puts the power cap, fan curve and voltage offset back to firmware defaults, so re-apply them before every start rather than once at boot. Keep the devcoredump under `/sys/class/drm/card*/device/devcoredump/data`; a reboot loses it. `docker inspect` shows exit code 0 for a container Docker has already restarted, which says nothing about how the old process ended |
 | `--draft-model is not implemented` | This engine loads its drafter from the container | `rad-convert --draft-model DIR` at conversion time |
 | `context_length_exceeded` on a request | The **prompt alone** does not fit the context. `max_tokens` is clamped rather than refused, so this fires only when there is no room left to generate at all | Shorten the prompt by the number of tokens the message names, or raise `--max-model-len` if the model allows it |
 | `unknown option '--foo'` and the engine exits | Deliberate. A typo in a budget flag is the difference between the plan you asked for and one the planner invented | Check `radiance --help` |
