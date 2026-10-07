@@ -1442,7 +1442,7 @@ under the request's own spelling of each. `server.default_max_tokens` is `null` 
 | `decode_tokens_total`, `prefill_tokens_total` | |
 | `decode_tokens_per_second`, `prefill_tokens_per_second` | |
 | `draft_tokens_total`, `draft_accepted_total`, `draft_acceptance_ratio` | |
-| `draft_position_reached_total`, `draft_position_acceptance_ratio` | acceptance by position, since start |
+| `draft_position_reached_total`, `draft_position_accepted_total`, `draft_position_acceptance_ratio` | acceptance by position: the two counters over any window, the ratio since start |
 | `draft_refills_total`, `draft_refill_tokens_total` | prefix hits ended a drafter window early, and the tokens recomputed (§4.6) |
 | `decode_rows_unspeculated_total` | rows that never drafted at all |
 | `draft_depth_adaptive`, `draft_verify_depth_total{depth}` | the adaptive window's mean over the running sequences, and verifies by the drafts they carried; only with `RADIANCE_DRAFT_ADAPT` (§4.6) |

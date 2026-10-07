@@ -140,6 +140,7 @@ void Metrics::sample(const SchedMetrics& m) {
     for (int j = 0; j < seen; ++j) {
         const int64_t r = m.draft_pos_reached[j];
         g_draft_pos_reached_[j].set((double)r);
+        g_draft_pos_accepted_[j].set((double)m.draft_pos_accepted[j]);
         g_draft_pos_[j].set(r ? (double)m.draft_pos_accepted[j] / (double)r : 0.0);
     }
     /* Published after the gauges it bounds, so a concurrent render never lists a position whose
@@ -393,7 +394,9 @@ std::string Metrics::render() const {
     /* CONDITIONAL, per draft position: of the verifies that reached position j -- every earlier
      * one accepted -- the fraction that took j as well. The pooled ratio above cannot tell a
      * drafter that decays from one whose later rounds are broken; these can, and the companion
-     * `_reached_total` says how much evidence each position carries. */
+     * `_reached_total` says how much evidence each position carries. `_accepted_total` gives the
+     * same ratio over any window: at a fixed depth the next position's reach would do, but an
+     * adaptive window can end at j with j taken. */
     const int seen = draft_pos_seen_.load(std::memory_order_acquire);
     if (seen > 0) {
         const std::string base = L.substr(0, L.size() - 1);
@@ -408,6 +411,11 @@ std::string Metrics::render() const {
         for (int j = 0; j < seen; ++j)
             w.out += "radiance:draft_position_reached_total" + base + ",position=\"" +
                      std::to_string(j) + "\"} " + num(g_draft_pos_reached_[j].get()) + '\n';
+        w.help("radiance:draft_position_accepted_total",
+               "Verifies that accepted each draft position.", "counter");
+        for (int j = 0; j < seen; ++j)
+            w.out += "radiance:draft_position_accepted_total" + base + ",position=\"" +
+                     std::to_string(j) + "\"} " + num(g_draft_pos_accepted_[j].get()) + '\n';
     }
     /* THE ADAPTIVE DRAFT WINDOW, only while RADIANCE_DRAFT_ADAPT is on: where the policy stands --
      * at one sequence, that sequence's window -- and where it has been, as verifies by the

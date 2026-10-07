@@ -2308,6 +2308,35 @@ TEST(concurrent_scrapes_count_each_total_once) {
     CHECK_EQ(value("radiance:prefill_tokens_total"), 5000.0);
 }
 
+/* EACH DRAFT POSITION'S ACCEPTANCES ARE A COUNTER NEXT TO ITS REACH. At a fixed depth position
+ * j+1's reach is j's acceptances, but an adaptive window can end at j with j taken, so a ratio
+ * over a window needs both. Here two verifies end at position 1 with it accepted. */
+TEST(each_draft_position_counts_its_acceptances) {
+    Metrics m("m", 1024);
+    server::SchedMetrics s;
+    s.draft_depth_seen = 3;
+    s.draft_pos_reached[0] = 10; s.draft_pos_accepted[0] = 7;
+    s.draft_pos_reached[1] = 7;  s.draft_pos_accepted[1] = 5;
+    s.draft_pos_reached[2] = 3;  s.draft_pos_accepted[2] = 2;
+    m.sample(s);
+    PromDoc d = parse_prom(m.render());
+    CHECK_EQ((int)d.errors.size(), 0);
+    CHECK_EQ(d.type["radiance:draft_position_accepted_total"], std::string("counter"));
+    CHECK_EQ(d.type["radiance:draft_position_reached_total"], std::string("counter"));
+    auto value = [&d](const std::string& name) {
+        auto it = d.samples.find(name);
+        return it == d.samples.end() ? -1.0 : it->second;
+    };
+    const std::string L = "{model_name=\"m\",engine=\"0\"";
+    const std::string A = "radiance:draft_position_accepted_total" + L + ",position=";
+    CHECK_NEAR(value(A + "\"0\"}"), 7.0, 1e-9);
+    CHECK_NEAR(value(A + "\"1\"}"), 5.0, 1e-9);
+    CHECK_NEAR(value(A + "\"2\"}"), 2.0, 1e-9);
+    CHECK_NEAR(value(A + "\"3\"}"), -1.0, 1e-9);
+    CHECK_NEAR(value("radiance:draft_position_acceptance_ratio" + L + ",position=\"1\"}"),
+               5.0 / 7.0, 1e-9);
+}
+
 /* THE ADAPTIVE DRAFT WINDOW (RADIANCE_DRAFT_ADAPT) IS EXPOSED ONLY WHILE IT IS ON, so a deployment
  * without it scrapes exactly what it always did -- and when it is on, the gauge and the histogram
  * are well-formed families with the labels every other sample carries. */
