@@ -2668,6 +2668,13 @@ static const RadConstraint cArExact8[] = {
     C_EQ("world_size", 8), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
     C_P2P,
 };
+/* No DIV: the three-rank two-shot shards unevenly (r4d_rad_ar_twoshot_3rank_exact), so the only
+ * shape it needs is the 16-byte push ar_setup already checks. */
+static const RadConstraint cArTsExact3[] = {
+    C_EQ("world_size", 3), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_GE("numel", R4D_AR_WIDE_ONESHOT_MAX_ELEMS + 1), C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
+    C_P2P,
+};
 static const RadConstraint cArTsExact4[] = {
     C_EQ("world_size", 4), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
     C_DIV("numel", 64), C_GE("numel", R4D_AR_WIDE_ONESHOT_MAX_ELEMS + 1),
@@ -4345,6 +4352,20 @@ static const RadKernelInfo kKernels[] = {
 
 /* ---------------------------------------------------------------------------- all-reduce ----
  * The two-shot rows outrank the one-shots, for the reason the constraint block above states. */
+{ "ar_twoshot_3rank_exact", "all_reduce", "ar",
+  "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, per-block pipelined "
+  "handshake",
+  "exactly 3 ranks, all peer-accessible; messages above "
+  R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements, two hops; shards as even as the word count "
+  "allows (the first words % 3 take one more); shares the wide family's flag/seq/scratch set; in "
+  "place; cudagraph-safe",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks "
+  "and to ar_oneshot_3rank_exact",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_TWOSHOT,
+  ROW(cArTsExact3), ROW(tAr), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_exact, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+
 { "ar_twoshot_4rank_exact", "all_reduce", "ar",
   "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, per-block pipelined "
   "handshake",
@@ -4435,8 +4456,9 @@ static const RadKernelInfo kKernels[] = {
   r4d_shape_all_gather },
 { "ar_oneshot_3rank_exact", "all_reduce", "ar",
   "all-reduce (sum), one-shot push over P2P IPC scratch, per-block handshake",
-  "exactly 3 ranks, all peer-accessible; one scratch slot per (parity, source rank); "
-  "the only wide form at three -- the two-shot shards the message `world` ways; cudagraph-safe",
+  "exactly 3 ranks, all peer-accessible; one scratch slot per (parity, source rank); in place; "
+  "above " R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements ar_twoshot_3rank_exact outranks it; "
+  "cudagraph-safe",
   "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
   ROW(cArExact3), ROW(tAr), nullptr,

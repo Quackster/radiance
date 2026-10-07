@@ -870,6 +870,33 @@ extern "C" int r4d_rad_ar_oneshot_8rank_exact(const RadArgs* a, RadStream s) {
  * the thread that already read it, later in its own program order, and no peer reads this rank's
  * input -- peers read their own scratch. The selector hands the two-shot the messages above the
  * one-shot's size bound (r4d_rows.cpp, cArTsExact4). */
+/* AT THREE RANKS THE SHARDS ARE UNEVEN, so there is no divisibility to check: a 2048-wide bf16
+ * row is 256 words and a step's message is 256 * rows of them, a multiple of 3 only one step in
+ * three. The kernel gives the first (words % 3) shards one word more, the slot holds two of the
+ * longest, and the fold is the one-shot's -- fp32, ascending rank order -- so the two rows that
+ * share this op produce the same bits and the band edge between them moves nothing a request
+ * could see. */
+extern "C" int r4d_rad_ar_twoshot_3rank_exact(const RadArgs* a, RadStream s) {
+    ArCall c;
+    int rc = ar_setup(a, &c, 1);
+    if (rc != RAD_OK) return rc;
+    if (c.in->world != 3) return RAD_E_SHAPE;
+    if (c.numel > R4D_AR_TWOSHOT_WIDE_MAX_ELEMS) return RAD_E_SHAPE;
+    const long words16 = c.numel * c.in->esize / 16;
+    if (words16 < c.in->world) return RAD_E_SHAPE;
+    const long sh_max = (words16 + c.in->world - 1) / c.in->world;
+    if (2 * sh_max * 16 > c.in->slot_bytes) return RAD_E_SCRATCH;
+    const ArInst* in = c.in;
+    R4D_TRY("ar_twoshot_3rank_exact",
+        r4d_ar_twoshot_3rank_exact(in->peer_scratch[0], in->peer_scratch[1],
+                                   in->peer_flags[0], in->peer_flags[1],
+                                   in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                                   c.inp, c.out, c.numel, in->dtype, in->rank,
+                                   (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
+                                   c.pub));
+    return RAD_OK;
+}
+
 extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
     ArCall c;
     int rc = ar_setup(a, &c, 1);
