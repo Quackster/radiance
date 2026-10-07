@@ -605,6 +605,15 @@ int ref_gated_quant_fp8(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------- the per-row (OCP-MX) forms
+ *
+ * `ref_rmsnorm_quant_fp8` and `ref_gated_quant_fp8` already read `group` as 0 when the parameter is
+ * absent and clamp it to n (line ~530/583 above), which is exactly one scale per row. These ops'
+ * schemas carry no `group`, so the two functions ARE the per-row implementations and these wrappers
+ * only exist to give the registry a name whose `_shape` twin is the per-row one. */
+int ref_rmsnorm_quant_fp8_row(const RadArgs* a, RadStream s) { return ref_rmsnorm_quant_fp8(a, s); }
+int ref_gated_quant_fp8_row  (const RadArgs* a, RadStream s) { return ref_gated_quant_fp8(a, s); }
+
 /* ------------------------------------------------------------- gemm_nt_q_gated */
 /* `a`, `a_scale`, `b`w, `b_scale`w -> `q`, `scale`, `out_bf16`?
  *
@@ -658,14 +667,29 @@ int ref_gemm_nt_q_gated(const RadArgs* a, RadStream) {
     if (ob && numel(ob) < M * n) return RAD_E_SHAPE;
 
     const bool mx = B->dtype == RAD_FP4E2M1;
-    const Scales SA = make_scales(as_, M, K, false);
-    const Scales SB = make_scales(bs_, N, K, mx);
+    Scales SA = make_scales(as_, M, K, false);
+    Scales SB = make_scales(bs_, N, K, mx);
+    /* The OCP-MX fold's reference exponent is `gemm_nt_q_gated_mx`'s eighth operand, appended after
+     * the quantiser's two outputs (r4d_rows.cpp's oGemmNtQGatedMx); for the fp8 form there is no
+     * operand 7 and `t_in` returns null, so this is the shared gated implementation's no-op there
+     * and only the MX call is made clamp-aware. */
+    scales_ref(SB, t_in(a, 7), N);
     const Mat ma = as_mat(A, M, K), mb = as_mat(B, N, K);
+
+    /* The folded MX reference is per-output-row: hoist `wref_at` (a max over the K/32 reference
+     * plane) out of the per-element `quant_dot` so it is computed once per row, not once per (m,n). */
+    std::vector<int> wref_b;
+    if (mx && SB.ref) {
+        wref_b.resize((size_t)N);
+        for (int64_t j = 0; j < N; ++j) wref_b[(size_t)j] = SB.wref_at(j);
+    }
 
     #pragma omp parallel for schedule(static)
     for (int64_t m = 0; m < M; ++m) {
         std::vector<float> row((size_t)N), v((size_t)n);
-        for (int64_t j = 0; j < N; ++j) row[(size_t)j] = quant_dot(ma, mb, SA, SB, m, j, K);
+        for (int64_t j = 0; j < N; ++j)
+            row[(size_t)j] = quant_dot(ma, mb, SA, SB, m, j, K,
+                                       wref_b.empty() ? -1 : wref_b[(size_t)j]);
         const int64_t obb = ob ? rowoff(ob, m, n) : 0;
         const int64_t obs = ob ? laststride(ob) : 1;
         /* Both halves narrowed to bf16 before the gate; the header says why. */
@@ -680,6 +704,20 @@ int ref_gemm_nt_q_gated(const RadArgs* a, RadStream) {
         fp8_row(v.data(), n, g, q, s, m);
     }
     return RAD_OK;
+}
+
+/* ------------------------------------------------------------- gemm_nt_q_gated_mx */
+/* The OCP-MX (mxfp4a8) gated fold: the same arithmetic as `ref_gemm_nt_q_gated` at a group of the
+ * whole row. Its schema has no `group`, so the shared implementation reads the absent group as 0
+ * and clamps it to n, which is one scale per row; and the weight is e2m1, so `mx` there is already
+ * true and make_scales reads the E8M0 plane. `b_ref` does NOT cancel, which the earlier note here
+ * got wrong: the device folds E4M3_RNE(code * 2^-dsh) into each element (underflowing to zero for
+ * dsh around 13+) and multiplies 2^(Wref-127) back out once per row -- a per-code element fold, not
+ * a per-block scale, so it differs from both 2^(E8M0-127) and 2^(Wref-127-dsh). `ref_gemm_nt_q_gated`
+ * attaches operand 7 (this op's b_ref slot) through `scales_ref`, so the shared implementation is
+ * fold-aware for MX and unchanged for fp8, and this wrapper is a name. */
+int ref_gemm_nt_q_gated_mx(const RadArgs* a, RadStream s) {
+    return ref_gemm_nt_q_gated(a, s);
 }
 
 /* ------------------------------------------------------------- dflash_select */
@@ -699,11 +737,14 @@ int ref_gemm_nt_q_gated(const RadArgs* a, RadStream) {
  * THE WALK IS SERIAL IN l, which is why it is an op and not a GEMM and an argmax: scoring the full
  * [steps, K, K] edge tensor computes K times the edges that are ever read, because the predecessor
  * is not known until the previous step has been decided. The parallelism here is over sequences. */
-int ref_dflash_select(const RadArgs* a, RadStream) {
-    if (a->n_t < 7) return RAD_E_INVAL;
-    const RadTensor *cand = &a->t[0], *un = &a->t[1], *anc = &a->t[3];
-    const RadTensor *pred = &a->t[4], *succ = &a->t[5], *out = &a->t[6];
-    const RadTensor* hp = t_in(a, 2);
+/* ONE BODY FOR BOTH SPELLINGS. `psc` and `ssc` are the per-row (or one-for-all) f32 scales of an
+ * E4M3 codebook and are null for the plain one, where every factor below is 1. A scale is applied
+ * where the kernel applies it: the predecessor row's into `ax` once a step, the candidate row's
+ * onto the finished dot -- so the two spellings agree on a codebook that is the same numbers either way. */
+static int dflash_select_body(const RadArgs* a, const RadTensor* cand, const RadTensor* un,
+                              const RadTensor* hp, const RadTensor* anc, const RadTensor* pred,
+                              const RadTensor* psc, const RadTensor* succ, const RadTensor* ssc,
+                              const RadTensor* out) {
     if (!cand->data || !un->data || !anc->data || !pred->data || !succ->data || !out->data)
         return RAD_E_INVAL;
 
@@ -720,6 +761,15 @@ int ref_dflash_select(const RadArgs* a, RadStream) {
     if (numel(anc) < (M - 1) * astr + 1 || numel(out) < M * steps) return RAD_E_SHAPE;
     if (numel(pred) < nv * R || numel(succ) < nv * R) return RAD_E_SHAPE;
     if (hp && numel(hp) < M * steps * R) return RAD_E_SHAPE;
+    /* A scale plane is one element for the whole codebook or one a row, and nothing in between. */
+    auto scale_ok = [&](const RadTensor* t) {
+        return !t || (t->data && (numel(t) == 1 || numel(t) >= nv));
+    };
+    if (!scale_ok(psc) || !scale_ok(ssc)) return RAD_E_SHAPE;
+    auto row_scale = [&](const RadTensor* t, int64_t id) -> float {
+        if (!t) return 1.0f;
+        return ldt(t, numel(t) == 1 ? 0 : id * laststride(t));
+    };
 
     const int64_t cs = laststride(cand), us = laststride(un), os = laststride(out);
     const int64_t ps = laststride(pred), sxs = laststride(succ);
@@ -738,8 +788,9 @@ int ref_dflash_select(const RadArgs* a, RadStream) {
              * the vocabulary contributes nothing rather than reading past the codebook: at step 0
              * it is whatever the target committed, and a padding row's is not a token. */
             const bool ok = pid >= 0 && pid < nv;
+            const float pscl = ok ? row_scale(psc, pid) : 0.0f;
             for (int64_t i = 0; i < R; ++i)
-                ax[(size_t)i] = (ok ? ldt(pred, rowoff(pred, pid, R) + i * ps) : 0.0f) *
+                ax[(size_t)i] = (ok ? ldt(pred, rowoff(pred, pid, R) + i * ps) * pscl : 0.0f) *
                                 (hp ? ldt(hp, hb + i * hs) : 1.0f);
 
             int64_t best_c = 0;
@@ -749,7 +800,9 @@ int ref_dflash_select(const RadArgs* a, RadStream) {
                 float sc = ldt(un, ub + c * us);
                 if (tok >= 0 && tok < nv) {
                     const int64_t sb = rowoff(succ, tok, R);
-                    for (int64_t i = 0; i < R; ++i) sc += ax[(size_t)i] * ldt(succ, sb + i * sxs);
+                    float dot = 0.0f;
+                    for (int64_t i = 0; i < R; ++i) dot += ax[(size_t)i] * ldt(succ, sb + i * sxs);
+                    sc += dot * row_scale(ssc, tok);
                 }
                 if (sc > best_s) { best_s = sc; best_c = c; }
             }
@@ -758,4 +811,31 @@ int ref_dflash_select(const RadArgs* a, RadStream) {
         }
     }
     return RAD_OK;
+}
+
+int ref_dflash_select(const RadArgs* a, RadStream) {
+    if (a->n_t < 7) return RAD_E_INVAL;
+    const RadTensor *cand = &a->t[0], *un = &a->t[1], *anc = &a->t[3];
+    const RadTensor *pred = &a->t[4], *succ = &a->t[5], *out = &a->t[6];
+    if (!cand->data || !un->data || !anc->data || !pred->data || !succ->data || !out->data)
+        return RAD_E_INVAL;
+    return dflash_select_body(a, cand, un, t_in(a, 2), anc, pred, nullptr, succ, nullptr, out);
+}
+
+/* `cand`, `unary`, `hp`?, `anchor`, `pred`w, `pred_scale`w, `succ`w, `succ_scale`w -> `tokens`
+ *
+ * dflash_select over codebooks held as E4M3 codes: codebook[v][r] = codes[v][r] * scale[v], one f32
+ * scale a row (or one for the whole table). A SEPARATE OP and not a dtype on the plain one, for the
+ * reason embed_lookup_q is: the operand list differs and operands are positional. The two
+ * codebooks are 2 x 121 MiB at bf16 on the shipped checkpoint; this halves them, and the KV cache
+ * takes the difference. */
+int ref_dflash_select_q(const RadArgs* a, RadStream) {
+    if (a->n_t < 9) return RAD_E_INVAL;
+    const RadTensor *cand = &a->t[0], *un = &a->t[1], *anc = &a->t[3];
+    const RadTensor *pred = &a->t[4], *psc = &a->t[5], *succ = &a->t[6], *ssc = &a->t[7];
+    const RadTensor* out = &a->t[8];
+    if (!cand->data || !un->data || !anc->data || !pred->data || !succ->data || !out->data ||
+        !psc->data || !ssc->data)
+        return RAD_E_INVAL;
+    return dflash_select_body(a, cand, un, t_in(a, 2), anc, pred, psc, succ, ssc, out);
 }

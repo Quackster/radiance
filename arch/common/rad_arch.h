@@ -127,6 +127,36 @@ inline const char* calib_dir() {
     return d && *d ? d : nullptr;
 }
 
+/* THE LAYER RANGE, INCLUSIVE. Every tap's accumulator is PERSIST and live for the whole program,
+ * and one layer's are [n_embd^2 + n_ff^2] f32 -- 93.79 GiB across this 27B model's 48 trunk
+ * layers, which is larger than a card. So a calibration run names the layers it wants and is
+ * chunked: one process a range, every process writing its own per-layer files into the same
+ * directory (the stem carries the layer, so the chunks cannot collide or overwrite).
+ *
+ * BOTH DEFAULT TO "all layers", so a run that names neither behaves exactly as before -- the
+ * RADIANCE_CALIB_DIR gate alone still means the whole model. FROM is the first layer and TO the
+ * last, both 0-based and matching the `layer` a block is declared at. */
+inline long long calib_layer_from() {
+    static const long long v = [] {
+        const char* s = std::getenv("RADIANCE_CALIB_FROM");
+        return s && *s ? std::atoll(s) : 0LL;
+    }();
+    return v;
+}
+inline long long calib_layer_to() {
+    static const long long v = [] {
+        const char* s = std::getenv("RADIANCE_CALIB_TO");
+        return s && *s ? std::atoll(s) : 0x7FFFFFFFFFFFFFFFLL;
+    }();
+    return v;
+}
+/* Whether layer `l` is inside the chunk. The taps AND this into their `calib` condition, so a layer
+ * outside the range declares no accumulator and no `gram_accum` -- which is what keeps a chunk's
+ * arena small rather than paying for every layer's Hessian at once. */
+inline bool calib_layer_in(int64_t l) {
+    return l >= calib_layer_from() && l <= calib_layer_to();
+}
+
 /* The token count at which the tap dumps and switches itself off. Off by default in the sense
  * that calib_dir() gates it; this only says how much is enough. */
 inline long long calib_target() {

@@ -1,0 +1,27 @@
+# q35-9b-mxfp4.recipe -- Qwen3.5-9B (bf16) converted to an OCP-MXFP4 trunk under fp8 activations,
+# as the q35-9b-mxfp4.rad container would serve it.
+#
+#   rad-convert <Qwen3.5-9B bf16 checkpoint> --quant-id mxfp4 \
+#       --recipe data/recipes/q35-9b-mxfp4.recipe -o q35-9b-mxfp4.rad
+#
+# The 9B is the same qwen3_5 family as the 27B (32 layers, 16 heads, head_dim 256, gated attention
+# every fourth layer with gated delta net between), so it is served by the SAME qwen35_mxfp4 plugin.
+# This checkpoint carries no MTP head and no DFlash2 drafter, so the rule set is the 27B recipe's
+# trunk rules without the `mtp.*`/`dflash.*` lines.
+#
+# The trunk linears -- attention q/k/v/o, the delta net's fused in_proj_qkv|in_proj_z and out_proj,
+# the MLP gate_up and down -- become OCP MXFP4: E2M1 codes with an E8M0 shared exponent a group of
+# 32, spelled `codes=fp4_e2m1 group=32 scale=e8m0`. The lm_head is block fp8 (half the bytes, the
+# widest GEMM). Norms, the embedding, the GDN in_proj_a/in_proj_b (48 rows, not a whole group of 32)
+# and the vision tower match no rule and stay bf16.
+
+output.weight                        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+blk.*.attn_qg.weight                 rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_k.weight                  rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_v.weight                  rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_output.weight             rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ssm_inz.weight                 rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ssm_out.weight                 rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ffn_gate_up.weight             rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ffn_down.weight                rtn  codes=fp4_e2m1 group=32 scale=e8m0

@@ -132,12 +132,130 @@ inline RadOperand wrow_slice(rad_weight h, int64_t first, int64_t n, int64_t pit
     return o;
 }
 
+/* ============================== MXFP4 DRAFTER LINEARS, OPT-IN ==============================
+ *
+ * Upstream PR #30 (commit efb0dd7) lets the DFlash2 drafter's linears run OCP-MXFP4 instead of the
+ * block fp8 the drafter release ships: a smaller weight read whole every decode step, at the cost
+ * of acceptance on code (RTN to e2m1 is 11.7 % relative error vs fp8's 2.6 %). A draft is
+ * verified, so only acceptance can move -- never an emitted token. The PR calls it "an option, not
+ * the recommended recipe", so it is ENV-GATED here rather than read off the container:
+ *
+ *   RADIANCE_MX_DF2_DRAFTER_MX=1 radiance --model <MXFP4-drafter container> serve
+ *
+ * OFF (the default) declares exactly what DenseFP8 always has -- the same call, so an fp8
+ * container is byte-for-byte the graph it was. ON declares the nine linears as fp4_e2m1 codes with
+ * an E8M0 exponent plane and that plane again as the per-row reference, and issues the same
+ * `gemm_nt_q` at `dtype=mxfp4a8` -- an existing libr4d row, no new kernel needed. The container
+ * must have been quantised so by the recipe (`codes=fp4_e2m1 group=32 scale=e8m0`); a container
+ * that is not OCP-MXFP4 is refused with that instruction, not mis-read.
+ *
+ * The flag is read once, like kMxArFold, so the declare and the issue site agree. */
+inline constexpr bool kDf2DrafterMxDefault = false;
+inline bool df2_drafter_mx_from_env() {
+    const char* v = std::getenv("RADIANCE_MX_DF2_DRAFTER_MX");
+    if (!v || !v[0]) return kDf2DrafterMxDefault;
+    return v[0] == '1' || v[0] == 't' || v[0] == 'T' || v[0] == 'y' || v[0] == 'Y';
+}
+inline const bool kDf2DrafterMx = df2_drafter_mx_from_env();
+
+/* The OCP-MXFP4 group width, named here rather than pulled from rad_mx.h (this header is also
+ * compiled into the fp8 arch, which does not include rad_mx.h). It is the group the encoding and
+ * the layout hook both require. */
+enum { DF2_MX_GROUP = 32 };
+
+/* An OCP-MXFP4 weight for this block: e2m1 codes, an E8M0 plane at [1 x 32], no transform. */
+inline bool df2_is_mxfp4(const RadEncoding& e) {
+    if (!rad_enc_is(&e, "affine") || e.n_planes != 2 || e.transform[0]) return false;
+    const RadEncPlane* sc = rad_enc_plane(&e, "scale");
+    return e.plane[0].dtype == RAD_FP4E2M1 && e.plane[0].block[1] == 1 && sc &&
+           sc->dtype == RAD_E8M0 && sc->block[0] == 1 && sc->block[1] == DF2_MX_GROUP;
+}
+
+/* One drafter linear. Holds DenseFP8's two planes plus the MX reference view when the flag put it
+ * in MXFP4. `w`/`s` keep DenseFP8's names so the buffer accesses below read unchanged. */
+struct Df2Lin {
+    rad_weight w = 0, s = 0;
+    rad_weight ref = 0;      /* the E8M0 plane as a per-row reference; MX only */
+    bool       mx = false;
+
+    int declare(RadBuilder* b, Names& nm, const char* base, int64_t N, int64_t K,
+                int access, int shard, RadWeightGroup grp,
+                std::initializer_list<const char*> src,
+                std::initializer_list<int64_t> row_parts = {});
+
+    /* `gemm_nt_q` over this weight, at the dtype it was declared in, ranged M 1..hi. */
+    rad_op gemm(RadBuilder* b, int64_t hi, int64_t N, int64_t K,
+                std::initializer_list<rad_buf> reads, std::initializer_list<rad_buf> writes) const {
+        if (mx)
+            return rw(b, RAD_OP(b, "gemm_nt_q",
+                          RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                     RAD_INT("group", DF2_MX_GROUP), RAD_STR("dtype", "mxfp4a8")),
+                          RAD_WEIGHTS(w, s, ref)),
+                      reads, writes);
+        return rw(b, RAD_OP(b, "gemm_nt_q",
+                      RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                 RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "fp8a8")),
+                      RAD_WEIGHTS(w, s)),
+                  reads, writes);
+    }
+    /* The op's trailing `b_ref` operand: the reference view for MXFP4, absent for fp8. */
+    RadOperand bref() const { return mx ? RAD_W(ref) : RAD_NONE; }
+};
+
+inline int Df2Lin::declare(RadBuilder* b, Names& nm, const char* base, int64_t N, int64_t K,
+                           int access, int shard, RadWeightGroup grp,
+                           std::initializer_list<const char*> src,
+                           std::initializer_list<int64_t> row_parts) {
+    /* OFF: DenseFP8 declares it, unchanged -- the same function, so an fp8 container is byte-for-
+     * byte the graph it was before this flag existed. */
+    if (!kDf2DrafterMx) {
+        DenseFP8 d;
+        const int rc = d.declare(b, nm, base, N, K, access, shard, grp, src, row_parts);
+        w = d.w; s = d.s; mx = false;
+        return rc;
+    }
+    /* ON: OCP-MXFP4 only. The name map is made once, here, and the encoding it resolves to is the
+     * authority on whether this weight was quantised to the fp4 grid. */
+    if (N <= 0 || K <= 0 || src.size() == 0) return RAD_E_INVAL;
+    const char* wn = nm.f("%s.weight", base);
+    RAD_ARCH_TRY(map_linear(b, wn, src));
+    RadEncoding enc{};
+    if (!weight_enc(b, wn, &enc) || !df2_is_mxfp4(enc)) {
+        fprintf(stderr, "radiance: RADIANCE_MX_DF2_DRAFTER_MX is set but '%s' is not OCP-MXFP4; "
+                        "the recipe must quantise the drafter linears "
+                        "`codes=fp4_e2m1 group=32 scale=e8m0`\n", base);
+        return RAD_E_DTYPE;
+    }
+    /* The exponent plane is one row tall, so a part needs only whole 16-row tiles; K takes whole
+     * 128s because the E4M3 activation in front carries a scale per (row, 128). */
+    if (N % 16 || K % RAD_FP8_BLOCK) {
+        fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; an MXFP4 weight takes rows in 16s "
+                        "and K in whole %d-column activation scale blocks.\n",
+                base, (long long)N, (long long)K, RAD_FP8_BLOCK);
+        return RAD_E_INVAL;
+    }
+    int64_t p[RAD_MAX_ROW_PARTS] = {0};
+    int     np = 0;
+    for (int64_t q : row_parts) {
+        if (np >= RAD_MAX_ROW_PARTS || q % 16) return RAD_E_INVAL;
+        p[np++] = q;
+    }
+    w   = decl_view(b, wn, nullptr, "codes", RAD_FP4E2M1, { N, K }, access, shard, grp, p, np);
+    s   = decl_view(b, nm.f("%s.scale", base), wn, "scale", RAD_E8M0, { N, K / DF2_MX_GROUP },
+                    access, shard, grp, p, np);
+    ref = decl_view(b, nm.f("%s.ref", base), wn, "scale", RAD_E8M0, { N, K / DF2_MX_GROUP },
+                    access, shard, grp, p, np);
+    mx = w && s && ref;
+    return mx ? RAD_OK : RAD_E_INVAL;
+}
+
 struct Dflash2 {
     enum { MAX_LAYERS = 8 };
 
     /* Everything the drafter's own config.json says that its geometry does not. Read by the
-     * plugin from `draft.*` metadata keys and handed in whole, so this file reads no environment
-     * and no container. */
+     * plugin from `draft.*` metadata keys and handed in whole, so this struct comes from no
+     * environment and no container. (The one environment read in this file is
+     * RADIANCE_MX_DF2_DRAFTER_MX, and it only picks the drafter linears' weight format.) */
     struct Config {
         int64_t n_taps   = 0;     /* how many trunk layers `fc` concatenates */
         int64_t block    = 0;     /* query rows a sequence: the anchor plus n_spec mask tokens */
@@ -238,12 +356,22 @@ struct Dflash2 {
      * the decode budget after the trunk's own GEMMs. On Qwen3.8-27B at depth 7, MXFP4 rounded to
      * nearest accepts ~1% fewer tokens a step than fp8 and takes ~1.5 ms off a ~34 ms step.
      * Nothing it computes can change an emitted token, because every draft is verified against the
-     * trunk exactly; the only thing quantising it can move is acceptance. */
-    DenseFP8   w_fc{};
+     * trunk exactly; the only thing quantising it can move is acceptance.
+     *
+     * `Df2Lin` wraps DenseFP8 behind RADIANCE_MX_DF2_DRAFTER_MX (default off, declared above):
+     * off, it delegates to DenseFP8 unchanged; on, it declares the weight OCP-MXFP4 and issues the
+     * `mxfp4a8` row. See the flag's block comment. */
+    Df2Lin     w_fc{};
     rad_weight w_hnorm = 0, w_norm = 0;
     rad_weight w_selp = 0, w_pred = 0, w_succ = 0;
+    /* ...and their f32 scales, when the container holds the two codebooks as E4M3 codes (a scale a
+     * row). Both or neither: the selector op is one or the other. */
+    rad_weight w_preds = 0, w_succs = 0;
     rad_weight w_tok = 0;                    /* the TARGET's embedding table */
+    rad_weight w_toks = 0;                   /* ...and its E4M3 scale, set before declare() */
     rad_weight w_dh = 0, w_dhs = 0;          /* the 2-bit copy of the TARGET's lm_head */
+    bool       dh4 = false;                  /* ...or a 4-bit one, when the recipe made it u4 */
+    bool       dh8 = false;                  /* ...or an int8 one (i8 codes, bf16 scale a 128) */
 
     /* per-layer weights */
     rad_weight w_anorm[MAX_LAYERS] = {}, w_fnorm[MAX_LAYERS] = {};
@@ -254,9 +382,9 @@ struct Dflash2 {
      * [2*kv_dim/128][K/128] plane for a [kv_dim, K] op and refuse it. Two weights make the op's N
      * and the planes' rows the same number again, shard independently at kv_dim, and issue the
      * same two launches. */
-    DenseFP8   w_q[MAX_LAYERS]{},  w_k[MAX_LAYERS]{}, w_v[MAX_LAYERS]{}, w_o[MAX_LAYERS]{};
+    Df2Lin     w_q[MAX_LAYERS]{},  w_k[MAX_LAYERS]{}, w_v[MAX_LAYERS]{}, w_o[MAX_LAYERS]{};
     rad_weight w_qn[MAX_LAYERS] = {}, w_kn[MAX_LAYERS] = {};
-    DenseFP8   w_gu[MAX_LAYERS]{}, w_dn[MAX_LAYERS]{};
+    Df2Lin     w_gu[MAX_LAYERS]{}, w_dn[MAX_LAYERS]{};
     rad_weight w_acp[MAX_LAYERS] = {}, w_acb[MAX_LAYERS] = {};
     rad_weight w_fcp[MAX_LAYERS] = {}, w_fcb[MAX_LAYERS] = {};
 
@@ -355,10 +483,52 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
     w_selp  = decl_w(b, nm.f("dflash.sel_proj.weight"), RAD_BF16, {cfg.sel_rank, g.n_embd},
                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
-    w_pred  = decl_w(b, nm.f("dflash.sel_pred"), RAD_BF16, {g.n_vocab_all, cfg.sel_rank},
-                     RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
-    w_succ  = decl_w(b, nm.f("dflash.sel_succ"), RAD_BF16, {g.n_vocab_all, cfg.sel_rank},
-                     RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
+    /* THE SELECTOR'S CODEBOOKS AT E4M3, when the container holds them so. Two [248320, 256] tables
+     * of bf16 are 2 x 121 MiB resident; at E4M3 codes and an f32 scale a row they are half that,
+     * and the difference goes to the KV cache (~3.9k tokens). The walk reads K candidate rows and
+     * one predecessor row a step, so the format costs no time. What it can move is acceptance, and
+     * only that: a draft is verified. Decided from what the container says each table IS (the
+     * same rule the token embedding follows), so a container with bf16 codebooks is declared and
+     * served exactly as before, and a recipe line is all it takes to opt in. A scale plane that is
+     * one for the whole table is read too (a 1 x 1 view); the shipped recipe writes one a row. */
+    {
+        RadEncoding ep{}, es{};
+        auto e4m3 = [](const RadEncoding& e) {
+            return e.n_planes == 2 && e.plane[0].dtype == RAD_F8E4M3 &&
+                   rad_enc_find(&e, "scale") == 1 && e.plane[1].dtype == RAD_F32;
+        };
+        const bool qp = weight_enc(b, nm.f("dflash.sel_pred"), &ep) && e4m3(ep);
+        const bool qs = weight_enc(b, nm.f("dflash.sel_succ"), &es) && e4m3(es);
+        if (qp != qs) {
+            fprintf(stderr, "radiance: dflash2's selector codebooks are %s for pred and %s for "
+                    "succ; the selector op takes both E4M3 or both bf16\n",
+                    qp ? "E4M3" : "not E4M3", qs ? "E4M3" : "not E4M3");
+            return RAD_E_UNSUPPORTED;
+        }
+        if (qp) {
+            auto rows_of = [&](const RadEncoding& e) -> int64_t {
+                return e.plane[1].block[0] == 1 ? g.n_vocab_all : 1;
+            };
+            w_pred  = decl_view(b, nm.f("dflash.sel_pred"), nullptr, "codes", RAD_F8E4M3,
+                                {g.n_vocab_all, cfg.sel_rank}, RAD_ACCESS_VOCAB, RAD_SHARD_NONE,
+                                grp_model());
+            w_preds = decl_view(b, nm.f("dflash.sel_pred.scale"), nm.f("dflash.sel_pred"), "scale",
+                                RAD_F32, {rows_of(ep), 1}, RAD_ACCESS_VOCAB, RAD_SHARD_NONE,
+                                grp_model());
+            w_succ  = decl_view(b, nm.f("dflash.sel_succ"), nullptr, "codes", RAD_F8E4M3,
+                                {g.n_vocab_all, cfg.sel_rank}, RAD_ACCESS_VOCAB, RAD_SHARD_NONE,
+                                grp_model());
+            w_succs = decl_view(b, nm.f("dflash.sel_succ.scale"), nm.f("dflash.sel_succ"), "scale",
+                                RAD_F32, {rows_of(es), 1}, RAD_ACCESS_VOCAB, RAD_SHARD_NONE,
+                                grp_model());
+            if (!w_pred || !w_preds || !w_succ || !w_succs) return RAD_E_INVAL;
+        } else {
+            w_pred  = decl_w(b, nm.f("dflash.sel_pred"), RAD_BF16, {g.n_vocab_all, cfg.sel_rank},
+                             RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
+            w_succ  = decl_w(b, nm.f("dflash.sel_succ"), RAD_BF16, {g.n_vocab_all, cfg.sel_rank},
+                             RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
+        }
+    }
 
     /* THE 2-BIT DRAFT HEAD. The same declaration the MTP head makes, for the same reasons, argued
      * at length in rad_block_mtp_fp8.h: `dflash.draft_head.weight` is the target's lm_head under a
@@ -552,12 +722,19 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                   {w.ck, w.cv}, {});
 
     /* ---------------------------------------------------------------- the query pass */
-    op_embed = rw(b, RAD_OP(b, "embed_lookup",
-                     RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n_embd", g.n_embd),
-                                RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
-                                RAD_INT("vocab_offset", g.vocab_off)),
-                     RAD_WEIGHTS(w_tok)),
-                 {}, {w.x});
+    op_embed = w_toks
+        ? rw(b, RAD_OP(b, "embed_lookup_q",
+                 RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n_embd", g.n_embd),
+                            RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                            RAD_INT("vocab_offset", g.vocab_off)),
+                 RAD_WEIGHTS(w_tok, w_toks)),
+             {}, {w.x})
+        : rw(b, RAD_OP(b, "embed_lookup",
+                 RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n_embd", g.n_embd),
+                            RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                            RAD_INT("vocab_offset", g.vocab_off)),
+                 RAD_WEIGHTS(w_tok)),
+             {}, {w.x});
     /* The trunk's embedding is vocab-sharded, so this gather is partial and takes the same exact
      * reduction. It is on the DRAFT path, which runs once a step ahead of the trunk: a second
      * small collective. */
@@ -819,7 +996,15 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
               {w.sel_h}, {w.hp});
     /* `anchor_stride` is `block`, because the operand is the step's own token_ids: a draft pass
      * carries `block` ids a sequence and the anchor is the first of them. */
-    op_sel = rw(b, RAD_OP(b, "dflash_select",
+    op_sel = w_preds
+        ? rw(b, RAD_OP(b, "dflash_select_q",
+                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", cfg.steps()),
+                              RAD_INT("top_k", cfg.sel_topk), RAD_INT("rank", cfg.sel_rank),
+                              RAD_INT("n_vocab", g.n_vocab_all),
+                              RAD_INT("anchor_stride", cfg.block), RAD_STR("dtype", g.dtype)),
+                   RAD_WEIGHTS(w_pred, w_preds, w_succ, w_succs)),
+               {w.cand, w.unary, w.hp}, {w.tokens})
+        : rw(b, RAD_OP(b, "dflash_select",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", cfg.steps()),
                               RAD_INT("top_k", cfg.sel_topk), RAD_INT("rank", cfg.sel_rank),
                               RAD_INT("n_vocab", g.n_vocab_all),
@@ -876,7 +1061,11 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
     const int64_t NG = cfg.ng(g.n_embd);
     const int64_t half = cfg.taps * NG;      /* prepare's coefficients, then finish's */
 
-    RAD_ISSUE_N(c, op_embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(w_tok), brows(w.x, T));
+    if (w_toks)
+        RAD_ISSUE_N(c, op_embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(w_tok), RAD_W(w_toks),
+                    brows(w.x, T), RAD_NONE);
+    else
+        RAD_ISSUE_N(c, op_embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(w_tok), brows(w.x, T));
     if (op_embed_ar)
         RAD_ISSUE_N(c, op_embed_ar, (int64_t)T * g.n_embd, brows(w.x, T), RAD_NONE);
 

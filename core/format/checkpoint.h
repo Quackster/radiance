@@ -145,6 +145,7 @@ private:
     int add_shard(const std::string& p, const std::string& prefix = "");
     int open_safetensors(const std::string& path);
     int open_gguf(const std::string& path);
+    int alias_mxfp4();
     void detect_import();
 
     enum Kind { None, Gguf, SafeT } kind_ = None;
@@ -163,6 +164,8 @@ private:
 };
 
 /* ================================================================== logical weights */
+struct ParoLinear;                            /* a paroquant_mxfp6 source linear, defined below */
+
 /* A declared weight's source, as the name map resolves it: pieces joined along `concat_dim`, and
  * for block-scaled FP8 each piece's scale plane beside it. */
 struct CkptWeight {
@@ -173,6 +176,10 @@ struct CkptWeight {
     uint32_t rank = 0;
     int64_t  shape[RAD_MAX_RANK] = {0};       /* the logical shape */
     int64_t  rows = 0, cols = 0;              /* its [rows, cols] view (rad_enc_view) */
+    /* PAROQUANT: one a piece, when that piece is a rotated linear of a `paroquant_mxfp6`
+     * checkpoint; empty otherwise. Its shape is the LOGICAL [N, K], and ckpt_rows_f32 de-rotates
+     * each piece through ckpt_paro_rows_f32 rather than reading the packed codes. */
+    std::vector<std::shared_ptr<ParoLinear>> paro;
     /* The encoding the pieces ARE, when it is trivial; `why` says what is not when it is not. */
     bool        trivial = false;
     /* GPTQ-PACKED PIECES, read into `enc` (`i4` or `i8` codes, bf16 scales a 128 of K) by
@@ -207,5 +214,53 @@ int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::
  * into `dst`: the bytes a container entry holds for it. */
 int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* dst,
                     std::string* why);
+
+/* ================================================================== paroquant_mxfp6
+ *
+ * THE PAROQUANT CHECKPOINT'S QUANTIZED LINEAR, read into the core's own terms. A quantised linear
+ * ships five tensors: `<base>.weight` (U8, packed 6-bit E2M3 codes four to three bytes),
+ * `.weight_scale` (U8 E8M0, one shared exponent a 32-wide MX group) and the rotation
+ * `.pairs` (I16 [S,K]), `.theta` (F16 [S,K/2]) and `.channel_scales` (F16 [1,K]). The published
+ * transform is w = R(v) . D; the core's givens encoding wants column-global pairs and the scale
+ * on the left of the decoder's divide (enc_givens_paro_tables), so the reader globalizes the
+ * pairs and stores 1/channel_scales. What it produces is an ordinary `affine` encoding with a
+ * `givens` transform, decodable by enc_decode_rows like any container weight.
+ *
+ * The plane buffers are owned here; `data(k)` is enc plane k's canonical row-major bytes. The
+ * codes and the E8M0 scale are NOT copied -- they point straight into the checkpoint's mapping,
+ * since a convert holds one of these a linear and the codes are the whole weight. Build an
+ * EncodedView over them while this lives. */
+struct ParoLinear {
+    std::string name;
+    int64_t     rows = 0, cols = 0;
+    int64_t     stages = 0;                         /* S, the pairs' first extent */
+    int64_t     group = 0;                          /* the rotation group width */
+    RadEncoding enc{};
+    const void* code = nullptr;                     /* enc plane 0: packed E2M3 codes */
+    const void* wscale = nullptr;                   /* enc plane 1: E8M0 exponents */
+    std::vector<uint8_t> pairs;                     /* enc plane 2: i32 [S, K] global pairs */
+    std::vector<uint8_t> angle;                     /* enc plane 3: f32 [S, K/2] angles */
+    std::vector<uint8_t> tscale;                    /* enc plane 4: f32 [1, K], 1/channel_scales */
+
+    const void* data(int k) const {
+        switch (k) {
+            case 0:  return code;
+            case 1:  return wscale;
+            case 2:  return pairs.empty()  ? nullptr : pairs.data();
+            case 3:  return angle.empty()  ? nullptr : angle.data();
+            case 4:  return tscale.empty() ? nullptr : tscale.data();
+            default: return nullptr;
+        }
+    }
+};
+
+/* Read the paroquant_mxfp6 linear whose tensors are `<base>.weight` and its four companions.
+ * RAD_OK; RAD_E_NOTFOUND when the base or a companion is absent; RAD_E_FORMAT/RAD_E_SHAPE when
+ * they disagree or the rotation does not fit. `out->name` is `base`. */
+int ckpt_paro_read(Checkpoint& ck, const std::string& base, ParoLinear* out, std::string* why);
+
+/* Logical rows [r0, r0 + nr) of a read linear as f32 [nr, cols], through the core's givens
+ * decoder. */
+int ckpt_paro_rows_f32(const ParoLinear& w, int64_t r0, int64_t nr, float* out, std::string* why);
 
 }  /* namespace rad */

@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 using namespace rad;
@@ -90,6 +91,11 @@ T fp8(const std::string& name, std::vector<int64_t> shape) {
     return t;
 }
 
+/* U8 bytes taken as they are: the two planes of a compressed-tensors MXFP4 linear. */
+T u8(const std::string& name, std::vector<int64_t> shape, std::vector<uint8_t> bytes) {
+    return T{ name, "U8", shape, std::move(bytes) };
+}
+
 RadNameMap map(const char* declared, int mode, std::vector<const char*> src,
                std::vector<int> index = {}, int concat_dim = 0) {
     RadNameMap m{};
@@ -107,6 +113,13 @@ const char* kConfig =
     "{\"model_type\":\"qwen3_5\",\"hidden_size\":256,\"num_hidden_layers\":2,"
     "\"quantization_config\":{\"quant_method\":\"fp8\",\"fmt\":\"e4m3\","
     "\"weight_block_size\":[128,128]}}";
+
+/* A compressed-tensors OCP-MXFP4 release: llm-compressor names the CONTAINER as the quant_method
+ * and the numbers in `format`, which is the key that says `mxfp4`. */
+const char* kMxConfig =
+    "{\"model_type\":\"qwen3_5\",\"hidden_size\":256,\"num_hidden_layers\":2,"
+    "\"quantization_config\":{\"quant_method\":\"compressed-tensors\","
+    "\"format\":\"mxfp4-pack-quantized\"}}";
 
 }  /* namespace */
 
@@ -332,6 +345,85 @@ TEST(what_is_not_served_as_it_is_says_why) {
     CHECK(w.why.find("no scale plane") != std::string::npos);
     REQUIRE_EQ(ckpt_resolve(ck, prog, "mixed", false, &w, &why), RAD_OK);
     CHECK(!w.trivial);
+    remove_checkpoint(dir);
+}
+
+/* A COMPRESSED-TENSORS MXFP4 LINEAR IS TWO U8 PLANES the plugin already reads: `.weight_packed`
+ * (two e2m1 codes a byte, low nibble first) aliased as `p.weight` at fp4_e2m1 [N][K], beside
+ * `.weight_scale` (one E8M0 exponent a 32) aliased as `p.weight_scale_inv`. The weight is then a
+ * trivial `fp4_e2m1*e8m0[1x32]`, so its value is code * its 32-wide block's exponent. */
+TEST(compressed_tensors_mxfp4_is_aliased_to_the_two_mx_planes) {
+    const int64_t N = 2, K = 64;
+    std::vector<uint8_t> packed((size_t)(N * K / 2), 0), scale((size_t)(N * K / 32), 127);
+    packed[0]  = 0x21;   /* row 0 cols 0,1: code 1 (0.5), code 2 (1.0) */
+    packed[1]  = 0x43;   /* cols 2,3:        code 3 (1.5), code 4 (2.0) */
+    packed[16] = 0x65;   /* cols 32,33:      code 5 (3.0), code 6 (4.0) */
+    scale[1]   = 128;    /* row 0, cols 32..63: 2^1 */
+    scale[2]   = 126;    /* row 1, cols 0..31:  2^-1 */
+    const std::string dir = write_checkpoint(
+        { u8("p.weight_packed", { N, K / 2 }, packed), u8("p.weight_scale", { N, K / 32 }, scale) },
+        kMxConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK_EQ(ck.meta().quant, std::string("mxfp4"));
+
+    const SrcTensor* w = ck.find("p.weight");
+    REQUIRE(w != nullptr);
+    CHECK_EQ(w->rad_dtype, (uint32_t)RAD_FP4E2M1);
+    REQUIRE_EQ(w->shape.size(), (size_t)2);
+    CHECK_EQ(w->shape[0], N);
+    CHECK_EQ(w->shape[1], K);
+    const SrcTensor* si = ck.find("p.weight_scale_inv");
+    REQUIRE(si != nullptr);
+    CHECK_EQ(si->rad_dtype, (uint32_t)RAD_E8M0);
+    CHECK_EQ(si->shape[1], K / 32);
+
+    Program prog;
+    prog.name_map.push_back(map("p", RAD_MAP_COPY, { "p.weight" }));
+    CkptWeight cw;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "p", false, &cw, &why), RAD_OK);
+    REQUIRE(cw.trivial);
+    CHECK(rad_enc_is(&cw.enc, "affine"));
+    REQUIRE_EQ(cw.enc.n_planes, 2);
+    CHECK_EQ(cw.enc.plane[0].dtype, (uint32_t)RAD_FP4E2M1);
+    CHECK_EQ(cw.enc.plane[1].dtype, (uint32_t)RAD_E8M0);
+    CHECK_EQ(cw.enc.plane[1].block[0], (int64_t)1);
+    CHECK_EQ(cw.enc.plane[1].block[1], (int64_t)32);
+    CHECK_EQ(cw.cols, K);
+
+    std::vector<float> f((size_t)K);
+    REQUIRE_EQ(ckpt_rows_f32(cw, 0, 1, f.data(), &why), RAD_OK);
+    CHECK_EQ(f[0], 0.5f);
+    CHECK_EQ(f[1], 1.0f);
+    CHECK_EQ(f[2], 1.5f);
+    CHECK_EQ(f[3], 2.0f);
+    CHECK_EQ(f[4], 0.0f);
+    CHECK_EQ(f[32], 6.0f);   /* code 5 * 2.0 */
+    CHECK_EQ(f[33], 8.0f);   /* code 6 * 2.0 */
+    REQUIRE_EQ(ckpt_rows_f32(cw, 1, 1, f.data(), &why), RAD_OK);
+    CHECK_EQ(f[0], 0.0f);
+
+    std::vector<uint8_t> raw((size_t)(K / 2));
+    REQUIRE_EQ(ckpt_plane_rows(cw, 0, 0, 1, raw.data(), &why), RAD_OK);
+    CHECK_EQ(raw[0], (uint8_t)0x21);
+    CHECK_EQ(raw[16], (uint8_t)0x65);
+    std::vector<uint8_t> sraw((size_t)(K / 32));
+    REQUIRE_EQ(ckpt_plane_rows(cw, 1, 0, 1, sraw.data(), &why), RAD_OK);
+    CHECK_EQ(sraw[0], (uint8_t)127);
+    CHECK_EQ(sraw[1], (uint8_t)128);
+    remove_checkpoint(dir);
+}
+
+/* A pair whose shapes do not fit [N][K/2] beside [N][K/32] is refused by name when the checkpoint
+ * opens, rather than served with a scale grid read at the wrong width. */
+TEST(a_compressed_tensors_mxfp4_pair_that_disagrees_is_refused_by_name) {
+    const std::string dir = write_checkpoint(
+        { u8("p.weight_packed", { 2, 32 }, std::vector<uint8_t>(64, 0)),
+          u8("p.weight_scale", { 2, 1 }, std::vector<uint8_t>(2, 127)) },  /* wants [2][2] */
+        kMxConfig);
+    Checkpoint ck;
+    CHECK_EQ(ck.open(dir), RAD_E_FORMAT);
     remove_checkpoint(dir);
 }
 

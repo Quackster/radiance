@@ -83,6 +83,26 @@ static void mxfp4_to_f32(const uint8_t* src, float* dst, int64_t n) {
     }
 }
 
+/* Four e2m3 codes per three bytes, little-endian LSB-first -- ref_common.h's mxfp6_code and the
+ * ABI's rad_load_bits(base, 6, i) are the same selection written as one group unpack. Left scalar
+ * for the mxfp4 reason: this plane is read by the oracle and the checker, not by a kernel this
+ * plugin serves at speed. */
+static void mxfp6_to_f32(const uint8_t* src, float* dst, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        const uint8_t* g = src + 3 * (i >> 2);
+        uint8_t v;
+        switch (i & 3) {
+            case 0:  v = (uint8_t)(g[0] & 0x3fu); break;
+            case 1:  v = (uint8_t)(((g[1] & 0x0fu) << 2) | (g[0] >> 6)); break;
+            case 2:  v = (uint8_t)(((g[2] & 0x03u) << 4) | (g[1] >> 4)); break;
+            default: v = (uint8_t)(g[2] >> 2); break;
+        }
+        const int e = (v >> 3) & 0x3u, m = v & 0x7u;
+        const float f = (e == 0) ? (float)m / 8.0f : std::ldexp(1.0f + (float)m / 8.0f, e - 1);
+        dst[i] = (v & 0x20u) ? -f : f;
+    }
+}
+
 /* ================================================================== the generic row */
 void row_to_f32(uint32_t dt, const void* src, float* dst, int64_t n) {
     switch (dt) {
@@ -95,6 +115,7 @@ void row_to_f32(uint32_t dt, const void* src, float* dst, int64_t n) {
         case RAD_I4:     w4_to_f32((const uint8_t*)src, dst, n); break;
         case RAD_I2:     w2_to_f32((const uint8_t*)src, dst, n); break;
         case RAD_FP4E2M1:  mxfp4_to_f32((const uint8_t*)src, dst, n); break;
+        case RAD_FP6E2M3:  mxfp6_to_f32((const uint8_t*)src, dst, n); break;
         default:
             /* Everything left is an integer or a bool, none of them hot. The ABI's own accessor is
              * the definition and there is nothing to vectorise about a u8 widen nobody runs. */
@@ -202,7 +223,7 @@ const float* in_row(const RadTensor* t, int64_t base, int64_t n, float* scr) {
          * row shifted by one nibble -- a permutation, and the kind that produces plausible numbers.
          * Every real W4 row starts on a group boundary, so this costs nothing. */
         const int sub = (t->dtype == RAD_I4 || t->dtype == RAD_FP4E2M1) ? 1
-                      : (t->dtype == RAD_I2) ? 3 : 0;
+                      : (t->dtype == RAD_I2 || t->dtype == RAD_FP6E2M3) ? 3 : 0;
         if (!sub || (base & sub) == 0) {
             const void* p = byte_at(t->data, t->dtype, base);
             return row_f32_in(t->dtype, p, scr, n);
@@ -216,7 +237,7 @@ void out_row(const RadTensor* t, int64_t base, int64_t n, const float* src) {
     const int64_t st = laststride(t);
     if (st == 1) {
         const int sub = (t->dtype == RAD_I4 || t->dtype == RAD_FP4E2M1) ? 1
-                      : (t->dtype == RAD_I2) ? 3 : 0;
+                      : (t->dtype == RAD_I2 || t->dtype == RAD_FP6E2M3) ? 3 : 0;
         if (!sub || (base & sub) == 0) {
             row_from_f32(t->dtype, src, (void*)byte_at(t->data, t->dtype, base), n);
             return;

@@ -108,8 +108,39 @@ set(R4D_UNITS
   "r4d_gemm_w4a8_tiled|-DR4D_GEMM_W4A8_GROUP=${RAD_W4_GROUP}"
   "r4d_gemm_w4a8_prefill|-DR4D_GEMM_W4A8_GROUP=${RAD_W4_GROUP}"
   "r4d_gemm_mxfp4a8_nt_m64|"
-  "r4d_gemm_mxfp4a8_tiled|"
+  # The native OCP-MXFP4 GEMMs: selectable decode (split-K across workgroups) and tiled (the
+  # activation re-tiled into fragment order) kernels. Compiled unconditionally; the row table
+  # selects which one wins (RADIANCE_MX_GEMM / RADIANCE_MX_TUNE).
   "r4d_gemm_mxfp4a8_decode|"
+  "r4d_gemm_mxfp4a8_tiled|"
+  # The gated fold of the decode MX row: SwiGLU and the whole-row quantiser in the epilogue.
+  "r4d_gemm_mxfp4a8_gated_nt_m64|"
+  # The wider OCP-MX codebooks: e4m3 (one byte per code) and e2m3 (four codes per three bytes).
+  # Self-scaling -- the e8m0 plane is applied per 32-group in the epilogue and no per-row reference
+  # is declared, so these take no b_ref operand and have no gated variant (the fold is mxfp4-only).
+  "r4d_gemm_mxfp8a8_nt_m64|"
+  "r4d_gemm_mxfp6a8_nt_m64|"
+  # The DENSE int5 (w5a8) row: five bits a code, promoted exactly to e4m3, on the same E8M0-per-32
+  # grid. Not the MX family (the codes are linear integers, not an OCP float code), so it has its
+  # own kernel file and no staged prefill variant -- the tiled entry reuses the m64 launch.
+  "r4d_gemm_w5a8_nt_m64|"
+  # Per-row (per-token) E4M3 activation quantiser: the OCP-MX (mxfp4a8) GEMMs read their
+  # activation with one f32 scale per row, not the per-128 group the block-scaled fp8 family uses.
+  "r4d_quant_act_fp8_row|"
+  # The ParoQuant path-A producer: rotate a bf16 activation into a still-rotated paroquant weight's
+  # stored domain (a learned Givens rotation), then per-row E4M3 quantise. Its own unit -- the
+  # rotation is arbitrary per weight, unlike the fp8 family's folded Walsh-Hadamard.
+  "r4d_paroquant_quant_fp8_row|"
+  # Path A's multi-partition producer: one launch rotates a shared input into P consumers'
+  # rotated domains (gate/up, q/k/v, in_proj_qkv/z), where the single producer would be P launches.
+  "r4d_paroquant_quant_fp8_row_multi|"
+  # Path A's FUSED producers: the fused row op the MX family already runs (rmsnorm/gated) with the
+  # Givens rotation and the per-row quantiser folded into the SAME launch, once per consumer
+  # partition. They exist to remove the per-linear producer launch that dominates path A's decode.
+  "r4d_paroquant_fused_row|"
+  # The per-row (OCP-MX) forms of the fused producers, plus the gated-attention gate form: the same
+  # producer operands as the group=128 fusions with a whole-row scale plane.
+  "r4d_fused_quant_fp8_row|"
   # Block-scaled FP8 -- the format Qwen3.8-27B-FP8 ships in.
   # No -D: the 128x128 block is a property of the checkpoint on disk and not a quantiser choice
   # like RAD_W4_GROUP, so it is a constant in the source and the entry points reject a mismatch.

@@ -353,6 +353,7 @@ public:
         int64_t played = 0, recorded = 0, audited = 0;
         int64_t issued_unkeyed = 0, issued_refused = 0, issued_first = 0;
         int64_t dispatched = 0, unordered = 0;
+        int64_t evicted = 0, tape_cap = 0;   /* tapes pushed out of the cache; its capacity */
     };
     PassCounts  pass_counts() const {
         PassCounts c;
@@ -364,6 +365,8 @@ public:
         c.issued_first   = pc_first_.load(std::memory_order_relaxed);
         c.dispatched     = pc_dispatched_.load(std::memory_order_relaxed);
         c.unordered      = pc_unordered_.load(std::memory_order_relaxed);
+        c.evicted        = pc_evicted_.load(std::memory_order_relaxed);
+        c.tape_cap       = (int64_t)tape_cap_;
         return c;
     }
     void*       arena_base()   const { return arena_.base(); }
@@ -541,7 +544,11 @@ private:
                   int rec1);
     int  haz_mark(PassTape& t);
 
-    static constexpr size_t  kTapes      = 24;     /* recorded passes kept, least recently used out */
+    static constexpr size_t  kTapesDefault = 24;   /* recorded passes kept, least recently used out */
+    /* ...RADIANCE_TAPES overrides it (read once in prepare()): a many-sequence server has more
+     * live pass shapes than 24, and every one that is evicted is recorded again the next time
+     * it recurs. PassCounts::evicted says whether that is happening. */
+    size_t                   tape_cap_   = kTapesDefault;
     static constexpr int64_t kAuditPlays = 1024;
 
     std::vector<PassTape> tapes_;
@@ -551,6 +558,7 @@ private:
     size_t                tape_seen_at_ = 0;
     std::vector<uint64_t> tape_refused_;       /* keys whose pass could not be recorded */
     uint64_t              tape_told_ = 0;      /* draft passes whose first recording was logged */
+    bool                  tape_evict_told_ = false;   /* the first eviction was logged */
     bool                  tape_on_ = false;    /* the backend can, and nothing needs every issue */
     bool                  record_passes_ = true;   /* CtxDesc::record_passes */
     PassTape*             rec_ = nullptr;      /* the tape being recorded, while one is */
@@ -801,7 +809,7 @@ private:
     std::atomic<int64_t> ar_calls_{0}, ar_bytes_{0};
     std::atomic<int64_t> pc_played_{0}, pc_recorded_{0}, pc_audited_{0};
     std::atomic<int64_t> pc_unkeyed_{0}, pc_refused_{0}, pc_first_{0};
-    std::atomic<int64_t> pc_dispatched_{0}, pc_unordered_{0};
+    std::atomic<int64_t> pc_dispatched_{0}, pc_unordered_{0}, pc_evicted_{0};
 };
 
 }  /* namespace rad */

@@ -93,11 +93,13 @@ int         avx_isa_force(int level);
     X(scale_rows)           X(fill)                                                               \
     /* ---- quantisation and rotation */                                                          \
     X(quant_act_i8)         X(had_quant_act_i8)     X(quant_act_fp8)        X(had_quant_act_fp8)  \
-    X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8)   X(dequant)            \
-    X(rmsnorm_quant_fp8)    X(gated_quant_fp8)                                                    \
+    X(quant_act_fp8_row)    X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8) \
+    X(dequant)                                                                                \
+    X(rmsnorm_quant_fp8)    X(gated_quant_fp8)    X(rmsnorm_quant_fp8_row) X(gated_quant_fp8_row) \
     /* ---- gemm and the vocabulary edges */                                                      \
     X(gemm_nt)              X(gemm_nt_bias)         X(gemm_nt_q)            X(gemm_nt_q_bias)     \
-    X(gemm_nt_q_gated)      X(embed_lookup)         X(embed_lookup_q)       X(logits_gemm)        \
+    X(gemm_nt_q_gated)      X(gemm_nt_q_gated_mx)   X(embed_lookup)         X(embed_lookup_q)     \
+    X(logits_gemm)                                                                                \
     /* ---- attention */                                                                          \
     X(attn_paged)           X(attn_dense)           X(kv_store)             X(rope)               \
     X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)                              \
@@ -114,7 +116,7 @@ int         avx_isa_force(int level);
     X(sample_penalties)     X(sample_dry)           X(sample_temp)          X(sample_topk)        \
     X(sample_topp)          X(sample_minp)          X(sample_typical)       X(sample_xtc)         \
     X(sample_merge_topk)    X(sample_mask)          X(sample_pick)          X(sample_argmax)      \
-    X(dflash_select)
+    X(dflash_select)        X(dflash_select_q)
 
 /* The table one ISA level fills. One member per op, same order as AVX_OP_LIST. A missing
  * definition is a link error against the level's own table definition in avx_table.cpp. */

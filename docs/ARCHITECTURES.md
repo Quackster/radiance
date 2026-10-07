@@ -11,6 +11,9 @@ into the id an architecture plugin claims.
 | `arch/llama_dense_fp8` | `llama` | *(empty)* | the same graph from a bf16 checkpoint; `rad-convert` quantises. MiniCPM5-2B |
 | `arch/qwen35_bf16` | `qwen35` | *(empty)* | the Qwen3.5/3.6/3.8 dense hybrid, served bf16 |
 | `arch/qwen35_fp8` | `qwen35` | `fp8_e4m3` | the same, block-scaled FP8 weights and activations |
+| `arch/qwen35_mxfp4` | `qwen35` | `mxfp4` | the same dense hybrid in native OCP-MXFP4 (fp4 e2m1 codes, one e8m0 scale per 32 along K) with per-row fp8 activations |
+| `arch/qwen35_mxfp8` | `qwen35` | `mxfp8` | the same graph in native OCP-MXFP8 (e4m3 codes, one e8m0 scale per 32 along K, no reference byte); `qwen35_mxfp4.cpp` at a different codebook |
+| `arch/qwen35_mxfp6` | `qwen35` | `mxfp6` | the same graph in native OCP-MXFP6 (e2m3 codes packed 4-per-3-bytes, one e8m0 scale per 32, no reference byte) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert |
 
@@ -92,6 +95,20 @@ that the kernel-plugin constraint model is the right shape.
 | gated attention, interleaved q/gate | `qk_norm_rope_gate` (reads the q/gate interleave off the operand's row pitch) |
 | GDN gated norm over an interleaved z | `gdn_gated_norm_had_quant_i8` (`zgrp`/`zblk`) |
 | vision head_dim 72 | `attn_vit_h72_bf16` |
+
+## Qwen3.8-27B-MXFP4 (OCP-MX)
+
+The same graph as `Qwen3.8-27B-FP8`, with the trunk linear weights in native OCP micro-scaling:
+fp4 e2m1 codes, one e8m0 scale per 32 columns of K, and a per-row E8M0 reference. The activation
+path is unchanged — per-row E4M3 with one f32 scale per token — so the plugin reuses the fp8
+blocks' `quant_act_fp8_row` / AR-row producers and selects the `mxfp4a8` GEMMs instead of the
+block-scaled fp8 ones. The MTP head and the DFlash2 drafter stay fp8, as in the FP8 checkpoint.
+
+The one reading that is arithmetically silent: the `mxfp4a8` kernels do not multiply by the stored
+per-32 scale directly. They fold each 32-block against the row's reference
+(`dsh = clamp(wref - e8m0, 0, 15)`) and promote the 4-bit code to E4M3 as `E4M3_RNE(code * 2^-dsh)`;
+a block whose exponent sits at or below `dsh = 13` flushes to zero. The reference in `libref`
+models exactly this fold (not a per-block scale), which is what the engine oracle checks.
 
 ## Tensor names — the FP8 safetensors checkpoint
 

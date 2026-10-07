@@ -403,11 +403,11 @@ TEST(detokenize_stops_wait_for_the_reasoning_closer) {
     Tokenizer t;
     CHECK_OK(t.init(qwen_vocab()));
 
-    const std::string think = "restating it, Q: what is two and two</think>";
+    const std::string think = "restating it, Q: what is two and two response";
     std::vector<int32_t> ids;
     CHECK_OK(t.encode(think + "The answer is 4. Q: next", ids, false, true));
     Detokenizer d(qwen_vocab(), { "Q:" });
-    d.defer_stops_until("</think>");
+    d.defer_stops_until(" response");
     std::string s;
     for (int32_t id : ids) {
         s += d.push(id);

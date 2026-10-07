@@ -1,0 +1,56 @@
+# q38-27b-mxfp4-df2mx.recipe -- q38-27b-mxfp4.recipe with the DFlash2 drafter's linears OCP-MXFP4
+# instead of block fp8, as the served engine declares under RADIANCE_MX_DF2_DRAFTER_MX.
+#
+#   rad-convert <Qwen3.8-27B bf16 checkpoint> --draft-model <DFlash2 checkpoint> \
+#       --quant-id mxfp4 --recipe data/recipes/q38-27b-mxfp4-df2mx.recipe -o q38-27b-mxfp4-df2mx.rad
+#
+#   RADIANCE_MX_DF2_DRAFTER_MX=1 radiance --model q38-27b-mxfp4-df2mx.rad ... serve
+#
+# WHY A SEPARATE FILE. The flag picks the FORMAT the block declares (fp8 vs mxfp4a8), and the format
+# it reads is whatever the container holds -- a container quantised fp4 cannot be served fp8. So the
+# A/B is two containers, not one: q38-27b-mxfp4.recipe stays the block-fp8 control (serve with the
+# flag unset), and THIS recipe produces the MXFP4-drafter variant (serve with the flag set). The
+# trunk, lm_head, MTP rules and selector/embedding rules are q38-27b-mxfp4.recipe's and say why
+# there; only the six DFlash2 linear rules below change.
+#
+# THE DFLASH2 DRAFTER'S LINEARS, OCP-MXFP4 by round to nearest from the bf16 release (e2m1 codes,
+# an E8M0 exponent a 32) -- half the bytes of block fp8 on a model read whole every decode step,
+# served by the same `gemm_mxfp4a8` rows as the trunk. It is an OPTION, not the recommended recipe:
+# RTN to MXFP4 (11.7 % relative error vs fp8's 2.6 %) costs acceptance on code. A draft is verified
+# by the trunk, so this moves acceptance and never an emitted token. The selector projection,
+# codebooks and convolution weights stay bf16 (not named here).
+
+# The token embedding, E4M3 under ONE f32 scale (`block=*x*`, read by embed_lookup_q).
+token_embd.weight                    rtn  codes=fp8_e4m3 block=*x* scale=f32 rule=search
+
+# The lm_head, block fp8 -- NOT MXFP4.
+output.weight                        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The MTP head, block fp8 (declared only when the MTP head, not the DFlash2 drafter, is merged).
+mtp.draft_head.weight                rtn  codes=u2 zero=u8 group=128 scale=f16
+blk.64.*.weight                      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The DFlash2 drafter's 2-bit copy of the target's head.
+dflash.draft_head.weight             rtn  codes=u2 zero=u8 group=128 scale=f16
+
+# The DFlash2 drafter's linears, OCP-MXFP4 (the one change from q38-27b-mxfp4.recipe). The arch
+# declares them `mxfp4a8` only under RADIANCE_MX_DF2_DRAFTER_MX=1; with the flag unset a container
+# built from this file is refused by name rather than mis-read.
+dflash.fc.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_q.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_k.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_v.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_output.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_gate_up.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_down.weight         rtn  codes=fp4_e2m1 group=32 scale=e8m0
+
+# The trunk linears, OCP MXFP4 (as q38-27b-mxfp4.recipe).
+blk.*.attn_qg.weight                 rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_k.weight                  rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_v.weight                  rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_qkv.weight                rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_output.weight             rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ssm_inz.weight                 rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ssm_out.weight                 rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ffn_gate_up.weight             rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ffn_down.weight                rtn  codes=fp4_e2m1 group=32 scale=e8m0

@@ -312,6 +312,10 @@ static inline int cfg_for(const RadArgs* a, long long K, long long M, long long 
 
 enum { G_A = 0, G_B, G_Y };                                     /* gemm_nt          */
 enum { Q_A = 0, Q_ASCALE, Q_B, Q_BSCALE, Q_Y, Q_ASUM, Q_BREF };  /* gemm_nt_q       */
+/* gemm_nt_q_paro -- the partition-select form. NEW NAMES AND NEW POSITIONS: the two extra
+ * activation partitions and their scales sit between `a_scale` and the weight, so the list does not
+ * overlap the Q_* indices above and neither can be read with the other's constants. */
+enum { QP_A = 0, QP_ASCALE, QP_A2, QP_ASCALE2, QP_A3, QP_ASCALE3, QP_B, QP_BSCALE, QP_Y };
 
 struct GemmOps {
     /* A flattened view of `a`, when the caller declared it rank 3; see gemm_ops. Held by value
@@ -321,11 +325,24 @@ struct GemmOps {
     long long M, N, K;
 };
 
+/* The operand view `gemm_nt_q_paro` reads. `a2`/`ascale2` and `a3`/`ascale3` are optional partitions;
+ * an absent pointer means the previous partition extends to the next boundary. */
+struct GemmOpsParo {
+    RadTensor a_flat, y_flat;
+    const RadTensor *a, *ascale, *a2, *ascale2, *a3, *ascale3, *b, *bscale, *y;
+    long long M, N, K;
+};
+
 /* THE MXFP4 GEMMS' ACTIVATION SCALE GRID, read off the operand rather than assumed. One f32 a row
  * (`[M]` or `[M][1]`: a per-token quantiser) is group 0; one per (row, 128 of K) (`[M][ceil(K/128)]`:
  * the block-scaled fp8 family's quantisers, which every fused producer in arch/common writes) is
  * group 128, read at the operand's own row stride. Anything else is refused by shape: a grid read
- * at the wrong width is an answer that is merely wrong. */
+ * at the wrong width is an answer that is merely wrong.
+ *
+ * RADIANCE'S OWN MXFP4 PATH IS ALWAYS GROUP 0: `a_scale` is one f32 per row (`[M,1]`), so the
+ * per-(row,128) grid is only reachable from a caller that supplies it. `mx_ascale_grid` therefore
+ * resolves group 0 for every row this plugin registers today, and the ABLK code path the MXFP4
+ * kernels gate is inert for our path. */
 static inline int mx_ascale_grid(const GemmOps& g, int* group, int* rs) {
     const RadTensor* s = g.ascale;
     if (!s || g.M <= 0) return R4D_NO(RAD_E_INVAL);
@@ -410,6 +427,56 @@ static inline int gemm_ops(const RadArgs* a, GemmOps* g, int quantised) {
     if (!r4d_contig(g->a) || !r4d_contig(g->y)) return R4D_NO(RAD_E_STRIDE);
     if (!r4d_aligned(g->a->data, 16) || !r4d_aligned(g->b->data, 16)) return R4D_NO(RAD_E_ALIGN);
 
+    g->M = g->a->shape[0];
+    g->K = g->a->shape[1];
+    g->N = g->y->shape[1];
+    if (g->y->shape[0] != g->M) return R4D_NO(RAD_E_SHAPE);
+    if (g->M < 1 || g->N < 1 || g->K < 1) return R4D_NO(RAD_E_SHAPE);
+    return RAD_OK;
+}
+
+/* gemm_nt_q_paro's operand reader. Same checks as gemm_ops for the required operands, plus the two
+ * optional partitions: a partition present without its scale is refused rather than run against a
+ * scale the caller believes was applied. The rank-3 fold is repeated so a merged activation handed
+ * as [tokens, heads, width] is read as a rank-2 [tokens, heads*width], exactly as gemm_ops does. */
+static inline int gemm_ops_paro(const RadArgs* a, GemmOpsParo* g) {
+    std::memset(g, 0, sizeof(*g));
+    g->a       = r4d_opt(a, QP_A);
+    g->ascale  = r4d_opt(a, QP_ASCALE);
+    g->a2      = r4d_opt(a, QP_A2);
+    g->ascale2 = r4d_opt(a, QP_ASCALE2);
+    g->a3      = r4d_opt(a, QP_A3);
+    g->ascale3 = r4d_opt(a, QP_ASCALE3);
+    g->b       = r4d_opt(a, QP_B);
+    g->bscale  = r4d_opt(a, QP_BSCALE);
+    g->y       = r4d_opt(a, QP_Y);
+    if (!g->a || !g->ascale || !g->b || !g->bscale || !g->y) return R4D_NO(RAD_E_INVAL);
+    if (g->a2 && !g->ascale2) return R4D_NO(RAD_E_INVAL);
+    if (g->a3 && !g->ascale3) return R4D_NO(RAD_E_INVAL);
+    if (g->a->rank < 2) return R4D_NO(RAD_E_SHAPE);
+    if (g->a->rank > 2) {
+        if (!r4d_contig(g->a)) return R4D_NO(RAD_E_STRIDE);
+        g->a_flat = *g->a;
+        int64_t k = 1;
+        for (uint32_t d = 1; d < g->a->rank; ++d) k *= g->a->shape[d];
+        g->a_flat.rank = 2;
+        g->a_flat.shape[1] = k;  g->a_flat.stride[1] = 1;
+        g->a_flat.stride[0] = k;
+        g->a = &g->a_flat;
+    }
+    if (g->y->rank < 2) return R4D_NO(RAD_E_SHAPE);
+    if (g->y->rank > 2) {
+        if (!r4d_contig(g->y)) return R4D_NO(RAD_E_STRIDE);
+        g->y_flat = *g->y;
+        int64_t n = 1;
+        for (uint32_t d = 1; d < g->y->rank; ++d) n *= g->y->shape[d];
+        g->y_flat.rank = 2;
+        g->y_flat.shape[1] = n;  g->y_flat.stride[1] = 1;
+        g->y_flat.stride[0] = n;
+        g->y = &g->y_flat;
+    }
+    if (!r4d_contig(g->a) || !r4d_contig(g->y)) return R4D_NO(RAD_E_STRIDE);
+    if (!r4d_aligned(g->a->data, 16) || !r4d_aligned(g->b->data, 16)) return R4D_NO(RAD_E_ALIGN);
     g->M = g->a->shape[0];
     g->K = g->a->shape[1];
     g->N = g->y->shape[1];

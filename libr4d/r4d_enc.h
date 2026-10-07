@@ -32,6 +32,22 @@ inline bool affine(const RadEncoding* e, uint32_t codes, uint32_t scale, int64_t
     return true;
 }
 
+/* THE SAME WITH TRAILING PLANES THE KERNEL DOES NOT READ: codes at plane 0, the `scale` by role,
+ * a `transform` exactly, and ANY number of further planes beyond those two. A weight stored rotated
+ * carries its rotation tables beside the codes and scale a GEMM reads (rad_mx.h's paroquant arch),
+ * so the GEMM's layout hook must accept them without mistaking one for a scale or a zero. The table
+ * planes are read by the producer, never here. */
+inline bool affine_extra(const RadEncoding* e, uint32_t codes, uint32_t scale, int64_t br, int64_t bc,
+                         const char* transform) {
+    if (!e || !rad_enc_is(e, "affine")) return false;
+    if (std::strncmp(e->transform, transform, RAD_ENC_STR) != 0) return false;
+    if (e->n_planes < 2) return false;
+    if (e->plane[0].dtype != codes || e->plane[0].block[1] != 1) return false;
+    const int s = rad_enc_find(e, "scale");
+    return s >= 0 && e->plane[s].dtype == scale && e->plane[s].kind == RAD_PLANE_TILED &&
+           e->plane[s].block[0] == br && e->plane[s].block[1] == bc;
+}
+
 /* The same with a SCALAR CODEBOOK: `codes` indexing a `table` plane of `entries` values of dtype
  * `tab`, the `scale` as above, `transform` exactly, and no other plane. What the table HOLDS is not
  * in an encoding -- a declaration has no plane bytes -- so a kernel that decodes one fixed table

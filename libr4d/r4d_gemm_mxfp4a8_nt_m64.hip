@@ -163,47 +163,94 @@ __global__ void r4d_gemm_mxfp4a8_nt_m64_kernel(
       }
   }
 
-  for (int k = 0; k < Ks; k += 16) {
-    const int kg = kbase + k;                       // fragment base, both lane halves
-    if constexpr (ABLK) {
-      if (k && (kg & 127) == 0) {                   // a new 128-wide activation block
-#pragma unroll
-        for (int i = 0; i < MT; i++)
-#pragma unroll
-          for (int e = 0; e < 8; e++) {
-            int r = (mt0 + i) * 16 + mhalf + e;
-            r = r < M - 1 ? r : M - 1;
-            float s = As[(size_t)r * as_rs + (kg >> 7)];
-            s = s > 0.f ? s : scur[i][e];
-            const float q = scur[i][e] / s;
-            scur[i][e] = s;
-#pragma unroll
-            for (int j = 0; j < NPW; j++) acc[j][i][e] *= q;
-          }
-      }
-    }
-    const int kstep = kg / 16;
-    const int blk = kg / R4D_GEMM_MXFP4_GROUP;      // one E8M0 block covers this whole step
-    v2i af[MT];
+  // SOFTWARE-PIPELINED K LOOP. The plain form issues one weight read per K-step and waits on it
+  // before the WMMA, so at the top of the M band the wave stalls on every K-step. Here the NEXT
+  // k-step's A and W loads are issued before the CURRENT k-step's WMMA, so a K-tile's memory
+  // requests are in flight while the previous one computes. The fragment-order weight read (lane
+  // l's four bytes at slot l, 128 contiguous bytes a wave) and the fold are unchanged; only the
+  // ordering of the loads against the WMMA moves. The two in-flight fragment sets are the double
+  // buffer.
+  {
+    const int kg0 = kbase;
+    const int kstep0 = kg0 / 16;
+    const int blk0 = kg0 / R4D_GEMM_MXFP4_GROUP;
+    v2i af_cur[MT];
 #pragma unroll
     for (int i = 0; i < MT; i++) {
       int r = (mt0 + i) * 16 + nlane;
       r = r < M - 1 ? r : M - 1;
-      const unsigned int* pa = (const unsigned int*)(A + (size_t)r * K + kg + mhalf);
-      af[i][0] = (int)pa[0];
-      af[i][1] = (int)pa[1];
+      const unsigned int* pa = (const unsigned int*)(A + (size_t)r * K + kg0 + mhalf);
+      af_cur[i][0] = (int)pa[0];
+      af_cur[i][1] = (int)pa[1];
     }
+    unsigned int wv_cur[NPW];
+    int dsh_cur[NPW];
 #pragma unroll
-    for (int j = 0; j < NPW; j++) {
-      const int n = wrow[j];
-      // Fragment-order weight: lane l's four bytes for this (n-tile, k-step) sit at slot l, so the
-      // wave reads 128 contiguous bytes. In checkpoint order these would be sixteen rows K/2 bytes
-      // apart -- a fully strided read on the operand that dominates traffic.
-      const unsigned int wv = Wp[((size_t)wtile[j] * ksteps + kstep) * WAVE32 + lane];
-      const v2i wf = r4d_mxfp4_frag8(wv, r4d_mxfp4_fold_d(wref[j], Ws[(size_t)blk * N + n]));
+    for (int j = 0; j < NPW; j++)
+      wv_cur[j] = Wp[((size_t)wtile[j] * ksteps + kstep0) * WAVE32 + lane];
 #pragma unroll
-      for (int i = 0; i < MT; i++)
-        acc[j][i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i], wf, acc[j][i]);
+    for (int j = 0; j < NPW; j++)
+      dsh_cur[j] = r4d_mxfp4_fold_d((int)wref[j], (int)Ws[(size_t)blk0 * N + wrow[j]]);
+    for (int k = 0; k < Ks; k += 16) {
+      const int kg = kbase + k;                       // fragment base, both lane halves
+      if constexpr (ABLK) {
+        if (k && (kg & 127) == 0) {                   // a new 128-wide activation block
+#pragma unroll
+          for (int i = 0; i < MT; i++)
+#pragma unroll
+            for (int e = 0; e < 8; e++) {
+              int r = (mt0 + i) * 16 + mhalf + e;
+              r = r < M - 1 ? r : M - 1;
+              float s = As[(size_t)r * as_rs + (kg >> 7)];
+              s = s > 0.f ? s : scur[i][e];
+              const float q = scur[i][e] / s;
+              scur[i][e] = s;
+#pragma unroll
+              for (int j = 0; j < NPW; j++) acc[j][i][e] *= q;
+            }
+        }
+      }
+      // Issue the NEXT k-step's loads (the in-flight buffer) before this k-step's WMMA.
+      v2i af_next[MT];
+      unsigned int wv_next[NPW];
+      int dsh_next[NPW];
+      const int k1 = k + 16;
+      if (k1 < Ks) {
+        const int kg1 = kbase + k1;
+        const int kstep1 = kg1 / 16;
+        const int blk1 = kg1 / R4D_GEMM_MXFP4_GROUP;
+#pragma unroll
+        for (int i = 0; i < MT; i++) {
+          int r = (mt0 + i) * 16 + nlane;
+          r = r < M - 1 ? r : M - 1;
+          const unsigned int* pa = (const unsigned int*)(A + (size_t)r * K + kg1 + mhalf);
+          af_next[i][0] = (int)pa[0];
+          af_next[i][1] = (int)pa[1];
+        }
+#pragma unroll
+        for (int j = 0; j < NPW; j++)
+          wv_next[j] = Wp[((size_t)wtile[j] * ksteps + kstep1) * WAVE32 + lane];
+#pragma unroll
+        for (int j = 0; j < NPW; j++)
+          dsh_next[j] = r4d_mxfp4_fold_d((int)wref[j], (int)Ws[(size_t)blk1 * N + wrow[j]]);
+      }
+      // Compute THIS k-step from the in-hand buffer.
+#pragma unroll
+      for (int j = 0; j < NPW; j++) {
+        const v2i wf = r4d_mxfp4_frag8(wv_cur[j], dsh_cur[j]);
+#pragma unroll
+        for (int i = 0; i < MT; i++)
+          acc[j][i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af_cur[i], wf, acc[j][i]);
+      }
+      // Advance the double buffer -- only when a next step was actually loaded. On the final K-step
+      // `k1 == Ks` leaves af_next/wv_next/dsh_next unset, and reading them would be an
+      // uninitialised read; nothing consumes them after the loop, so do not advance.
+      if (k1 < Ks) {
+#pragma unroll
+        for (int i = 0; i < MT; i++) af_cur[i] = af_next[i];
+#pragma unroll
+        for (int j = 0; j < NPW; j++) { wv_cur[j] = wv_next[j]; dsh_cur[j] = dsh_next[j]; }
+      }
     }
   }
 

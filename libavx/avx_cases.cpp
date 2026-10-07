@@ -120,6 +120,15 @@ std::vector<Case> build_cases() {
                                     HI("group", group), HS("dtype", "bf16"), HF("wadd", 0) });
         add("gated_quant_fp8",    { HI("M", 5), HI("n", 256), HI("group", group),
                                     HS("dtype", "bf16"), HS("act", "silu") });
+        /* The per-row (OCP-MX) forms: same producers, one scale per row, no `group`. */
+        add("rmsnorm_quant_fp8_row", { HI("M", 5), HI("n", 256), HF("eps", 1e-6),
+                                      HS("dtype", "bf16"), HF("wadd", 0) });
+        add("gated_quant_fp8_row",   { HI("M", 5), HI("n", 256), HS("dtype", "bf16"),
+                                      HS("act", "silu") });
+        /* The standalone per-row quantiser the OCP-MX GEMMs consume: one f32 scale a row, no
+         * `group`. 256 keeps the row wider than any vector; the off-grid 260 case below exercises
+         * the tail a whole-row quantiser still has to cover. */
+        add("quant_act_fp8_row",     { HI("M", 5), HI("n", 256), HS("dtype", "bf16") });
     }
     /* The fp8 fusions off the grid: a row the group does not divide (260 = 4 x 64 + 4, so the last
      * scale covers four values), f32 activations -- which are narrowed to bf16 all the same -- and
@@ -128,6 +137,11 @@ std::vector<Case> build_cases() {
                                HS("dtype", "f32"), HF("wadd", 1) });
     add("gated_quant_fp8",   { HI("M", 5), HI("n", 260), HI("group", 64), HS("dtype", "f32"),
                                HS("act", "sigmoid") });
+    add("rmsnorm_quant_fp8_row", { HI("M", 5), HI("n", 260), HF("eps", 1e-6), HS("dtype", "f32"),
+                                   HF("wadd", 1) });
+    add("gated_quant_fp8_row",   { HI("M", 5), HI("n", 260), HS("dtype", "f32"),
+                                   HS("act", "sigmoid") });
+    add("quant_act_fp8_row",     { HI("M", 5), HI("n", 260), HS("dtype", "f32") });
     add("gram_accum", { HI("M", 5), HI("n", 128), HI("group", 128), HS("dtype", "fp8_e4m3") },
         0, 2.0 * 5 * 128 * 128);
     /* ...and the plain bf16 activation, which passes no scale. */
@@ -146,13 +160,14 @@ std::vector<Case> build_cases() {
             add("logits_gemm",  { HI("M", M), HI("n_vocab", 96), HI("n_embd", 259),
                                   HS("dtype", dt) }, 0, fl);
         }
-    /* fp8a8 and fp8a16 ARE THE ONLY TWO libref CAN DESCRIBE, and that is a real limit rather than
-     * a gap in this table: `gemm_nt_q` is one op over six weight formats and the SCALE GRID is
-     * what differs between them -- per row, per row-group, per output-row-block, an e8m0 exponent
-     * byte, with or without a zero point. Every one of those is a property of the kernel that
-     * reads it, so libref declines to guess (ref_shapes.cpp says so at length) and a case at
-     * "w4a8" would be SKIPPED, not checked. The packed-nibble path is still exercised -- through
-     * `dequant`, whose grid the schema does state. */
+    /* fp8a8 AND fp8a16 ARE THE TWO libref DESCRIBES AMONG THE NON-MX FORMATS, and that is a real
+     * limit rather than a gap in this table: `gemm_nt_q` is one op over six weight formats and the
+     * SCALE GRID is what differs between them -- per row, per row-group, per output-row-block, an
+     * e8m0 exponent byte, with or without a zero point. Every one of those is a property of the
+     * kernel that reads it, so libref declines to guess (ref_shapes.cpp says so at length) and a
+     * case at "w4a8" would be SKIPPED, not checked. The packed-nibble path is still exercised --
+     * through `dequant`, whose grid the schema does state. OCP-MX is the exception and has cases of
+     * its own below, because libr4d's mxfp4 layout recipe states its grid. */
     for (const char* dt : { "fp8a8", "fp8a16" })
         for (int M : { 1, 65 }) {
             const double fl = 2.0 * M * 96 * 256;
@@ -161,6 +176,26 @@ std::vector<Case> build_cases() {
             add("gemm_nt_q_bias", { HI("M", M), HI("N", 96), HI("K", 256), HI("group", 128),
                                     HS("dtype", dt) }, 0, fl);
         }
+    /* OCP-MX (mxfp4a8, mxfp6a8, mxfp8a8). libref CAN describe this grid -- its shape hook reads
+     * libr4d's own mxfp4 layout recipe -- so the case runs instead of skipping, and it is worth
+     * running because the MX fold is per-ELEMENT and not a plane read: the device stores
+     * E4M3_RNE(code * 2^-dsh) with dsh = clamp(Wref - E8M0, 0, 15) and applies 2^(Wref-127) once per
+     * row, so the E4M3 rounding is code-dependent and a block far below its row's reference
+     * underflows to ZERO rather than scaling up to 2^(Wref-15-127). K = 256 is eight 32-wide blocks
+     * a row, and the shape recipe draws each block exponent and each row's b_ref as small integers
+     * independently, so the in-range, the saturated and the e8m0 >= Wref cases all occur. M = 1 is
+     * decode and 65 one row past the m64 band. The e2m3 and e4m3 arms carry NO fold (their codes
+     * are self-scaling), so their rows check the plain epilogue against the same drawn grid, and
+     * the bias form declines all three formats -- it has no b_ref slot for the fold. */
+    for (int M : { 1, 65 }) {
+        const double fl = 2.0 * M * 96 * 256;
+        for (const char* mx : { "mxfp4a8", "mxfp6a8", "mxfp8a8", "w5a8" })
+            add("gemm_nt_q", { HI("M", M), HI("N", 96), HI("K", 256), HI("group", 32),
+                               HS("dtype", mx) }, 0, fl);
+        add("gemm_nt_q_gated_mx", { HI("M", M), HI("N", 192), HI("K", 256),
+                                    HS("dtype", "mxfp4a8"), HS("act", "silu") }, 0,
+            2.0 * M * 192 * 256);
+    }
     /* The gated form, which libref describes at fp8a8 only. N is the WEIGHT's rows, so the output
      * is N/2 wide: 96 is one scale group a row at group 128 and 256 is two. */
     for (int M : { 1, 65 })
@@ -358,6 +393,11 @@ std::vector<Case> build_cases() {
                            HI("n_vocab", 300), HI("anchor_stride", 1), HS("dtype", "bf16") });
     add("dflash_select", { HI("M", 5), HI("steps", 3), HI("top_k", 12), HI("rank", 37),
                            HI("n_vocab", 97), HI("anchor_stride", 2), HS("dtype", "bf16") });
+    /* ...and over E4M3 codebooks with a scale a row, at the same two shapes. */
+    add("dflash_select_q", { HI("M", 3), HI("steps", 4), HI("top_k", 8), HI("rank", 64),
+                             HI("n_vocab", 300), HI("anchor_stride", 1), HS("dtype", "bf16") });
+    add("dflash_select_q", { HI("M", 5), HI("steps", 3), HI("top_k", 12), HI("rank", 37),
+                             HI("n_vocab", 97), HI("anchor_stride", 2), HS("dtype", "bf16") });
 
     /* ================================================================== speed-only, at model size
      *

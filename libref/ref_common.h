@@ -76,6 +76,17 @@ static inline float mxfp4_elem_to_f32(uint8_t nib) {
     return (nib & 0x8u) ? -v : v;
 }
 
+/* OCP MXFP6 element (e2m3): sign in bit 5, exponent in 4:3 with bias 1, mantissa in 2:0. Again no
+ * infinity and no NaN, the subnormal exponent decodes as M/8, and the largest magnitude is 7.5
+ * (E=3, M=7 -> 1.875 * 4). This is rad_fp6_to_f32(c, 2) spelled out -- the ABI's decoder and this
+ * one are the same function, and ref's loaders below are written against this name. */
+static inline float fp6e2m3_elem_to_f32(uint8_t c) {
+    const int e = (c >> 3) & 0x3u, m = c & 0x7u;
+    const float v = (e == 0) ? (float)m / 8.0f
+                             : std::ldexp(1.0f + (float)m / 8.0f, e - 1);
+    return (c & 0x20u) ? -v : v;
+}
+
 /* OCP e8m0 block scale: a raw exponent byte, value 2^(e-127). 255 is NaN by definition. */
 static inline float e8m0_to_f32(uint8_t e) {
     if (e == 0xff) return std::nanf("");
@@ -93,8 +104,14 @@ static inline float e8m0_to_f32(uint8_t e) {
  *           construction one radix down, so 0..3 maps to -2..1.
  *   RAD_FP4E2M1 two e2m1 nibbles per byte, element 2i low, with one e8m0 scale per 32 elements
  *           carried in a separate stream (the `b_scale` operand).
+ *   RAD_FP6E2M3 four e2m3 codes per THREE bytes, a plain 6-bit little-endian LSB-first bit stream:
+ *           element i occupies bits [6i, 6i+6) of the plane, exactly rad_load_bits(base, 6, i) and
+ *           PARO-MXFP6's HF tensors, whose `.weight` declares [N, 3K/4]. MXFP6 carries its e8m0
+ *           block scale in the same separate `b_scale` stream as MXFP4.
+ *   RAD_F8E4M3 one byte a code when it is an MXFP8 weight -- no sub-byte packing, and its e8m0
+ *           block scale rides the same [N, K/32] stream as MXFP6's and MXFP4's.
  *
- * All three return the RAW CODE's value. The group scale is applied by the caller, because only
+ * All of these return the RAW CODE's value. The group scale is applied by the caller, because only
  * the caller knows where the scale stream is. */
 static inline float w4_code(const void* p, int64_t i) {
     uint8_t b = ((const uint8_t*)p)[i >> 1];
@@ -106,9 +123,30 @@ static inline float w2_code(const void* p, int64_t i) {
     uint8_t c = (uint8_t)((b >> (2 * (i & 3))) & 0x3u);
     return (float)((int)(c ^ 0x2u) - 2);
 }
+/* RAD_I5: five bits a code, element i in bits [5i, 5i+5) of the plane (rad_load_bits(base, 5, i)),
+ * symmetric two's-complement code, value = (c ^ 16) - 16, so 0..31 maps to -16..15. This is the
+ * dense int5 weight's code, promoted exactly to E4M3 by r4d_gemm_w5a8_nt_m64's table. */
+static inline float w5_code(const void* p, int64_t i) {
+    const uint32_t c = rad_load_bits((const uint8_t*)p, 5, i);
+    return (float)((int)(c ^ 16u) - 16);
+}
 static inline float mxfp4_code(const void* p, int64_t i) {
     uint8_t b = ((const uint8_t*)p)[i >> 1];
     return mxfp4_elem_to_f32((i & 1) ? (uint8_t)(b >> 4) : (uint8_t)(b & 0xf));
+}
+/* Four e2m3 codes per three bytes, little-endian LSB-first -- the same element rad_load_bits(p, 6, i)
+ * selects, spelled as the four unpack cases of one 3-byte group. */
+static inline float mxfp6_code(const void* p, int64_t i) {
+    const uint8_t* b = (const uint8_t*)p;
+    const uint8_t* g = b + 3 * (i >> 2);
+    uint8_t v;
+    switch (i & 3) {
+        case 0:  v = (uint8_t)(g[0] & 0x3fu); break;
+        case 1:  v = (uint8_t)(((g[1] & 0x0fu) << 2) | (g[0] >> 6)); break;
+        case 2:  v = (uint8_t)(((g[2] & 0x03u) << 4) | (g[1] >> 4)); break;
+        default: v = (uint8_t)(g[2] >> 2); break;
+    }
+    return fp6e2m3_elem_to_f32(v);
 }
 
 /* ================================================================== element access
@@ -130,7 +168,9 @@ static inline float ld_dt(uint32_t dt, const void* p, int64_t i) {
         case RAD_I64:    return (float)((const int64_t*)p)[i];
         case RAD_I4:     return w4_code(p, i);
         case RAD_I2:     return w2_code(p, i);
+        case RAD_I5:     return w5_code(p, i);
         case RAD_FP4E2M1:  return mxfp4_code(p, i);
+        case RAD_FP6E2M3:  return mxfp6_code(p, i);
         default:         return 0.0f;
     }
 }
@@ -199,7 +239,9 @@ template <> struct Cvt<RAD_I8>     { static inline float ld(const void* p, int64
 template <> struct Cvt<RAD_I32>    { static inline float ld(const void* p, int64_t i) { return (float)((const int32_t*)p)[i]; } };
 template <> struct Cvt<RAD_I4>     { static inline float ld(const void* p, int64_t i) { return w4_code(p, i); } };
 template <> struct Cvt<RAD_I2>     { static inline float ld(const void* p, int64_t i) { return w2_code(p, i); } };
+template <> struct Cvt<RAD_I5>     { static inline float ld(const void* p, int64_t i) { return w5_code(p, i); } };
 template <> struct Cvt<RAD_FP4E2M1>  { static inline float ld(const void* p, int64_t i) { return mxfp4_code(p, i); } };
+template <> struct Cvt<RAD_FP6E2M3>  { static inline float ld(const void* p, int64_t i) { return mxfp6_code(p, i); } };
 
 /* ------------------------------------------------------------------ the ranged key
  *

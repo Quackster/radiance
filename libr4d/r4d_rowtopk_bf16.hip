@@ -46,8 +46,8 @@
 //   * Stage 2's slice is NOT random.  Stage 1 writes chunk-major, so at stride 32 with RC=32 lane
 //     0 would receive the maximum of EVERY chunk -- exactly where the row's top-R concentrates --
 //     and PT=8 then drops all but eight of them.  That is the second way the filter can lose.  Stage 2
-//     therefore carries PT = 32 >= R: a lane can hold the entire answer, so no distribution of the
-//     candidates over lanes can lose one.  It is exact by construction, not by argument.
+//     therefore carries a PT >= R: a lane can hold the entire answer, so no
+//     distribution of the candidates over lanes can lose one.  It is exact by construction, not by argument.
 //
 // RC IS THE ONE PLACE THE ANSWER CAN BE APPROXIMATE, and it is the caller's choice.  A chunk hands
 // on its own top-RC, so the row top-R survives unless MORE THAN RC of it falls in a single chunk.
@@ -70,7 +70,14 @@
 #ifndef R4D_TOPK_PT1
 #define R4D_TOPK_PT1   8       // stage 1: >= the eight bf16 a lane loads in one step
 #endif
-#define R4D_TOPK_PT2   32      // stage 2: >= R, so a lane can hold the whole answer
+/* THE SELECTION DEPTH IS TEMPLATED, NOT ONE MACRO. A lane's list must be >= R for the re-sort to
+ * be exact ("a real limit, not a tuning choice"), and 32 served every caller until the DFlash2
+ * verify head needed R = 80. But the round is a dependent chain of R shifts of the whole PT-deep
+ * list, so a permanent 128 would make the EXISTING R <= 32 callers (the drafter's own top-16) pay
+ * four times the shift work. Two instantiations: 32 for R <= 32, exactly the old kernel, and 128
+ * for the wide path, which only the gated verify head reaches. */
+#define R4D_TOPK_PT2_MIN 32    // R <= 32: the historical shape, bit-for-bit
+#define R4D_TOPK_PT2_MAX 128   // R <= 128: the verify head's R = 80
 
 typedef unsigned u4v_tk __attribute__((ext_vector_type(4)));
 typedef __attribute__((address_space(1))) const u4v_tk* r4d_tk_gv4;
@@ -217,25 +224,26 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4d_rowtopk_stag
 // pad indistinguishable from this rank's first real token.  The pair plane says -1 instead, which
 // is the sentinel the merge drops -- and a sentinel rather than -INFINITY, because a masked logit
 // legitimately takes that value.
+template <int PT>
 __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_stage2_kernel(
     const unsigned long long* __restrict__ P, float* __restrict__ OV, int* __restrict__ OI,
     float* __restrict__ OP, int off, int R, int n) {
   const int m = blockIdx.x;
   const int lane = threadIdx.x;
 
-  unsigned long long t[R4D_TOPK_PT2];
+  unsigned long long t[PT];
 #pragma unroll
-  for (int q = 0; q < R4D_TOPK_PT2; q++) t[q] = 0ull;
+  for (int q = 0; q < PT; q++) t[q] = 0ull;
 
   // THE KEY DECIDES, NOT THE FLOAT, as in stage 1 -- see tk_insert.  A chunk that handed on a NaN
   // among its top-RC handed on one fewer real candidate, so dropping the NaN here can leave the row
   // short of R, and the pad that fills the gap is what the merge reports as id -1.  An empty slot's
   // key is 0 and never places.
   const unsigned long long* p = P + (size_t)m * n;
-  for (int i = lane; i < n; i += R4D_TOPK_WAVE) tk_insert<R4D_TOPK_PT2>(t, p[i]);
+  for (int i = lane; i < n; i += R4D_TOPK_WAVE) tk_insert<PT>(t, p[i]);
 
   for (int r = 0; r < R; r++) {
-    const unsigned long long w = tk_round<R4D_TOPK_PT2>(t);
+    const unsigned long long w = tk_round<PT>(t);
     if (lane == 0) {
       // A chunk that ran out of candidates wrote a zero key, and a zero key must not read back as
       // a real column: it is an empty slot and says so.
@@ -280,7 +288,7 @@ static int rowtopk_bf16_sharded_emit(long y, long partial, long outv, long outi,
   if (N % 8) return -2;
   // R <= PT2 is what makes stage 2 exact whatever the candidates look like; it is a real limit,
   // not a tuning choice, so it is checked rather than clamped.
-  if (R < 1 || R > R4D_TOPK_PT2)
+  if (R < 1 || R > R4D_TOPK_PT2_MAX)
     return -3;
   if (RC < 1 || RC > PT1 * R4D_TOPK_WAVE)
     return -4;
@@ -301,9 +309,15 @@ static int rowtopk_bf16_sharded_emit(long y, long partial, long outv, long outi,
   }
 #undef R4D_TK_S1
   if (emit_rc != RAD_OK) return emit_rc;
-  return R4D_EMIT(sk, r4d_rowtopk_stage2_kernel, dim3(M), dim3(R4D_TOPK_WAVE), 0,
-                  (const unsigned long long*)partial, (float*)outv, (int*)outi,
-                  (float*)outp, off, R, nch * RC);
+  // Two instantiations: the historical 32-deep chain for the R <= 32 callers, and the 128-deep one
+  // the verify head's R = 80 needs. A lane must hold the whole answer for the re-sort to be exact.
+  if (R > R4D_TOPK_PT2_MIN)
+    return R4D_EMIT(sk, (r4d_rowtopk_stage2_kernel<R4D_TOPK_PT2_MAX>), dim3(M),
+                    dim3(R4D_TOPK_WAVE), 0, (const unsigned long long*)partial, (float*)outv,
+                    (int*)outi, (float*)outp, off, R, nch * RC);
+  return R4D_EMIT(sk, (r4d_rowtopk_stage2_kernel<R4D_TOPK_PT2_MIN>), dim3(M),
+                  dim3(R4D_TOPK_WAVE), 0, (const unsigned long long*)partial, (float*)outv,
+                  (int*)outi, (float*)outp, off, R, nch * RC);
 }
 
 void r4d_rowtopk_bf16_sharded(long y, long partial, long outv, long outi, long outp,
@@ -335,25 +349,26 @@ __device__ __forceinline__ unsigned long long tk_key_f32(float v, unsigned id) {
   return ((unsigned long long)u << 32) | (unsigned)(0xFFFFFFFFu - id);
 }
 
+template <int PT>
 __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_merge_kernel(
     const float* __restrict__ G, float* __restrict__ OV, int* __restrict__ OI, int R, int n) {
   const int m = blockIdx.x;
   const int lane = threadIdx.x;
 
-  unsigned long long t[R4D_TOPK_PT2];
+  unsigned long long t[PT];
 #pragma unroll
-  for (int q = 0; q < R4D_TOPK_PT2; q++) t[q] = 0ull;
+  for (int q = 0; q < PT; q++) t[q] = 0ull;
 
   const float* const row = G + (size_t)m * n * 2;
   for (int i = lane; i < n; i += R4D_TOPK_WAVE) {
     int id;
     __builtin_memcpy(&id, row + (size_t)i * 2, sizeof(int));
     if (id < 0) continue;
-    tk_insert<R4D_TOPK_PT2>(t, tk_key_f32(row[(size_t)i * 2 + 1], (unsigned)id));
+    tk_insert<PT>(t, tk_key_f32(row[(size_t)i * 2 + 1], (unsigned)id));
   }
 
   for (int r = 0; r < R; r++) {
-    const unsigned long long w = tk_round<R4D_TOPK_PT2>(t);
+    const unsigned long long w = tk_round<PT>(t);
     if (lane == 0) {
       OV[(size_t)m * R + r] = w ? tk_val(w) : -INFINITY;
       OI[(size_t)m * R + r] = w ? tk_idx(w) : -1;
@@ -365,10 +380,15 @@ void r4d_rowtopk_merge(long gathered, long outv, long outi, int M, int R, int W,
   if (M < 1 || R < 1 || W < 1) throw std::runtime_error("r4d rowtopk_merge: M, R and W must be >= 1");
   // R <= PT2 is what makes this exact whatever the candidates look like -- a lane can hold the
   // whole answer -- so it is checked rather than clamped, the same as stage 2's.
-  if (R > R4D_TOPK_PT2) throw std::runtime_error("r4d rowtopk_merge: R must be 1..32");
-  hipLaunchKernelGGL(r4d_rowtopk_merge_kernel, dim3(M), dim3(R4D_TOPK_WAVE), 0,
-                     (hipStream_t)stream, (const float*)gathered, (float*)outv, (int*)outi,
-                     R, W * R);
+  if (R > R4D_TOPK_PT2_MAX) throw std::runtime_error("r4d rowtopk_merge: R must be 1..128");
+  if (R > R4D_TOPK_PT2_MIN)
+    hipLaunchKernelGGL((r4d_rowtopk_merge_kernel<R4D_TOPK_PT2_MAX>), dim3(M),
+                       dim3(R4D_TOPK_WAVE), 0, (hipStream_t)stream, (const float*)gathered,
+                       (float*)outv, (int*)outi, R, W * R);
+  else
+    hipLaunchKernelGGL((r4d_rowtopk_merge_kernel<R4D_TOPK_PT2_MIN>), dim3(M),
+                       dim3(R4D_TOPK_WAVE), 0, (hipStream_t)stream, (const float*)gathered,
+                       (float*)outv, (int*)outi, R, W * R);
 }
 
 // ============================================================== logit_rerank
@@ -395,19 +415,19 @@ void r4d_rowtopk_merge(long gathered, long outv, long outi, int M, int R, int W,
 // row's own bf16 scale per 128 columns in its tail -- with each code an int8 value rather than an
 // E4M3 one. The drafter's rescoring reads whichever head the trunk's logits GEMM reads, so a model
 // with an int8 head needs this form or its lm_head has no device reader here.
-#define R4D_RERANK_WPB 8       // waves a block: 256 threads, and R <= 32 so a wave takes <= 4
+#define R4D_RERANK_WPB 8       // waves a block: 256 threads; R <= 128 rides several candidates a wave
 
 __device__ __forceinline__ float tk_bf2f(unsigned short b) {
   return __uint_as_float((unsigned)b << 16);
 }
 
-template <bool I8>
+template <bool I8, int PT>
 __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_RERANK_WPB) void r4d_logit_rerank_kernel(
     const unsigned short* __restrict__ X, const int* __restrict__ IN,
     const unsigned char* __restrict__ W, int* __restrict__ OI, float* __restrict__ OV,
     float* __restrict__ OP, int R, long K, long voff, long nv, long w_ld) {
-  __shared__ float s_sc[R4D_TOPK_PT2];
-  __shared__ int   s_id[R4D_TOPK_PT2];
+  __shared__ float s_sc[PT];
+  __shared__ int   s_id[PT];
 
   const int  m    = blockIdx.x;
   const int  lane = threadIdx.x & (R4D_TOPK_WAVE - 1);
@@ -437,14 +457,17 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_RERANK_WPB) void r4d_logit_rera
   __syncthreads();
   if (wv != 0) return;
 
-  unsigned long long t[R4D_TOPK_PT2];
+  unsigned long long t[PT];
 #pragma unroll
-  for (int q = 0; q < R4D_TOPK_PT2; q++) t[q] = 0ull;
-  if (lane < R && s_id[lane] >= 0)
-    tk_insert<R4D_TOPK_PT2>(t, tk_key_f32(s_sc[lane], (unsigned)s_id[lane]));
+  for (int q = 0; q < PT; q++) t[q] = 0ull;
+  /* EVERY CANDIDATE IS INSERTED, not just the first wave: the R scores sit in `s_id`/`s_sc`
+   * indexed 0..R-1, and for R > 32 a lane < R test would silently drop candidates 32..R-1 --
+   * precisely the ones the wide verify-head path exists for. */
+  for (int c = lane; c < R; c += R4D_TOPK_WAVE)
+    if (s_id[c] >= 0) tk_insert<PT>(t, tk_key_f32(s_sc[c], (unsigned)s_id[c]));
 
   for (int r = 0; r < R; r++) {
-    const unsigned long long w = tk_round<R4D_TOPK_PT2>(t);
+    const unsigned long long w = tk_round<PT>(t);
     if (lane == 0) {
       const float v = w ? tk_val(w) : -INFINITY;
       const int   i = w ? tk_idx(w) : -1;
@@ -466,12 +489,17 @@ static int logit_rerank_emit(long x, long idx_in, long head, long outi, long out
   if (M < 1 || R < 1 || K < 1 || nv < 1) return -1;
   // R <= PT2 is what makes the re-sort exact whatever the scores look like -- one lane holds the
   // whole answer -- so it is checked rather than clamped, the same as the merge's.
-  if (R > R4D_TOPK_PT2) return -2;
-#define R4D_RERANK_EMIT(I8)                                                                     \
-  R4D_EMIT(sk, r4d_logit_rerank_kernel<I8>, dim3(M), dim3(R4D_TOPK_WAVE * R4D_RERANK_WPB), 0,    \
-           (const unsigned short*)x, (const int*)idx_in, (const unsigned char*)head, (int*)outi,  \
+  if (R < 1 || R > R4D_TOPK_PT2_MAX) return -2;
+#define R4D_RERANK_EMIT(I8, PT)                                                                 \
+  R4D_EMIT(sk, (r4d_logit_rerank_kernel<I8, PT>), dim3(M),                                      \
+           dim3(R4D_TOPK_WAVE * R4D_RERANK_WPB), 0,                                             \
+           (const unsigned short*)x, (const int*)idx_in, (const unsigned char*)head, (int*)outi, \
            (float*)outv, (float*)outp, R, K, voff, nv, w_ld)
-  const int rc = i8 ? R4D_RERANK_EMIT(true) : R4D_RERANK_EMIT(false);
+  const bool wide = R > R4D_TOPK_PT2_MIN;
+  const int rc = i8 ? (wide ? R4D_RERANK_EMIT(true, R4D_TOPK_PT2_MAX)
+                            : R4D_RERANK_EMIT(true, R4D_TOPK_PT2_MIN))
+                    : (wide ? R4D_RERANK_EMIT(false, R4D_TOPK_PT2_MAX)
+                            : R4D_RERANK_EMIT(false, R4D_TOPK_PT2_MIN));
 #undef R4D_RERANK_EMIT
   return rc;
 }
@@ -491,10 +519,10 @@ void r4d_logit_rerank(long x, long idx_in, long head, long outi, long outv, long
 
 enum { T_X = 0, T_IDX, T_VAL, T_PAIRS };
 
-/* R > 32 is refused here, not by a constraint: libr4d's row says R <= 1024 in both its predicate
- * and its prose, and the entry point throws above R4D_TOPK_PT2 == 32, calling that "a real limit,
- * not a tuning choice". The constraint table transcribes what libr4d wrote and this is the
- * per-call half that makes the pair sound. */
+/* R > R4D_TOPK_PT2_MAX is refused here, not by a constraint: libr4d's row says R <= 1024 in both its
+ * predicate and its prose, and the entry point throws above R4D_TOPK_PT2_MAX, calling that "a real
+ * limit, not a tuning choice" -- a lane must hold the whole answer. 128 now, for the verify head's
+ * rerank of 80, and the two spellings are kept in step deliberately. */
 static int topk_params(const RadArgs* a,
                        const RadTensor** x, const RadTensor** idx, const RadTensor** val,
                        long long* M, long long* N, long long* R, int* RC, int* NCH, int* PT1) {
@@ -518,7 +546,7 @@ static int topk_params(const RadArgs* a,
     *R = r4d_geti_or(a, "R", 0);
     if (*M < 1 || *N < 1) return R4D_NO(RAD_E_SHAPE);
     if (*N % 8) return R4D_NO(RAD_E_SHAPE);
-    if (*R < 1 || *R > 32) return R4D_NO(RAD_E_SHAPE);
+    if (*R < 1 || *R > R4D_TOPK_PT2_MAX) return R4D_NO(RAD_E_SHAPE);
 
     R4dTopkCfg tk;
     r4d_cfg_topk(a, &tk);
@@ -603,7 +631,7 @@ extern "C" int r4d_rad_rowtopk_merge(const RadArgs* a, RadStream s) {
     const long long R = r4d_geti_or(a, "R", 0);
     const long long W = r4d_geti_or(a, "world_size", 0);
     if (M < 1 || R < 1 || W < 1) return R4D_NO(RAD_E_SHAPE);
-    if (R > 32) return R4D_NO(RAD_E_SHAPE);
+    if (R > R4D_TOPK_PT2_MAX) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(g) < M * W * R * 2) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(idx) < M * R || r4d_numel(val) < M * R) return R4D_NO(RAD_E_SHAPE);
 
@@ -644,7 +672,7 @@ static int rad_logit_rerank(const RadArgs* a, const R4dSink& sk, bool i8) {
     const long long R    = r4d_geti_or(a, "R", 0);
     const long long voff = r4d_geti_or(a, "vocab_off", 0);
     if (K < 1 || NV < 1 || R < 1) return R4D_NO(RAD_E_SHAPE);
-    if (R > 32) return R4D_NO(RAD_E_SHAPE);
+    if (R > R4D_TOPK_PT2_MAX) return R4D_NO(RAD_E_SHAPE);
     const long long M = (x->rank >= 1) ? x->shape[0] : r4d_geti_or(a, "M", 0);
     if (M < 1) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(x) < M * K || r4d_numel(in) < M * R) return R4D_NO(RAD_E_SHAPE);
@@ -666,4 +694,59 @@ static int rad_logit_rerank_i8_body(const RadArgs* a, const R4dSink& sk) {
     return rad_logit_rerank(a, sk, true);
 }
 R4D_ENTRY(r4d_rad_logit_rerank_i8, rad_logit_rerank_i8_body)
+
+// ============================================================== the sparse header's write
+//
+// THE LAST HALF OF THE DFLASH2 VERIFY HEAD. The rerank above produces R (global id, exact value)
+// pairs a row; this writes them into the TARGET's own logits buffer as a SPARSE row -- -inf
+// everywhere else -- which is what the existing sampler then consumes unchanged. The rest of the
+// row is filled first because the sampler reads the full vocabulary width; the finite set is the
+// only eligible one, and the gate that makes that safe is the batch's verify_head (see
+// abi/rad_runtime.h), NOT this kernel's business.
+//
+// ONE BLOCK A ROW, the fill in a grid stride and the scatter behind a barrier: R is at most a few
+// dozen, so the scatter is a rounding error beside the fill, and after the barrier the fill and the
+// scatter cannot race on a column.
+//
+// `vocab_off` IS THE SHARD'S FIRST GLOBAL COLUMN, and an id outside this rank's rows is DROPPED --
+// its value belongs to the other rank's logits plane, and the sampler's vocab-parallel path already
+// gathers the candidates across ranks. Dropping rather than clamping: a clamped id would write a
+// real value onto a token this rank does not own.
+__global__ __launch_bounds__(256) void r4d_logits_scatter_kernel(
+    float* __restrict__ out, const int* __restrict__ idx, const float* __restrict__ val,
+    int n_vocab, int R, int off) {
+  const int m = blockIdx.x;
+  float* const row = out + (size_t)m * n_vocab;
+  for (int j = threadIdx.x; j < n_vocab; j += blockDim.x) row[j] = -INFINITY;
+  __syncthreads();
+  for (int r = threadIdx.x; r < R; r += blockDim.x) {
+    const int gid = idx[(size_t)m * R + r];
+    const int loc = gid - off;
+    if (loc >= 0 && loc < n_vocab) row[loc] = val[(size_t)m * R + r];
+  }
+}
+
+static int rad_logits_scatter_body(const RadArgs* a, const R4dSink& sk) {
+    const RadTensor* idx = r4d_opt(a, 0);
+    const RadTensor* val = r4d_opt(a, 1);
+    const RadTensor* out = r4d_opt(a, 2);
+    if (!out || !idx || !val) return R4D_NO(RAD_E_INVAL);
+    if (out->dtype != RAD_F32 || idx->dtype != RAD_I32 || val->dtype != RAD_F32)
+        return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(out) || !r4d_contig(idx) || !r4d_contig(val)) return R4D_NO(RAD_E_STRIDE);
+    /* M and n_vocab come off the operands -- M is a band ceiling the step narrows, and n_vocab is
+     * this rank's column count -- with the parameters as the sizing-time fallback, exactly as
+     * rowtopk_merge reads its own. */
+    const long long M  = (out->rank >= 1) ? out->shape[0] : r4d_geti_or(a, "M", 0);
+    const long long NV = (out->rank >= 2) ? out->shape[1] : r4d_geti_or(a, "n_vocab", 0);
+    const long long R  = r4d_geti_or(a, "R", 0);
+    const long long off = r4d_geti_or(a, "vocab_off", 0);
+    if (M < 1 || NV < 1 || R < 1) return R4D_NO(RAD_E_SHAPE);
+    if (off < 0) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(idx) < M * R || r4d_numel(val) < M * R) return R4D_NO(RAD_E_SHAPE);
+    return R4D_EMIT(sk, r4d_logits_scatter_kernel, dim3((unsigned)M), dim3(256), 0,
+                    (float*)r4d_addr(out), (const int*)r4d_addr(idx),
+                    (const float*)r4d_addr(val), (int)NV, (int)R, (int)off);
+}
+R4D_ENTRY(r4d_rad_logits_scatter, rad_logits_scatter_body)
 

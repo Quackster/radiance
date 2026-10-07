@@ -1,0 +1,36 @@
+# q38-27b-paro-mxfp6.recipe -- Qwen3.8-27B-PARO-MXFP6 (`quant_method: paroquant_mxfp6`) converted
+# to a PLAIN canonical MXFP6 .rad the qwen35_mxfp6 plugin serves unchanged (Path B).
+#
+#   rad-convert /home/juup/models/Qwen3.8-27B-PARO-MXFP6 \
+#       --recipe data/recipes/q38-27b-paro-mxfp6.recipe -o q38-27b-paro-mxfp6.rad
+#
+# The rotated trunk linears are de-rotated to base-oriented f32 rows at read time
+# (core/format/checkpoint.cpp ckpt_resolve/ckpt_rows_f32 via ckpt_paro_rows_f32) and re-quantised
+# on the same OCP-MX grid as the bf16 source's recipe, so the container is byte-for-byte the shape
+# q38-27b-mxfp6.rad is. The rotation is undone before the quantiser sees the weight, so this costs
+# one extra MXFP6 rounding vs the rotated domain (expected approx 4e-2 relative Frobenius).
+#
+# DIFFERENCE FROM q38-27b-mxfp6.recipe: this checkpoint stores every weight it does not quantise as
+# F16, while the plugin declares token_embd, ssm_ab, ssm_conv1d and the vision tower BF16 -- and a
+# declared-bf16 weight may only be widened exactly at load, which f16->bf16 is not. The final
+# catch-all `cast dtype=bf16` converts those (and the f32-declared norms, exactly as the bf16
+# container holds them). It is last, so the MX and head rules above decide their weights first.
+
+# The lm_head, block fp8 -- the widest GEMM, kept on the codebook with the most mantissas.
+output.weight                          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The trunk linears, OCP MXFP6: fp6 E2M3 codes with an E8M0 shared exponent a group of 32. The
+# de-rotated f32 rows are re-quantised here.
+blk.*.attn_qg.weight                   rtn  codes=fp6_e2m3 group=32 scale=e8m0
+blk.*.attn_k.weight                    rtn  codes=fp6_e2m3 group=32 scale=e8m0
+blk.*.attn_v.weight                    rtn  codes=fp6_e2m3 group=32 scale=e8m0
+blk.*.attn_output.weight               rtn  codes=fp6_e2m3 group=32 scale=e8m0
+blk.*.ssm_inz.weight                   rtn  codes=fp6_e2m3 group=32 scale=e8m0
+blk.*.ssm_out.weight                   rtn  codes=fp6_e2m3 group=32 scale=e8m0
+blk.*.ffn_gate_up.weight               rtn  codes=fp6_e2m3 group=32 scale=e8m0
+blk.*.ffn_down.weight                  rtn  codes=fp6_e2m3 group=32 scale=e8m0
+
+# Everything else the checkpoint holds as f16, converted to bf16 so the plugin's declared dtypes
+# are met (f16 is not an exact widening of bf16). Norms and biases are cheap; the trunk linears are
+# already decided above.
+*                                      cast  dtype=bf16

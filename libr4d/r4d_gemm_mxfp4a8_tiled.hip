@@ -364,7 +364,14 @@ extern "C" void r4d_gemm_mxfp4a8_tiled(long at, long ascale, long wq, long ws, l
 
 // ============================================================== the plugin ABI entry point
 // The row-major activation is re-tiled into the op's scratch, then the GEMM reads it from there.
+//
+// THE `dec` AXIS (r4d_rows.cpp's tGemmMxfp4Tiled): 1 serves the band with the DECODE row's kernel
+// instead of this one, so a tuner can compare the two at one shape. The decode row is M <= 128 and
+// its split partial is the op's scratch, so the scratch hook follows the same switch.
+extern "C" int r4d_rad_gemm_mxfp4a8_decode(const RadArgs*, RadStream);
+extern "C" int64_t r4d_rad_gemm_mxfp4a8_decode_scratch(const RadArgs*);
 extern "C" int r4d_rad_gemm_mxfp4a8_tiled(const RadArgs* a, RadStream s) {
+    if (r4d_geti_or(a, "dec", 0) == 1) return r4d_rad_gemm_mxfp4a8_decode(a, s);
     GemmOps g;
     int rc = gemm_ops(a, &g, 1);
     if (rc != RAD_OK) return rc;
@@ -393,6 +400,7 @@ extern "C" int r4d_rad_gemm_mxfp4a8_tiled(const RadArgs* a, RadStream s) {
 /* The core sizes the op's scratch from this, at the band's widest M: the fragment-tiled copy of
  * the activation, whole 16-row fragments. */
 extern "C" int64_t r4d_rad_gemm_mxfp4a8_tiled_scratch(const RadArgs* a) {
+    if (r4d_geti_or(a, "dec", 0) == 1) return r4d_rad_gemm_mxfp4a8_decode_scratch(a);
     const long long M = r4d_geti_or(a, "M", 0), K = r4d_geti_or(a, "K", 0);
     return (int64_t)r4d_mxfp4a8_tile_a_bytes((int)M, (int)K);
 }

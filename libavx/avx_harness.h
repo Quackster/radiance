@@ -140,12 +140,25 @@ static inline size_t dt_bytes(uint32_t dt, int64_t n) {
     return (size_t)((n * rad_dtype_bits(dt) + 7) / 8);
 }
 
-/* W4 / W2 / MXFP4 have no store side in the ABI's accessor, and the packed grids are WEIGHT
+/* W4 / W2 / MXFP4 / MXFP6 have no store side in the ABI's accessor, and the packed grids are WEIGHT
  * operands a fixture would lay out rather than draw. Writing the CODE directly is the honest
  * alternative: both plugins decode the same symmetric two's-complement nibble
  * (libref/ref_common.h), so the bytes mean the same thing to both sides, which is the only
  * property the comparison needs. */
 static inline void h_narrow(const float* src, uint32_t dt, int64_t n, void* dst) {
+    if (dt == RAD_FP6E2M3 || dt == RAD_FP6E3M2) {
+        /* A drawn index IS the code: 0..63 covers all 64 e2m3 patterns, and every pattern is a
+         * value -- sign, the subnormal M/8 arm, and the 7.5 top all occur. */
+        uint8_t* b = (uint8_t*)dst;
+        std::memset(b, 0, dt_bytes(dt, n));
+        const int maxc = 63;
+        for (int64_t i = 0; i < n; ++i) {
+            int c = (int)std::lrintf(src[i]);
+            c = c < 0 ? 0 : (c > maxc ? maxc : c);
+            rad_store_bits(b, 6, i, (uint32_t)c);
+        }
+        return;
+    }
     if (dt == RAD_I4 || dt == RAD_FP4E2M1) {
         uint8_t* b = (uint8_t*)dst;
         std::memset(b, 0, dt_bytes(dt, n));

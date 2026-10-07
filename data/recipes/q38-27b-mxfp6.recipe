@@ -1,0 +1,80 @@
+# q38-27b-mxfp6.recipe -- Qwen3.8-27B converted from its bf16 checkpoint, as the q38-27b-mxfp6.rad
+# container serves it: an OCP-MXFP6 trunk under fp8 activations, a block-fp8 MTP head and DFlash2
+# drafter, everything else as the checkpoint holds it.
+#
+#   rad-convert <Qwen3.8-27B bf16 checkpoint> --quant-id mxfp6 \
+#       --recipe data/recipes/q38-27b-mxfp6.recipe -o q38-27b-mxfp6.rad
+#
+#   # the same, with the DFlash2 drafter in place of the MTP head:
+#   rad-convert <Qwen3.8-27B bf16 checkpoint> --draft-model <DFlash2 checkpoint> \
+#       --quant-id mxfp6 --recipe data/recipes/q38-27b-mxfp6.recipe -o q38-27b-mxfp6-df2.rad
+#
+# The checkpoint carries no quantization_config, so everything a rule does not name stays bf16: the
+# norms and biases, A_log, dt_bias, conv1d, the GDN in_proj_a/in_proj_b (48 rows each, not a whole
+# group of 32), the router -- and the vision tower (v.*), which libr4d serves in bf16. Rank-1
+# weights a pattern happens to match are declined by the quantiser and kept as they are. The first
+# rule that matches a weight decides it.
+#
+# The trunk linears -- attention q/k/v/o, the delta net's fused in_proj_qkv|in_proj_z and out_proj,
+# the MLP gate_up and down -- are OCP MXFP6: fp6 E2M3 codes with an E8M0 shared exponent a group of
+# 32, which the grid spells `codes=fp6_e2m3 group=32 scale=e8m0` (and e8m0's own default rule is
+# the OCP shared exponent, so `rule=mx` need not be written). The codes pack four to three bytes --
+# three u8 hold four codes, so the code view is 3*K/4 bytes wide, K % 32 whole. libr4d reads that
+# encoding as two views of one weight -- the packed E2M3 codes and the [K/32, N] exponent plane --
+# through its `gemm_nt_q` rows with `dtype=mxfp6a8`; the activation is E4M3 with one f32 scale a
+# row, the same producer mxfp4 uses. MXFP6 carries no per-row reference byte: the kernel applies
+# the e8m0 per group in the epilogue, with no wref/dsh fold. The lm_head is block fp8, not MX: the
+# widest GEMM in the model, and the logits path stays on the codebook with the most mantissas.
+
+# The token embedding, E4M3 under ONE f32 scale (`block=*x*`, read by embed_lookup_q): half the
+# bytes of the bf16 table -- 1.18 GiB at 248k x 5120 -- and all of it handed to the KV cache. A
+# gather reads a handful of rows a step, so the format costs no time. The arch reads the format off
+# the container, so a container converted without this line keeps the bf16 table and embed_lookup.
+token_embd.weight                    rtn  codes=fp8_e4m3 block=*x* scale=f32 rule=search
+
+# The lm_head, block fp8 -- NOT MXFP6, and not bf16. It is the widest GEMM in the model and the
+# plan keeps it at block fp8 (half the bytes of bf16; logits are the model's most codebook-sensitive
+# output). No other rule matches `output.weight`, so without this line it would silently stay bf16.
+output.weight                        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The MTP head, block fp8. Its DECODER-block linears reuse the fp8 blocks, and its one extra block
+# is declared as trunk layer 64 (n_main), so those weights carry a `blk.64.` prefix and their fp8
+# rule sits AHEAD of the trunk's MX rules. `mtp.fc.weight` is deliberately NOT quantised: the MTP
+# block hard-codes it bf16 and reads it with the unquantised `gemm_nt` (rad_block_mtp_fp8.h), so a
+# `mtp.*` rule would plan an fp8 grid under a gemm with no quantised row and the conversion would
+# refuse. Its four norms are rank-1 and declined anyway.
+mtp.draft_head.weight                rtn  codes=u2 zero=u8 group=128 scale=f16
+# `64` is this checkpoint's trunk depth (num_hidden_layers): the MTP layer is declared at index
+# n_main = 64. On a different member of the family this rule would land on a real trunk layer, so it
+# is model-specific by construction.
+blk.64.*.weight                      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The DFlash2 drafter's 2-bit copy of the target's head -- u2 codes, an f16 scale and a u8 zero a
+# group of 128 -- read by its draft rounds only. A draft is verified by the trunk, so this moves
+# acceptance and never an emitted token.
+dflash.draft_head.weight             rtn  codes=u2 zero=u8 group=128 scale=f16
+
+# The DFlash2 drafter's linears, block fp8 from its bf16 release: read whole on every decode step.
+dflash.fc.weight                     rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_q.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_k.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_v.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_output.weight      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_gate_up.weight      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_down.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The trunk linears, OCP MXFP6. The encoding a kernel reads is exactly the codes and the shared
+# exponent -- no stored column scales, no reference byte -- so `rtn` is the form. E2M3 over E3M2:
+# the same 6 bits with one more mantissa bit and no sign-of-zero asymmetry, which is what both the
+# OCP MX spec and the PARO-MXFP6 anchor checkpoint use.
+blk.*.attn_qg.weight                 rtn  codes=fp6_e2m3 group=32 scale=e8m0
+blk.*.attn_k.weight                  rtn  codes=fp6_e2m3 group=32 scale=e8m0
+blk.*.attn_v.weight                  rtn  codes=fp6_e2m3 group=32 scale=e8m0
+# The FUSED q|gate,k,v projection, declared only under RADIANCE_MX_ATTN_FUSE_QKV (default off; see
+# rad_block_attn_gated_mxfp4.h); the three lines above are not declared in that mode.
+blk.*.attn_qkv.weight                rtn  codes=fp6_e2m3 group=32 scale=e8m0
+blk.*.attn_output.weight             rtn  codes=fp6_e2m3 group=32 scale=e8m0
+blk.*.ssm_inz.weight                 rtn  codes=fp6_e2m3 group=32 scale=e8m0
+blk.*.ssm_out.weight                 rtn  codes=fp6_e2m3 group=32 scale=e8m0
+blk.*.ffn_gate_up.weight             rtn  codes=fp6_e2m3 group=32 scale=e8m0
+blk.*.ffn_down.weight                rtn  codes=fp6_e2m3 group=32 scale=e8m0

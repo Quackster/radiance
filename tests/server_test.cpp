@@ -140,6 +140,9 @@ struct FakeChatTemplate : IChatTemplate {
         out->think_open = think_open;
         out->think_close = think_close;
         out->think_starts_open = think_starts_open;
+        /* The assistant prefix already inside `prompt`; the server reads it to see whether the
+         * rendered prompt leaves a reasoning block open (OaiRequest::stops_after). */
+        out->generation_prompt = gen_prompt;
         return RAD_OK;
     }
     bool supports_tools() const override { return tools_ok; }
@@ -155,6 +158,9 @@ struct FakeChatTemplate : IChatTemplate {
     /* The reasoning block a render reports. FakeTokenizer makes a one-byte marker one token. */
     std::string think_open, think_close;
     bool        think_starts_open = false;
+    /* The assistant prefix the render carries (ChatRender::generation_prompt). A template that
+     * ends it inside an open  thinking block tells the server the reply starts as reasoning. */
+    std::string gen_prompt;
 
     /* Reads "TOOL:<name>:<json...>" -- everything after the second colon is the arguments,
      * however incomplete, and it arrives a piece at a time. That is exactly the shape the
@@ -941,6 +947,47 @@ TEST(a_stop_string_is_cut_out_of_the_answer) {
     CHECK_EQ(j["choices"][0]["finish_reason"].get<std::string>(), std::string("stop"));
     /* Cutting the answer frees the blocks immediately rather than at completion (spec §14). */
     CHECK(f.sched.saw_cancel());
+}
+
+/* THE STOP STRINGS ARE THE ANSWER'S, NOT THE REASONING'S. The rendered prompt ends inside an open
+ *  thinking block, so the reply begins as reasoning; the caller's stop string appears in that
+ * reasoning (a reasoning model restating the question writes "Q:"), and pre-fix it ended the
+ * request there with the reasoning cut short and no answer at all (finish_reason "stop", empty
+ * answer), which lm-eval's GSM8K scores as wrong. With OaiRequest::stops_after and pump()'s floor
+ * the stop matches only after  response, so it cuts the ANSWER. */
+TEST(a_stop_string_cuts_the_answer_not_an_open_reasoning_block) {
+    Fixture f;
+    /* The reasoning markers are the literal tokens, written with escapes so a tag-like literal in
+     * this source cannot be mangled: open " thinking", close " response". */
+    const std::string open_marker  = "\x3cthink\x3e";
+    const std::string close_marker = "\x3c\x2fthink\x3e";
+    f.tmpl.gen_prompt = "assistant\n" + open_marker + "\n";
+    /* The chat format declares the block's closer and that the render leaves it open; the server's
+     * stops_after is read off the render (ChatRender::think_close / think_starts_open). */
+    f.tmpl.think_close = close_marker;
+    f.tmpl.think_starts_open = true;
+    /* Reasoning restates the question (writing "Q:"), then closes, answers, then writes the stop
+     * again to begin the next question. */
+    f.sched.reply = "reasoning. Q: what is 2+2?" + close_marker + "The answer is 4. Q: next";
+    /* The parse, not just the pump: the render that leaves the block open sets stops_after. */
+    {
+        OaiRequest pr; ApiError pe;
+        CHECK_OK(parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}],"stop":["Q:"]})",
+                                    f.odeps(), f.limits(), &pr, &pe));
+        CHECK_EQ(pr.stops_after, close_marker);
+    }
+    HttpResponse r = f.post("/v1/chat/completions",
+                            R"({"messages":[{"role":"user","content":"hi"}],"max_tokens":128,
+                                "stop":["Q:"]})");
+    CHECK_EQ(r.status, 200);
+    json j = json::parse(r.body);
+    const auto& c = j["choices"][0];
+    /* The "Q:" written while thinking did NOT end the stream: the answer after the closer was
+     * delivered, and only the "Q:" after it cut the stream. */
+    CHECK_EQ(c["message"]["content"].get<std::string>(),
+             "reasoning. Q: what is 2+2?" + close_marker + "The answer is 4. ");
+    CHECK(has(c["message"]["content"].get<std::string>(), "The answer is 4."));
+    CHECK_EQ(c["finish_reason"].get<std::string>(), std::string("stop"));
 }
 
 TEST(a_complete_tool_call_is_reported_as_tool_calls) {

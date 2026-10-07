@@ -410,6 +410,23 @@ int Engine::step_loop() {
      * collected, and a pass issued ahead would have overwritten them by then. */
     pipelining_ = !cfg_.kld() && drafter_.kind != RAD_DRAFT_BLOCK &&
                   (serial_drafting() || cfg_.n_spec <= 0);
+    /* RADIANCE_ADAPTIVE_K=1: per-sequence verify length for a block drafter (sched/adaptive_k.h).
+     * Not for a serial drafter, whose depth is decided on the card before the host sees it. */
+    if (drafter_.kind == RAD_DRAFT_BLOCK && cfg_.n_spec > 0) {
+        const AdaptiveK::Params akp = AdaptiveK::Params::from_env();
+        if (akp.enabled) (void)sched_.set_adaptive_k(akp);
+        /* RADIANCE_LOOKUP_DRAFT=1: whole-context prompt lookup over the block drafter's proposal
+         * (sched/lookup_draft.h). */
+        const LookupParams lkp = LookupParams::from_env();
+        if (lkp.enabled) (void)sched_.set_lookup_draft(lkp, (int)drafter_.window);
+        /* RADIANCE_DRAFT_REFILL=<tokens>: on a prefix-cache hit recompute this many cached tokens (clamped to the
+         * drafter window) so the windowed drafter has context at once. Default = the window; 0 = off. */
+        {
+            const char* v = std::getenv("RADIANCE_DRAFT_REFILL");
+            const int64_t n = (v && *v) ? std::atoll(v) : (int64_t)drafter_.window;
+            (void)sched_.set_draft_refill((int)drafter_.window, n);
+        }
+    }
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* Read once. See the block in the idle branch below for what it is for. */
     /* "kv" | "arena" | "all" | "kv:<name>,<name>" -- the last narrows the KV scrub to named groups,
@@ -2096,6 +2113,8 @@ int Engine::run_server() {
                 s.passes.issued_first   += pc.issued_first;
                 s.passes.dispatched     += pc.dispatched;
                 s.passes.unordered      += pc.unordered;
+                s.passes.evicted        += pc.evicted;
+                s.passes.tape_cap        = pc.tape_cap;
             }
 
             s.link.present        = true;

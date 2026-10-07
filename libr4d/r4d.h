@@ -572,6 +572,9 @@ int  r4d_gemm_mxfp4a8_tiled_group(void);
 // scratch, which only the plugin ABI hands over.
 int  r4d_gemm_mxfp4a8_decode_max_m(void);
 
+// (The ported PR #30 decode/tiled raw entries are gone: upstream merged those kernels under the
+// native r4d_rad_gemm_mxfp4a8_decode / _tiled names, which the plugin raises with RADIANCE_MX_GEMM.)
+
 // ---- BLOCK-SCALED FP8: the format a checkpoint ships in ----------------------------------------
 //
 // Every other quantised GEMM above reads a weight this library's own quantiser produced.  This
@@ -764,6 +767,20 @@ int  r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long peer_flag
                               int nblocks, int nthreads, int drain, int acq, int wire,
                               long loc_pack, long loc_scale_off);
 int  r4d_ar_rmsnorm_quant_fp8_chunk_elems(void);
+
+// The per-row (OCP-MX) twin of r4d_ar_rmsnorm_quant_fp8: the same two-rank all-reduce folded in
+// front of the norm, with quant_act_fp8_row's whole-row quantiser. The scale is [M][1], there is no
+// `group`, and the arithmetic after the reduction is rmsnorm_quant_fp8_row's three passes. `x` and
+// `res` are the same operands; `wire` 6 needs `n` to be a multiple of
+// r4d_ar_rmsnorm_quant_fp8_row_chunk_elems(), so that a chunk never straddles a row.
+int  r4d_ar_rmsnorm_quant_fp8_row(long peer_scratch, long my_scratch, long peer_flags,
+                                  long my_flags, long seq_ctrs, long slot_stride16,
+                                  long x, long res, long w, long y, long q, long s,
+                                  int M, int n, float eps, float wadd, int w_f32,
+                                  int r_ld, int y_ld, int q_ld, int s_ld, long stream,
+                                  int nblocks, int nthreads, int drain, int acq, int wire,
+                                  long loc_pack, long loc_scale_off);
+int  r4d_ar_rmsnorm_quant_fp8_row_chunk_elems(void);
 
 // ---- sampling ----------------------------------------------------------------------------------
 //

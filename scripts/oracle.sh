@@ -27,8 +27,8 @@
 # and decodes them before it compares; a row that relayouts a weight and publishes no inverse is
 # NOT CHECKED and says so by name. Read those lines: they are coverage this instrument does not
 # have. The fp8 rows, the int8 (i8a8) block rows, the MoE 4-bit expert plane and its E4M3 scale
-# views (both grouped GEMMs, every class) and the dense w4 rows answer; the w8a16, w8a8, w2a8 and
-# mxfp4 rows do not.
+# views (both grouped GEMMs, every class), the dense w4 rows and the mxfp4 rows answer; the
+# w8a16, w8a8 and w2a8 rows do not.
 #
 # NOT EVERY GAP IS AN INVERSE SOMEBODY HAS NOT WRITTEN, AND THIS ONE IS A MISSING ZERO POINT.
 # `gemm_w2a8_nt` -- the 2-bit draft head, live on EVERY speculating container, and the same gap

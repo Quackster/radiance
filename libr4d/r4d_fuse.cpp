@@ -770,3 +770,37 @@ extern "C" int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, uint64_
         return RAD_E_NOTFOUND;
     }
 }
+
+/* The per-row twin, the same two steps with the group=128 quantiser replaced by
+ * rmsnorm_quant_fp8_row (no `group`). Every property the group=128 hook relies on holds here: the
+ * tail step is itself a declared op carrying the same optional operands in the same positions, and
+ * the reduced bytes are the standalone wire's, so absence and wire both propagate through the
+ * wiring. */
+extern "C" int r4d_fuse_ar_rmsnorm_quant_fp8_row(const RadParam* p, int n_p, uint64_t present,
+                                                 int step, RadFuseStep* out) {
+
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    const int64_t world = pi(p, n_p, "world_size");
+    const int64_t wire = pi(p, n_p, "wire", 0);
+    if (M <= 0 || n <= 0 || world <= 0) return RAD_E_UNSUPPORTED;
+    if (wire != 0 && wire != 6) return RAD_E_UNSUPPORTED;
+
+    switch (step) {
+    case 0: {
+        Step s(out, "all_reduce");
+        s.mirror(p, n_p, "world_size").pint("numel", (long long)(M * n))
+         .mirror(p, n_p, "dtype").pint("exact", wire == 0 ? 1 : 0);
+        if (wire != 0) s.pint("min_bytes", 0);
+        return s.wire({ 0, RAD_FUSE_NONE });        /* x (inout), y */
+    }
+    case 1: {
+        Step s(out, "rmsnorm_quant_fp8_row");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps")
+         .mirror(p, n_p, "dtype").mirror_opt(p, n_p, "wadd");
+        return s.wire({ 0, 1, 2, 3, 4, 5 });        /* x, residual, w, q, scale, out_bf16 */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}

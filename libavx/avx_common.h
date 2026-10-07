@@ -206,7 +206,11 @@ static inline int64_t row_stride(const RadTensor* t, int64_t cols) {
  * THE PACKED CODES. rad_load_f32 returns 0 for W4, W2 and MXFP4 -- its contract says a dtype it
  * cannot read is a refusal and not a value -- so every strided or odd-offset read of a packed
  * weight that falls off the row converter would decode as zeros. The codes are libref's
- * (ref_common.h: w4_code, w2_code, mxfp4_code), the same ones row_to_f32 unpacks in bulk.
+ * (ref_common.h: w4_code, w2_code, mxfp4_code, mxfp6_code), the same ones row_to_f32 unpacks in
+ * bulk. MXFP6 is NOT one of those refusals: the ABI reads it off the bit stream
+ * (rad_load_bits(base, 6, i)), which is the identical 4-per-3-byte convention ref_common.h
+ * documents, so the default arm below decodes it correctly -- and it decodes MXFP8 byte codes the
+ * same way, as plain e4m3.
  *
  * THE INTEGER STORE ROUNDS TO NEAREST-EVEN AND SATURATES, as libref's st_dt does, where
  * rad_store_f32 truncates and converts out-of-range values with a plain cast. A NaN stores 0. */
@@ -347,12 +351,16 @@ static inline void st_int_dt(uint32_t dt, void* p, int64_t i, int64_t v) {
 static inline int64_t ldi(const RadTensor* t, int64_t off) { return ld_int_dt(t->dtype, t->data, off); }
 
 /* Bytes of element i for a dtype whose element is not a whole byte. Only the packed weight codes
- * need it and they are always read through row_to_f32, but `dequant` addresses a group start. */
+ * need it and they are always read through row_to_f32, but `dequant` addresses a group start.
+ * e2m3 needs i % 4 == 0 -- four codes to three bytes, so only every fourth element starts a byte
+ * -- and callers gate it with the same mask I2 carries. */
 static inline const void* byte_at(const void* base, uint32_t dt, int64_t i) {
     const uint8_t* b = (const uint8_t*)base;
     switch (dt) {
         case RAD_I4:    case RAD_FP4E2M1: return b + (i >> 1);
         case RAD_I2:                    return b + (i >> 2);
+        case RAD_I5:                    return b + 5 * (i >> 3);   /* int5: byte-aligned iff i % 8 == 0 */
+        case RAD_FP6E2M3: case RAD_FP6E3M2: return b + 3 * (i >> 2);
         default:                        return b + i * (size_t)(rad_dtype_bits(dt) / 8);
     }
 }

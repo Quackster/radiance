@@ -133,6 +133,12 @@ struct Logical {
     CkptWeight      src;
     const Compiled* rule = nullptr;
     RadEncoding     enc{};
+    /* PATH A: keep a paroquant_mxfp6 source's rotation instead of de-rotating it. The container
+     * then carries the checkpoint's own 5-plane `givens` encoding -- codes and scale as the source
+     * holds them, plus the globalised pairs/angle/1-channel_scales tables -- and the qwen35_paroquant
+     * arch serves it. Only a SINGLE-member weight can be kept: a joined weight's members have one
+     * rotation each, which is not one GEMM's. */
+    bool            paro_as_is = false;
     int             status = RAD_OK;
     std::string     why;
     /* from the declarations that take it */
@@ -210,6 +216,8 @@ void usage() {
         "                       rules. Repeatable\n"
         "      --list-quantizers  every quantiser loaded and the options each takes, then exit\n"
         "      --arch ID        override the architecture id from the checkpoint\n"
+        "      --quant-id ID    override the quantisation id from the checkpoint, the second half\n"
+        "                       of the plugin key (spec §2.4)\n"
         "      --home DIR       $RADIANCE_HOME (kernels/, architectures/, quantizers/)\n"
         "      --kernels A:B    kernel plugin hierarchy, first wins. Default $RADIANCE_KERNELS.\n"
         "                       Declare checks the recipe against the kernels it resolves\n"
@@ -252,7 +260,8 @@ void usage() {
 }  /* namespace */
 
 int main(int argc, char** argv) {
-    std::string in, out, arch_override, home = rad_home(), tokjson, imat_path, draft_dir;
+    std::string in, out, arch_override, quant_override, home = rad_home(), tokjson, imat_path,
+                draft_dir;
     std::vector<std::string> hierarchy = rad_hierarchy_from_env();
     std::vector<std::string> recipe_files, quant_flags;
     int64_t  max_tok = 8192;
@@ -279,6 +288,7 @@ int main(int argc, char** argv) {
         else if (a == "--quant")     quant_flags.push_back(next("--quant"));
         else if (a == "--list-quantizers") list_quant = true;
         else if (a == "--arch")      arch_override = next("--arch");
+        else if (a == "--quant-id")  quant_override = next("--quant-id");
         else if (a == "--home")      home = next("--home");
         else if (a == "--kernels")   hierarchy = rad_split_list(next("--kernels"));
         else if (a == "--tokenizer") tokjson = next("--tokenizer");
@@ -399,6 +409,30 @@ int main(int argc, char** argv) {
                  rad_meta_gets(&meta.m, "draft.architectures", "?"));
     }
     if (!arch_override.empty()) meta.arch = arch_override;
+    /* The quantisation id is the second half of the plugin key and, with the architecture, what
+     * selects the plugin (spec §2.4). A bf16 checkpoint names none -- `qwen35_bf16` serves it --
+     * so a recipe that changes every linear's format states the id the converted container needs.
+     * It is set here, ahead of finish(), because finish() republishes meta.m.quant. */
+    if (!quant_override.empty()) meta.quant = quant_override;
+    /* A paroquant_mxfp6 checkpoint is not served as it is: the rotation is undone at read time
+     * (core/format/checkpoint.cpp) and the recipe's quantiser writes a plain canonical MXFP6
+     * container, which the qwen35_mxfp6 plugin serves. So the container's quant id is mxfp6, not
+     * the source's -- and the plugin reads `quantization_config.quant_method` out of the metadata
+     * table as its own guard, so that key must name the container too, not the source. An explicit
+     * --quant-id still wins. */
+    if (const char* qm = meta.get("quantization_config.quant_method")) {
+        if (std::string(qm) == "paroquant_mxfp6") {
+            if (quant_override.empty()) meta.quant = "mxfp6";
+            meta.set("quantization_config.quant_method", meta.quant);
+            RAD_INFO("source is paroquant_mxfp6; writing a plain MXFP6 container (quant %s)",
+                     meta.quant.c_str());
+        }
+    }
+    /* PATH A. `--quant-id paroquant_mxfp6` opts into keeping the rotation: the container keeps the
+     * source's `givens` encoding and the qwen35_paroquant plugin serves it, rotating each linear's
+     * activation as it is read. Without it the block above de-rotates to plain MXFP6 (path B). */
+    const bool keep_paro = quant_override == "paroquant_mxfp6";
+    if (keep_paro) RAD_INFO("paroquant_mxfp6 and --quant-id agree: keeping the rotation (path A)");
     /* --set, added after the checkpoint's own config and the drafter's, so an operator's key is
      * the last word. Declare reads RadModelMeta and so does the engine's, from the container's
      * header, so a choice that changes the graph is stated once and held at both. */
@@ -535,6 +569,17 @@ int main(int argc, char** argv) {
         if (rc < 0) {
             L.status = rc;
             L.why = why;
+        } else if (keep_paro && !L.src.paro.empty()) {
+            /* PATH A: keep the rotation. A single member is served as it stands; a join of two
+             * rotated members is not one GEMM's, because they have different rotations. */
+            if (L.src.paro.size() == 1) {
+                L.enc = L.src.paro[0]->enc;
+                L.paro_as_is = true;
+            } else {
+                L.status = RAD_E_UNSUPPORTED;
+                L.why = "a joined paroquant weight has a rotation a member, which path A cannot "
+                        "serve as one GEMM; map its members as separate weights";
+            }
         } else if (const RecipeRule* r = recipe.match(name)) {
             L.rule = by_rule[r];
             const RadQuantWeight qw = quant_weight(L, nullptr);
@@ -977,6 +1022,30 @@ int main(int argc, char** argv) {
             if (verbose)
                 RAD_DEBUG("  %-52s %-30s %10s reused", name.c_str(), enc_name(L.enc).c_str(),
                           humanb(j.bytes).c_str());
+            return RAD_OK;
+        }
+
+        /* --- PATH A: A KEPT ROTATION. The five canonical planes the reader built -- the packed
+         * E2M3 codes and the E8M0 exponents straight from the checkpoint, and the globalised
+         * pairs/angle/1-channel_scales tables -- go in as they are. The weight's planes are its
+         * `givens` encoding, so the GEMM's layout hook lays out the codes and scale exactly as it
+         * does for a plain MXFP6 weight and the tables ride beside them for the producer. */
+        if (L.paro_as_is) {
+            const ParoLinear& p = *L.src.paro[0];
+            for (int k = 0; k < L.enc.n_planes; ++k) {
+                const void* d = p.data(k);
+                const int64_t pb = rad_enc_plane_bytes(&L.enc.plane[k], L.src.rows, L.src.cols);
+                if (!d || pb <= 0) {
+                    RAD_ERR("'%s': its paroquant plane '%s' is empty", name.c_str(),
+                            L.enc.plane[k].role);
+                    return RAD_E_FORMAT;
+                }
+                if (w.write_plane(idx, k, 0, d, pb) != RAD_OK) return RAD_E_IO;
+            }
+            written += j.bytes;
+            if (verbose)
+                RAD_DEBUG("  %-52s %-30s %10s as is (path A, rotation kept)", name.c_str(),
+                          enc_name(L.enc).c_str(), humanb(j.bytes).c_str());
             return RAD_OK;
         }
 

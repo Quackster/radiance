@@ -12,7 +12,9 @@
 #include "rad_encoding.h"
 #include "rad_quant.h"
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace rad {
 
@@ -55,6 +57,34 @@ void fwht_inplace(float* v, int64_t n);
 
 /* The canonical spelling of an encoding (rad_enc_format), as a string. */
 std::string enc_name(const RadEncoding& e);
+
+/* ================================================================== ParoQuant's rotation tables
+ *
+ * A `paroquant_mxfp6` CHECKPOINT'S ROTATION, AS THE ENCODING'S. The published checkpoint describes
+ * its transform as w = R(v) . D: `channel_scales` is the diagonal D applied to the RIGHT of the
+ * rotation, and `pairs` are indices LOCAL to a `group`-wide rotation group (0..group-1), one group
+ * after another along the row. The encoding's convention is the other way round -- v = w . D . G1
+ * ... GS, decoded by givens_inverse as w = v . GS^T ... G1^T . D^-1 (abi/rad_encoding.h) -- so
+ * this globalizes the pairs (column = group base + local index) and stores the RECIPROCAL scale,
+ * 1/channel_scales. givens_inverse's divide then multiplies by D and reconstructs exactly R(v). D.
+ *
+ * `pairs` is I16 [stages * cols]; `theta` F16 [stages * cols/2] in radians; `channel_scales` F16
+ * [cols]. The three outputs receive the tables' canonical bytes: i32 global pairs [stages, cols],
+ * f32 angles [stages, cols/2], f32 1/D [1, cols]. RAD_OK, or RAD_E_SHAPE when the geometry is not
+ * a whole number of rotation groups / RAD_E_FORMAT when a local pair is outside its group or a
+ * channel scale is zero. */
+int enc_givens_paro_tables(int64_t stages, int64_t cols, int64_t group, const int16_t* pairs,
+                           const uint16_t* theta, const uint16_t* channel_scales,
+                           std::vector<uint8_t>* pairs_i32, std::vector<uint8_t>* angle_f32,
+                           std::vector<uint8_t>* scale_f32, std::string* why);
+
+/* THE FORWARD READING OF THOSE TABLES: the activation-side rotation path A serves with. Given the
+ * encoding's `t.pairs`/`t.angle`/`t.scale` (scale = 1/channel_scales) and an input row x, computes
+ * a = (x / t.scale) . M_dec^T in place -- givens_inverse's stages in ascending order, transposed --
+ * so that for any stored code row v, dot(a, v) == dot(x, w) with w the base weight givens_inverse
+ * decodes from v. A givens-fused producer runs this on the bf16 activation before its fp8 quantiser.
+ * RAD_OK, or RAD_E_SHAPE when the tables do not fit the row. */
+int enc_givens_forward(const EncodedView& v, float* row, std::string* why = nullptr);
 
 /* ================================================================== a selection, as a reader reads it
  *

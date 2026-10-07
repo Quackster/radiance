@@ -260,12 +260,17 @@ TEST(op_vocabulary) {
         "embed_lookup_q", "cast",
         "scale_rows",
         "softmax",
-        "quant_act_i8", "quant_act_fp8", "had_quant_act_fp8", "had_quant_act_i8", "gram_accum",
+        "quant_act_i8", "quant_act_fp8", "quant_act_fp8_row", "had_quant_act_fp8",
+        "had_quant_act_i8", "gram_accum",
         /* The fused fp8 forms. A host run needs EVERY op covered, so these are what stands
          * between RADIANCE_HOST_DOMAIN and "site 'host' is unavailable for this band". */
-        "rmsnorm_quant_fp8", "gated_quant_fp8", "gemm_nt_q_gated", "dflash_select",
+        "rmsnorm_quant_fp8", "gated_quant_fp8", "gemm_nt_q_gated", "gemm_nt_q_gated_mx",
+        "dflash_select", "dflash_select_q",
         "rmsnorm_had_quant_i8",
         "gated_had_quant_i8",
+        /* The per-row (OCP-MX) forms have a ref too; `gate_quant_fp8_row` does not, the same way
+         * the group `gate_quant_fp8` has none -- it is libr4d-only. */
+        "rmsnorm_quant_fp8_row", "gated_quant_fp8_row",
         "dequant",
         "gemm_nt", "gemm_nt_bias", "gemm_nt_q", "gemm_nt_q_bias", "grid_embed",
         "attn_paged", "attn_dense", "kv_store", "rope", "rope_table", "qk_norm_rope", "qsa_block_key",
@@ -558,6 +563,72 @@ TEST(op_embed_lookup_q) {
     A b; b.t(bad).t(wte).t(sc).t(y)
          .i("M", 1).i("n_embd", 2).i("n_vocab", 4).s("dtype", "bf16");
     CHECK(run("embed_lookup_q", b) != RAD_OK);
+}
+
+/* DFlash2's candidate walk over E4M3 codebooks, on paper. V = 4, R = 2, two steps of two candidates.
+ * The codes are the ones whose values are exact literals (0x38 = 1.0, 0x40 = 2.0, 0x3c = 1.5,
+ * 0xb8 = -1.0, 0x00 = 0), and the scales are powers of two, so every expected number below is
+ * exact.
+ *
+ *   pred rows (codes * scale):  0: [1, 2] * 1      1: [1.5, -1] * 0.5 = [0.75, -0.5]
+ *                               2: [0, 1] * 2 = [0, 2]       3: [2, 2] * 0.25 = [0.5, 0.5]
+ *   succ rows (codes * scale):  0: [1, 1] * 1      1: [2, 0] * 0.5 = [1, 0]
+ *                               2: [-1, 1] * 2 = [-2, 2]     3: [1.5, 2] * 1
+ *
+ * Case 1, anchor 0, hp absent. Step 0: ax = pred[0] = [1, 2]; candidates {1, 2} score 1 and 2, so
+ * the walk takes token 2. Step 1: ax = pred[2] = [0, 2]; candidates {0, 3} score 2 + 0 and
+ * 4 - 3 = 1, so it takes token 0 -- the unary term is what separates them. A kernel that ignored
+ * the SUCCESSOR scales would score step 0 at 2 and 1 and take token 1 instead.
+ *
+ * Case 2, anchor 3, unary {0, 1} at step 0: ax = pred[3] = [0.5, 0.5], candidates {1, 2} score 0.5
+ * and 0 + 1 = 1, so token 2. A kernel that ignored the PREDECESSOR scale (ax = [2, 2]) scores 2
+ * and 1 and takes token 1.
+ *
+ * Case 3 is the same walk over a codebook that is the same numbers at ONE scale for the table, and
+ * a candidate id outside the vocabulary, which scores its unary term alone. */
+TEST(op_dflash_select_q) {
+    T pc(RAD_F8E4M3, {4, 2});
+    pc.raw({ 0x38, 0x40,   0x3c, 0xb8,   0x00, 0x38,   0x40, 0x40 });
+    T ps(RAD_F32, {4, 1}); ps.f({ 1.0f, 0.5f, 2.0f, 0.25f });
+    T sc_(RAD_F8E4M3, {4, 2});
+    sc_.raw({ 0x38, 0x38,   0x40, 0x00,   0xb8, 0x38,   0x3c, 0x40 });
+    T ss(RAD_F32, {4, 1}); ss.f({ 1.0f, 0.5f, 2.0f, 1.0f });
+
+    auto walk = [&](int64_t anchor, std::vector<float> unary, std::vector<int64_t> cand,
+                    const T& pscale, const T& sscale, T& out) {
+        T cd(RAD_I32, {2, 2}); cd.n(cand);
+        T un(RAD_F32, {2, 2}); un.f(unary);
+        T an(RAD_I32, {1}); an.n({ anchor });
+        A a; a.t(cd).t(un).tnull().t(an).t(pc).t(pscale).t(sc_).t(sscale).t(out)
+             .i("M", 1).i("steps", 2).i("top_k", 2).i("rank", 2).i("n_vocab", 4)
+             .i("anchor_stride", 1).s("dtype", "bf16");
+        return run("dflash_select_q", a);
+    };
+
+    T out(RAD_I32, {1, 2});
+    CHECK_OK(walk(0, { 0, 0, 0, -3 }, { 1, 2, 0, 3 }, ps, ss, out));
+    CHECK_EQ(out.iat(0), 2);
+    CHECK_EQ(out.iat(1), 0);
+
+    T out2(RAD_I32, {1, 2});
+    CHECK_OK(walk(3, { 0, 1, 0, 0 }, { 1, 2, 0, 3 }, ps, ss, out2));
+    CHECK_EQ(out2.iat(0), 2);
+
+    /* One scale for the whole table. All-ones scales make it the raw codes: anchor 0, ax = [1, 2],
+     * candidates {1, 7}: token 7 is outside the vocabulary and scores its unary term (0.5) alone,
+     * token 1 scores <[1, 2], [2, 0]> = 2, so the walk takes token 1; the second step then starts
+     * from token 1's raw row [1.5, -1] against candidates {2, 3}: 1.5 * -1 + -1 * 1 = -2.5 and
+     * 1.5 * 1.5 + -1 * 2 = 0.25, token 3. */
+    T one(RAD_F32, {1}); one.f({ 1.0f });
+    T out3(RAD_I32, {1, 2});
+    CHECK_OK(walk(0, { 0, 0.5f, 0, 0 }, { 1, 7, 2, 3 }, one, one, out3));
+    CHECK_EQ(out3.iat(0), 1);
+    CHECK_EQ(out3.iat(1), 3);
+
+    /* A scale plane that is neither one element nor a row each is refused, not guessed at. */
+    T bad(RAD_F32, {2, 1}); bad.f({ 1.0f, 1.0f });
+    T out4(RAD_I32, {1, 2});
+    CHECK(walk(0, { 0, 0, 0, 0 }, { 1, 2, 0, 3 }, bad, ss, out4) != RAD_OK);
 }
 
 /* PLE's gate, on paper. n = 2 and hc = 2, which is the smallest shape where both asymmetries of
@@ -1455,6 +1526,113 @@ TEST(op_gemm_nt_q) {
     CHECK_EQ(y3.at(1), (3 * 2.0f + 4 * 4.0f) * 1.0f);
 }
 
+/* MXFP8 AND MXFP6, the self-scaling members of the OCP-MX family. The grid is mxfp4's -- an e8m0
+ * exponent byte per 32 K and per output row, over an E4M3 activation carrying one f32 scale per row
+ * -- and the difference is that there is NO `b_ref`: e2m3 and e4m3 codes hold their own exponent, so
+ * a per-row reference has nothing to fold and the reference reads the e8m0 plane directly. Every
+ * number below is the group sub-sum times `a_scale` times that exponent, in the order `quant_dot`
+ * fixes, and every factor is an integer or a power of two, so f32 holds the chain exactly and
+ * equality is the check rather than a tolerance. */
+TEST(op_gemm_nt_q_mxfp8a8_mxfp6a8) {
+    /* mxfp8a8 at N 2, K 64 -- two 32-wide groups. Activation rows are all 1.0 (0x38) and all 2.0
+     * (0x40); weight row 0 is all 1.0 and row 1 all -2.0, which is 0xC0 and NOT 0x80: the sign is
+     * bit 7 of an E4M3 byte, so 0x80 alone is -0. The exponent rows {127,129} and {126,127} make one
+     * output row's two groups scale by 1 and 4 and the other's by 1/2 and 1, so all four outputs
+     * differ and an exponent read off the wrong axis cannot pass. */
+    std::vector<uint8_t> a8(64, 0x38), a8b(64, 0x40);
+    a8.insert(a8.end(), a8b.begin(), a8b.end());
+    std::vector<uint8_t> b8(64, 0x38), b8b(64, 0xC0);
+    b8.insert(b8.end(), b8b.begin(), b8b.end());
+    T am8(RAD_F8E4M3, {2, 64}); am8.raw(a8);
+    T as8(RAD_F32, {2, 1});     as8.f({0.5f, 2.0f});
+    T bm8(RAD_F8E4M3, {2, 64}); bm8.raw(b8);
+    T bs8(RAD_U8, {2, 2});      bs8.n({127, 129, 126, 127});
+    T y8(RAD_F32, {2, 2});
+    A c8; c8.t(am8).t(as8).t(bm8).t(bs8).t(y8)
+           .i("M", 2).i("N", 2).i("K", 64).i("group", 32).s("dtype", "mxfp8a8");
+    CHECK_OK(run("gemm_nt_q", c8));
+    /* A group of 32 equal products is 32 * a * w: 32, 64, -64, -128 before the scales, so
+     * y00 = 32*.5*1 + 32*.5*4 = 80,   y01 = -64*.5*.5 + -64*.5*1 = -48,
+     * y10 = 64*2*1 + 64*2*4 = 640,    y11 = -128*2*.5 + -128*2*1 = -384. */
+    CHECK_EQ(y8.at(0), 80.0f);
+    CHECK_EQ(y8.at(1), -48.0f);
+    CHECK_EQ(y8.at(2), 640.0f);
+    CHECK_EQ(y8.at(3), -384.0f);
+
+    /* mxfp6a8 at the same geometry, on the 4-codes-per-3-bytes wire format, which is where a wrong
+     * shift hides. The bytes are the ABI's `rad_load_bits` reading: v0 = b0 & 0x3f, v1 = the low
+     * nibble of b1 above b0's top two bits, v2 = the low pair of b2 above b1's high nibble, v3 = b2
+     * >> 2. So 08 44 11 is the code sequence 08, 10, 14, 04 -- E2M3 values 1.0, 2.0, 3.0, 0.5, four
+     * DIFFERENT magnitudes in the four POSITIONS, because a shift that moves one code into another's
+     * place changes the sum rather than merely renaming it -- and 28 4C 93 is the same four negated
+     * (E2M3's sign is bit 5, not bit 7). Row 0 then repeats 0x18 (4.0) as 18 86 61 and row 1 repeats
+     * 0x38 (-4.0) as 38 8E E3, so each group of 32 sums to 52, -52, 128 or -128. */
+    const uint8_t q1[3] = {0x08, 0x44, 0x11}, q2[3] = {0x28, 0x4C, 0x93};
+    const uint8_t q3[3] = {0x18, 0x86, 0x61}, q4[3] = {0x38, 0x8E, 0xE3};
+    std::vector<uint8_t> b6;
+    for (const uint8_t* q : {q1, q3, q2, q4})
+        for (int rep = 0; rep < 8; ++rep)
+            for (int j = 0; j < 3; ++j) b6.push_back(q[j]);
+    REQUIRE_EQ((long long)b6.size(), 96LL);            /* 128 codes at 6 bits */
+    T am6(RAD_F8E4M3, {2, 64}); am6.raw(a8);
+    T as6(RAD_F32, {2, 1});     as6.f({0.5f, 2.0f});
+    T bm6(RAD_FP6E2M3, {2, 64}); bm6.raw(b6);
+    T bs6(RAD_U8, {2, 2});      bs6.n({127, 128, 129, 126});
+    T y6(RAD_F32, {2, 2});
+    A c6; c6.t(am6).t(as6).t(bm6).t(bs6).t(y6)
+           .i("M", 2).i("N", 2).i("K", 64).i("group", 32).s("dtype", "mxfp6a8");
+    CHECK_OK(run("gemm_nt_q", c6));
+    /* y00 = 52*.5*1 + 128*.5*2 = 154,   y01 = -52*.5*4 + -128*.5*.5 = -136,
+     * y10 = 104*2*1 + 256*2*2 = 1232,   y11 = -104*2*4 + -256*2*.5 = -1088. */
+    CHECK_EQ(y6.at(0), 154.0f);
+    CHECK_EQ(y6.at(1), -136.0f);
+    CHECK_EQ(y6.at(2), 1232.0f);
+    CHECK_EQ(y6.at(3), -1088.0f);
+
+    /* THE DESCRIPTIONS, where "no fold" is a checked statement and not a comment. The mx branch
+     * describes seven operands for every member of the family, and operand 6 -- `b_ref` -- is ABSENT
+     * for mxfp6a8 and mxfp8a8 while mxfp4a8 describes it over the canonical [N][K/32] plane. An e2m3
+     * code plane is drawn as an index operand clamped to the sixty-four codes the format has; an e4m3
+     * one is drawn as an ordinary weight, because an index draw over all 256 patterns mostly selects
+     * subnormals and the format's NaN. K % 32 is declined for all three. */
+    const RadKernelInfo* k = kern("gemm_nt_q");
+    REQUIRE(k != nullptr && k->opd_shape != nullptr);
+    for (const char* dt : {"mxfp8a8", "mxfp6a8", "mxfp4a8"}) {
+        const bool e2m1 = std::strcmp(dt, "mxfp4a8") == 0;
+        const bool e2m3 = std::strcmp(dt, "mxfp6a8") == 0;
+        A s; s.i("M", 2).i("N", 2).i("K", 64).i("group", 32).s("dtype", dt);
+        const RadArgs* r = s.get();
+        RadOpdDesc d{};
+        REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 0, &d), RAD_OK);   /* a -- E4M3 activation */
+        CHECK_EQ(d.dtype, (uint32_t)RAD_F8E4M3);
+        CHECK_EQ(d.shape[0], 2LL); CHECK_EQ(d.shape[1], 64LL);
+        REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 1, &d), RAD_OK);   /* a_scale -- one per ROW */
+        CHECK_EQ(d.dtype, (uint32_t)RAD_F32);
+        CHECK_EQ(d.shape[0], 2LL); CHECK_EQ(d.shape[1], 1LL);
+        REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 2, &d), RAD_OK);   /* b -- the code plane */
+        CHECK_EQ(d.dtype, (uint32_t)(e2m1 ? (int)RAD_FP4E2M1 : e2m3 ? (int)RAD_FP6E2M3
+                                                                    : (int)RAD_F8E4M3));
+        CHECK_EQ(d.shape[0], 2LL); CHECK_EQ(d.shape[1], 64LL);   /* logical [N,K] */
+        CHECK_EQ(d.fill, (uint32_t)(e2m3 || e2m1 ? RAD_FILL_INDEX : RAD_FILL_NORMAL));
+        if (e2m3) CHECK_EQ(d.idx_max, 64LL);
+        REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 3, &d), RAD_OK);   /* b_scale -- e8m0 [N][K/32] */
+        CHECK_EQ(d.dtype, (uint32_t)RAD_U8);
+        CHECK_EQ(d.shape[0], 2LL); CHECK_EQ(d.shape[1], 2LL);
+        CHECK_EQ(d.idx_max, 128LL);
+        REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 4, &d), RAD_OK);   /* y */
+        CHECK_EQ(d.dtype, (uint32_t)RAD_BF16);
+        CHECK_EQ(d.shape[0], 2LL); CHECK_EQ(d.shape[1], 2LL);
+        REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 5, &d), RAD_OK);   /* a_sum -- never for MX */
+        CHECK(d.flags & (uint32_t)RAD_OPD_F_ABSENT);
+        REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 6, &d), RAD_OK);   /* b_ref -- mxfp4 only */
+        if (e2m1) CHECK_EQ(d.flags & (uint32_t)RAD_OPD_F_ABSENT, 0u);
+        else      CHECK(d.flags & (uint32_t)RAD_OPD_F_ABSENT);
+        A s30; s30.i("M", 2).i("N", 2).i("K", 30).i("group", 32).s("dtype", dt);
+        const RadArgs* r30 = s30.get();
+        CHECK_EQ(k->opd_shape(r30->p, r30->n_p, 2, &d), RAD_E_UNSUPPORTED);
+    }
+}
+
 /* A BLOCK GRID WHOSE LAST BLOCK IS PARTIAL, on both axes. K = 300 at 128 is three scales over 128,
  * 128 and 44 columns; N = 129 is two row blocks, the second of one row, and N = 300 is three. The
  * expected value of every output is written out from that definition: with every code 1, output
@@ -1585,6 +1763,406 @@ TEST(op_gemm_nt_q_gated_is_the_pair) {
     int64_t differs = 0;
     for (int64_t i = 0; i < M * nout; ++i) if (q1.mem[(size_t)i] != q3.mem[(size_t)i]) ++differs;
     CHECK(differs > M * nout / 4);
+}
+
+/* ================================================================== the OCP-MX per-row producers
+ *
+ * The four ops below are what the `qwen35_mxfp4` blocks issue where the fp8 twin issues the
+ * block-scaled pair: a per-ROW E4M3 quantiser, its norm and gate fusions, and the gated GEMM fold
+ * whose weight is an OCP micro-scaled fp4. Until now they were only NAME-CHECKED (op_vocabulary),
+ * so a wrong constant -- 448 vs 127, a group clamp, the bf16 narrowing before the gate -- passed.
+ * Each case here pins the arithmetic against the pair it replaces and against a hand expectation.
+ */
+
+/* quant_act_fp8_row IS quant_act_fp8 AT A GROUP OF THE WHOLE ROW. The scale is one f32 a row and
+ * the row is the group, so `group == n` names the same function; the case asserts byte identity
+ * there AND against a hand-computed amax/448, so agreement is not the only evidence. K = 17408 is
+ * the documented widest activation row (the ffn gate/up K); K = 37 and 33 are NOT multiples of the
+ * 32-element OCP block -- the per-row scale has no block to align to, and a case that only ever
+ * ran K % 32 == 0 could not tell. */
+TEST(op_quant_act_fp8_row_is_the_whole_row_group) {
+    const int64_t Ks[] = { 37, 33, 17408 };
+    for (int64_t K : Ks) {
+        const int64_t M = K > 1000 ? 1 : 3;
+        T x(RAD_F32, { M, K });
+        for (int64_t r = 0; r < M; ++r)
+            for (int64_t i = 0; i < K; ++i) {
+                float v = (float)((int)((r * 131 + i * 17) % 97) - 48) * 0.25f;
+                if (i == (r * 41) % K) v = 300.0f;      /* one channel far above the row's rest */
+                st_dt(RAD_F32, x.t.data, r * K + i, v);
+            }
+
+        T qr(RAD_F8E4M3, { M, K }), sr(RAD_F32, { M, 1 });
+        A row; row.t(x).t(qr).t(sr).i("M", M).i("n", K).s("dtype", "f32");
+        CHECK_OK(run("quant_act_fp8_row", row));
+
+        /* The per-group op at `group == n`, the reading the per-row shape hook takes. */
+        T qg(RAD_F8E4M3, { M, K }), sg(RAD_F32, { M, 1 });
+        A grp; grp.t(x).t(qg).t(sg).i("M", M).i("n", K).i("group", K).s("dtype", "f32");
+        CHECK_OK(run("quant_act_fp8", grp));
+
+        int64_t bad_q = 0, bad_s = 0, bad_pair_q = 0, bad_pair_s = 0, live = 0;
+        for (int64_t r = 0; r < M; ++r) {
+            float amax = 0.0f;
+            for (int64_t i = 0; i < K; ++i) amax = std::fmax(amax, std::fabs(x.at(r * K + i)));
+            const float sc  = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+            const float inv = 1.0f / sc;
+            float sgot = sr.at(r), pgot = sg.at(r);
+            if (std::memcmp(&sgot, &sc, 4) != 0) ++bad_s;
+            if (std::memcmp(&pgot, &sc, 4) != 0) ++bad_pair_s;
+            for (int64_t i = 0; i < K; ++i) {
+                float v = x.at(r * K + i) * inv;
+                if (v >  448.0f) v =  448.0f;
+                if (v < -448.0f) v = -448.0f;
+                const uint8_t want = f32_to_fp8e4m3(v);
+                if (qr.mem[(size_t)(r * K + i)] != want) ++bad_q;
+                if (qg.mem[(size_t)(r * K + i)] != want) ++bad_pair_q;
+                live += want != 0;
+            }
+        }
+        CHECK_EQ(bad_q, (int64_t)0);
+        CHECK_EQ(bad_s, (int64_t)0);
+        CHECK_EQ(bad_pair_q, (int64_t)0);
+        CHECK_EQ(bad_pair_s, (int64_t)0);
+        CHECK(live > 0);
+    }
+}
+
+/* rmsnorm_quant_fp8_row AGAINST rmsnorm FOLLOWED BY quant_act_fp8_row. The fused form narrows the
+ * normalised value to bf16 and takes the codes over THAT value (ref_rmsnorm_quant_fp8 says why),
+ * so running `rmsnorm` into a bf16 output and the per-row quantiser over those bytes is the same
+ * function, and `out_bf16` must hold exactly those bytes. The pair's route is checked against the
+ * fused one AND against a hand amax/448 of the bf16 that was stored. */
+TEST(op_rmsnorm_quant_fp8_row_is_the_pair) {
+    const int64_t M = 2, K = 40;                 /* K not a multiple of the 128 fp8 block */
+    T x(RAD_BF16, { M, K });
+    for (int64_t r = 0; r < M; ++r)
+        for (int64_t i = 0; i < K; ++i)
+            st_dt(RAD_BF16, x.t.data, r * K + i,
+                  (float)((int)((r * 53 + i * 11) % 41) - 20) * 0.125f);
+    T w(RAD_F32, { K });
+    for (int64_t i = 0; i < K; ++i) st_dt(RAD_F32, w.t.data, i, 0.5f + 0.05f * (float)(i % 7));
+
+    T q1(RAD_F8E4M3, { M, K }), s1(RAD_F32, { M, 1 }), ob1(RAD_BF16, { M, K });
+    A f; f.t(x).tnull().t(w).t(q1).t(s1).t(ob1)
+          .i("M", M).i("n", K).d("eps", 0.0).s("dtype", "bf16");
+    CHECK_OK(run("rmsnorm_quant_fp8_row", f));
+
+    T y(RAD_BF16, { M, K });
+    A n; n.t(x).t(w).t(y).i("M", M).i("n", K).d("eps", 0.0).s("dtype", "bf16");
+    CHECK_OK(run("rmsnorm", n));
+    T q2(RAD_F8E4M3, { M, K }), s2(RAD_F32, { M, 1 });
+    A g; g.t(y).t(q2).t(s2).i("M", M).i("n", K).s("dtype", "bf16");
+    CHECK_OK(run("quant_act_fp8_row", g));
+
+    int64_t bad_q = 0, bad_s = 0, bad_y = 0, live = 0;
+    for (int64_t i = 0; i < M * K; ++i) {
+        if (q1.mem[(size_t)i] != q2.mem[(size_t)i]) ++bad_q;
+        if (ob1.mem[(size_t)(2 * i)] != y.mem[(size_t)(2 * i)] ||
+            ob1.mem[(size_t)(2 * i + 1)] != y.mem[(size_t)(2 * i + 1)]) ++bad_y;
+        live += q1.mem[(size_t)i] != 0;
+    }
+    for (int64_t r = 0; r < M; ++r) {
+        float a = s1.at(r), b = s2.at(r);
+        if (std::memcmp(&a, &b, 4) != 0) ++bad_s;
+        /* The codes were taken over the bf16 `out_bf16`, so its whole-row amax/448 must be THE
+         * scale -- a per-128 group would differ on a row whose blocks straddle the outlier. */
+        float amax = 0.0f;
+        for (int64_t i = 0; i < K; ++i) amax = std::fmax(amax, std::fabs(ob1.at(r * K + i)));
+        const float want = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+        CHECK_NEAR(s1.at(r), want, 0.0);
+    }
+    CHECK_EQ(bad_q, (int64_t)0);
+    CHECK_EQ(bad_s, (int64_t)0);
+    CHECK_EQ(bad_y, (int64_t)0);
+    CHECK(live > 0);
+}
+
+/* gated_quant_fp8_row AGAINST silu_mul FOLLOWED BY quant_act_fp8_row, and (for the sigmoid gate a
+ * gated attention o_proj uses) AGAINST ITS OWN hand arithmetic. The sigmoid form is NOT equal to a
+ * `sigmoid`+`mul` pair through a bf16 intermediate: the fused op keeps the logistic in f32 and
+ * narrows only the product, so a pair comparison there would be a different function. That is a
+ * property worth pinning rather than hiding, so the silu route is a pair check and the sigmoid
+ * route a literal. */
+TEST(op_gated_quant_fp8_row_is_the_pair_and_the_gate) {
+    const int64_t M = 2, n = 48;
+    T gu(RAD_BF16, { M, 2 * n });
+    for (int64_t r = 0; r < M; ++r)
+        for (int64_t i = 0; i < 2 * n; ++i)
+            st_dt(RAD_BF16, gu.t.data, r * 2 * n + i,
+                  (float)((int)((r * 37 + i * 19) % 29) - 14) * 0.25f);
+
+    T q1(RAD_F8E4M3, { M, n }), s1(RAD_F32, { M, 1 }), ob1(RAD_BF16, { M, n });
+    A f; f.t(gu).t(q1).t(s1).t(ob1).i("M", M).i("n", n).s("dtype", "bf16").s("act", "silu");
+    CHECK_OK(run("gated_quant_fp8_row", f));
+
+    T y(RAD_BF16, { M, n });
+    A m; m.t(gu).t(y).i("M", M).i("n", n).s("dtype", "bf16");
+    CHECK_OK(run("silu_mul", m));
+    T q2(RAD_F8E4M3, { M, n }), s2(RAD_F32, { M, 1 });
+    A g; g.t(y).t(q2).t(s2).i("M", M).i("n", n).s("dtype", "bf16");
+    CHECK_OK(run("quant_act_fp8_row", g));
+
+    int64_t bad_q = 0, bad_y = 0, bad_s = 0, live = 0;
+    for (int64_t i = 0; i < M * n; ++i) {
+        if (q1.mem[(size_t)i] != q2.mem[(size_t)i]) ++bad_q;
+        if (ob1.mem[(size_t)(2 * i)] != y.mem[(size_t)(2 * i)] ||
+            ob1.mem[(size_t)(2 * i + 1)] != y.mem[(size_t)(2 * i + 1)]) ++bad_y;
+        live += q1.mem[(size_t)i] != 0;
+    }
+    for (int64_t r = 0; r < M; ++r) {
+        float a = s1.at(r), b = s2.at(r);
+        if (std::memcmp(&a, &b, 4) != 0) ++bad_s;
+    }
+    CHECK_EQ(bad_q, (int64_t)0);
+    CHECK_EQ(bad_s, (int64_t)0);
+    CHECK_EQ(bad_y, (int64_t)0);
+    CHECK(live > 0);
+
+    /* The silu literal: silu(gt)*up, narrowed once, then the whole-row E4M3 quantiser. */
+    for (int64_t r = 0; r < M; ++r) {
+        std::vector<float> v((size_t)n);
+        for (int64_t i = 0; i < n; ++i) {
+            const float gt = gu.at(r * 2 * n + i), up = gu.at(r * 2 * n + n + i);
+            const float sg = 1.0f / (1.0f + std::exp(-gt));
+            v[(size_t)i] = bf16_to_f32(f32_to_bf16((gt * sg) * up));
+        }
+        float amax = 0.0f;
+        for (float e : v) amax = std::fmax(amax, std::fabs(e));
+        const float sc  = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+        const float inv = 1.0f / sc;
+        CHECK_NEAR(s1.at(r), sc, 0.0);
+        for (int64_t i = 0; i < n; ++i) {
+            float c = v[(size_t)i] * inv;
+            if (c >  448.0f) c =  448.0f;
+            if (c < -448.0f) c = -448.0f;
+            CHECK_EQ((long long)q1.mem[(size_t)(r * n + i)],
+                     (long long)f32_to_fp8e4m3(c));
+        }
+    }
+
+    /* The sigmoid form's literal, with the logistic left in f32 before the product. */
+    T qs(RAD_F8E4M3, { M, n }), ss(RAD_F32, { M, 1 }), obs(RAD_BF16, { M, n });
+    A sf; sf.t(gu).t(qs).t(ss).t(obs)
+            .i("M", M).i("n", n).s("dtype", "bf16").s("act", "sigmoid");
+    CHECK_OK(run("gated_quant_fp8_row", sf));
+    for (int64_t r = 0; r < M; ++r) {
+        std::vector<float> v((size_t)n);
+        for (int64_t i = 0; i < n; ++i) {
+            const float gt = gu.at(r * 2 * n + i), up = gu.at(r * 2 * n + n + i);
+            const float sg = 1.0f / (1.0f + std::exp(-gt));
+            v[(size_t)i] = bf16_to_f32(f32_to_bf16(sg * up));
+        }
+        float amax = 0.0f;
+        for (float e : v) amax = std::fmax(amax, std::fabs(e));
+        const float sc  = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+        const float inv = 1.0f / sc;
+        CHECK_NEAR(ss.at(r), sc, 0.0);
+        for (int64_t i = 0; i < n; ++i) {
+            float c = v[(size_t)i] * inv;
+            if (c >  448.0f) c =  448.0f;
+            if (c < -448.0f) c = -448.0f;
+            CHECK_EQ((long long)qs.mem[(size_t)(r * n + i)],
+                     (long long)f32_to_fp8e4m3(c));
+        }
+    }
+}
+
+/* gemm_nt_q_gated_mx AGAINST gemm_nt_q (mxfp4a8) FOLLOWED BY gated_quant_fp8_row, on operand
+ * shapes the fold's own rules admit: N % 16, K % 32, N = 2*nout. The weight is row-major e2m1 (the
+ * checkpoint's canonical plane, NOT libr4d's fragment order -- the header of ref_quant.cpp's
+ * gemm_nt_q_gated says why a comparison against the engine's own stored bytes would measure the
+ * permutation), the E8M0 plane is [N, K/32], and `b_ref` is a per-row reference that VARIES so a
+ * reference taken from the wrong row shows. The exponents span more than the 15-binade fold
+ * so the clamp is live on both routes. The pair shares `quant_dot`, so the comparison is bytes; a
+ * host reference of the whole chain runs beside it to catch a shared error. */
+TEST(op_gemm_nt_q_gated_mx_is_the_pair) {
+    const int64_t M = 3, nout = 32, N = 2 * nout, K = 64, kb = K / 32;
+    const float kmag[8] = { 0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f };
+    auto e2m1 = [&](int c) { const float m = kmag[c & 7]; return (c & 8) ? -m : m; };
+
+    std::vector<int> code((size_t)N * K);
+    std::vector<uint8_t> wb((size_t)N * K / 2, 0);
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t k = 0; k < K; ++k) {
+            const int c = (int)(((n * 11 + k * 5 + 1) % 15));    /* 0..14, never a NaN code */
+            code[(size_t)(n * K + k)] = c;
+            wb[(size_t)(n * K / 2 + k / 2)] |= (uint8_t)(c << (4 * (k % 2)));
+        }
+    T b(RAD_FP4E2M1, { N, K }); b.raw(wb);
+    T bs(RAD_U8, { N, kb });
+    std::vector<uint8_t> bsbytes((size_t)N * kb);
+    for (int64_t n = 0; n < N; ++n) {
+        const int base = 138 + (int)(n % 4) * 2;                 /* b_ref varies by row */
+        for (int64_t g = 0; g < kb; ++g)
+            bsbytes[(size_t)(n * kb + g)] =
+                (uint8_t)(base - (int)((n * 3 + g * 7) % 20));   /* some d > 15, clamp live */
+    }
+    bs.raw(bsbytes);
+    T bref(RAD_U8, { N });
+    for (int64_t n = 0; n < N; ++n)
+        bref.mem[(size_t)n] = (uint8_t)(138 + (int)(n % 4) * 2);
+
+    T a(RAD_F8E4M3, { M, K });
+    std::vector<uint8_t> abytes((size_t)M * K);
+    std::vector<float> as(M);
+    for (int64_t m = 0; m < M; ++m) {
+        as[(size_t)m] = 0.5f + 0.25f * (float)m;
+        for (int64_t k = 0; k < K; ++k) {
+            const float v = (float)((int)((m * 29 + k * 13) % 23) - 11) * 0.25f;
+            abytes[(size_t)(m * K + k)] = f32_to_fp8e4m3(v);
+        }
+    }
+    a.raw(abytes);
+    T asc(RAD_F32, { M, 1 }); asc.f(as);
+
+    /* The fold: no [M, N] plane is ever written. b_ref is operand 7, after the optional out_bf16. */
+    T q1(RAD_F8E4M3, { M, nout }), s1(RAD_F32, { M, 1 }), ob1(RAD_BF16, { M, nout });
+    A fd; fd.t(a).t(asc).t(b).t(bs).t(q1).t(s1).t(ob1).t(bref)
+            .i("M", M).i("N", N).i("K", K).s("dtype", "mxfp4a8").s("act", "silu");
+    CHECK_OK(run("gemm_nt_q_gated_mx", fd));
+
+    /* The pair. `N` is the weight's rows and `n` is half of it on the quantiser. b_ref is operand 6
+     * on gemm_nt_q, after the null a_sum slot, so the element fold is the same device fold. */
+    T y(RAD_BF16, { M, N });
+    A gp; gp.t(a).t(asc).t(b).t(bs).t(y).tnull().t(bref)
+            .i("M", M).i("N", N).i("K", K).i("group", 32).s("dtype", "mxfp4a8");
+    CHECK_OK(run("gemm_nt_q", gp));
+    T q2(RAD_F8E4M3, { M, nout }), s2(RAD_F32, { M, 1 }), ob2(RAD_BF16, { M, nout });
+    A gq; gq.t(y).t(q2).t(s2).t(ob2)
+            .i("M", M).i("n", nout).s("dtype", "bf16").s("act", "silu");
+    CHECK_OK(run("gated_quant_fp8_row", gq));
+
+    /* Two planes of zeros would agree, so the codes are asserted live before the comparison. */
+    int64_t live = 0;
+    for (int64_t i = 0; i < M * nout; ++i) live += q1.mem[(size_t)i] != 0;
+    REQUIRE(live > M * nout / 2);
+
+    int64_t bad_q = 0, bad_s = 0, bad_y = 0;
+    for (int64_t i = 0; i < M * nout; ++i) {
+        if (q1.mem[(size_t)i] != q2.mem[(size_t)i]) ++bad_q;
+        if (ob1.mem[(size_t)(2 * i)] != ob2.mem[(size_t)(2 * i)] ||
+            ob1.mem[(size_t)(2 * i + 1)] != ob2.mem[(size_t)(2 * i + 1)]) ++bad_y;
+    }
+    for (int64_t m = 0; m < M; ++m) {
+        float x1 = s1.at(m), x2 = s2.at(m);
+        if (std::memcmp(&x1, &x2, 4) != 0) ++bad_s;
+    }
+    CHECK_EQ(bad_q, (int64_t)0);
+    CHECK_EQ(bad_s, (int64_t)0);
+    CHECK_EQ(bad_y, (int64_t)0);
+
+    /* A HOST REFERENCE OF THE WHOLE CHAIN, with the device's element fold, to catch a fold and a
+     * pair that are wrong the same way. The element is E4M3_RNE(code * 2^-dsh) and the row factor
+     * 2^(Wref-127) is applied once, exactly as the kernel's kMag table + epilogue do. A tolerance on
+     * the bf16 product, not bytes: the device's split-K sums in a different order than this loop. */
+    auto bscale = [&](int64_t n, int64_t g, float code) {
+        int wref = (int)bref.mem[(size_t)n];
+        int d = wref - (int)bs.mem[(size_t)(n * kb + g)];
+        if (d < 0) d = 0;
+        if (d > 15) d = 15;
+        return fp8e4m3_to_f32(f32_to_fp8e4m3(code * std::ldexp(1.0f, -d))) *
+               std::ldexp(1.0f, wref - 127);
+    };
+    std::vector<float> Wv((size_t)N * K);
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t k = 0; k < K; ++k) Wv[(size_t)(n * K + k)] = e2m1(code[(size_t)(n * K + k)]);
+    double worst = 0.0;
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t j = 0; j < nout; ++j) {
+            float ag = 0.0f, au = 0.0f;
+            for (int64_t g = 0; g < kb; ++g) {
+                float sg = 0.0f, su = 0.0f;
+                for (int64_t k = g * 32; k < (g + 1) * 32; ++k) {
+                    const float av = fp8e4m3_to_f32(abytes[(size_t)(m * K + k)]);
+                    sg += av * bscale(j, g, Wv[(size_t)(j * K + k)]);
+                    su += av * bscale(nout + j, g, Wv[(size_t)((nout + j) * K + k)]);
+                }
+                ag += sg * as[(size_t)m];
+                au += su * as[(size_t)m];
+            }
+            const float gg = bf16_to_f32(f32_to_bf16(ag));
+            const float uu = bf16_to_f32(f32_to_bf16(au));
+            const float want = bf16_to_f32(f32_to_bf16((gg / (1.0f + std::exp(-gg))) * uu));
+            const double d = std::fabs(ob2.at(m * nout + j) - want);
+            const double tol = 4e-3 * std::fabs(want) + 1e-2;
+            if (d > worst) worst = d > tol ? d / (tol + 1e-30) : 0.0;
+        }
+    CHECK(worst <= 1.0);
+}
+
+/* THE `dsh` FOLD, the numeric difference between reading a block's E8M0 exponent directly and the
+ * device's fold. The device never reads a block exponent as a scale: it folds E4M3_RNE(code *
+ * 2^-dsh), dsh = clamp(Wref - E8M0, 0, 15), into each ELEMENT and multiplies 2^(Wref - 127) back
+ * out once per row. The E4M3 rounding is per-code and the fold UNDERFLOWS TO ZERO for dsh around
+ * 13+, so a block far below its row's reference contributes NOTHING -- it is not scaled up to
+ * 2^(Wref - 15 - 127), and it is not the true 2^(E8M0 - 127) either. Reading the plane directly --
+ * which libref did until `Scales::ref`/`scales_ref` -- disagrees on exactly those blocks, and both
+ * answers are plausible floats.
+ *
+ * The case makes the disagreement UNMISSABLE rather than a last-bit one: each row's reference
+ * block (the one whose exponent Wref is) has all-zero codes, so the far-below block is the row's
+ * ONLY contribution and the expected value is exactly 0 while the direct read is a power of two.
+ * `b_ref` VARIES by row, so a reference read from the wrong row shows as a factor, not a rounding.
+ * Output is f32, so the comparison is exact arithmetic and not hidden under bf16's 8-bit mantissa.
+ *
+ * DEPENDS ON the device-exact reference (libref/ref_gemm.h::fold_mag): without `b_ref` attached the
+ * expected literal below is the true 2^(E8M0 - 127) and this case is the one that goes red. */
+TEST(op_gemm_nt_q_b_ref_saturates_the_folded_exponent) {
+    const int64_t M = 2, N = 16, K = 64, kb = K / 32;
+
+    /* Block 0: the row's highest exponent, codes 0. Block 1: 16..18 below it, codes all +6 -- so
+     * the row is exactly the far-below block's contribution. */
+    std::vector<uint8_t> wb((size_t)N * K / 2, 0);
+    std::vector<uint8_t> bsbytes((size_t)N * kb, 0);
+    std::vector<uint8_t> brefbytes((size_t)N, 0);
+    std::vector<int> base((size_t)N);
+    for (int64_t n = 0; n < N; ++n) {
+        base[(size_t)n] = 130 + (int)(n % 4) * 3;                 /* varying b_ref */
+        brefbytes[(size_t)n] = (uint8_t)base[(size_t)n];
+        bsbytes[(size_t)(n * kb + 0)] = (uint8_t)base[(size_t)n];
+        bsbytes[(size_t)(n * kb + 1)] = (uint8_t)(base[(size_t)n] - 16 - (int)(n % 3));
+        for (int64_t k = 32; k < K; ++k) {                        /* block 1, code 7 = +6 */
+            wb[(size_t)(n * K / 2 + k / 2)] |= (uint8_t)(7 << (4 * (k % 2)));
+        }
+    }
+    T b(RAD_FP4E2M1, { N, K }); b.raw(wb);
+    T bs(RAD_U8, { N, kb });    bs.raw(bsbytes);
+    T br(RAD_U8, { N });        br.raw(brefbytes);
+
+    T a(RAD_F8E4M3, { M, K });                                  /* a = 1 everywhere (code 0x38) */
+    std::vector<uint8_t> abytes((size_t)M * K, 0x38);
+    a.raw(abytes);
+    T asc(RAD_F32, { M, 1 });
+    for (int64_t m = 0; m < M; ++m) st_dt(RAD_F32, asc.t.data, m, 0.5f + 0.5f * (float)m);
+
+    T y(RAD_F32, { M, N });
+    A gp; gp.t(a).t(asc).t(b).t(bs).t(y).tnull().t(br)
+            .i("M", M).i("N", N).i("K", K).i("group", 32).s("dtype", "mxfp4a8");
+    CHECK_OK(run("gemm_nt_q", gp));
+
+    int64_t bad = 0, unclamped_matches = 0;
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t n = 0; n < N; ++n) {
+            const int wref = (int)br.mem[(size_t)n];
+            int d = wref - (int)bs.mem[(size_t)(n * kb + 1)];
+            if (d < 0) d = 0;
+            if (d > 15) d = 15;
+            /* The device folds each +6 code to E4M3_RNE(6 * 2^-dsh) and applies 2^(Wref-127) once.
+             * At dsh = 15 that magnitude underflows to zero, so the far-below block contributes
+             * NOTHING -- it is not scaled up to 2^(Wref-15-127). */
+            const float mag  = fp8e4m3_to_f32(f32_to_fp8e4m3(6.0f * std::ldexp(1.0f, -d)));
+            const float want = asc.at(m) * 32.0f * mag * std::ldexp(1.0f, wref - 127);
+            const float true_ = asc.at(m) * (32.0f * 6.0f) *
+                                e8m0_to_f32(bs.mem[(size_t)(n * kb + 1)]);
+            const float got = y.at(m * N + n);
+            if (std::memcmp(&got, &want, 4) != 0) ++bad;
+            if (std::memcmp(&got, &true_, 4) == 0) ++unclamped_matches;
+        }
+    CHECK_EQ(bad, (int64_t)0);
+    /* Sensitivity: if the folded reading did not saturate, every row would have matched the true
+     * exponent instead -- so a reference that ignored b_ref cannot pass by accident. */
+    CHECK_EQ(unclamped_matches, (int64_t)0);
 }
 
 TEST(op_vocab_edges) {

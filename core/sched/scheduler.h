@@ -18,8 +18,10 @@
  *   - DRAFT DEPTH, controlled against measured acceptance (draft.h, §10).
  */
 #pragma once
+#include "adaptive_k.h"
 #include "batch.h"
 #include "draft.h"
+#include "lookup_draft.h"
 #include "metrics.h"
 
 #include <chrono>
@@ -107,6 +109,10 @@ struct SchedReq {
         draft_filled = 0;
         draft_lo     = 0;
         draft_hi     = 0;
+        ak           = AdaptiveK::Stat{};
+        ak_cap       = RAD_SCHED_MAX_SPEC;
+        lk.reset();
+        if (lk_idx) lk_idx->reset();
     }
 
     /* THE ADAPTIVE DRAFT WINDOW'S ESTIMATE FOR THIS REQUEST (--draft-window adaptive, draft.h), and
@@ -116,6 +122,17 @@ struct SchedReq {
     DraftAdapt adapt;
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
+
+    /* WHOLE-CONTEXT LOOKUP DRAFT (lookup_draft.h): the per-sequence suffix index (allocated on the
+     * first search of a sequence longer than the drafter's window), whether the proposal standing for
+     * the next step is the lookup's, and whether the last lookup step was hot (accepted >= HOT). */
+    std::unique_ptr<LookupIndex> lk_idx;
+    LookupMode lk;
+
+    /* ADAPTIVE VERIFY LENGTH (adaptive_k.h): this sequence's acceptance history, and the cap the
+     * policy put on its draft for the step being planned. A cap at RAD_SCHED_MAX_SPEC is "none". */
+    AdaptiveK::Stat ak;
+    int32_t  ak_cap = RAD_SCHED_MAX_SPEC;
 
     int32_t  sched_tokens = 0;   /* tokens given to this request in the current step */
     int32_t  entry = -1;         /* its index in the current StepPlan, or -1 */
@@ -438,6 +455,24 @@ public:
     const StepPlan&      plan() const { return plan_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
+    /* Turns the adaptive verify length on (adaptive_k.h) with these parameters. Engine thread,
+     * before the first step; a no-op for p.enabled == false. The engine calls it for a block
+     * drafter only: a serial drafter's depth is fixed on the card before the host sees it. */
+    int                  set_adaptive_k(const AdaptiveK::Params& p);
+    const AdaptiveK&     adaptive_k() const { return ak_; }
+    /* Turns the whole-context lookup draft on (lookup_draft.h). Engine thread, before the first step,
+     * block drafter only; `window` is the drafter's attention window in tokens (0: unknown, 2048 is
+     * used) -- sources closer than that are the drafter's own to copy. A no-op when !p.enabled. */
+    int                  set_lookup_draft(const LookupParams& p, int window);
+    /* DRAFT REFILL. A prefix-cache hit leaves a windowed block drafter without K/V for the cached tokens
+     * (hit_holes_draft_), and it stays silent until its window has slid past the hole. With `refill` > 0 a hit
+     * is ended `refill` tokens before the end of the prompt (down to a block, and for a hybrid model down to a
+     * linear-state checkpoint), so the trunk recomputes those tokens, the drafter's context pass sees them, and
+     * the sequence drafts from its first decode step. `refill` is clamped to the drafter's window: more would
+     * buy nothing. 0 = off. A hit that would have to give back more than 2 * refill extra tokens (no checkpoint
+     * near enough) is kept whole and the drafter waits as before. */
+    int                  set_draft_refill(int window, int64_t refill);
+    const LookupParams&  lookup_draft() const { return lk_p_; }
     SchedMetrics         metrics() const;
 
     /* THE OBSERVERS' COPY. A dashboard, a scraper or an admin call reads what the engine thread
@@ -493,6 +528,22 @@ private:
     int64_t       draft_refill_ = 0;
     BatchBuilder  builder_;
     DraftController draft_;
+    AdaptiveK       ak_;
+    std::vector<AdaptiveK::Cand> ak_cand_;
+    std::vector<int32_t>         ak_slot_;
+    std::vector<int>             ak_k_;
+    int64_t ak_calls_ = 0, ak_steps_ = 0, ak_rows_saved_ = 0, ak_hist_[RAD_SCHED_MAX_SPEC + 1] = {};
+
+    /* The lookup draft. lk_considered_: proposals that went through the override (the drafter's own,
+     * for a request that may speculate); lk_taken_: the ones it replaced; lk_steps_ / lk_drafted_ /
+     * lk_accepted_: the verify steps that carried a lookup proposal, the tokens in them and how many
+     * were accepted. */
+    LookupParams lk_p_;
+    int64_t lk_min_dist_ = 0;
+    int64_t lk_considered_ = 0, lk_taken_ = 0, lk_steps_ = 0, lk_drafted_ = 0, lk_accepted_ = 0;
+    /* Replaces the first `n` tokens of s.draft with the lookup's when the policy says so; returns the
+     * new count and sets s.lk.used. */
+    int lookup_override(SchedReq& s, int n);
 
     /* Where this sequence's block-drafter cache begins, as the guard in block_begin reads it
      * and block_end records it. One rule, one place. */

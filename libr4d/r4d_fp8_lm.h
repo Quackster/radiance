@@ -50,4 +50,21 @@ inline int64_t lm_row_bytes(int64_t K) {
 // allocator happened to leave there.
 inline int64_t lm_row_used(int64_t K) { return K + 2 * (K / 128); }
 
+// THE INT4 HEAD'S ROW (logits_gemm_i4): the same row at half the code bytes -- K/2 bytes of
+// two's-complement nibbles, element 2j in the low nibble of byte j (rad_store_bits' order), then the
+// row's own nkb bf16 scales, then the pad to 16. At K = 5120 that is 2640 bytes against 5200.
+inline int64_t lm4_row_bytes(int64_t K) {
+    const int64_t used = K / 2 + 2 * (K / 128);
+    return (used + 15) & ~(int64_t)15;
+}
+
+// ...AND ITS ASYMMETRIC FORM (logits_gemm_u4g64 / _u4g128): unsigned nibbles, then the row's bf16
+// scale a group, then its u8 zero a group, then the pad -- (code - zero) * scale, libquant's
+// `codes=u4 zero=u8`. At K = 5120 and group 64 that is 2560 + 160 + 80 = 2800 bytes.
+inline int64_t lm4a_row_bytes(int64_t K, int64_t group) {
+    const int64_t ng = K / group;
+    const int64_t used = K / 2 + 3 * ng;
+    return (used + 15) & ~(int64_t)15;
+}
+
 }  // namespace r4d_fp8

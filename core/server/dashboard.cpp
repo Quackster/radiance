@@ -341,6 +341,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             p["issued_first"]   = s.passes.issued_first;
             p["dispatched"]     = s.passes.dispatched;
             p["unordered"]      = s.passes.unordered;
+            p["evicted"]        = s.passes.evicted;
+            p["tape_cap"]       = s.passes.tape_cap;
             o["passes"] = std::move(p);
         }
     }

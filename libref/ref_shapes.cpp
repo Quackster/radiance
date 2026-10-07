@@ -802,7 +802,7 @@ int ref_gemm_nt_bias_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* 
     return o.finish("gemm_nt_bias", operand, out);
 }
 
-/* BLOCK-SCALED FP8 ONLY, and the restriction is the honest one rather than laziness.
+/* BLOCK-SCALED FP8 AND OCP-MX ONLY, and the restriction is the honest one rather than laziness.
  *
  * `gemm_nt_q` is one op over six weight formats and the SCALE GRID is what differs between them --
  * per row, per row-group, per output-row-block, an e8m0 exponent byte, with or without a zero point
@@ -812,14 +812,80 @@ int ref_gemm_nt_bias_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* 
  *
  * The fp8 family is different: its grid is stated by the CHECKPOINT -- E4M3 [N][K] against a bf16
  * [ceil(N/128)][ceil(K/128)] plane, with `group` carrying the 128 -- so there is nothing left to
- * guess. It is also the family the production model runs on. `a_sum` and `b_ref` belong to the
- * asymmetric-integer and mxfp4 grids and are absent; ref implements neither. */
+ * guess. It is also the family the production model runs on. THE OCP-MX GRID IS THE OTHER ONE that
+ * can be described, because libr4d's own mxfp4 layout hooks state it; it is documented on the branch
+ * below. `a_sum` belongs to the asymmetric-integer grids and is absent from both. */
 static int gemm_q_shape(const RadParam* p, int n_p, int operand, bool bias, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), N = gi(p, n_p, "N", 0), K = gi(p, n_p, "K", 0);
     const int64_t group = gi(p, n_p, "group", 0);
     const char* q = gs(p, n_p, "dtype");
     const bool a8  = q && std::strcmp(q, "fp8a8")  == 0;
     const bool a16 = q && std::strcmp(q, "fp8a16") == 0;
+    const bool mx4 = q && std::strcmp(q, "mxfp4a8") == 0;
+    const bool mx6 = q && std::strcmp(q, "mxfp6a8") == 0;
+    const bool mx8 = q && std::strcmp(q, "mxfp8a8") == 0;
+    const bool w5  = q && std::strcmp(q, "w5a8")   == 0;
+    const bool mx  = mx4 || mx6 || mx8 || w5;
+    /* THE OCP-MX GRID IS THE CHECKPOINT'S, like fp8's and unlike the other four: libr4d's own mxfp4
+     * layout hooks state it (r4d_layout.cpp's mx_enc_layout), so there is nothing to guess. It is
+     * described here off the CANONICAL planes make_scales reads, NOT libr4d's relaid `[K/32][N]`
+     * form: `b` is the row-major code plane logically [N, K] (two e2m1 nibbles per byte, or four
+     * e2m3 codes per three bytes on the wire, which the ABI's element count already expresses),
+     * `b_scale` is E8M0 [N][K/32] -- one exponent per 32 K, one row per output row -- and `b_ref`
+     * is the per-row E8M0 reference, DESCRIBED over the canonical [N][K/32] plane its `wref` view
+     * derives from (a max, so not invertible on its own; the unrelayout broadcasts it and the
+     * reference reads the row max). `a_scale` is one
+     * f32 per ROW, not fp8's per-group grid, and `a_sum` belongs to the asymmetric-integer formats
+     * and is absent. The bias form carries no `b_ref` and no MX kernel, so it declines rather than
+     * describing an operand the schema does not have.
+     *
+     * THE GRID IS THE SAME FOR mxfp6a8 AND mxfp8a8 AND THAT IS WHY THEY RIDE ON THIS BRANCH: the
+     * e8m0 [N][K/32] plane does not care what the codes it scales are. What differs is the code
+     * plane and the reference. e2m3 and e4m3 codes are SELF-SCALING -- OCP gives them the full
+     * exponent range their formats hold -- so the device's per-row `b_ref` fold exists for mxfp4
+     * only, the shape describes no b_ref for the other two, `scales_ref` therefore never attaches,
+     * and the reference reads the e8m0 plane directly: the no-fold path libref already computes.
+     *
+     * b_scale, b_ref AND b ARE DRAWN AS INDEX OPERANDS, which is not a pretence that they are
+     * indices: it is the ABI's way to ask for a spread of small integers instead of the standard
+     * normals a float operand gets, whose u8 casting is zero -- a zero exponent plane and an all-
+     * zero-nibble weight would make every block scale 1 and every product 0, and a comparison of
+     * two zero fills is exactly the agreement a checker must not report. b's index draw is clamped
+     * by the harness's own e2m1 packer to the eight magnitudes the format has, and by the same
+     * packer's e2m3 arm to the sixty-four codes the format has. An e4m3 code plane needs NEITHER:
+     * it is a byte dtype the harness's ordinary float store converts into, so mxfp8a8's b is drawn
+     * as a plain weight -- normals narrowed through the E4M3 rounder, exactly the bytes a
+     * checkpoint's plane holds -- and an index draw over all 256 patterns would mostly select
+     * subnormals and the format's one NaN pattern, comparing two NaN propagations rather than two
+     * GEMMs. Exponent draws are
+     * bounded at 128 (exclusive), i.e. 0..127: a full 0..254 draw spans 2^-127..2^127 and makes a
+     * block sum overflow to inf (and an inf*0 gate to NaN) before either implementation can be
+     * compared, while 0..127 keeps every scale in [2^-127, 1] and still covers the dsh clamp and
+     * its d>15 saturation. */
+    if (mx) {
+        if (bias || N <= 0 || K <= 0 || K % 32) return RAD_E_UNSUPPORTED;
+        Opd o;
+        o.t((uint32_t)RAD_F8E4M3,  { M, K });              /* a       -- E4M3 activation */
+        o.t((uint32_t)RAD_F32,     { M, 1 });              /* a_scale -- one per ROW */
+        if (mx4)     o.t_idx_dt((uint32_t)RAD_FP4E2M1, { N, K }, 16, -1, 0); /* b -- e2m1, 8 codes */
+        else if (mx6) o.t_idx_dt((uint32_t)RAD_FP6E2M3, { N, K }, 64, -1, 0); /* b -- e2m3, 64 codes */
+        else if (w5)  o.t_idx_dt((uint32_t)RAD_I5, { N, K }, 32, -1, 0);   /* b -- int5, 32 codes */
+        else          o.t((uint32_t)RAD_F8E4M3, { N, K });  /* b     -- e4m3, drawn as normals */
+        if (w5) o.t((uint32_t)RAD_F16, { N, K / 32 });     /* b_scale -- [N][K/32] f16 */
+        else    o.t_idx_dt((uint32_t)RAD_U8, { N, K / 32 }, 128, -1, 0); /* b_scale -- e8m0 */
+        o.t((uint32_t)RAD_BF16,    { M, N });              /* y */
+        o.skip();                                          /* a_sum   -- asymmetric-integer only */
+        /* `b_ref` is described over the CANONICAL [N][K/32] plane the `wref` view is derived from,
+         * not over its logical [N]. The per-op oracle inverts the device layout with the row's
+         * RadUnrelayoutFn, whose destination is this operand's selected (canonical) plane, so the
+         * declared numel must match that plane's extent or `enc_selection_logical` refuses on
+         * `rows*cols != n`. The reference reads the row max from it, which is the operands' whole
+         * meaning; `scales_ref` accepts this rank-2 form. mxfp6 and mxfp8 have NO reference fold
+         * -- their codes are self-scaling -- so their rows skip the operand. */
+        if (mx4) o.t_idx_dt((uint32_t)RAD_U8, { N, K / 32 }, 128, -1, 0); /* b_ref -- canonical plane */
+        else     o.skip();                                /* b_ref -- mxfp6/mxfp8 have no fold */
+        return o.finish("gemm_nt_q", operand, out);
+    }
     if ((!a8 && !a16) || N <= 0 || K <= 0 || group <= 0) return RAD_E_UNSUPPORTED;
     /* The bias form takes `a_scale` as a REQUIRED operand, so the fp8a16 reading -- a bf16
      * activation and no activation scale at all -- cannot be expressed there. Declining is the
@@ -1377,6 +1443,33 @@ int ref_gated_quant_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDes
     return o.finish("gated_quant_fp8", operand, out);
 }
 
+/* The per-row (OCP-MX) forms: the same extents with the scale at [M, 1] rather than [M, n/group].
+ * `ref_rmsnorm_quant_fp8`/`ref_gated_quant_fp8` already default the group to the whole row when the
+ * `group` parameter is absent, so they ARE these ops' implementations. */
+int ref_rmsnorm_quant_fp8_row_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    Opd o;
+    o.t(D, { M, n });                       /* x */
+    o.t(D, { M, n });                       /* residual, inout */
+    o.t(D, { n });                          /* w, the gain */
+    o.t((uint32_t)RAD_F8E4M3, { M, n });    /* q */
+    o.t((uint32_t)RAD_F32, { M, 1 });       /* scale, one per row */
+    o.t((uint32_t)RAD_BF16, { M, n });      /* out_bf16 */
+    return o.finish("rmsnorm_quant_fp8_row", operand, out);
+}
+
+int ref_gated_quant_fp8_row_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    Opd o;
+    o.t(D, { M, 2 * n });                   /* gate_up, gate half first */
+    o.t((uint32_t)RAD_F8E4M3, { M, n });    /* q */
+    o.t((uint32_t)RAD_F32, { M, 1 });       /* scale, one per row */
+    o.t((uint32_t)RAD_BF16, { M, n });      /* out_bf16 */
+    return o.finish("gated_quant_fp8_row", operand, out);
+}
+
 /* `N` IS THE WEIGHT'S ROWS AND IT IS TWICE THE FUSED WIDTH, which is the one thing a caller coming
  * from gemm_nt_q gets wrong here: the quantised output is [M, N/2], not [M, N]. */
 int ref_gemm_nt_q_gated_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -1398,6 +1491,32 @@ int ref_gemm_nt_q_gated_shape(const RadParam* p, int n_p, int operand, RadOpdDes
     o.t((uint32_t)RAD_F32, { M, ng });      /* scale */
     o.t((uint32_t)RAD_BF16, { M, n });      /* out_bf16 */
     return o.finish("gemm_nt_q_gated", operand, out);
+}
+
+/* The OCP-MX (mxfp4a8) fold. The weight is row-major e2m1 [N, K] here -- libref reads the
+ * CHECKPOINT's planes, not libr4d's fragment order -- the E8M0 plane is [N, K/32] (the canonical
+ * orientation make_scales reads), and `scale` is one f32 per row. `b_ref` is attached by the shared
+ * gated implementation through `scales_ref` (operand 7) and is described over the canonical
+ * [N][K/32] plane the `wref` view derives from (see gemm_nt_q's MX branch), so the block scale
+ * here is the device's saturated 2^(Wref-127-dsh). As on `gemm_nt_q`'s MX branch, the code and
+ * exponent operands are drawn as small integers: a normal draw would make them zero and the
+ * comparison vacuous. */
+int ref_gemm_nt_q_gated_mx_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), N = gi(p, n_p, "N", 0), K = gi(p, n_p, "K", 0);
+    const char* q = gs(p, n_p, "dtype");
+    const bool mx = q && std::strcmp(q, "mxfp4a8") == 0;
+    if (!mx || M <= 0 || N <= 0 || K <= 0 || (N & 1) || (K % 32)) return RAD_E_UNSUPPORTED;
+    const int64_t n = N / 2;
+    Opd o;
+    o.t((uint32_t)RAD_F8E4M3, { M, K });        /* a */
+    o.t((uint32_t)RAD_F32, { M, 1 });           /* a_scale, one per row */
+    o.t_idx_dt((uint32_t)RAD_FP4E2M1, { N, K }, 16, -1, 0);    /* b, canonical row-major e2m1 */
+    o.t_idx_dt((uint32_t)RAD_U8, { N, K / 32 }, 128, -1, 0);   /* b_scale, canonical [N][K/32] e8m0 */
+    o.t((uint32_t)RAD_F8E4M3, { M, n });        /* q */
+    o.t((uint32_t)RAD_F32, { M, 1 });           /* scale, one per row */
+    o.t((uint32_t)RAD_BF16, { M, n });          /* out_bf16 */
+    o.t_idx_dt((uint32_t)RAD_U8, { N, K / 32 }, 128, -1, 0);   /* b_ref, canonical wref plane */
+    return o.finish("gemm_nt_q_gated_mx", operand, out);
 }
 
 /* DFlash2's candidate walk. `cand` holds TOKEN IDS drawn from the vocabulary and `anchor` one per
@@ -1422,6 +1541,30 @@ int ref_dflash_select_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     o.t((uint32_t)RAD_BF16, { nv, R });                      /* succ */
     o.t_idx_dt((uint32_t)RAD_I32, { M, steps }, nv, -1, 0);  /* tokens */
     return o.finish("dflash_select", operand, out);
+}
+
+/* The same walk over E4M3 codebooks. The scale is declared one a row; a table with a single scale
+ * is also legal and is checked at launch, where the plane's real extent is known. */
+int ref_dflash_select_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M     = gi(p, n_p, "M", 0);
+    const int64_t steps = gi(p, n_p, "steps", 0);
+    const int64_t K     = gi(p, n_p, "top_k", 0);
+    const int64_t R     = gi(p, n_p, "rank", 0);
+    const int64_t nv    = gi(p, n_p, "n_vocab", 0);
+    const int64_t astr  = gi(p, n_p, "anchor_stride", 1);
+    if (M <= 0 || steps <= 0 || K <= 0 || R <= 0 || nv <= 0 || astr <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t rows = M * steps;
+    Opd o;
+    o.t_idx_dt((uint32_t)RAD_I32, { rows, K }, nv, -1, 0);   /* cand */
+    o.t((uint32_t)RAD_F32, { rows, K });                     /* unary */
+    o.t((uint32_t)RAD_BF16, { rows, R });                    /* hp, absent is a plane of ones */
+    o.t_idx_dt((uint32_t)RAD_I32, { M * astr }, nv, -1, 0);  /* anchor */
+    o.t((uint32_t)RAD_F8E4M3, { nv, R });                    /* pred codes */
+    o.t((uint32_t)RAD_F32, { nv, 1 });                       /* pred scale */
+    o.t((uint32_t)RAD_F8E4M3, { nv, R });                    /* succ codes */
+    o.t((uint32_t)RAD_F32, { nv, 1 });                       /* succ scale */
+    o.t_idx_dt((uint32_t)RAD_I32, { M, steps }, nv, -1, 0);  /* tokens */
+    return o.finish("dflash_select_q", operand, out);
 }
 
 namespace {

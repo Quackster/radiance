@@ -72,11 +72,14 @@ int create_sized(const std::string& path, int64_t bytes) {
     return fd;
 }
 
+/* A reference file the manifest says needs `bytes`. It may be larger: a subset manifest that
+ * scores only the first documents of a reference still points at the whole file and reads the
+ * prefix. It may not be smaller -- that is a recording that died or a truncated file. */
 int open_sized(const std::string& path, int64_t bytes) {
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) return -1;
     struct stat st{};
-    if (::fstat(fd, &st) != 0 || (int64_t)st.st_size != bytes) { ::close(fd); return -2; }
+    if (::fstat(fd, &st) != 0 || (int64_t)st.st_size < bytes) { ::close(fd); return -2; }
     return fd;
 }
 

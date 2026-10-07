@@ -436,6 +436,169 @@ extern "C" int r4d_rad_unrelayout_i8_logits(const RadParam* p, int n_p, int oper
     return RAD_OK;
 }
 
+/* ---- the INT4 head (logits_gemm_i4): i4 codes with a bf16 scale a row per 128 columns, stored
+ * as r4d_fp8::lm4_row_bytes' row -- the K/2 code bytes as libquant packed them (low nibble
+ * first), the row's own scales, the pad -- and handed to the kernel as BYTES. */
+namespace {
+int lm4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                   const int* sel, const RadTensor* pl, int n, RadLayout* out, FGeom* gout) {
+    if (!out || !pl) return RAD_E_INVAL;
+    if (operand != LGL_W) return RAD_E_UNSUPPORTED;
+    FGeom g;
+    const int rc = lgeom(p, n_p, &g);
+    if (rc != RAD_OK) return rc;
+    if (!r4d_enc::affine(enc, RAD_I4, RAD_BF16, 1, R4D_FP8_BLOCK)) return RAD_E_DTYPE;
+    if (!r4d_enc::selects(enc, sel, n, "codes", "scale")) return RAD_E_SHAPE;
+    if (g.K % 2 || !r4d_enc::dims(pl[0], g.N, g.K) || !r4d_enc::dims(pl[1], g.N, g.sk))
+        return RAD_E_SHAPE;
+    const long long stride = r4d_fp8::lm4_row_bytes(g.K);
+    ffill(out, "r4d.i4lm.r128", RAD_U8, g.N, stride, g.N * stride);
+    if (gout) *gout = g;
+    return RAD_OK;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_i4_logits(const RadParam* p, int n_p, int operand,
+                                        const RadEncoding* enc, const int* sel,
+                                        const RadTensor* pl, int n, RadLayout* out) {
+    return lm4_enc_layout(p, n_p, operand, enc, sel, pl, n, out, nullptr);
+}
+
+extern "C" int r4d_rad_relayout_i4_logits(const RadParam* p, int n_p, int operand,
+                                          const RadEncoding* enc, const int* sel,
+                                          const RadTensor* pl, int n, void* dst,
+                                          int64_t dst_bytes) {
+    RadLayout L;
+    FGeom g;
+    const int rc = lm4_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g);
+    if (rc != RAD_OK) return rc;
+    if (dst_bytes != L.bytes || !pl[0].data || !pl[1].data) return RAD_E_SHAPE;
+    const long long stride = r4d_fp8::lm4_row_bytes(g.K), cb = g.K / 2;
+    const uint8_t* codes = (const uint8_t*)pl[0].data;
+    const uint16_t* sc = (const uint16_t*)pl[1].data;
+    uint8_t* d = (uint8_t*)dst;
+    std::memset(d, 0, (size_t)dst_bytes);
+    for (long long r = 0; r < g.N; ++r) {
+        uint8_t* row = d + r * stride;
+        std::memcpy(row, codes + r * cb, (size_t)cb);
+        std::memcpy(row + cb, sc + r * g.sk, (size_t)(2 * g.sk));
+    }
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_unrelayout_i4_logits(const RadParam* p, int n_p, int operand,
+                                            const RadEncoding* enc, const int* sel,
+                                            const void* src, int64_t src_bytes,
+                                            const RadTensor* pl, int n) {
+    RadLayout L;
+    FGeom g;
+    const int rc = lm4_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g);
+    if (rc != RAD_OK) return rc;
+    if (src_bytes != L.bytes || !pl[0].data || !pl[1].data) return RAD_E_SHAPE;
+    const long long stride = r4d_fp8::lm4_row_bytes(g.K), cb = g.K / 2;
+    const uint8_t* s = (const uint8_t*)src;
+    uint8_t* codes = (uint8_t*)pl[0].data;
+    uint16_t* sc = (uint16_t*)pl[1].data;
+    for (long long r = 0; r < g.N; ++r) {
+        std::memcpy(codes + r * cb, s + r * stride, (size_t)cb);
+        std::memcpy(sc + r * g.sk, s + r * stride + cb, (size_t)(2 * g.sk));
+    }
+    return RAD_OK;
+}
+
+/* ---- the ASYMMETRIC int4 heads (logits_gemm_u4g64 / _u4g128): libquant's `codes=u4 zero=u8
+ * group=G scale=bf16`, stored as r4d_fp8::lm4a_row_bytes' row -- the K/2 code bytes, the row's
+ * bf16 scale a group, its u8 zero a group, the pad. The planes are found by ROLE, three of them. */
+namespace {
+int lm4a_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                    const int* sel, const RadTensor* pl, int n, RadLayout* out, FGeom* gout,
+                    int64_t group, int* ic, int* is, int* iz) {
+    if (!out || !pl) return RAD_E_INVAL;
+    if (operand != LGL_W) return RAD_E_UNSUPPORTED;
+    FGeom g;
+    const int rc = lgeom(p, n_p, &g);
+    if (rc != RAD_OK) return rc;
+    if (!r4d_enc::affine(enc, RAD_U4, RAD_BF16, 1, group, RAD_U8)) return RAD_E_DTYPE;
+    if (n != 3) return RAD_E_SHAPE;
+    *ic = *is = *iz = -1;
+    for (int i = 0; i < 3; ++i) {
+        const char* r = r4d_enc::role(enc, sel, i);
+        if (!std::strcmp(r, "codes")) *ic = i;
+        else if (!std::strcmp(r, "scale")) *is = i;
+        else if (!std::strcmp(r, "zero")) *iz = i;
+    }
+    if (*ic < 0 || *is < 0 || *iz < 0) return RAD_E_SHAPE;
+    const int64_t ng = g.K / group;
+    if (g.K % group || !r4d_enc::dims(pl[*ic], g.N, g.K) || !r4d_enc::dims(pl[*is], g.N, ng) ||
+        !r4d_enc::dims(pl[*iz], g.N, ng))
+        return RAD_E_SHAPE;
+    const long long stride = r4d_fp8::lm4a_row_bytes(g.K, group);
+    ffill(out, group == 64 ? "r4d.u4lm.g64" : "r4d.u4lm.g128", RAD_U8, g.N, stride, g.N * stride);
+    if (gout) *gout = g;
+    return RAD_OK;
+}
+int lm4a_relayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                  const RadTensor* pl, int n, void* dst, int64_t dst_bytes, int64_t group) {
+    RadLayout L;
+    FGeom g;
+    int ic, is, iz;
+    const int rc = lm4a_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g, group, &ic, &is, &iz);
+    if (rc != RAD_OK) return rc;
+    if (dst_bytes != L.bytes || !pl[ic].data || !pl[is].data || !pl[iz].data) return RAD_E_SHAPE;
+    const long long stride = r4d_fp8::lm4a_row_bytes(g.K, group), cb = g.K / 2, ng = g.K / group;
+    uint8_t* d = (uint8_t*)dst;
+    std::memset(d, 0, (size_t)dst_bytes);
+    for (long long r = 0; r < g.N; ++r) {
+        uint8_t* row = d + r * stride;
+        std::memcpy(row, (const uint8_t*)pl[ic].data + r * cb, (size_t)cb);
+        std::memcpy(row + cb, (const uint16_t*)pl[is].data + r * ng, (size_t)(2 * ng));
+        std::memcpy(row + cb + 2 * ng, (const uint8_t*)pl[iz].data + r * ng, (size_t)ng);
+    }
+    return RAD_OK;
+}
+int lm4a_unrelayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                    const int* sel, const void* src, int64_t src_bytes, const RadTensor* pl, int n,
+                    int64_t group) {
+    RadLayout L;
+    FGeom g;
+    int ic, is, iz;
+    const int rc = lm4a_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g, group, &ic, &is, &iz);
+    if (rc != RAD_OK) return rc;
+    if (src_bytes != L.bytes || !pl[ic].data || !pl[is].data || !pl[iz].data) return RAD_E_SHAPE;
+    const long long stride = r4d_fp8::lm4a_row_bytes(g.K, group), cb = g.K / 2, ng = g.K / group;
+    const uint8_t* s = (const uint8_t*)src;
+    for (long long r = 0; r < g.N; ++r) {
+        std::memcpy((uint8_t*)pl[ic].data + r * cb, s + r * stride, (size_t)cb);
+        std::memcpy((uint16_t*)pl[is].data + r * ng, s + r * stride + cb, (size_t)(2 * ng));
+        std::memcpy((uint8_t*)pl[iz].data + r * ng, s + r * stride + cb + 2 * ng, (size_t)ng);
+    }
+    return RAD_OK;
+}
+}  /* namespace */
+
+#define R4D_U4LM_HOOKS(G)                                                                       \
+extern "C" int r4d_rad_layout_u4g##G##_logits(const RadParam* p, int n_p, int operand,         \
+                                              const RadEncoding* enc, const int* sel,          \
+                                              const RadTensor* pl, int n, RadLayout* out) {    \
+    int ic, is, iz;                                                                             \
+    return lm4a_enc_layout(p, n_p, operand, enc, sel, pl, n, out, nullptr, G, &ic, &is, &iz);  \
+}                                                                                               \
+extern "C" int r4d_rad_relayout_u4g##G##_logits(const RadParam* p, int n_p, int operand,       \
+                                                const RadEncoding* enc, const int* sel,        \
+                                                const RadTensor* pl, int n, void* dst,         \
+                                                int64_t dst_bytes) {                           \
+    return lm4a_relayout(p, n_p, operand, enc, sel, pl, n, dst, dst_bytes, G);                 \
+}                                                                                               \
+extern "C" int r4d_rad_unrelayout_u4g##G##_logits(const RadParam* p, int n_p, int operand,     \
+                                                  const RadEncoding* enc, const int* sel,      \
+                                                  const void* src, int64_t src_bytes,          \
+                                                  const RadTensor* pl, int n) {                \
+    return lm4a_unrelayout(p, n_p, operand, enc, sel, src, src_bytes, pl, n, G);               \
+}
+R4D_U4LM_HOOKS(64)
+R4D_U4LM_HOOKS(128)
+#undef R4D_U4LM_HOOKS
+
 /* ---- hc_read's mixing matrices and mtp_enter's fc: e4m3 codes with an f32 scale a group of the
  * row, the scales in the row's tail and the row padded to 16 bytes. */
 namespace {
@@ -543,10 +706,11 @@ extern "C" int r4d_rad_unrelayout_mtp_e4m3(const RadParam* p, int n_p, int opera
 /* ================================================================= embed_lookup_q's table
  *
  * The gather reads the table AS IT IS, so this hook only answers whether it can: E4M3 codes with
- * ONE bf16 scale for the whole table (`fp8_e4m3*bf16[*x*]`, the n-gram table's recipe), or the
- * table as the checkpoint ships it, plain bf16 with no scale. The same two forms libavx's host
- * gather accepts (avx_layout_ngram), checked the same way, so a model whose table one of them
- * reads is never refused by the other at declare. */
+ * ONE bf16 or f32 scale for the whole table (`fp8_e4m3*bf16[*x*]`, the n-gram table's recipe; the f32
+ * one is a token embedding a converter wrote under one scale), or the
+ * table as the checkpoint ships it, plain bf16 with no scale. Those are the forms libavx's host
+ * gather accepts (avx_layout_ngram), checked the same way, except for the f32 scale, which only
+ * this device row reads: a table that carries one is served by libr4d alone. */
 extern "C" int r4d_rad_layout_embed_q(const RadParam* p, int n_p, int operand,
                                       const RadEncoding* enc, const int* sel,
                                       const RadTensor* pl, int n, RadLayout* out) {
@@ -563,7 +727,8 @@ extern "C" int r4d_rad_layout_embed_q(const RadParam* p, int n_p, int operand,
     }
     const RadEncPlane* sc = rad_enc_plane(enc, "scale");
     if (!rad_enc_is(enc, "affine") || enc->n_planes != 2 || enc->transform[0] ||
-        enc->plane[0].dtype != RAD_F8E4M3 || !sc || sc->dtype != RAD_BF16 || sc->block[0] != 0 ||
+        enc->plane[0].dtype != RAD_F8E4M3 || !sc || (sc->dtype != RAD_BF16 && sc->dtype != RAD_F32) ||
+        sc->block[0] != 0 ||
         sc->block[1] != 0)
         return RAD_E_DTYPE;
     if (n != 1 || !pl || !sel) return RAD_E_SHAPE;

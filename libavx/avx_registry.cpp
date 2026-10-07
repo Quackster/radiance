@@ -139,7 +139,10 @@ static const RadParamSpec pCast[] = { P_INT("M"), P_INT("n"), P_STR("from"), P_S
 
 /* ---- quantisation and rotation ------------------------------------------------------------ */
 static const RadParamSpec pQuant[]      = { P_INT("M"), P_INT("n"), P_INT("group"),
-                                            P_STR("dtype") };
+                                             P_STR("dtype") };
+/* The per-row form: quant_act_fp8 with the group dropped (the OCP-MX mxfp4a8 GEMMs read one f32
+ * activation scale per token). The implementation reads an absent group as 0 and clamps it to n. */
+static const RadParamSpec pQuantRow[]   = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 static const RadOperandSpec oQuant[]    = { OPD("x"), OUT("q"), OUT("scale"), OUT_O("asum") };
 static const RadOperandSpec oHadQuant[] = { OPD("x"), OUT("q"), OUT("scale") };
 static const RadOperandSpec oQuantFp8[] = { OPD("x"), OUT("q"), OUT("scale") };
@@ -154,6 +157,11 @@ static const RadParamSpec pGatedQuantFp8[]   = { P_INT("M"), P_INT("n"), P_INT("
                                                  P_STR("dtype"), P_STRO("act") };
 static const RadOperandSpec oGatedQuantFp8[] = { OPD("gate_up"), OUT("q"), OUT("scale"),
                                                  OUT_O("out_bf16") };
+/* The per-row (OCP-MX) forms: no `group`, so the shared body clamps it to n (one scale per row). */
+static const RadParamSpec pRmsQuantFp8Row[]   = { P_INT("M"), P_INT("n"), P_F64("eps"),
+                                                  P_STR("dtype"), P_F64O("wadd") };
+static const RadParamSpec pGatedQuantFp8Row[] = { P_INT("M"), P_INT("n"), P_STR("dtype"),
+                                                  P_STRO("act") };
 
 static const RadParamSpec pRmsHadQuant[]   = { P_INT("M"), P_INT("n"), P_F64("eps"),
                                                P_INT("group"), P_STR("dtype"), P_F64O("wadd") };
@@ -191,6 +199,15 @@ static const RadParamSpec pGemmQGated[]    = { P_INT("M"), P_INT("N"), P_INT("K"
                                                P_STR("dtype"), P_STR("act") };
 static const RadOperandSpec oGemmQGated[]  = { OPD("a"), OPD("a_scale"), WGT("b"), WGT("b_scale"),
                                                OUT("q"), OUT("scale"), OUT_O("out_bf16") };
+/* The OCP-MX (mxfp4a8) fold: a new op, not a dtype, because the MX weight's `b_ref` is an eighth
+ * operand and the positional list has an exact arity check (libr4d/r4d_rows.cpp says why). No
+ * `group`: the scale is one per row. `b_ref` is the per-row fold reference and is read by the
+ * shared gated kernel (avx_gemm.cpp's scales_ref at operand 7), matching libref. */
+static const RadParamSpec pGemmQGatedMx[]  = { P_INT("M"), P_INT("N"), P_INT("K"),
+                                               P_STR("dtype"), P_STR("act") };
+static const RadOperandSpec oGemmQGatedMx[]= { OPD("a"), OPD("a_scale"), WGT("b"), WGT("b_scale"),
+                                               OUT("q"), OUT("scale"), OUT_O("out_bf16"),
+                                               WGT_O("b_ref") };
 
 /* ---- attention ---------------------------------------------------------------------------- */
 static const RadParamSpec pAttnPaged[] = {
@@ -428,6 +445,9 @@ static const RadParamSpec pDflashSelect[]    = { P_INT("M"), P_INT("steps"), P_I
 static const RadOperandSpec oDflashSelect[]  = { OPD("cand"), OPD("unary"), OPD_O("hp"),
                                                  OPD("anchor"), WGT("pred"), WGT("succ"),
                                                  OUT("tokens") };
+static const RadOperandSpec oDflashSelectQ[] = { OPD("cand"), OPD("unary"), OPD_O("hp"),
+                                                 OPD("anchor"), WGT("pred"), WGT("pred_scale"),
+                                                 WGT("succ"), WGT("succ_scale"), OUT("tokens") };
 
 /* ================================================================== the schema table
  * The doc strings are libavx's own and say what this plugin does with the op -- which of the two
@@ -483,6 +503,8 @@ static const RadOpSchema kSchemas[] = {
   "symmetric int8 activation quantiser, one f32 scale per `group` contiguous elements. `asum` is "
   "not produced -- libavx has no asymmetric grid to feed, exactly as libref has none." },
 { "quant_act_fp8", ARR(pQuant), ARR(oQuantFp8), "symmetric block-scaled E4M3 quantiser." },
+{ "quant_act_fp8_row", ARR(pQuantRow), ARR(oQuantFp8),
+  "symmetric per-row E4M3 quantiser, one f32 scale per row (the OCP-MX mxfp4a8 form)." },
 { "had_quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
   "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser. No normalisation: "
   "the 1/group is folded into the stored weight scale at convert (docs/OPS.md)." },
@@ -503,6 +525,10 @@ static const RadOpSchema kSchemas[] = {
 { "gated_quant_fp8", ARR(pGatedQuantFp8), ARR(oGatedQuantFp8),
   "act(gate) * up over a packed [M, 2n] plane, gate half first, then the E4M3 quantiser over the "
   "bf16-narrowed product. `act` is silu or sigmoid, silu by default." },
+{ "rmsnorm_quant_fp8_row", ARR(pRmsQuantFp8Row), ARR(oRmsQuantFp8),
+  "the per-row (OCP-MX) form of rmsnorm_quant_fp8: one f32 scale per row in `scale` [M, 1]." },
+{ "gated_quant_fp8_row", ARR(pGatedQuantFp8Row), ARR(oGatedQuantFp8),
+  "the per-row (OCP-MX) form of gated_quant_fp8: act(gate) * up, then one f32 scale per row." },
 { "gemm_nt", ARR(pGemm), ARR(oGemm),
   "C = A B^T, f32 accumulate, cache-blocked with a register-blocked microkernel. Sums in a "
   "different order from libref's straight loop by construction; the kbench tolerance for a bf16 "
@@ -510,12 +536,17 @@ static const RadOpSchema kSchemas[] = {
 { "gemm_nt_bias", ARR(pGemmBias), ARR(oGemmBias),
   "C = act(A B^T + bias) + res, each step rounded to C's dtype." },
 { "gemm_nt_q", ARR(pGemmQ), ARR(oGemmQ),
-  "C = A B^T with group-scaled quantised operands. `a_sum` and `b_ref` are libr4d's asymmetric and "
-  "mxfp4 forms and are ignored here, as they are in libref." },
+  "C = A B^T with group-scaled quantised operands. `a_sum` is libr4d's asymmetric form and is "
+  "ignored here, as it is in libref; `b_ref` is the OCP-MX per-output-row reference and folds the "
+  "block scale exactly as the device does." },
 { "gemm_nt_q_bias", ARR(pGemmQ), ARR(oGemmQBias), "quantised C = A B^T + bias." },
 { "gemm_nt_q_gated", ARR(pGemmQGated), ARR(oGemmQGated),
   "gemm_nt_q over a [N, K] gate_up plane with gated_quant_fp8's pass in the epilogue, byte for "
   "byte the pair. `N` is the weight's rows, twice the fused width; the output is [M, N/2]." },
+{ "gemm_nt_q_gated_mx", ARR(pGemmQGatedMx), ARR(oGemmQGatedMx),
+  "the OCP-MX (mxfp4a8) gated fold: the same epilogue at a group of the whole row, with `b_ref` "
+  "the per-output-row reference exponent. `N` is the weight's rows; the output is [M, N/2] with "
+  "one f32 scale per row." },
 { "attn_paged", ARR(pAttnPaged), ARR(oAttnPaged),
   "paged causal / sliding-window attention, any query length, online-softmax so one pass over the "
   "cache suffices." },
@@ -587,6 +618,9 @@ static const RadOpSchema kSchemas[] = {
   "a greedy walk over a candidate lattice: score[l, c] = unary[l, c] + sum_r pred[pid(l)][r] * "
   "hp[l][r] * succ[cand[l, c]][r], pid(0) the anchor and pid(l) the walk's own previous pick. "
   "`hp` absent is a plane of ones." },
+{ "dflash_select_q", ARR(pDflashSelect), ARR(oDflashSelectQ),
+  "dflash_select over codebooks held as E4M3 codes with an f32 scale a row (or one for the table): "
+  "codebook[v][r] = codes[v][r] * scale[v]." },
 };
 
 /* ================================================================== the kernel table
@@ -667,6 +701,9 @@ SIMPLE("avx_had_quant_act_i8", "had_quant_act_i8", "quant",
        L(had_quant_act_i8)),
 SIMPLE("avx_quant_act_fp8", "quant_act_fp8", "quant", "symmetric block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale", L(quant_act_fp8)),
+SIMPLE("avx_quant_act_fp8_row", "quant_act_fp8_row", "quant",
+       "symmetric per-row E4M3 quantiser, one f32 scale per row",
+       "float in, fp8_e4m3 out, f32 scale per row", L(quant_act_fp8_row)),
 SIMPLE("avx_had_quant_act_fp8", "had_quant_act_fp8", "quant",
        "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale per group; n a multiple of group",
@@ -689,18 +726,30 @@ SIMPLE("avx_rmsnorm_quant_fp8", "rmsnorm_quant_fp8", "quant",
 SIMPLE("avx_gated_quant_fp8", "gated_quant_fp8", "quant",
        "act(gate) * up over a packed [M, 2n] plane, then the E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale, bf16 out_bf16", L(gated_quant_fp8)),
+SIMPLE("avx_rmsnorm_quant_fp8_row", "rmsnorm_quant_fp8_row", "quant",
+       "RMS norm, optional residual add, and the per-row E4M3 quantiser in one pass",
+       "float in, fp8_e4m3 out, f32 scale per row, bf16 out_bf16", L(rmsnorm_quant_fp8_row)),
+SIMPLE("avx_gated_quant_fp8_row", "gated_quant_fp8_row", "quant",
+       "act(gate) * up over a packed [M, 2n] plane, then the per-row E4M3 quantiser",
+       "float in, fp8_e4m3 out, f32 scale per row, bf16 out_bf16", L(gated_quant_fp8_row)),
 
 SIMPLE("avx_gemm_nt", "gemm_nt", "gemm", "C = A B^T, f32 accumulate, cache-blocked", DT_FLOAT,
        L(gemm_nt)),
 SIMPLE("avx_gemm_nt_bias", "gemm_nt_bias", "gemm", "C = A B^T + bias", DT_FLOAT, L(gemm_nt_bias)),
-SIMPLE("avx_gemm_nt_q", "gemm_nt_q", "gemm", "C = A B^T with group-scaled quantised operands",
-       "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; f32 accumulate", L(gemm_nt_q)),
-SIMPLE("avx_gemm_nt_q_bias", "gemm_nt_q_bias", "gemm", "quantised C = A B^T + bias",
-       "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; f32 accumulate", L(gemm_nt_q_bias)),
+ SIMPLE("avx_gemm_nt_q", "gemm_nt_q", "gemm", "C = A B^T with group-scaled quantised operands",
+        "i8 / fp8 / float A; w4, w2, mxfp4, mxfp6, mxfp8, i8 or float B; f32 accumulate",
+        L(gemm_nt_q)),
+ SIMPLE("avx_gemm_nt_q_bias", "gemm_nt_q_bias", "gemm", "quantised C = A B^T + bias",
+        "i8 / fp8 / float A; w4, w2, mxfp4, mxfp6, mxfp8, i8 or float B; f32 accumulate",
+        L(gemm_nt_q_bias)),
 SIMPLE("avx_gemm_nt_q_gated", "gemm_nt_q_gated", "gemm",
        "gemm_nt_q over a gate_up plane with the gated E4M3 quantiser in the epilogue",
        "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; fp8_e4m3 out, f32 scale",
        L(gemm_nt_q_gated)),
+SIMPLE("avx_gemm_nt_q_gated_mx", "gemm_nt_q_gated_mx", "gemm",
+       "the OCP-MX gated fold: gate_up with silu*up and the whole-row E4M3 quantiser in the epilogue",
+       "fp8_e4m3 A with a per-row scale; mxfp4 B; fp8_e4m3 out, one f32 scale per row",
+       L(gemm_nt_q_gated_mx)),
 
 ROW("avx_attn_paged", "attn_paged", "attn",
     "paged causal / sliding-window attention, any query length",
@@ -810,6 +859,10 @@ SIMPLE("avx_sample_argmax", "sample_argmax", "sample", "greedy pick", DT_FLOAT, 
 SIMPLE("avx_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates and tokens, float unary and codebooks", L(dflash_select)),
+SIMPLE("avx_dflash_select_q", "dflash_select_q", "draft",
+       "DFlash2's greedy walk over the candidate lattice, E4M3 codebooks",
+       "i32 candidates and tokens, float unary, E4M3 codebooks with f32 scales",
+       L(dflash_select_q)),
 };
 
 /* ================================================================== plugin exports */

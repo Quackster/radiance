@@ -175,6 +175,10 @@ void Metrics::sample(const SchedMetrics& m) {
     c_draft_refills_.inc(std::max(0.0, (double)m.draft_refills - c_draft_refills_.get()));
     c_draft_refill_tokens_.inc(
         std::max(0.0, (double)m.draft_refill_tokens - c_draft_refill_tokens_.get()));
+    c_lookup_taken_.inc(std::max(0.0, (double)m.lookup_taken - c_lookup_taken_.get()));
+    c_lookup_steps_.inc(std::max(0.0, (double)m.lookup_steps - c_lookup_steps_.get()));
+    c_lookup_drafted_.inc(std::max(0.0, (double)m.lookup_drafted - c_lookup_drafted_.get()));
+    c_lookup_accepted_.inc(std::max(0.0, (double)m.lookup_accepted - c_lookup_accepted_.get()));
     c_attn_cached_.inc(std::max(0.0, (double)m.attn_cached_tokens - c_attn_cached_.get()));
     c_linear_cached_.inc(std::max(0.0, (double)m.linear_cached_tokens - c_linear_cached_.get()));
     c_checkpoints_.inc(std::max(0.0, (double)m.checkpoints_written - c_checkpoints_.get()));
@@ -366,6 +370,15 @@ std::string Metrics::render() const {
     w.counter("radiance:draft_refill_tokens_total",
               "Cached prompt tokens those hits gave back to be recomputed.",
               L, c_draft_refill_tokens_.get());
+    w.counter("radiance:lookup_draft_taken_total",
+              "Proposals the whole-context lookup draft replaced the drafter's with (RADIANCE_LOOKUP_DRAFT).",
+              L, c_lookup_taken_.get());
+    w.counter("radiance:lookup_draft_steps_total",
+              "Verify steps that carried a lookup-draft proposal.", L, c_lookup_steps_.get());
+    w.counter("radiance:lookup_draft_tokens_total",
+              "Draft tokens verified in lookup-draft steps.", L, c_lookup_drafted_.get());
+    w.counter("radiance:lookup_draft_accepted_total",
+              "Draft tokens accepted in lookup-draft steps.", L, c_lookup_accepted_.get());
 
     /* PREFIX CACHING, DECOUPLED (spec §7.3). vllm:gpu_prefix_cache_hit_rate is the ATTENTION one,
      * because that is what vLLM's single number has always meant. The linear side hits at a

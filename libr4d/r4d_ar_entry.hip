@@ -1167,6 +1167,117 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
+/* THE PER-ROW (OCP-MX) TWIN. Deliberately the same shim as `r4d_rad_ar_rmsnorm_quant_fp8` with the
+ * group=128 quantiser replaced by quant_act_fp8_row's whole-row one: no `group` parameter, the
+ * scale is `[M, 1]` rather than `[M, ceil(K/128)]`, and the tail arithmetic is
+ * rmsnorm_quant_fp8_row's. Everything the fp8 form says about `x` being INOUT, the wire and the
+ * row partition holds here unchanged -- the reduction still closes over a whole row and the 6-bit
+ * wire still packs in chunks that must not straddle one. */
+extern "C" int r4d_rad_ar_rmsnorm_quant_fp8_row(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 2) return RAD_E_SHAPE;
+
+    const RadTensor* x  = r4d_opt(a, AL_X);
+    const RadTensor* rs = r4d_opt(a, AL_RESID);
+    const RadTensor* w  = r4d_opt(a, AL_W);
+    const RadTensor* q  = r4d_opt(a, AL_Q);
+    const RadTensor* sc = r4d_opt(a, AL_SCALE);
+    const RadTensor* ob = r4d_opt(a, AL_OUTBF16);
+    if (!x || !w || !q || !sc) return RAD_E_INVAL;
+    if (!r4d_contig(w)) return RAD_E_STRIDE;
+
+    /* Rank 2 everywhere, for rmsnorm_quant_fp8_row's reason: a norm has a gain per channel. */
+    if (x->rank != 2 || q->rank != 2 || sc->rank != 2) return RAD_E_SHAPE;
+    if (ob && ob->rank != 2) return RAD_E_SHAPE;
+    const long long M = x->shape[0], K = x->shape[1];
+    if (M < 1 || K < 1) return RAD_E_SHAPE;
+    if (M * K > in->max_numel) return RAD_E_SHAPE;
+    /* A row must be a whole number of 16B words, because a block pushes its rows as words. */
+    if (K % 8) return RAD_E_SHAPE;
+
+    if (r4d_numel(w) != K) return RAD_E_SHAPE;
+    if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return RAD_E_DTYPE;
+    if (q->shape[0] != M || q->shape[1] != K) return RAD_E_SHAPE;
+    /* ONE SCALE PER ROW: `[M, 1]`, not the per-128 group plane the fp8 form carries. */
+    if (sc->shape[0] != M || sc->shape[1] != 1) return RAD_E_SHAPE;
+    if (ob && (ob->shape[0] != M || ob->shape[1] != K)) return RAD_E_SHAPE;
+    if (rs && (rs->rank != 2 || rs->shape[0] != M || rs->shape[1] != K)) return RAD_E_SHAPE;
+    /* x IS THE MESSAGE, so its rows must be tight. The other operands may be pitched. */
+    const long long xp = r4d_row_pitch(x), qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc);
+    const long long yp = ob ? r4d_row_pitch(ob) : 0, rp = rs ? r4d_row_pitch(rs) : 0;
+    if (xp < 0 || qp < 0 || sp < 0 || yp < 0 || rp < 0) return RAD_E_STRIDE;
+    if (xp != K) return RAD_E_STRIDE;
+    /* The codes store is a 32-bit word per four columns, so a pitched `q` must stay 4-aligned --
+     * the same guard the standalone `rmsnorm_quant_fp8_row` and `quant_act_fp8_row` carry. */
+    if (qp % 4) return RAD_E_STRIDE;
+
+    const float eps  = (float)r4d_getf(a, "eps", 1e-6);
+    const float wadd = (float)r4d_getf(a, "wadd", 0.0);
+    const int w_f32 = w->dtype == RAD_F32;
+
+    const int wire = (int)r4d_geti_or(a, "wire", 0);
+    if (wire != 0 && wire != 6) return RAD_E_INVAL;
+    if (wire == 6) {
+        const int ce = r4d_ar_rmsnorm_quant_fp8_row_chunk_elems();
+        if (ce <= 0 || K % ce) return RAD_E_SHAPE;
+        if (!in->locpack) return RAD_E_STATE;
+    }
+
+    R4dArCfg cfgv;
+    r4d_cfg_ar(a, &cfgv);
+    const R4dArCfg* cfg = &cfgv;
+    /* THE WIDTH IS NOT A TUNING KNOB ON THIS ROW, exactly as the fp8 form explains: it decides
+     * which columns a thread accumulates into the sum of squares, so the fused kernel and the
+     * standalone `rmsnorm_quant_fp8_row` it stands in for must pick the same one, and that one
+     * depends on M. Zero means "the norm's width". */
+    const int nthreads = 0;
+    /* ONE BLOCK A ROW, the norm's shape; see the fp8 form for the full argument. */
+    int nblocks = cfg->nblocks > 0 ? cfg->nblocks : (int)M;
+    if (nblocks > (int)M) nblocks = (int)M;
+    constexpr int kNbCap = 256;
+    if (nblocks > kNbCap) nblocks = kNbCap;
+    if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+    if (nblocks < 1) nblocks = 1;
+
+    /* RADIANCE_MX_AR_DEBUG=1 prints the first few fused-row launches with the sizes the kernel
+     * will run against. This is the one place the served-engine prefill fault can be pinned from
+     * without a debugger: it shows what the SHIM saw (M, K, wire, blocks) against what the shared
+     * AR instance was sized for (max_numel, slot16, loc_scale_off) and the pointers it passed, so
+     * an instance that is too small for M, or a slot offset the kernel steps past, is visible
+     * directly. Off by default and bounded, so it costs one getenv and nothing else. */
+    static const bool ar_dbg = [] {
+        const char* v = std::getenv("RADIANCE_MX_AR_DEBUG");
+        return v && v[0] && v[0] != '0';
+    }();
+    if (ar_dbg) {
+        static int ar_dbg_n = 0;
+        if (ar_dbg_n < 32) {
+            ++ar_dbg_n;
+            std::fprintf(stderr,
+                         "[mx-ar] M=%lld K=%lld wire=%d nb=%d max_numel=%lld slot16=%lld "
+                         "loc_scale_off=%lld slot_bytes=%lld locpack=%ld peer_scratch=%ld "
+                         "my_scratch=%ld x=%llu res=%llu y=%llu\n",
+                         M, K, wire, nblocks, (long long)in->max_numel, (long long)in->slot16,
+                         (long long)(in->slot_bytes / 2), (long long)in->slot_bytes,
+                         (long)in->locpack,
+                         (long)in->peer_scratch[0], (long)in->my_scratch,
+                         (unsigned long long)r4d_addr(x), (unsigned long long)r4d_addr(rs),
+                         (unsigned long long)r4d_addr(ob));
+        }
+    }
+
+    const int e = r4d_ar_rmsnorm_quant_fp8_row(
+        in->peer_scratch[0], in->my_scratch,
+        in->peer_flags[0], in->my_flags, in->my_seq,
+        in->slot16, r4d_addr(x), r4d_addr(rs), r4d_addr(w), r4d_addr(ob), r4d_addr(q),
+        r4d_addr(sc), (int)M, (int)K, eps, wadd, w_f32,
+        (int)rp, (int)yp, (int)qp, (int)sp,
+        (long)(uintptr_t)s, nblocks, nthreads, cfg->drain, cfg->acq, wire,
+        in->locpack, in->slot_bytes / 2);
+    return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
 /* THE ALL-REDUCE WITH THE GATED RESIDUAL'S WRITE IN IT: `all_reduce` of `y` and then `hc_write`
  * of the reduced `y` into `h`, one kernel. A block whose output feeds a hyper-connection write
  * skips its own collective when this runs, and the write carries it.

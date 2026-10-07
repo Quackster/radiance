@@ -1,5 +1,6 @@
 /* checkpoint.cpp -- see checkpoint.h. */
 #include "checkpoint.h"
+#include "encoding.h"
 #include "rad_plugin.h"
 
 #include <nlohmann/json.hpp>
@@ -264,6 +265,16 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
     if (const char* qm = gs("quantization_config.quant_method")) {
         out->quant = qm;
         if (const char* fm = gs("quantization_config.fmt")) { out->quant += "_"; out->quant += fm; }
+        /* COMPRESSED-TENSORS NAMES ITS FORMAT, NOT ITS METHOD. `quant_method` is the container
+         * library (llm-compressor's) and says nothing about the numbers; `format` does. An
+         * OCP-MXFP4 release -- e2m1 codes, one E8M0 exponent a 32 -- is `mxfp4`, the descriptor
+         * qwen35_mxfp4 claims; any other format keeps its name so it is refused as itself. */
+        if (out->quant == "compressed-tensors") {
+            const char* cf = gs("quantization_config.format");
+            out->quant = cf && !std::strcmp(cf, "mxfp4-pack-quantized")
+                             ? std::string("mxfp4")
+                             : "compressed-tensors_" + std::string(cf ? cf : "?");
+        }
     }
 
     out->finish();
@@ -476,8 +487,57 @@ int Checkpoint::open_safetensors(const std::string& path) {
             fp8_bc_ = c;
         }
     }
+    if (meta_.quant == "mxfp4") RAD_TRY(alias_mxfp4());
     detect_import();
     meta_.finish();
+    return RAD_OK;
+}
+
+/* A COMPRESSED-TENSORS MXFP4 LINEAR IS TWO U8 TENSORS, and they are already the two planes of
+ * `fp4_e2m1*e8m0[1x32]` byte for byte:
+ *
+ *   X.weight_packed   U8 [N][K/2]    two e2m1 codes a byte, element 2j in the LOW nibble
+ *   X.weight_scale    U8 [N][K/32]   an E8M0 exponent a 32 of K
+ *
+ * llm-compressor packs `x[..., 0::2] | x[..., 1::2] << 4`, and a 4-bit plane here is low nibble
+ * first (rad_load_bits), so the codes need no repacking at all. Each pair is ALIASED as the names
+ * the rest of this file already reads -- `X.weight` at fp4_e2m1 [N][K] and its companion
+ * `X.weight_scale_inv` at e8m0 -- over the same mapped bytes, which makes the weight trivial
+ * exactly as a block-fp8 one is and lets rad-convert copy it. Nothing is aliased for a pair whose
+ * shapes disagree; it is refused by name, since a scale grid read at the wrong width is a model
+ * that loads and is wrong. */
+int Checkpoint::alias_mxfp4() {
+    static const char kP[] = ".weight_packed";
+    const size_t lp = sizeof(kP) - 1;
+    std::vector<SrcTensor> add;
+    for (const SrcTensor& t : tensors_) {
+        if (t.name.size() <= lp || t.name.compare(t.name.size() - lp, lp, kP) != 0) continue;
+        const std::string base = t.name.substr(0, t.name.size() - lp);
+        const SrcTensor* sc = find(base + ".weight_scale");
+        if (t.rad_dtype != RAD_U8 || t.shape.size() != 2 || !sc || sc->rad_dtype != RAD_U8 ||
+            sc->shape.size() != 2 || sc->shape[0] != t.shape[0] ||
+            sc->shape[1] * 32 != t.shape[1] * 2) {
+            RAD_ERR("'%s' is not an MXFP4 pair: want U8 [N][K/2] codes beside a U8 [N][K/32] "
+                    "'%s.weight_scale'", t.name.c_str(), base.c_str());
+            return RAD_E_FORMAT;
+        }
+        if (find(base + ".weight")) continue;
+        SrcTensor w = t;
+        w.name      = base + ".weight";
+        w.rad_dtype = RAD_FP4E2M1;
+        w.shape     = { t.shape[0], t.shape[1] * 2 };
+        SrcTensor s = *sc;
+        s.name      = base + ".weight_scale_inv";
+        s.rad_dtype = RAD_E8M0;
+        add.push_back(std::move(w));
+        add.push_back(std::move(s));
+    }
+    for (SrcTensor& s : add) {
+        index_.emplace(s.name, tensors_.size());
+        tensors_.push_back(std::move(s));
+    }
+    RAD_INFO("checkpoint: %zu compressed-tensors MXFP4 linear(s) read as fp4_e2m1*e8m0[1x32]",
+             add.size() / 2);
     return RAD_OK;
 }
 
@@ -723,6 +783,14 @@ namespace {
 /* FP8's scale plane is a companion tensor: `X.weight` is scaled by `X.weight_scale_inv`. */
 std::string scale_name(const std::string& codes) { return codes + "_scale_inv"; }
 
+/* The paroquant base of a `.weight` tensor name -- the name its `.pairs`/`.theta`/`channel_scales`
+ * companions hang off -- or "" for a name that is not one. A rotated linear is a `.weight` with a
+ * `.pairs` beside it, so this is the whole test ckpt_resolve needs. */
+std::string paro_base_of(const std::string& n) {
+    return n.size() > 7 && n.compare(n.size() - 7, 7, ".weight") == 0
+               ? n.substr(0, n.size() - 7) : std::string();
+}
+
 }  /* namespace */
 
 std::string ckpt_tensor_of(const SrcTensor& t) {
@@ -821,6 +889,41 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
         for (size_t k = 0; k < srcs.size(); ++k) tried += (k ? " or " : "") + std::string(srcs[k].name);
         return refuse(RAD_E_NOTFOUND, "it needs one of " + tried + ", and " + ck.path() +
                                       " holds none of them");
+    }
+
+    /* A PAROQUANT LINEAR, when every piece's `.weight` has the rotation companions beside it. It
+     * is read into the core's own terms here and presented at its LOGICAL [N, K] -- the packed
+     * codes are 3K/4 bytes a row, not K -- so a recipe's quantiser sees the de-rotated f32 rows
+     * and never the codes. It is not trivial: only a recipe rule can decide it. */
+    if (!paro_base_of(out->pieces[0]->name).empty() &&
+        ck.find(paro_base_of(out->pieces[0]->name) + ".pairs")) {
+        if (out->concat_dim != 0)
+            return refuse(RAD_E_SHAPE, "'" + name + "' joins paroquant linears along a column");
+        out->paro.reserve(out->pieces.size());
+        int64_t cols0 = -1;
+        for (const SrcTensor* st : out->pieces) {
+            const std::string base = paro_base_of(st->name);
+            std::string w1;
+            auto p = std::make_shared<ParoLinear>();
+            const int rc = base.empty() ? RAD_E_FORMAT : ckpt_paro_read(ck, base, p.get(), &w1);
+            if (rc != RAD_OK)
+                return refuse(rc == RAD_E_NOTFOUND ? RAD_E_FORMAT : rc,
+                              "'" + name + "': " + (w1.empty() ? "a piece is not a paroquant "
+                                                                "linear" : w1));
+            if (cols0 < 0) cols0 = p->cols;
+            else if (p->cols != cols0)
+                return refuse(RAD_E_SHAPE, "'" + name + "' joins paroquant linears of different "
+                                           "column counts");
+            out->paro.push_back(std::move(p));
+        }
+        out->rank = 2;
+        out->shape[0] = 0;
+        for (const auto& p : out->paro) out->shape[0] += p->rows;
+        out->shape[1] = out->paro[0]->cols;
+        rad_enc_view(out->rank, out->shape, &out->rows, &out->cols);
+        out->trivial = false;
+        out->why = "its source is a paroquant_mxfp6 linear, which no recipe rule has quantised";
+        return RAD_OK;
     }
 
     /* THE LOGICAL SHAPE: the pieces joined along concat_dim, every other extent agreeing. */
@@ -926,6 +1029,22 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             rad_enc_add_plane(&out->enc, "codes", dt, 1, 1);
             rad_enc_add_plane(&out->enc, "scale", sdt, br, bc);
         }
+    } else if (dt == RAD_FP4E2M1 && scaled) {
+        /* OCP-MXFP4, the pair alias_mxfp4() made: e2m1 codes and one E8M0 exponent per 32 of K
+         * in each row. The block is one row tall, so pieces join along rows with no alignment
+         * condition; a join along columns would interleave two exponent grids and is not one. */
+        out->trivial = d == 0 || out->pieces.size() == 1;
+        if (!out->trivial) out->why = "its MXFP4 pieces are joined along a column";
+        for (size_t k = 0; k < out->pieces.size() && out->trivial; ++k) {
+            const SrcTensor& pk = *out->pieces[k];
+            const SrcTensor& sk = *out->scales[k];
+            if (sk.rad_dtype != RAD_E8M0 || pk.shape.size() != 2 || sk.shape.size() != 2 ||
+                sk.shape[0] != pk.shape[0] || pk.shape[1] % 32 || sk.shape[1] != pk.shape[1] / 32) {
+                out->trivial = false;
+                out->why = "'" + sk.name + "' is not the [rows][K/32] E8M0 plane of '" + pk.name + "'";
+            }
+        }
+        if (out->trivial) out->enc = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
     } else if (!unscaled) {
         out->why = "some of its pieces carry a scale plane and some do not";
     } else if (dt == RAD_F8E4M3 || dt == RAD_F8E5M2) {
@@ -1075,7 +1194,8 @@ int piece_f32(const SrcTensor& t, int64_t e, int64_t n, float* out) {
             }
             return RAD_OK;
         }
-        case RAD_F16: case RAD_F8E4M3: case RAD_F8E5M2: case RAD_FP4E2M1:
+        case RAD_F16: case RAD_F8E4M3: case RAD_F8E5M2:
+        case RAD_FP4E2M1: case RAD_E8M0:
         case RAD_I8: case RAD_U8: case RAD_I16: case RAD_I32: case RAD_U32: case RAD_U16:
             for (int64_t i = 0; i < n; ++i) out[i] = rad_load_f32(p, t.rad_dtype, e + i);
             return RAD_OK;
@@ -1092,6 +1212,22 @@ int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::
         return rc;
     };
     if (r0 < 0 || nr < 0 || r0 + nr > w.rows) return refuse(RAD_E_SHAPE, "rows out of range");
+    /* PAROQUANT: the pieces are rotated linears joined along rows; each is de-rotated to
+     * base-oriented f32 rows by the core's givens decoder. */
+    if (!w.paro.empty()) {
+        int64_t base = 0;
+        for (const std::shared_ptr<ParoLinear>& p : w.paro) {
+            const int64_t lo = std::max(r0, base), hi = std::min(r0 + nr, base + p->rows);
+            if (hi > lo) {
+                std::string w1;
+                const int st = ckpt_paro_rows_f32(*p, lo - base, hi - lo,
+                                                  out + (lo - r0) * w.cols, &w1);
+                if (st != RAD_OK) return refuse(st, w1);
+            }
+            base += p->rows;
+        }
+        return RAD_OK;
+    }
     Joined j;
     j.init(w.pieces, w.concat_dim);
     /* the runs come in order, so the cursor is the elements already written */
@@ -1161,7 +1297,8 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
     rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr, &pc);
     if (r0 < 0 || nr < 0 || r0 + nr > pr) return refuse(RAD_E_SHAPE, "plane rows out of range");
     const uint32_t dt = w.enc.plane[k].dtype;
-    const int64_t eb = rad_dtype_bits(dt) / 8;
+    const int64_t bits = rad_dtype_bits(dt);
+    const int64_t eb = bits / 8;
     uint8_t* o = (uint8_t*)dst;
     if (w.imported) {
         /* GPTQ-PACKED, RE-LAID: a row of codes is a column of the qweight, its words' bytes in
@@ -1197,9 +1334,9 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
         return RAD_OK;
     }
     if (k == 0) {
-        /* the codes: the pieces joined, bytes as they are. A sub-byte code (MXFP4) joins along
-         * rows of even width, so every run starts and ends on a byte. */
-        const int64_t bits = rad_dtype_bits(dt);
+        /* the codes: the pieces joined, bytes as they are. A sub-byte code (MXFP4's e2m1) is
+         * copied in whole bytes, which every run here is: a run starts and ends on a row, and a
+         * row of an even-K 4-bit plane is whole bytes. */
         Joined j;
         j.init(src, w.concat_dim);
         return j.walk(r0 * pc, (r0 + nr) * pc, [&](int p, int64_t e, int64_t n) {
@@ -1223,6 +1360,108 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
         base += sr;
     }
     return RAD_OK;
+}
+
+/* ================================================================== paroquant_mxfp6 */
+
+namespace {
+
+/* The rotation group width a published ParoQuant checkpoint uses: `group_size`, and the width the
+ * check performed below relies on -- `pairs` are a permutation of 0..127 inside each 128. */
+constexpr int64_t kParoGroup = 128;
+
+bool paro_rank2(const SrcTensor* t, int64_t* r, int64_t* c) {
+    if (t->shape.size() != 2) return false;
+    *r = t->shape[0];
+    *c = t->shape[1];
+    return true;
+}
+
+}  /* namespace */
+
+int ckpt_paro_read(Checkpoint& ck, const std::string& base, ParoLinear* out, std::string* why) {
+    auto refuse = [&](int rc, std::string m) {
+        if (why) *why = std::move(m);
+        return rc;
+    };
+    *out = ParoLinear{};
+    out->name = base;
+    const SrcTensor* w  = ck.find(base + ".weight");
+    const SrcTensor* ws = ck.find(base + ".weight_scale");
+    const SrcTensor* pa = ck.find(base + ".pairs");
+    const SrcTensor* th = ck.find(base + ".theta");
+    const SrcTensor* cs = ck.find(base + ".channel_scales");
+    if (!w || !ws || !pa || !th || !cs) {
+        std::string miss;
+        auto need = [&](const char* s, const SrcTensor* t) {
+            if (!t) miss += (miss.empty() ? "" : ", ") + std::string(s);
+        };
+        need(".weight", w); need(".weight_scale", ws); need(".pairs", pa);
+        need(".theta", th); need(".channel_scales", cs);
+        return refuse(RAD_E_NOTFOUND, "'" + base + "' is missing " + miss);
+    }
+    int64_t N = 0, wc = 0, sr = 0, sc = 0, S = 0, pc = 0, tr = 0, tc = 0;
+    if (w->rad_dtype != RAD_U8 || !paro_rank2(w, &N, &wc))
+        return refuse(RAD_E_FORMAT, "'" + w->name + "' is not a rank-2 u8 codes plane");
+    if (ws->rad_dtype != RAD_U8 || !paro_rank2(ws, &sr, &sc) || sr != N || sc < 1)
+        return refuse(RAD_E_FORMAT, "'" + ws->name + "' is not an [" + std::to_string(N) +
+                                    ", K/32] u8 scale plane for '" + w->name + "'");
+    const int64_t K = sc * 32;
+    if (wc * 4 != K * 3)
+        return refuse(RAD_E_FORMAT, "'" + w->name + "' holds " + std::to_string(wc) +
+                                    " bytes a row and " + std::to_string(K) +
+                                    " columns would pack into " + std::to_string(K * 3 / 4));
+    if (pa->rad_dtype != RAD_I16 || !paro_rank2(pa, &S, &pc) || S < 1 || pc != K)
+        return refuse(RAD_E_FORMAT, "'" + pa->name + "' is not an [S, " + std::to_string(K) +
+                                    "] i16 pairs plane");
+    if (th->rad_dtype != RAD_F16 || !paro_rank2(th, &tr, &tc) || tr != S || tc != K / 2)
+        return refuse(RAD_E_FORMAT, "'" + th->name + "' is not an [" + std::to_string(S) + ", " +
+                                    std::to_string(K / 2) + "] f16 angle plane");
+    if (cs->rad_dtype != RAD_F16 || cs->numel() != K)
+        return refuse(RAD_E_FORMAT, "'" + cs->name + "' is not a " + std::to_string(K) +
+                                    "-entry f16 channel scale plane");
+    if (K % kParoGroup || K % 2)
+        return refuse(RAD_E_SHAPE, "'" + base + "' has " + std::to_string(K) +
+                                   " columns, not a whole number of " +
+                                   std::to_string(kParoGroup) + "-wide rotation groups");
+
+    out->rows = N;
+    out->cols = K;
+    out->stages = S;
+    out->group = kParoGroup;
+    /* the codes and their MX scale are read as they are: the packed 6-bit bitstream is the ABI's
+     * own (lowest bits first along the row), and an E8M0 plane is a byte a group. They point into
+     * the checkpoint rather than being copied. */
+    out->code = w->data;
+    out->wscale = ws->data;
+    std::string t;
+    if (enc_givens_paro_tables(S, K, kParoGroup, (const int16_t*)pa->data, (const uint16_t*)th->data,
+                               (const uint16_t*)cs->data, &out->pairs, &out->angle,
+                               &out->tscale, &t) != RAD_OK)
+        return refuse(RAD_E_FORMAT, "'" + base + "': " + t);
+
+    rad_enc_clear(&out->enc);
+    rad_enc_copy_str(out->enc.scheme, "affine");
+    rad_enc_add_plane(&out->enc, "codes", RAD_FP6E2M3, 1, 1);
+    rad_enc_add_plane(&out->enc, "scale", RAD_E8M0, 1, 32);
+    rad_enc_add_table(&out->enc, "t.pairs", RAD_I32, S, K);
+    rad_enc_add_table(&out->enc, "t.angle", RAD_F32, S, K / 2);
+    rad_enc_add_table(&out->enc, "t.scale", RAD_F32, 1, K);
+    rad_enc_copy_str(out->enc.transform, "givens");
+    return RAD_OK;
+}
+
+int ckpt_paro_rows_f32(const ParoLinear& w, int64_t r0, int64_t nr, float* out,
+                       std::string* why) {
+    if (r0 < 0 || nr < 0 || r0 + nr > w.rows) {
+        if (why) *why = "paroquant rows out of range";
+        return RAD_E_SHAPE;
+    }
+    const void* p[RAD_ENC_MAX_PLANES] = {};
+    for (int k = 0; k < w.enc.n_planes && k < RAD_ENC_MAX_PLANES; ++k) p[k] = w.data(k);
+    EncodedView v;
+    enc_view(w.enc, w.rows, w.cols, p, &v);
+    return enc_decode_rows(v, r0, nr, out, why);
 }
 
 }  /* namespace rad */

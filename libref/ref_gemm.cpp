@@ -113,26 +113,39 @@ static void gemm_quant(const Mat& A, const Mat& B, const Scales& SA, const Scale
     const int64_t g = SB.group > 0 ? SB.group : K;
     const int64_t ngrp = (K + g - 1) / g;
     const bool coarse_a = !SA.p || SA.group >= g;
+    /* Must match `quant_dot` bit for bit: a folded mxfp4 weight folds 2^-dsh into each element as an
+     * E4M3 magnitude and applies 2^(Wref-127) once per row, so the row reference is hoisted and the
+     * codes folded per group. DB is a compile-time parameter, so the branch folds away for every
+     * other weight dtype. */
+    constexpr bool kMxfp4 = (DB == RAD_FP4E2M1);
+    const bool folded = kMxfp4 && SB.ref != nullptr;
 
     #pragma omp parallel for schedule(static)
     for (int64_t n = 0; n < N; ++n) {
         const int64_t b0 = n * B.rs;
+        const int wref_b = folded ? SB.wref_at(n) : 0;
+        const float rowfac = folded ? SB.row_factor(wref_b) : 1.0f;
         for (int64_t m = 0; m < M; ++m) {
             const int64_t a0 = m * A.rs;
             float acc = 0.0f;
             for (int64_t gi = 0; gi < ngrp; ++gi) {
                 const int64_t k0 = gi * g, k1 = (k0 + g < K) ? k0 + g : K;
-                const float sb = SB.p ? SB.grp(n, gi) : 1.0f;
+                const float sb = SB.p ? (folded ? rowfac : SB.grp(n, gi, wref_b)) : 1.0f;
+                const int dsh = folded ? SB.group_dsh(n, gi, wref_b) : 0;
                 float sub = 0.0f;
                 if (coarse_a) {
-                    for (int64_t k = k0; k < k1; ++k)
-                        sub += Cvt<DA>::ld(A.t->data, a0 + k * A.cs) *
-                               Cvt<DB>::ld(B.t->data, b0 + k * B.cs);
+                    for (int64_t k = k0; k < k1; ++k) {
+                        float bv = Cvt<DB>::ld(B.t->data, b0 + k * B.cs);
+                        if (folded) bv = SB.fold_mag(bv, dsh);
+                        sub += Cvt<DA>::ld(A.t->data, a0 + k * A.cs) * bv;
+                    }
                     acc += sub * (SA.p ? SA.at(m, k0) : 1.0f) * sb;
                 } else {
-                    for (int64_t k = k0; k < k1; ++k)
-                        sub += Cvt<DA>::ld(A.t->data, a0 + k * A.cs) * SA.at(m, k) *
-                               Cvt<DB>::ld(B.t->data, b0 + k * B.cs);
+                    for (int64_t k = k0; k < k1; ++k) {
+                        float bv = Cvt<DB>::ld(B.t->data, b0 + k * B.cs);
+                        if (folded) bv = SB.fold_mag(bv, dsh);
+                        sub += Cvt<DA>::ld(A.t->data, a0 + k * A.cs) * SA.at(m, k) * bv;
+                    }
                     acc += sub * sb;
                 }
             }
@@ -166,6 +179,7 @@ typedef void (*QuantFn)(const Mat&, const Mat&, const Scales&, const Scales&, co
             case RAD_I4:    return &gemm_quant<DA, RAD_I4>;          \
             case RAD_I2:    return &gemm_quant<DA, RAD_I2>;          \
             case RAD_FP4E2M1: return &gemm_quant<DA, RAD_FP4E2M1>;       \
+            case RAD_FP6E2M3: return &gemm_quant<DA, RAD_FP6E2M3>;       \
             case RAD_I8:    return &gemm_quant<DA, RAD_I8>;          \
             case RAD_F8E4M3:return &gemm_quant<DA, RAD_F8E4M3>;      \
             case RAD_BF16:  return &gemm_quant<DA, RAD_BF16>;        \
@@ -253,9 +267,25 @@ static int gemm_ntq_impl(const RadArgs* a, bool bias_operand) {
     if (numel(A) < M * K || numel(B) < N * K) return RAD_E_SHAPE;
     if (bias && numel(bias) < N) return RAD_E_SHAPE;
 
-    const bool mx = B->dtype == RAD_FP4E2M1;
+    /* An OCP-MX weight -- e2m1, e2m3 or an e4m3 plane scaled by an e8m0 grid (mxfp4a8, mxfp6a8,
+     * mxfp8a8) -- reads its b_scale as exponent bytes. `make_scales` turns that on ONLY when the
+     * scale stream is itself u8, so block-scaled fp8 is untouched: the checkpoint's weight_scale_inv
+     * is a bf16 plane and lands on the float read whatever this flag says. The no-fold rule is
+     * this: e2m3 and e4m3 codes are self-scaling, no `b_ref` is ever attached to them (the shape
+     * hook declines to describe one, and `scales_ref` needs the e8m0 grid the e4m3/bf16 pair never
+     * forms), and the folded path stays keyed to `db == RAD_FP4E2M1` in quant_dot and gemm_quant.
+     * DENSE INT5 (w5a8) rides this flag too, but its b_scale is f16 rather than u8, so `e8m0` stays
+     * false and the scale is read as a float; the flag is harmless there and keeps the "a block
+     * weight beside an integer/float code" reading in one place. */
+    const bool mx = B->dtype == RAD_FP4E2M1 || B->dtype == RAD_FP6E2M3 || B->dtype == RAD_F8E4M3 ||
+                    B->dtype == RAD_I5;
     Scales SA = make_scales(as_, M, K, false);
     Scales SB = make_scales(bs_, N, K, mx);
+    /* The OCP-MX fold's reference exponent, at operand 6 -- `gemm_nt_q`'s `a_sum`/`b_ref` trailing
+     * pair; the bias form has no such slot and no MX kernel. Attaching it makes the weight's block
+     * scale the device's saturated 2^(Wref-127-dsh); absent, `make_scales` reads the e8m0 plane
+     * directly and this call is exactly what it was before the fold existed. */
+    if (!bias_operand) scales_ref(SB, t_in(a, 6), N);
     /* `group` is in the schema and is what the SELECTOR matches on; the loop uses the group the
      * scale stream actually implies. They agree in every well-formed call, and where they do not
      * the stream is the one that describes the bytes. */

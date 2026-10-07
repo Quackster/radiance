@@ -136,6 +136,7 @@ struct PassStat {
     int64_t played = 0, recorded = 0, audited = 0;
     int64_t issued_unkeyed = 0, issued_refused = 0, issued_first = 0;
     int64_t dispatched = 0, unordered = 0;
+    int64_t evicted = 0, tape_cap = 0;   /* tapes evicted (summed); the per-rank capacity */
 };
 
 struct LiveSnapshot {

@@ -32,6 +32,7 @@
 
 #include "r4d_plugin.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -39,6 +40,77 @@
 
 #define ROW(a) (a), (int)(sizeof(a) / sizeof((a)[0]))
 #define NELEM(a) ((int)(sizeof(a) / sizeof((a)[0])))
+
+/* THE MX UNRELAYOUTS AND THE RECURRENT-GDN SHAPE HOOKS. They are declared in r4d_plugin.h for every
+ * family that had one when this file was last touched; these four do not yet appear there, and this
+ * file owns no header. `extern "C"` matches the definitions in r4d_layout.cpp and r4d_shapes.cpp
+ * (both are C-linkage hooks, exactly like the ones the header does declare). */
+extern "C" int r4d_rad_unrelayout_mxfp4(const RadParam*, int, int, const RadEncoding*, const int*,
+                                        const void*, int64_t, const RadTensor*, int);
+extern "C" int r4d_rad_unrelayout_mxfp4_gated(const RadParam*, int, int, const RadEncoding*,
+                                              const int*, const void*, int64_t, const RadTensor*, int);
+extern "C" int r4d_shape_gdn_recurrent_update(const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r4d_shape_gdn_conv_recurrent_update(const RadParam*, int, int, RadOpdDesc*);
+
+/* The MXFP8/MXFP6 device-side hooks. A1 owns the launch definitions; A2 owns the layout and
+ * unrelayout definitions in r4d_layout.cpp. r4d_plugin.h is not part of this task's file set, so the
+ * declarations live here beside the row that references them. */
+extern "C" int r4d_rad_gemm_mxfp8a8_m64(const RadArgs*, RadStream);
+extern "C" int r4d_rad_gemm_mxfp8a8_tiled(const RadArgs*, RadStream);
+extern "C" int r4d_rad_gemm_mxfp6a8_m64(const RadArgs*, RadStream);
+extern "C" int r4d_rad_gemm_mxfp6a8_tiled(const RadArgs*, RadStream);
+
+/* The DENSE int5 (w5a8) row's device and layout hooks. A separate family from the MX codebooks:
+ * the weight is a linear 5-bit integer, so it has its own kernel file and its own layout tag. */
+extern "C" int r4d_rad_gemm_w5a8a8_m64(const RadArgs*, RadStream);
+extern "C" int r4d_rad_gemm_w5a8a8_tiled(const RadArgs*, RadStream);
+extern "C" int r4d_rad_layout_w5a8(const RadParam*, int, int, const RadEncoding*, const int*,
+                                   const RadTensor*, int, RadLayout*);
+extern "C" int r4d_rad_relayout_w5a8(const RadParam*, int, int, const RadEncoding*, const int*,
+                                     const RadTensor*, int, void*, int64_t);
+extern "C" int r4d_rad_unrelayout_w5a8(const RadParam*, int, int, const RadEncoding*, const int*,
+                                       const void*, int64_t, const RadTensor*, int);
+
+extern "C" int r4d_rad_layout_mxfp8(const RadParam*, int, int, const RadEncoding*, const int*,
+                                    const RadTensor*, int, RadLayout*);
+extern "C" int r4d_rad_relayout_mxfp8(const RadParam*, int, int, const RadEncoding*, const int*,
+                                      const RadTensor*, int, void*, int64_t);
+extern "C" int r4d_rad_unrelayout_mxfp8(const RadParam*, int, int, const RadEncoding*, const int*,
+                                        const void*, int64_t, const RadTensor*, int);
+extern "C" int r4d_rad_layout_mxfp6(const RadParam*, int, int, const RadEncoding*, const int*,
+                                    const RadTensor*, int, RadLayout*);
+extern "C" int r4d_rad_relayout_mxfp6(const RadParam*, int, int, const RadEncoding*, const int*,
+                                      const RadTensor*, int, void*, int64_t);
+extern "C" int r4d_rad_unrelayout_mxfp6(const RadParam*, int, int, const RadEncoding*, const int*,
+                                        const void*, int64_t, const RadTensor*, int);
+
+/* THE INT4 LM_HEADS AND THE E4M3 SELECTOR. r4d_plugin.h is not part of this task's file set, so
+ * these declarations live here beside the rows that reference them, exactly like the MX ones above.
+ * The int4 layout hooks are defined in r4d_fp8_layout.cpp, the launch entries in
+ * r4d_gemm_fp8a16_nt_m1.hip, and the selector in r4d_dflash_select_bf16.hip / r4d_shapes.cpp. */
+extern "C" int r4d_rad_logits_gemm_i4(const RadArgs*, RadStream);
+extern "C" int r4d_rad_logits_gemm_u4g64(const RadArgs*, RadStream);
+extern "C" int r4d_rad_logits_gemm_u4g128(const RadArgs*, RadStream);
+extern "C" int r4d_rad_layout_i4_logits(const RadParam*, int, int, const RadEncoding*, const int*,
+                                        const RadTensor*, int, RadLayout*);
+extern "C" int r4d_rad_relayout_i4_logits(const RadParam*, int, int, const RadEncoding*, const int*,
+                                          const RadTensor*, int, void*, int64_t);
+extern "C" int r4d_rad_unrelayout_i4_logits(const RadParam*, int, int, const RadEncoding*,
+                                            const int*, const void*, int64_t, const RadTensor*, int);
+extern "C" int r4d_rad_layout_u4g64_logits(const RadParam*, int, int, const RadEncoding*, const int*,
+                                           const RadTensor*, int, RadLayout*);
+extern "C" int r4d_rad_relayout_u4g64_logits(const RadParam*, int, int, const RadEncoding*, const int*,
+                                             const RadTensor*, int, void*, int64_t);
+extern "C" int r4d_rad_unrelayout_u4g64_logits(const RadParam*, int, int, const RadEncoding*,
+                                               const int*, const void*, int64_t, const RadTensor*, int);
+extern "C" int r4d_rad_layout_u4g128_logits(const RadParam*, int, int, const RadEncoding*, const int*,
+                                            const RadTensor*, int, RadLayout*);
+extern "C" int r4d_rad_relayout_u4g128_logits(const RadParam*, int, int, const RadEncoding*, const int*,
+                                              const RadTensor*, int, void*, int64_t);
+extern "C" int r4d_rad_unrelayout_u4g128_logits(const RadParam*, int, int, const RadEncoding*,
+                                                const int*, const void*, int64_t, const RadTensor*, int);
+extern "C" int r4d_rad_dflash_select_q(const RadArgs*, RadStream);
+extern "C" int r4d_shape_dflash_select_q(const RadParam*, int, int operand, RadOpdDesc*);
 
 /* Parameter kinds, spelled once. A real-valued parameter is RAD_P_F64 (docs/OPS.md, "The four
  * rules"): eps, scale, theta, softplus_thr, l2_eps and wadd are all real, and round-tripping one
@@ -631,6 +703,19 @@ static const RadOperandSpec oDflashSelect[] = {
     { "succ",   RAD_OPD_WEIGHT, 0 },
     { "tokens", RAD_OPD_OUT,    0 },
 };
+/* The E4M3 codebooks, each followed by its f32 scale. A separate op and not a dtype on the above:
+ * the operand list differs and operands are positional (embed_lookup_q's argument). */
+static const RadOperandSpec oDflashSelectQ[] = {
+    { "cand",       RAD_OPD_IN,     0 },
+    { "unary",      RAD_OPD_IN,     0 },
+    { "hp",         RAD_OPD_IN,     1 },
+    { "anchor",     RAD_OPD_IN,     0 },
+    { "pred",       RAD_OPD_WEIGHT, 0 },
+    { "pred_scale", RAD_OPD_WEIGHT, 0 },
+    { "succ",       RAD_OPD_WEIGHT, 0 },
+    { "succ_scale", RAD_OPD_WEIGHT, 0 },
+    { "tokens",     RAD_OPD_OUT,    0 },
+};
 
 /* ------------------------------------------------------------------------------ collectives */
 static const RadParamSpec pAllReduce[] = {
@@ -710,21 +795,21 @@ static const RadParamSpec pGemmNtQ[] = {
     { "dtype", RAD_P_STR, RAD_REQUIRED },
 };
 /* docs/OPS.md's `gemm_nt_q` is `a`, `a_scale`, `b`w, `b_scale`w -> `y`. Two of libr4d's six
- * quantised GEMMs need a seventh operand each and neither is expressible as a weight aux stream,
- * because RadLayout can DECLARE aux streams beside a weight but RadArgs has no way to DELIVER
- * them to a launch:
+ * quantised GEMMs need a seventh operand each:
  *
  *   `a_sum`  the per-row per-group sum of the int8 activation codes, which the ASYMMETRIC 4-bit
  *            and the 2-bit grids subtract to remove the stored zero point. It is produced by
- *            `quant_act_i8`'s third output, so it is activation-side and could never have been a
- *            weight aux in the first place.
+ *            `quant_act_i8`'s third output, so it is activation-side and a plain input operand.
  *   `b_ref`  MXFP4's per-output-row reference exponent, against which the E8M0 block scale is
- *            folded so the inner loop has no rescale. This one IS a weight aux and is exactly the
- *            case RadLayout.aux_tag was written for -- it just cannot be passed.
+ *            folded so the inner loop has no rescale. It IS a real weight operand: rad_mx.h's
+ *            LinearMX declares it as a third view of the weight's E8M0 scale plane, the per-row
+ *            [N] reference the layout hook stores is what the shim reads as `Wref[nrow]`, and
+ *            `LinearMX::step` passes it at `RAD_W(wref)` (operand 6 here, 7 on the gated op). The
+ *            earlier "it just cannot be passed" note was wrong -- the ABI delivers it like any
+ *            other weight.
  *
  * Both are appended after `y` so OPS.md's list stays a positional prefix and ref is unaffected
- * until it implements a grid that needs them. That RadArgs cannot deliver a declared aux stream is
- * a genuine gap in the ABI, not a shortcut taken here. */
+ * until it implements a grid that needs them. */
 static const RadOperandSpec oGemmNtQ[] = {
     { "a",       RAD_OPD_IN,     0 },
     { "a_scale", RAD_OPD_IN,     1 },   /* absent for the f16-activation grids (w4a16, w8a16) */
@@ -733,6 +818,34 @@ static const RadOperandSpec oGemmNtQ[] = {
     { "y",       RAD_OPD_OUT,    0 },
     { "a_sum",   RAD_OPD_IN,     1 },
     { "b_ref",   RAD_OPD_WEIGHT, 1 },
+};
+
+/* `gemm_nt_q_paro` -- the partition-select form. A MERGED weight (a fused [gate|up], [q|k|v] or
+ * [in_proj_qkv|z]) run as ONE GEMM launch whose output columns take a different activation per
+ * partition, instead of P separate GEMMs. `a` covers columns below `pb1`, `a2` the columns at or
+ * past `pb1`, `a3` the columns at or past `pb2`; the boundaries are 16-aligned column offsets and an
+ * absent partition operand means the previous one extends to the next boundary. The two extra
+ * activation partitions and their per-row scales sit BETWEEN `a_scale` and the weight, which is the
+ * order the launch reads them in and why this is a new op rather than a flag on `gemm_nt_q`. */
+static const RadParamSpec pGemmNtQParo[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "N",     RAD_P_INT, RAD_REQUIRED },
+    { "K",     RAD_P_INT, RAD_REQUIRED },
+    { "group", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    { "pb1",   RAD_P_INT, RAD_OPTIONAL },   /* 16-aligned column offset; absent = no boundary */
+    { "pb2",   RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oGemmNtQParo[] = {
+    { "a",        RAD_OPD_IN,     0 },
+    { "a_scale",  RAD_OPD_IN,     0 },
+    { "a2",       RAD_OPD_IN,     1 },
+    { "a_scale2", RAD_OPD_IN,     1 },
+    { "a3",       RAD_OPD_IN,     1 },
+    { "a_scale3", RAD_OPD_IN,     1 },
+    { "b",        RAD_OPD_WEIGHT, 0 },
+    { "b_scale",  RAD_OPD_WEIGHT, 0 },
+    { "y",        RAD_OPD_OUT,    0 },
 };
 
 /* docs/OPS.md's `dequant` is activation-shaped (`M`(range) `n` `group` `dtype`). libr4d's
@@ -997,6 +1110,21 @@ static const RadOperandSpec oLogitRerank[] = {
     { "pairs",  RAD_OPD_OUT,    1 },
 };
 
+/* The DFlash2 verify head's SPARSE write: the target's own logits row, -inf everywhere except the
+ * R exactly-reranked candidates. `logits` is an OUTPUT and is overwritten whole -- the op fills it
+ * before it scatters, so nothing reads what was there. */
+static const RadParamSpec pLogitsScatter[] = {
+    { "M",         RAD_P_INT, RAD_REQUIRED },
+    { "R",         RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab",   RAD_P_INT, RAD_REQUIRED },
+    { "vocab_off", RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oLogitsScatter[] = {
+    { "idx",    RAD_OPD_IN,  0 },
+    { "val",    RAD_OPD_IN,  0 },
+    { "logits", RAD_OPD_OUT, 0 },
+};
+
 static const RadOperandSpec oRowTopkMerge[] = {
     { "gathered", RAD_OPD_IN,  0 },
     { "idx",      RAD_OPD_OUT, 0 },
@@ -1041,6 +1169,120 @@ static const RadOperandSpec oQuantActFp8[] = {
     { "x",     RAD_OPD_IN,  0 },
     { "q",     RAD_OPD_OUT, 0 },
     { "scale", RAD_OPD_OUT, 0 },
+};
+
+/* `quant_act_fp8_row` is a NEW OP and this plugin fixes its schema. It is quant_act_fp8 with the
+ * group dropped: one symmetric E4M3 scale per ROW rather than per (row, 128 columns), which is
+ * what the OCP-MX (mxfp4a8) GEMMs read -- their epilogue carries a single f32 per token, `As[m]`,
+ * and there is no per-128 group on the activation side. The same three operands as quant_act_fp8;
+ * there is no `group` parameter because the group is the whole row by the op's meaning. */
+static const RadParamSpec pQuantActFp8Row[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+
+/* `paroquant_quant_fp8_row` is the PATH-A PRODUCER and this plugin fixes its schema. It rotates a
+ * bf16 activation into a still-rotated ParoQuant weight's stored domain and then quantises it to
+ * E4M3 with one f32 scale per row -- the activation a `mxfp6a8` GEMM reads when its weight is a
+ * `paroquant` affine encoding whose `givens` tables this op consumes. `stages` is the Givens depth
+ * S (one per `t.pairs` row) and must be a parameter because the table extents are not derivable
+ * from `M`/`n`. The three tables are WEIGHT operands: they belong to the same logical weight the
+ * consuming GEMM reads and are cached with it, not fed per call. See r4d_paroquant_quant_fp8_row.hip
+ * and PAROQUANT-PATH-A-PLAN.md. */
+static const RadParamSpec pParoquantQuantFp8Row[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "n",      RAD_P_INT, RAD_REQUIRED },
+    { "stages", RAD_P_INT, RAD_REQUIRED },
+    { "dtype",  RAD_P_STR, RAD_REQUIRED },
+    { "k_base", RAD_P_INT, 0 },   /* this rank's first column of the full K the pairs index */
+};
+static const RadOperandSpec oParoquantQuantFp8Row[] = {
+    { "x",       RAD_OPD_IN,     0 },
+    { "pairs",   RAD_OPD_WEIGHT, 0 },
+    { "angle",   RAD_OPD_WEIGHT, 0 },
+    { "t_scale", RAD_OPD_WEIGHT, 0 },
+    { "q",       RAD_OPD_OUT,    0 },
+    { "scale",   RAD_OPD_OUT,    0 },
+};
+/* The P=2 multi-partition producer: one launch rotates a shared input into gate_proj and up_proj
+ * (or the delta net's in_proj_qkv and in_proj_z), which have different rotations. Operands are
+ * input, then 3 weights a partition, then 2 outputs a partition -- inputs, weights, outputs. */
+static const RadParamSpec pParoquantQuantFp8RowMulti2[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "n",      RAD_P_INT, RAD_REQUIRED },
+    { "stages", RAD_P_INT, RAD_REQUIRED },
+    { "dtype",  RAD_P_STR, RAD_REQUIRED },
+    { "P",      RAD_P_INT, RAD_REQUIRED },
+    { "k_base", RAD_P_INT, 0 },
+};
+static const RadOperandSpec oParoquantQuantFp8RowMulti2[] = {
+    { "x",        RAD_OPD_IN,     0 },
+    { "pairs0",   RAD_OPD_WEIGHT, 0 },
+    { "angle0",   RAD_OPD_WEIGHT, 0 },
+    { "t_scale0", RAD_OPD_WEIGHT, 0 },
+    { "pairs1",   RAD_OPD_WEIGHT, 0 },
+    { "angle1",   RAD_OPD_WEIGHT, 0 },
+    { "t_scale1", RAD_OPD_WEIGHT, 0 },
+    { "q0",       RAD_OPD_OUT,    0 },
+    { "scale0",   RAD_OPD_OUT,    0 },
+    { "q1",       RAD_OPD_OUT,    0 },
+    { "scale1",   RAD_OPD_OUT,    0 },
+};
+
+/* The FUSED path-A producers (libr4d/r4d_paroquant_fused_row.hip): the fused row op the MX family
+ * already runs, with the Givens rotation and the per-row E4M3 quantiser folded into the same launch
+ * once per consumer partition. They exist to remove the per-linear producer LAUNCH that dominates
+ * path A's decode cost -- the arithmetic is the standalone producer's, byte for byte. Operands are
+ * the fused op's (input, optional residual, norm gain for the norm form) followed by P x
+ * {pairs, angle, t_scale} weight views and P x {q, scale} outputs. One schema per arity because the
+ * operand list is fixed. */
+static const RadParamSpec pParoquantFusedQuantFp8Row[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "n",      RAD_P_INT, RAD_REQUIRED },
+    { "stages", RAD_P_INT, RAD_REQUIRED },
+    { "dtype",  RAD_P_STR, RAD_REQUIRED },
+    { "P",      RAD_P_INT, RAD_REQUIRED },
+    { "k_base", RAD_P_INT, 0 },
+    P_F64("eps"),
+    P_F64O("wadd"),
+    { "act",    RAD_P_STR, RAD_OPTIONAL },   /* gated form only: silu (default) or sigmoid */
+    { "no_rot", RAD_P_INT, 0 },              /* DIAGNOSTIC only: skip the Givens stages */
+};
+static const RadOperandSpec oParoquantRmsnormQuantFp8Row2[] = {
+    { "x", RAD_OPD_IN, 0 }, { "res", RAD_OPD_INOUT, 1 }, { "w", RAD_OPD_WEIGHT, 0 },
+    { "pairs0", RAD_OPD_WEIGHT, 0 }, { "angle0", RAD_OPD_WEIGHT, 0 }, { "t_scale0", RAD_OPD_WEIGHT, 0 },
+    { "pairs1", RAD_OPD_WEIGHT, 0 }, { "angle1", RAD_OPD_WEIGHT, 0 }, { "t_scale1", RAD_OPD_WEIGHT, 0 },
+    { "q0", RAD_OPD_OUT, 0 }, { "scale0", RAD_OPD_OUT, 0 },
+    { "q1", RAD_OPD_OUT, 0 }, { "scale1", RAD_OPD_OUT, 0 },
+    { "y", RAD_OPD_OUT, 1 },
+};
+static const RadOperandSpec oParoquantRmsnormQuantFp8Row3[] = {
+    { "x", RAD_OPD_IN, 0 }, { "res", RAD_OPD_INOUT, 1 }, { "w", RAD_OPD_WEIGHT, 0 },
+    { "pairs0", RAD_OPD_WEIGHT, 0 }, { "angle0", RAD_OPD_WEIGHT, 0 }, { "t_scale0", RAD_OPD_WEIGHT, 0 },
+    { "pairs1", RAD_OPD_WEIGHT, 0 }, { "angle1", RAD_OPD_WEIGHT, 0 }, { "t_scale1", RAD_OPD_WEIGHT, 0 },
+    { "pairs2", RAD_OPD_WEIGHT, 0 }, { "angle2", RAD_OPD_WEIGHT, 0 }, { "t_scale2", RAD_OPD_WEIGHT, 0 },
+    { "q0", RAD_OPD_OUT, 0 }, { "scale0", RAD_OPD_OUT, 0 },
+    { "q1", RAD_OPD_OUT, 0 }, { "scale1", RAD_OPD_OUT, 0 },
+    { "q2", RAD_OPD_OUT, 0 }, { "scale2", RAD_OPD_OUT, 0 },
+    { "y", RAD_OPD_OUT, 1 },
+};
+/* The gated fused producer takes no norm and so no eps/wadd; its own param list keeps the schema
+ * from demanding a parameter it never reads. */
+static const RadParamSpec pParoquantGatedFusedQuantFp8Row[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "n",      RAD_P_INT, RAD_REQUIRED },
+    { "stages", RAD_P_INT, RAD_REQUIRED },
+    { "dtype",  RAD_P_STR, RAD_REQUIRED },
+    { "P",      RAD_P_INT, RAD_REQUIRED },
+    { "k_base", RAD_P_INT, 0 },
+    { "act",    RAD_P_STR, RAD_OPTIONAL },
+};
+static const RadOperandSpec oParoquantGatedQuantFp8Row1[] = {
+    { "gu", RAD_OPD_IN, 0 },
+    { "pairs0", RAD_OPD_WEIGHT, 0 }, { "angle0", RAD_OPD_WEIGHT, 0 }, { "t_scale0", RAD_OPD_WEIGHT, 0 },
+    { "q0", RAD_OPD_OUT, 0 }, { "scale0", RAD_OPD_OUT, 0 },
+    { "gu2", RAD_OPD_IN, 1 },   /* optional: up in its own [M][n] buffer, no merged [gate|up] */
 };
 
 /* `gram_accum` is a NEW OP and this plugin fixes its schema. It is the calibration half of GPTQ:
@@ -1310,6 +1552,22 @@ static const RadOperandSpec oArRmsNormQuantFp8[] = {
     { "out_bf16", RAD_OPD_OUT,    1 },
 };
 
+/* THE PER-ROW (OCP-MX) TWIN. Same operands in the same order as the group=128 fused all-reduce
+ * above -- an architecture that switches activation format changes the op name and the `scale`
+ * extent, not the operand order -- and the one parameter difference is the absent `group`, which
+ * the whole-row quantiser has no use for. `wire` is optional and only a caller that wants the
+ * rotated 6-bit payload names it. The MX blocks (rad_mx.h) declare exactly this set: M, n, eps,
+ * world_size, dtype, wadd, and wire on the compressed form. */
+static const RadParamSpec pArRmsNormQuantFp8Row[] = {
+    { "M",          RAD_P_INT, RAD_REQUIRED },
+    { "n",          RAD_P_INT, RAD_REQUIRED },
+    P_F64("eps"),
+    { "world_size", RAD_P_INT, RAD_REQUIRED },
+    { "dtype",      RAD_P_STR, RAD_REQUIRED },
+    P_F64O("wadd"),
+    { "wire",       RAD_P_INT, RAD_OPTIONAL },   /* 0 = exact bf16, 6 = rotated 6-bit */
+};
+
 static const RadParamSpec pGatedQuantFp8[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -1353,6 +1611,38 @@ static const RadOperandSpec oGemmNtQGated[] = {
     { "out_bf16", RAD_OPD_OUT,    1 },
 };
 
+/* THE OCP-MX (mxfp4a8) FORM, AND IT IS A NEW OP RATHER THAN A dtype ON gemm_nt_q_gated. The MX
+ * weight carries an EIGHTH operand `b_ref` -- the per-output-row reference exponent the E8M0 block
+ * scale is folded against (r4d_layout.cpp's Q_BREF) -- and operand lists are positional with an
+ * EXACT arity check at issue (core/runtime/issue.cpp): appending a slot to gemm_nt_q_gated would
+ * turn every existing 7-operand caller (arch/common/rad_block_mlp_fp8.h, rad_block_dflash2.h,
+ * rad_block_dspark.h, tests/ref_test.cpp) into a living arity error. `gemm_nt_q` carries b_ref only
+ * because it was declared with the slot from the start. So this is the op the MX grid needs: the
+ * same producer operands in the same order, with `b_ref` appended after the quantiser's outputs,
+ * and no `group` -- the group is the whole row by the op's meaning, exactly as in
+ * quant_act_fp8_row / gated_quant_fp8_row. `act` is REQUIRED for the reason gemm_nt_q_gated gives:
+ * only silu is compiled, and an optional parameter would let the row resolve for a gate it cannot
+ * serve. */
+static const RadParamSpec pGemmNtQGatedMx[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "N",     RAD_P_INT, RAD_REQUIRED },
+    { "K",     RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    { "act",   RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oGemmNtQGatedMx[] = {
+    { "a",        RAD_OPD_IN,     0 },
+    { "a_scale",  RAD_OPD_IN,     0 },
+    { "b",        RAD_OPD_WEIGHT, 0 },
+    { "b_scale",  RAD_OPD_WEIGHT, 0 },
+    { "q",        RAD_OPD_OUT,    0 },
+    { "scale",    RAD_OPD_OUT,    0 },
+    { "out_bf16", RAD_OPD_OUT,    1 },
+    { "b_ref",    RAD_OPD_WEIGHT, 1 },   /* optional at the ABI, REQUIRED by the shim: the fold
+                                          * has no reference without it, and the loader's union
+                                          * rule wants the same flag every plugin declares. */
+};
+
 static const RadParamSpec pGateQuantFp8[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -1366,6 +1656,31 @@ static const RadOperandSpec oGateQuantFp8[] = {
     { "q",        RAD_OPD_OUT, 0 },
     { "scale",    RAD_OPD_OUT, 0 },
     { "out_bf16", RAD_OPD_OUT, 1 },
+};
+
+/* THE PER-ROW (OCP-MX) FORMS. Same operands in the same order as the group=128 fusions above -- an
+ * architecture that switches activation format changes op names and not operand order -- and the
+ * one difference is the `scale` output, which is [M][1] rather than [M][ceil(n/128)]. There is no
+ * `group` parameter: the group is the whole row by the op's meaning, exactly as in
+ * `quant_act_fp8_row`. */
+static const RadParamSpec pRmsNormQuantFp8Row[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    P_F64("eps"),
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    P_F64O("wadd"),
+};
+static const RadParamSpec pGatedQuantFp8Row[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    P_STRO("act"),
+};
+static const RadParamSpec pGateQuantFp8Row[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    P_STRO("act"),
 };
 
 /* `sample_chain` is a NEW OP, and it is NOT docs/OPS.md's eight-op sampler chain
@@ -2018,6 +2333,10 @@ static const RadOpSchema kSchemas[] = {
            "positions, and the greedy walk that turns a block of independent top-k sets into one "
            "path. Only the K edges leaving the previous pick are scored, because the walk is "
            "serial and the other K-1 rows of the score matrix are never read."),
+    SCHEMA("dflash_select_q", pDflashSelect, oDflashSelectQ,
+           "dflash_select over codebooks held as E4M3 codes with an f32 scale a row (or one for the "
+           "table): codebook[v][r] = codes[v][r] * scale[v]. The same walk and the same guards, at "
+           "half the bytes of the bf16 codebooks."),
     SCHEMA("all_reduce", pAllReduce, oAllReduce,
            "sum over the tensor-parallel group. `exact` separates the exact sum from the "
            "quantised wire and a caller that does not declare it gets no kernel. At 4 and 8 ranks "
@@ -2032,8 +2351,14 @@ static const RadOpSchema kSchemas[] = {
            "C[M,N] = A[M,K] @ B[N,K]^T, unquantised."),
     SCHEMA("gemm_nt_q", pGemmNtQ, oGemmNtQ,
            "C[M,N] = A[M,K] @ dequant(Bq)[N,K]^T. `dtype` names the operand COMBINATION, so one "
-           "op covers w4a16 through mxfp4a8 and an architecture plugin that changes quant changes "
+           "op covers w4a16 through mxfp8a8/mxfp6a8 and an architecture plugin that changes quant changes "
            "one string."),
+    SCHEMA("gemm_nt_q_paro", pGemmNtQParo, oGemmNtQParo,
+           "C[M,N] = A_part[M,K] @ dequant(Bq)[N,K]^T over a MERGED weight, where each output-column "
+           "partition reads a different activation: columns below `pb1` use `a`, columns at or past "
+           "`pb1` use `a2`, and columns at or past `pb2` use `a3`. `pb1` and `pb2` are 16-aligned "
+           "column offsets and an absent partition operand means the previous one extends to the "
+           "next boundary. One launch instead of P separate GEMMs."),
     SCHEMA("dequant_w4", pDequantW4, oDequantW4,
            "a packed 4-bit fragment-ordered weight back to row-major bf16."),
     SCHEMA("scale_rows", pScaleRows, oScaleRows,
@@ -2116,6 +2441,12 @@ static const RadOpSchema kSchemas[] = {
            "row_topk reports them, `vocab_off` is this rank's first column, and an id outside its "
            "rows becomes a pad. Ties break on the LOWER id, the rule row_topk and row_topk_merge "
            "use, so a tie inside a shard and one between shards resolve alike."),
+    SCHEMA("logits_scatter", pLogitsScatter, oLogitsScatter,
+           "fills an [M, n_vocab] f32 logits row with -inf and scatters the R exactly-reranked "
+           "(global id, value) pairs into it -- the sparse row the sampler then reads. `vocab_off` "
+           "is this rank's first global column and an id outside its rows is dropped, the same "
+           "vocab-parallel contract row_topk and logit_rerank use; the safe-sampling gate that "
+           "makes a sparse row admissible is the batch's, not this op's."),
     SCHEMA("rmsnorm_quant_fp8", pRmsNormQuantFp8, oRmsNormQuantFp8,
            "RMS norm and the fp8 activation quantiser in one pass over the row. The bf16 norm "
            "output the unfused pair wrote is still written, and the codes are taken over it."),
@@ -2135,11 +2466,60 @@ static const RadOpSchema kSchemas[] = {
            "rather than a second numerical path."),
     SCHEMA("gate_quant_fp8", pGateQuantFp8, oGateQuantFp8,
            "the same, with the gate in its own operand rather than packed beside x."),
+    SCHEMA("gemm_nt_q_gated_mx", pGemmNtQGatedMx, oGemmNtQGatedMx,
+           "gemm_nt_q over a [2n, K] OCP-MXFP4 gate_up plane with gated_quant_fp8_row's pass folded "
+           "into the epilogue: silu(gate)*up, rounded to bf16, then the whole-row E4M3 quantiser. "
+           "`N` is the WEIGHT's rows, twice the fused width; the output is [M, N/2] with one f32 "
+           "scale per row. `b_ref` is the per-output-row reference exponent the E8M0 block scale is "
+           "folded against. Byte-identical to gemm_nt_q(mxfp4a8) followed by gated_quant_fp8_row "
+           "WHEN that GEMM runs its untuned auto configuration: this row declares no tunables, so "
+           "it always resolves cfg_for()'s default, and a pinned tune on gemm_mxfp4a8_nt_m64 would "
+           "move that row's last bits away from it."),
+    SCHEMA("rmsnorm_quant_fp8_row", pRmsNormQuantFp8Row, oRmsNormQuantFp8,
+           "the per-row (OCP-MX) form of rmsnorm_quant_fp8: the same producer operands, with "
+           "quant_act_fp8_row's whole-row scale in `scale` [M][1] instead of a per-128 group "
+           "plane. The bf16 norm output is still written and the codes are taken over it."),
+    SCHEMA("gated_quant_fp8_row", pGatedQuantFp8Row, oGatedQuantFp8,
+           "the per-row form of gated_quant_fp8: silu(a)*b or sigmoid(a)*b, then the whole-row "
+           "quantiser, with `scale` [M][1]."),
+    SCHEMA("gate_quant_fp8_row", pGateQuantFp8Row, oGateQuantFp8,
+           "the per-row form of gate_quant_fp8: the gate in its own operand, then the whole-row "
+           "quantiser, with `scale` [M][1]."),
     SCHEMA("quant_act_fp8", pQuantActFp8, oQuantActFp8,
-           "per-(row, `group`-column) symmetric E4M3 quantisation of a token-major activation, in "
-           "PLAIN ROW-MAJOR order rather than quant_act_i8's fragment order. The scale is "
-           "amax/448 -- a DEQUANT multiplier, the same sense as the checkpoint's "
-           "weight_scale_inv, so the fp8 GEMMs multiply both scales and never divide."),
+            "per-(row, `group`-column) symmetric E4M3 quantisation of a token-major activation, in "
+            "PLAIN ROW-MAJOR order rather than quant_act_i8's fragment order. The scale is "
+            "amax/448 -- a DEQUANT multiplier, the same sense as the checkpoint's "
+            "weight_scale_inv, so the fp8 GEMMs multiply both scales and never divide."),
+    SCHEMA("quant_act_fp8_row", pQuantActFp8Row, oQuantActFp8,
+            "per-ROW symmetric E4M3 quantisation of a token-major activation, in PLAIN ROW-MAJOR "
+            "order with a single f32 scale per row (amax/448, a DEQUANT multiplier). quant_act_fp8 "
+            "at a group of the whole row: the OCP-MX (mxfp4a8) GEMMs read their activation with one "
+            "scale per token and no per-128 group, and the constraint system has no param-eq-param "
+            "predicate, so `group == n` is a new op rather than a parameter on quant_act_fp8."),
+    SCHEMA("paroquant_quant_fp8_row", pParoquantQuantFp8Row, oParoquantQuantFp8Row,
+           "the PATH-A producer: rotate a bf16 activation into a still-rotated ParoQuant weight's "
+           "stored domain (divide by t_scale, then the Givens stages ascending and transposed), "
+           "then per-ROW symmetric E4M3 quantisation with one f32 scale per row (amax/448). The "
+           "three rotation tables are weight operands of the weight the consuming GEMM reads."),
+    SCHEMA("paroquant_quant_fp8_row_multi2", pParoquantQuantFp8RowMulti2,
+           oParoquantQuantFp8RowMulti2,
+           "the PATH-A producer for TWO consumers of one input: rotate a shared bf16 activation into "
+           "two differently-rotated domains in ONE launch (MLP gate|up, the delta net's "
+           "in_proj_qkv|z), each partition's arithmetic the single producer's. `P` is 2."),
+    SCHEMA("paroquant_rmsnorm_quant_fp8_row2", pParoquantFusedQuantFp8Row,
+           oParoquantRmsnormQuantFp8Row2,
+           "the PATH-A producer FUSED INTO THE NORM: one rmsnorm(+residual add) over a bf16 row and "
+           "TWO consumers' rotations+quantisers in the SAME launch -- what gate|up of an MLP (and "
+           "in_proj_qkv|z of the delta net) read, with no separate producer launch. `P` is 2."),
+    SCHEMA("paroquant_rmsnorm_quant_fp8_row3", pParoquantFusedQuantFp8Row,
+           oParoquantRmsnormQuantFp8Row3,
+           "the same fused norm producer for THREE consumers of one normed row -- attention's "
+           "q, k and v, which carry three rotations. `P` is 3."),
+    SCHEMA("paroquant_gated_quant_fp8_row1", pParoquantGatedFusedQuantFp8Row,
+           oParoquantGatedQuantFp8Row1,
+           "the PATH-A producer FUSED INTO THE GATED PRODUCT: silu(gate)*up (or sigmoid) and ONE "
+           "consumer's rotation+quantiser in the SAME launch -- the MLP down projection's input. "
+           "`P` is 1."),
     SCHEMA("quant_act_i8g", pQuantActFp8, oQuantActFp8,
            "quant_act_fp8 at INT8 codes: per-(row, `group`-column) symmetric int8, PLAIN ROW-MAJOR, "
            "the scale amax/127 and a code the value over it rounded to nearest-even. What the int8 "
@@ -2228,6 +2608,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("ar_rmsnorm_quant_fp8", pArRmsNormQuantFp8, oArRmsNormQuantFp8,
            "the two-rank all-reduce and the residual add, RMS norm and block-scaled fp8 "
            "quantisation that always follow it, in one kernel. Both wires."),
+    SCHEMA("ar_rmsnorm_quant_fp8_row", pArRmsNormQuantFp8Row, oArRmsNormQuantFp8,
+           "the per-row (OCP-MX) twin: the same all-reduce + residual add + RMS norm, with "
+           "quant_act_fp8_row's whole-row quantiser and one f32 scale per row in `scale` [M, 1]. "
+           "The tail arithmetic is rmsnorm_quant_fp8_row's, run after the reduction. Both wires."),
     SCHEMA("ar_hc_write", pArHcWrite, oArHcWrite,
            "the all-reduce and the gated residual's write that follows it, in one kernel. Both "
            "wires at two ranks, the exact one at four."),
@@ -2652,14 +3036,17 @@ static const RadConstraint cMoeGather[] = {
 static const RadConstraint cRowTopK[] = {
     C_DIV("N", 8), C_GE("M", 1), C_GE("R", 1), C_LE("R", 1024), C_IN("dtype", "bf16"),
 };
-/* R <= 32 is stage 2's PT, and the merge carries the same one for the same reason: a lane holds
+/* R <= 128 is stage 2's PT, and the merge carries the same one for the same reason: a lane holds
  * the whole answer, so no distribution of the candidates over lanes can lose one. */
 static const RadConstraint cRowTopKMerge[] = {
-    C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_GE("world_size", 1), C_IN("dtype", "bf16"),
+    C_GE("M", 1), C_GE("R", 1), C_LE("R", 128), C_GE("world_size", 1), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cLogitRerank[] = {
-    C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_GE("n_vocab", 1), C_GE("n_embd", 1),
+    C_GE("M", 1), C_GE("R", 1), C_LE("R", 128), C_GE("n_vocab", 1), C_GE("n_embd", 1),
     C_IN("dtype", "bf16"),
+};
+static const RadConstraint cLogitsScatter[] = {
+    C_GE("M", 1), C_GE("R", 1), C_LE("R", 128), C_GE("n_vocab", 1),
 };
 static const RadConstraint cGemmNt[] = {
     C_LE("M", 16), C_DIV("K", 256), C_IN("dtype", "bf16"),
@@ -2690,6 +3077,60 @@ static const RadConstraint cGemmNtW4A8[] = {
 };
 static const RadConstraint cGemmNtMxfp4A8[] = {
     C_LE("M", 64), C_DIV("K", 32), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
+};
+/* BAND EDGES FOR gemm_nt_q, carried by a row that can never be selected.
+ * core/plugin/bands.cpp takes its bucket boundaries from the LE/GE/EQ values of EVERY row of the op,
+ * and the constraints of one row are AND-ed -- so an edge cannot ride on a real row without narrowing
+ * what that row serves (an `M <= 16` on the decode row made it serve M <= 16 only, and M 17..64 fell
+ * to the tiled kernel: 4-5x slower GEMM). The edges live here instead, beside a dtype no tensor has,
+ * so this row matches nothing and only contributes its numbers to the band table.
+ * They split (8, 64] into (8, 16], (16, 32], (32, 48], (48, 64] and (64, max] into (64, 128],
+ * (128, 256], (256, 512], (512, 1024], (1024, 2048] and the open top. The native decode/tiled rows
+ * do not read the band (their ks / bk / tn / dec rules run on the actual M), so a band
+ * with no tune line launches exactly as before; the tiled row's `dec`/`tn` axes are tuned per
+ * band. The ordinary M constraints already present on real rows (M <= 8, M <= 16, M <= 64, M >= 65)
+ * contribute their own edges to the same table. */
+static const RadConstraint cGemmNtQBands[] = {
+    C_IN("dtype", "__bands__"),
+    C_LE("M", 16), C_LE("M", 32), C_LE("M", 48),
+    C_LE("M", 128), C_LE("M", 256), C_LE("M", 512), C_LE("M", 1024), C_LE("M", 2048),
+};
+/* Never launched: nothing selects the row (its dtype matches no tensor), and a caller that reached it
+ * anyway is refused rather than silently running something else. */
+static int r4d_rad_bands_only(const RadArgs*, RadStream) { return RAD_E_UNSUPPORTED; }
+/* MXFP8 and MXFP6 use the same entry bands as MXFP4. The OCP group is fixed at 32 by the format and
+ * enforced by their layout hooks; no b_ref is accepted for these two dtypes. */
+static const RadConstraint cGemmNtMxfp8A8[] = {
+    C_LE("M", 64), C_DIV("K", 32), C_DIV("N", 16), C_IN("dtype", "mxfp8a8"),
+};
+static const RadConstraint cGemmNtMxfp8A8Tiled[] = {
+    C_GE("M", 65), C_DIV("K", 32), C_DIV("N", 16), C_IN("dtype", "mxfp8a8"),
+};
+static const RadConstraint cGemmNtMxfp6A8[] = {
+    C_LE("M", 64), C_DIV("K", 32), C_DIV("N", 16), C_IN("dtype", "mxfp6a8"),
+};
+static const RadConstraint cGemmNtMxfp6A8Tiled[] = {
+    C_GE("M", 65), C_DIV("K", 32), C_DIV("N", 16), C_IN("dtype", "mxfp6a8"),
+};
+/* The partition-select (paro) rows: the same two bands and the same MXFP6 entry rules, over
+ * `gemm_nt_q_paro`'s merged-weight operand list. The `pb1`/`pb2` boundaries are validated in the
+ * launch (16-aligned, or absent), not here, because an absent optional is not a geometry the table
+ * reads. */
+static const RadConstraint cGemmNtMxfp6A8Paro[] = {
+    C_LE("M", 64), C_DIV("K", 32), C_DIV("N", 16), C_IN("dtype", "mxfp6a8"),
+};
+static const RadConstraint cGemmNtMxfp6A8ParoTiled[] = {
+    C_GE("M", 65), C_DIV("K", 32), C_DIV("N", 16), C_IN("dtype", "mxfp6a8"),
+};
+/* The DENSE int5 (w5a8) row. Same entry bands as MXFP4/6/8 -- a decode row at M <= 64 and a tiled
+ * row above it -- but the weight is a linear signed 5-bit integer (RAD_I5) on a per-32 f16
+ * scale grid rather than an OCP float code, so it is its own dtype and does not share the MX layout tag.
+ * No b_ref is accepted: integer magnitude is in the code and the group exponent is the only scale. */
+static const RadConstraint cGemmNtW5A8[] = {
+    C_LE("M", 64), C_DIV("K", 32), C_DIV("N", 16), C_IN("dtype", "w5a8"),
+};
+static const RadConstraint cGemmNtW5A8Tiled[] = {
+    C_GE("M", 65), C_DIV("K", 32), C_DIV("N", 16), C_IN("dtype", "w5a8"),
 };
 /* ---- block-scaled fp8 -------------------------------------------------------------------------
  *
@@ -2734,6 +3175,23 @@ static const RadConstraint cGemmNtI8A8Tiled[] = {
  * row here makes. */
 static const RadConstraint cQuantActFp8[] = {
     C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
+};
+/* The per-row form: n a multiple of 4 (a thread owns four columns, so the store is one dword),
+ * no group -- the group is the whole row by the op's meaning -- and a bf16 input. */
+static const RadConstraint cQuantActFp8Row[] = {
+    C_DIV("n", 4), C_IN("dtype", "bf16"),
+};
+/* The rotated producer: the ParoQuant rotation group is 128 wide, so `n` is a whole number of them
+ * (a stage cannot straddle a row end -- the pairs are group-local), a bf16 input, and at least one
+ * Givens stage. */
+static const RadConstraint cParoquantQuantFp8Row[] = {
+    C_DIV("n", 128), C_DIV("stages", 1), C_IN("dtype", "bf16"),
+};
+/* The FUSED producers take the standalone producer's shape rules -- the rotation group is 128 wide
+ * and the input is bf16 -- and add nothing else: P is a count of the operands the schema already
+ * fixes, so it needs no constraint. */
+static const RadConstraint cParoquantFusedQuantFp8Row[] = {
+    C_DIV("n", 128), C_DIV("stages", 1), C_IN("dtype", "bf16"),
 };
 /* The rotated form wants n DIVISIBLE BY THE GROUP, not merely by 4. A rotation block cannot
  * straddle the end of a row: the ragged tail the unrotated kernel writes zero-padded would mix
@@ -2802,6 +3260,14 @@ static const RadConstraint cArRmsNormQuantFp8[] = {
     C_EQ("world_size", 2),
     C_P2P,
 };
+/* The per-row twin: the all-reduce's `n DIV 8` and `world_size 2`, and no `group` -- the group is
+ * the whole row. The wire-6 chunk rule (n a multiple of 512) is not a constraint here, for the
+ * same reason it is not on cArRmsNormQuantFp8: it depends on which wire the caller names, and the
+ * shim refuses a shape the named wire cannot tile rather than claiming a band it cannot serve. */
+static const RadConstraint cArRmsNormQuantFp8Row[] = {
+    C_DIV("n", 8), C_IN("dtype", "bf16"), C_EQ("world_size", 2),
+    C_P2P,
+};
 /* hc_write's own bounds plus the all-reduce's: `n DIV 8` because `y` is pushed as 16B words, and
  * world_size 2 because the handshake is one peer flag per block. */
 static const RadConstraint cArHcWrite[] = {
@@ -2855,8 +3321,29 @@ static const RadConstraint cGemmNtQGatedFp8[] = {
     C_LE("M", 64), C_DIV("K", 256), C_DIV("N", 256), C_GE("N", 2048),
     C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "fp8a8"), C_IN("act", "silu"),
 };
+/* The MX twin: the same narrow band, a weight of 2*nout rows where nout is a whole number of
+ * 16-column output tiles, K a multiple of the MX 32-element block, and no `group` -- the scale is
+ * one f32 per row. N a multiple of 32 also makes `nout` a multiple of 16, which the output tiling
+ * needs. The row declares no tunables, so its split/tile/wave choice is cfg_for()'s default -- the
+ * same one the untuned `gemm_mxfp4a8_nt_m64` resolves -- which is what keeps the fold
+ * byte-identical to that GEMM (the row's prose says so). */
+static const RadConstraint cGemmNtQGatedMx[] = {
+    C_LE("M", 64), C_DIV("K", R4D_MXFP4_GROUP), C_DIV("N", 32),
+    C_IN("dtype", "mxfp4a8"), C_IN("act", "silu"),
+};
 static const RadConstraint cGateQuantFp8[] = {
     C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
+};
+/* The per-row forms: the quantiser's own row and nothing else. No `group` to constrain -- the group
+ * is the whole row -- so only the staging slot (four columns) and the activation format remain. */
+static const RadConstraint cRmsNormQuantFp8Row[] = {
+    C_DIV("n", 4), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cGatedQuantFp8Row[] = {
+    C_DIV("n", 4), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cGateQuantFp8Row[] = {
+    C_DIV("n", 4), C_IN("dtype", "bf16"),
 };
 /* libr4d's cSampleChain, unchanged. The kernel has no geometry -- the radix passes are over the 256
  * buckets of a float's bytes, not over the vocabulary -- so a row with no predicate at all would
@@ -3068,13 +3555,39 @@ static const RadTunable tGemmPrefill[] = {
     "compiled tile arm; 0 is BM 128 x BN 256, libr4d's own default" },
 };
 
-/* The MXFP4 tiled GEMM's one axis. Both values are compiled arms of one template; 0 is the M
- * crossover (TN=4 from M >= 2048), which needs M and so cannot be a constant. */
+/* The MXFP4 tiled GEMM's axes. `tn` is the column width; `dec` = 1 serves the band with the
+ * decode row's kernel instead of this one (r4d_gemm_mxfp4a8_tiled.hip), so a tuner can compare the
+ * two at one shape. */
 static const int64_t kMxTn[] = { 0, 2, 4 };
+static const int64_t kMxDec[] = { 0, 1 };
 static const RadTunable tGemmMxfp4Tiled[] = {
   { "tn", kMxTn, NELEM(kMxTn), 0,
     "16-column fragments per wave: 2 = 256x64 block, 4 = 256x128. 0 = TN 4 from M >= 2048" },
+  { "dec", kMxDec, NELEM(kMxDec), 0,
+    "1 = serve this band with the decode row instead of this kernel; 0 = this kernel" },
 };
+
+/* dec = 1 is legal only where the decode row reaches: M <= 128, N <= 36864. A band above that keeps
+ * the tiled kernel whatever the cache says. `afrag` is absent from our gemm_nt_q schema (the
+ * fragment-tiled A producers are not ported), so the afrag guard is inert here. */
+static int r4d_tune_valid_mxfp4_tiled(const RadParam* p, int n_p, const RadParam* c, int n_c) {
+    long long dec = 0;
+    for (int i = 0; i < n_c; ++i)
+        if (c[i].kind == RAD_P_INT && !std::strcmp(c[i].key, "dec")) dec = c[i].ival;
+    if (!dec) return 1;
+    long long M = 0, N = 0, afrag = 0;
+    for (int i = 0; i < n_p; ++i)
+        if (p[i].kind == RAD_P_INT) {
+            if (!std::strcmp(p[i].key, "M")) M = p[i].ival;
+            else if (!std::strcmp(p[i].key, "N")) N = p[i].ival;
+            else if (!std::strcmp(p[i].key, "afrag")) afrag = p[i].ival;
+        }
+    /* The wide decode form reads a row-major A, so it cannot meet a fragment-tiled producer whose
+     * tile reaches into the band. No op in this tree declares `afrag`, so this is a guard kept
+     * against a caller that does, not a reachable path today. */
+    if (afrag > 0 && afrag <= M) return 0;
+    return M > 0 && M <= 128 && N > 0 && N <= 36864;
+}
 
 /* The MXFP4 decode GEMM's axes. 0 on each is the kernel's own rule (r4d_gemm_mxfp4a8_decode.hip);
  * `nt` 1 streams the weight past the caches, 2 loads it plainly. */
@@ -3489,6 +4002,39 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_logits_gemm_i8, nullptr,
   r4d_rad_layout_i8_logits, r4d_rad_relayout_i8_logits,
   nullptr, r4d_rad_unrelayout_i8_logits },
+
+{ "logits_gemm_i4", "logits_gemm", "vocab",
+  "logits_gemm_i8 over an INT4 head: half the bytes of the stored row, two's-complement nibbles "
+  "and each row's own scales in its tail",
+  "any M -- 64 rows a pass on the WMMA tile, then chunked; n_embd a multiple of 128",
+  "bf16 x, i4 head (low nibble first) with a bf16 scale per ROW per 128 columns stored in the "
+  "row's tail, F32 LOGITS OUT, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LOGITS_FP8,
+  ROW(cLogitsGemmFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_logits_gemm_i4, nullptr,
+  r4d_rad_layout_i4_logits, r4d_rad_relayout_i4_logits,
+  nullptr, r4d_rad_unrelayout_i4_logits },
+
+{ "logits_gemm_u4g64", "logits_gemm", "vocab",
+  "logits_gemm_i4 on the ASYMMETRIC int4 grid at group 64: (code - zero) * scale, a bf16 scale "
+  "and a u8 zero a row per 64 columns in the row's tail",
+  "logits_gemm_i4's: any M, n_embd a multiple of 128",
+  "bf16 x, u4 head with a bf16 scale and a u8 zero per ROW per 64 columns, F32 LOGITS OUT",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LOGITS_FP8,
+  ROW(cLogitsGemmFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_logits_gemm_u4g64, nullptr,
+  r4d_rad_layout_u4g64_logits, r4d_rad_relayout_u4g64_logits,
+  nullptr, r4d_rad_unrelayout_u4g64_logits },
+
+{ "logits_gemm_u4g128", "logits_gemm", "vocab",
+  "logits_gemm_u4g64 at group 128",
+  "logits_gemm_i4's: any M, n_embd a multiple of 128",
+  "bf16 x, u4 head with a bf16 scale and a u8 zero per ROW per 128 columns, F32 LOGITS OUT",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LOGITS_FP8,
+  ROW(cLogitsGemmFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_logits_gemm_u4g128, nullptr,
+  r4d_rad_layout_u4g128_logits, r4d_rad_relayout_u4g128_logits,
+  nullptr, r4d_rad_unrelayout_u4g128_logits },
 
 /* ---------------------------- the decomposed sampler chain (r4d_sample_stages_f32.hip) ------
  *
@@ -3952,7 +4498,8 @@ static const RadKernelInfo kKernels[] = {
   "bf16 q/k/v and out, fp32 a,b; the state cache is f32 or f16 and the operand says which",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGdnRecurrentUpdate), NOTUNE,
-  nullptr, nullptr, r4d_rad_gdn_recurrent_update, nullptr, nullptr, nullptr },
+  nullptr, nullptr, r4d_rad_gdn_recurrent_update, nullptr, nullptr, nullptr,
+  r4d_shape_gdn_recurrent_update },
 
 { "gdn_conv_recurrent_update_k128_v128_bf16", "gdn_conv_recurrent_update", "gdn",
   "gdn decode: the recurrent update with gdn_conv_update folded into its prologue -- each "
@@ -3963,7 +4510,8 @@ static const RadKernelInfo kKernels[] = {
   "Byte-identical to gdn_conv_update followed by gdn_recurrent_update",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGdnConvRecurrentUpdate), NOTUNE,
-  nullptr, nullptr, r4d_rad_gdn_conv_recurrent_update, nullptr, nullptr, nullptr, nullptr,
+  nullptr, nullptr, r4d_rad_gdn_conv_recurrent_update, nullptr, nullptr, nullptr,
+  r4d_shape_gdn_conv_recurrent_update,
   nullptr, r4d_fuse_gdn_conv_recurrent_update, nullptr },
 
 /* ---------------------------------------------------------------- the gated residual --------
@@ -4362,7 +4910,163 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
   ROW(cGemmNtMxfp4A8), ROW(tGemmSkinny), r4d_tune_valid_gemm,
   nullptr, nullptr, r4d_rad_gemm_mxfp4a8_m64, nullptr, r4d_rad_layout_mxfp4,
-  r4d_rad_relayout_mxfp4 },
+  r4d_rad_relayout_mxfp4, r4d_shape_gemm_nt_q, r4d_rad_unrelayout_mxfp4 },
+
+/* NOT A KERNEL: the M band edges of gemm_nt_q (16, 32, 48, 128 ... 2048), kept off the real rows so
+ * that they do not narrow what those serve. Bands are a property of the op's whole candidate set, so
+ * this row is the table's only declaration site; its dtype matches no tensor, selection never returns
+ * it, and its launch refuses. See cGemmNtQBands. */
+{ "gemm_nt_q_bands", "gemm_nt_q", "gemm",
+  "not a kernel: the M band edges of gemm_nt_q (16, 32, 48, 128 ... 2048), kept off the real rows so "
+  "that they do not narrow what those serve",
+  "none: its dtype constraint matches no tensor, so selection never returns it",
+  "none",
+  RAD_DOMAIN_DEVICE, 0,
+  ROW(cGemmNtQBands), NOTUNE,
+  nullptr, nullptr, r4d_rad_bands_only, nullptr },
+
+/* THE MXFP8 AND MXFP6 FAMILY. These rows keep the same activation side as MXFP4 -- E4M3 codes plus
+ * one f32 scale per row -- but the weight has only the two canonical views named below. There is
+ * no b_ref/wref/dsh fold: E4M3 and E2M3 codes are self-scaled within the group. The stored forms
+ * are A2's fragment maps: mxfp8 uses one byte per code, mxfp6 uses the same fragment index in a
+ * N*K six-bit stream packed four codes per three bytes. */
+{ "gemm_mxfp8a8_nt_m64", "gemm_nt_q", "gemm",
+  "skinny GEMM with an OCP-MXFP8 weight and an fp8 activation, 16x16x16 fp8 WMMA",
+  "M <= 64; N a multiple of 16; K divisible by SK*32; weight pre-permuted into fragment order "
+  "(32 lanes x 8 bytes per n-tile/k-step), one E8M0 exponent per 32 K in [K/32][N] order; no "
+  "per-row reference exponent",
+  "e4m3 A with an f32 per-row scale, e4m3 W with an E8M0 scale per 32 K, bf16 C, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
+  ROW(cGemmNtMxfp8A8), ROW(tGemmSkinny), r4d_tune_valid_gemm,
+  nullptr, nullptr, r4d_rad_gemm_mxfp8a8_m64, nullptr, r4d_rad_layout_mxfp8,
+  r4d_rad_relayout_mxfp8, r4d_shape_gemm_nt_q, r4d_rad_unrelayout_mxfp8, nullptr, nullptr },
+
+{ "gemm_mxfp8a8_tiled", "gemm_nt_q", "gemm",
+  "prefill GEMM with an OCP-MXFP8 weight and an fp8 activation, 16x16x16 fp8 WMMA",
+  "M >= 65; N a multiple of 16; K divisible by SK*32; weight pre-permuted into fragment order "
+  "(32 lanes x 8 bytes per n-tile/k-step), one E8M0 exponent per 32 K in [K/32][N] order; no "
+  "per-row reference exponent",
+  "e4m3 A with an f32 per-row scale, e4m3 W with an E8M0 scale per 32 K, bf16 C, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_PREFILL,
+  ROW(cGemmNtMxfp8A8Tiled), ROW(tGemmSkinny), r4d_tune_valid_gemm,
+  nullptr, nullptr, r4d_rad_gemm_mxfp8a8_tiled, nullptr, r4d_rad_layout_mxfp8,
+  r4d_rad_relayout_mxfp8, r4d_shape_gemm_nt_q, r4d_rad_unrelayout_mxfp8, nullptr, nullptr },
+
+{ "gemm_mxfp6a8_nt_m64", "gemm_nt_q", "gemm",
+  "skinny GEMM with an OCP-MXFP6 weight and an fp8 activation, 16x16x16 fp8 WMMA",
+  "M <= 64; N a multiple of 16; K divisible by SK*32; weight pre-permuted into a N*K six-bit "
+  "fragment stream and packed four E2M3 codes per three bytes, one E8M0 exponent per 32 K in "
+  "[K/32][N] order; no per-row reference exponent",
+  "e4m3 A with an f32 per-row scale, e2m3 W with an E8M0 scale per 32 K, bf16 C, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
+  ROW(cGemmNtMxfp6A8), ROW(tGemmSkinny), r4d_tune_valid_gemm,
+  nullptr, nullptr, r4d_rad_gemm_mxfp6a8_m64, nullptr, r4d_rad_layout_mxfp6,
+  r4d_rad_relayout_mxfp6, r4d_shape_gemm_nt_q, r4d_rad_unrelayout_mxfp6, nullptr, nullptr },
+
+{ "gemm_mxfp6a8_tiled", "gemm_nt_q", "gemm",
+  "prefill GEMM with an OCP-MXFP6 weight and an fp8 activation, 16x16x16 fp8 WMMA",
+  "M >= 65; N a multiple of 16; K divisible by SK*32; weight pre-permuted into a N*K six-bit "
+  "fragment stream and packed four E2M3 codes per three bytes, one E8M0 exponent per 32 K in "
+  "[K/32][N] order; no per-row reference exponent",
+  "e4m3 A with an f32 per-row scale, e2m3 W with an E8M0 scale per 32 K, bf16 C, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_PREFILL,
+  ROW(cGemmNtMxfp6A8Tiled), ROW(tGemmSkinny), r4d_tune_valid_gemm,
+  nullptr, nullptr, r4d_rad_gemm_mxfp6a8_tiled, nullptr, r4d_rad_layout_mxfp6,
+  r4d_rad_relayout_mxfp6, r4d_shape_gemm_nt_q, r4d_rad_unrelayout_mxfp6, nullptr, nullptr },
+
+/* THE PARTITION-SELECT (paro) MXFP6 PAIR. The same weight format and the same m64 kernel, but the
+ * activation is chosen per output-column partition so a merged [gate|up] (or [q|k|v], or
+ * [in_proj_qkv|z]) runs as ONE GEMM launch instead of P. NPW is pinned to 1 so a wave owns exactly
+ * one 16-wide tile and the boundary is exact. The layout, relayout and unrelayout hooks are mxfp6's
+ * own -- the weight bytes are unchanged; only the operand list is longer. */
+{ "gemm_mxfp6a8_paro_nt_m64", "gemm_nt_q_paro", "gemm",
+  "skinny partition-select GEMM: a merged OCP-MXFP6 weight with a per-partition fp8 activation",
+  "M <= 64; N a multiple of 16; K divisible by SK*32; `pb1`/`pb2` 16-aligned column offsets; weight "
+  "pre-permuted into a N*K six-bit fragment stream and packed four E2M3 codes per three bytes, one "
+  "E8M0 exponent per 32 K in [K/32][N] order; no per-row reference exponent",
+  "e4m3 A per partition with an f32 per-row scale, e2m3 W with an E8M0 scale per 32 K, bf16 C, "
+  "fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
+  ROW(cGemmNtMxfp6A8Paro), ROW(tGemmSkinny), r4d_tune_valid_gemm,
+  nullptr, nullptr, r4d_rad_gemm_mxfp6a8_paro_m64, nullptr, r4d_rad_layout_mxfp6,
+  r4d_rad_relayout_mxfp6, r4d_shape_gemm_nt_q_paro, r4d_rad_unrelayout_mxfp6, nullptr, nullptr },
+
+{ "gemm_mxfp6a8_paro_tiled", "gemm_nt_q_paro", "gemm",
+  "prefill partition-select GEMM: a merged OCP-MXFP6 weight with a per-partition fp8 activation",
+  "M >= 65; N a multiple of 16; K divisible by 32; `pb1`/`pb2` 16-aligned column offsets; weight "
+  "pre-permuted into a N*K six-bit fragment stream and packed four E2M3 codes per three bytes, one "
+  "E8M0 exponent per 32 K in [K/32][N] order; no per-row reference exponent",
+  "e4m3 A per partition with an f32 per-row scale, e2m3 W with an E8M0 scale per 32 K, bf16 C, "
+  "fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_PREFILL,
+  ROW(cGemmNtMxfp6A8ParoTiled), ROW(tGemmSkinny), r4d_tune_valid_gemm,
+  nullptr, nullptr, r4d_rad_gemm_mxfp6a8_paro_m64, nullptr, r4d_rad_layout_mxfp6,
+  r4d_rad_relayout_mxfp6, r4d_shape_gemm_nt_q_paro, r4d_rad_unrelayout_mxfp6, nullptr, nullptr },
+
+/* THE DENSE INT5 (w5a8) FAMILY. The activation side is mxfp6's -- e4m3
+ * codes plus one f32 scale per row, one f16 scale per 32 K -- but the weight is a linear signed
+ * 5-bit integer (RAD_I5) pre-permuted into the same fragment order and packed five bits a code, not
+ * an OCP float code. That is why it is a row of its own and not another branch of the MX hooks: the
+ * layout tag differs and the promotion table is integer->e4m3. No b_ref and no wref fold. */
+{ "gemm_w5a8_nt_m64", "gemm_nt_q", "gemm",
+  "skinny GEMM with a dense signed 5-bit weight and an fp8 activation, 16x16x16 fp8 WMMA",
+  "M <= 64; N a multiple of 16; K divisible by SK*32; weight pre-permuted into a N*K five-bit "
+  "fragment stream (eight int5 codes in five bytes a lane), one f16 scale per 32 K in "
+  "[K/32][N] order; no per-row reference exponent",
+  "e4m3 A with an f32 per-row scale, int5 W promoted to e4m3 with an f16 scale per 32 K, bf16 C, "
+  "fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
+  ROW(cGemmNtW5A8), ROW(tGemmSkinny), r4d_tune_valid_gemm,
+  nullptr, nullptr, r4d_rad_gemm_w5a8a8_m64, nullptr, r4d_rad_layout_w5a8,
+  r4d_rad_relayout_w5a8, r4d_shape_gemm_nt_q, r4d_rad_unrelayout_w5a8, nullptr, nullptr },
+
+{ "gemm_w5a8_tiled", "gemm_nt_q", "gemm",
+  "prefill GEMM with a dense signed 5-bit weight and an fp8 activation, 16x16x16 fp8 WMMA",
+  "M >= 65; N a multiple of 16; K divisible by SK*32; weight pre-permuted into a N*K five-bit "
+  "fragment stream (eight int5 codes in five bytes a lane), one f16 scale per 32 K in "
+  "[K/32][N] order; no per-row reference exponent",
+  "e4m3 A with an f32 per-row scale, int5 W promoted to e4m3 with an f16 scale per 32 K, bf16 C, "
+  "fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_PREFILL,
+  ROW(cGemmNtW5A8Tiled), ROW(tGemmSkinny), r4d_tune_valid_gemm,
+  nullptr, nullptr, r4d_rad_gemm_w5a8a8_tiled, nullptr, r4d_rad_layout_w5a8,
+  r4d_rad_relayout_w5a8, r4d_shape_gemm_nt_q, r4d_rad_unrelayout_w5a8, nullptr, nullptr },
+
+/* THE GATED FOLD OF THE DECODE MX ROW: gemm_mxfp4a8_nt_m64 with SwiGLU and the whole-row fp8
+ * quantiser in its epilogue, so the [M, 2*nout] bf16 tensor between them is never written. Each
+ * wave owns an OUTPUT column tile and computes both the gate tile and the up tile for it, so the
+ * pairing gate[j]/up[j] is a per-lane matter and exact (the kernel's header explains why). The
+ * per-row amax spans every N tile, so it CANNOT close inside a block: the kernel stages the bf16
+ * product into `out_bf16` (or scratch) and a second launch takes the whole-row amax and emits the
+ * codes, which is `gated_quant_fp8_row`'s quantiser verbatim.
+ *
+ * DECODE BAND ONLY: M <= 64. The prefill band is a named refusal -- no row matches M >= 65 -- and
+ * not a slower path. The gate/up pairing and the two-rounding epilogue are correct at any M the
+ * launcher serves, but the amax is a per-row reduction the fold can only make with a second pass,
+ * and a prefill M would want the staged-tile kernel this is not. Claiming the band would hand the
+ * caller a kernel that fails at issue; leaving it unclaimed is reported at declare.
+ *
+ * NO TUNABLES: the row resolves cfg_for()'s default, exactly the point the untuned
+ * gemm_mxfp4a8_nt_m64 resolves, which is what keeps the fold byte-identical to that GEMM plus the
+ * quantiser. Pinning a tuned split on the unfused row without pinning it here would move the last
+ * bits; that is a deployment decision, and r4d_selftest pins neither. */
+{ "gemm_mxfp4a8_gated_nt_m64", "gemm_nt_q_gated_mx", "gemm",
+  "the decode MXFP4 GEMM with the SwiGLU and the per-row fp8 quantiser folded into its epilogue: "
+  "each wave owns an output column tile and computes gate and up together, then a second launch "
+  "takes the whole-row amax and emits the codes",
+  "M <= 64; N = 2*nout a multiple of 32; K a multiple of 32; act silu only. The weight is the "
+  "same fragment-order e2m1 stream, [K/32][2*nout] E8M0 plane and [2*nout] reference exponent the "
+  "ungated row reads",
+  "e4m3 A with an f32 per-row scale, e2m1 W with an E8M0 scale folded against a per-row reference, "
+  "and the QUANTISER's outputs: E4M3 codes, an f32 scale per ROW and an optional bf16 product. "
+  "Byte-identical to gemm_nt_q(mxfp4a8) followed by gated_quant_fp8_row when that GEMM runs its "
+  "untuned auto config -- the point this NOTUNE row always resolves; a pinned tune on the unfused "
+  "gemm_mxfp4a8_nt_m64 row moves its last bits and this fold does not follow it",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGemmNtQGatedMx), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_mxfp4a8_gated_m64, r4d_rad_gemm_mxfp4a8_gated_m64_scratch,
+  r4d_rad_layout_mxfp4_gated, r4d_rad_relayout_mxfp4_gated,
+  r4d_shape_gemm_nt_q_gated_mx, r4d_rad_unrelayout_mxfp4_gated, nullptr },
 
 { "gemm_mxfp4a8_decode", "gemm_nt_q", "gemm",
   "the OCP-MXFP4 GEMM for the DECODE band: split-K across workgroups with a fused last-arriver "
@@ -4386,7 +5090,7 @@ static const RadKernelInfo kKernels[] = {
   "e4m3 A with an f32 scale per row or per (row, 128), e2m1 W with an E8M0 scale per 32 K folded "
   "into the element against a per-row reference, bf16 C, fp32 accumulate",
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_TILED,
-  ROW(cGemmMxfp4A8Tiled), ROW(tGemmMxfp4Tiled), nullptr,
+  ROW(cGemmMxfp4A8Tiled), ROW(tGemmMxfp4Tiled), r4d_tune_valid_mxfp4_tiled,
   nullptr, nullptr, r4d_rad_gemm_mxfp4a8_tiled, r4d_rad_gemm_mxfp4a8_tiled_scratch,
   r4d_rad_layout_mxfp4, r4d_rad_relayout_mxfp4 },
 
@@ -4606,7 +5310,7 @@ static const RadKernelInfo kKernels[] = {
 
 { "rowtopk_bf16", "row_topk", "select",
   "exact per-row top-R of a bf16 matrix, descending, ties to the lower column",
-  "any M, N a multiple of 8, R <= 32 (the row says 1024 and the entry point says 32); "
+  "any M, N a multiple of 8, R <= 128 (the row says 1024 and the entry point says 128); "
   "two launches, caller-sized partial buffer",
   "bf16 in, f32 values + i32 columns out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
@@ -4616,7 +5320,7 @@ static const RadKernelInfo kKernels[] = {
 
 { "logit_rerank", "logit_rerank", "select",
   "R candidates a row rescored exactly against the full-precision head",
-  "any M, R <= 32, bf16 x and the E4M3 lm_head plane logits_gemm_fp8 stores; one block a row with "
+  "any M, R <= 128, bf16 x and the E4M3 lm_head plane logits_gemm_fp8 stores; one block a row with "
   "the waves spread over the candidates, one launch, no scratch",
   "bf16 in, f32 values + i32 ids out, ties to the lower id",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
@@ -4633,7 +5337,7 @@ static const RadKernelInfo kKernels[] = {
 
 { "logit_rerank_i8", "logit_rerank", "select",
   "logit_rerank over an INT8 head: the same candidates rescored against logits_gemm_i8's rows",
-  "logit_rerank's: any M, R <= 32, bf16 x and the i8 lm_head plane logits_gemm_i8 stores",
+  "logit_rerank's: any M, R <= 128, bf16 x and the i8 lm_head plane logits_gemm_i8 stores",
   "bf16 in, f32 values + i32 ids out, ties to the lower id",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cLogitRerank), NOTUNE,
@@ -4644,13 +5348,22 @@ static const RadKernelInfo kKernels[] = {
 
 { "rowtopk_merge", "row_topk_merge", "select",
   "the global top-R of world_size all-gathered per-rank candidate sets",
-  "any M, R <= 32; `gathered` is [M, world_size * R, 2] f32 pairs, an int32 id in the first slot; "
+  "any M, R <= 128; `gathered` is [M, world_size * R, 2] f32 pairs, an int32 id in the first slot; "
   "one wave a row, one launch, no scratch",
   "f32 pairs in, f32 values + i32 ids out, ties to the lower id",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cRowTopKMerge), NOTUNE,
   nullptr, nullptr, r4d_rad_rowtopk_merge, nullptr, nullptr, nullptr,
   r4d_shape_row_topk_merge },
+
+{ "logits_scatter_f32", "logits_scatter", "select",
+  "fills an [M, n_vocab] f32 logits row with -inf and scatters R reranked (global id, value) pairs",
+  "any M, R <= 128; one block a row, one launch, no scratch; ids outside this rank's rows dropped",
+  "f32 logits out, i32 ids + f32 values in",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cLogitsScatter), NOTUNE,
+  nullptr, nullptr, r4d_rad_logits_scatter, nullptr, nullptr, nullptr,
+  r4d_shape_logits_scatter },
 
 /* ------------------------------------------------- quantisation, norms and the fusions ------ */
 
@@ -4668,6 +5381,84 @@ static const RadKernelInfo kKernels[] = {
   ROW(cQuantActFp8), NOTUNE,
   nullptr, nullptr, r4d_rad_quant_act_fp8, nullptr, nullptr, nullptr,
   r4d_shape_quant_act_fp8, nullptr, nullptr, r4d_rad_quant_act_fp8_describe },
+
+/* THE PER-ROW FORM, for the OCP-MX (mxfp4a8) GEMMs, whose epilogue carries one f32 activation
+ * scale per token and no per-128 group. Same kernel family as quant_act_fp8 (448, scale 1 for a
+ * zero row, the clamp), the block-level reduction over the whole row being the only difference. */
+{ "quant_act_fp8_row", "quant_act_fp8_row", "quant",
+  "per-row symmetric E4M3 quantisation of a bf16 activation, one f32 scale per row",
+  "n a multiple of 4 -- a thread owns four columns, so the store is one dword; no group, the "
+  "group is the whole row; a block-level max reduction over the row, which runs to 17408 wide",
+  "bf16 in, E4M3 out in PLAIN ROW-MAJOR order with an f32 scale per row",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQuantActFp8Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_quant_act_fp8_row, nullptr, nullptr, nullptr,
+  r4d_shape_quant_act_fp8_row, nullptr, nullptr, r4d_rad_quant_act_fp8_row_describe },
+
+/* THE PATH-A PRODUCER, a ParoQuant-only op. It rotates a bf16 activation into a still-rotated
+ * ParoQuant weight's stored domain and quantises it to E4M3, one f32 scale per row. Not one of the
+ * conventional vocabulary and with no ref implementation: it is the activation half of a transform a
+ * plain MXFP6 GEMM cannot express, and its oracle is enc_givens_forward in the core. */
+{ "paroquant_quant_fp8_row", "paroquant_quant_fp8_row", "quant",
+  "rotate a bf16 activation into a still-rotated ParoQuant weight's stored domain and quantise it to "
+  "E4M3 with one f32 scale per row",
+  "n a multiple of the 128-wide ParoQuant rotation group; `stages` Givens stages; the pairs, angles "
+  "and 1/channel_scales tables are weight operands of the consuming GEMM's weight",
+  "bf16 in, E4M3 out in plain row-major order with one f32 scale per row",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cParoquantQuantFp8Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_paroquant_quant_fp8_row, nullptr, nullptr, nullptr,
+  r4d_shape_paroquant_quant_fp8_row, nullptr, nullptr,
+  r4d_rad_paroquant_quant_fp8_row_describe },
+
+/* Path A's two-consumer producer: one launch rotates a shared input into two rotated domains. */
+{ "paroquant_quant_fp8_row_multi2", "paroquant_quant_fp8_row_multi2", "quant",
+  "rotate a shared bf16 activation into two differently-rotated ParoQuant domains in one launch and "
+  "quantise each to E4M3 with one f32 scale per row",
+  "n a multiple of the 128-wide rotation group; `stages` Givens stages; P=2; each partition's "
+  "pairs/angles/1-channel_scales tables are weight operands of its consuming weight",
+  "bf16 in, two E4M3 outputs in plain row-major order with one f32 scale per row each",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cParoquantQuantFp8Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_paroquant_quant_fp8_row_multi, nullptr, nullptr, nullptr,
+  r4d_shape_paroquant_quant_fp8_row_multi2, nullptr, nullptr,
+  r4d_rad_paroquant_quant_fp8_row_multi_describe },
+
+/* THE FUSED path-A producers: the fused row op with the rotation+quantiser in the same launch, once
+ * per consumer partition. They remove the per-linear producer launch that dominates path A's decode
+ * cost. The arithmetic is the standalone producer's, byte for byte (gated by a device selftest). */
+{ "paroquant_rmsnorm_quant_fp8_row2", "paroquant_rmsnorm_quant_fp8_row2", "quant",
+  "one rmsnorm over a bf16 row and TWO consumers' ParoQuant rotations+E4M3 quantisers in one launch",
+  "n a multiple of the 128-wide rotation group; `stages` Givens stages; P=2; each partition's "
+  "pairs/angles/1-channel_scales tables are weight operands of its consuming weight",
+  "bf16 (+ optional residual) in, two E4M3 outputs with one f32 scale per row each",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cParoquantFusedQuantFp8Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_paroquant_rmsnorm_quant_fp8_row, nullptr, nullptr, nullptr,
+  r4d_shape_paroquant_rmsnorm_quant_fp8_row, nullptr, nullptr,
+  r4d_rad_paroquant_rmsnorm_quant_fp8_row_describe },
+
+{ "paroquant_rmsnorm_quant_fp8_row3", "paroquant_rmsnorm_quant_fp8_row3", "quant",
+  "one rmsnorm over a bf16 row and THREE consumers' ParoQuant rotations+E4M3 quantisers in one launch",
+  "n a multiple of the 128-wide rotation group; `stages` Givens stages; P=3; each partition's "
+  "pairs/angles/1-channel_scales tables are weight operands of its consuming weight",
+  "bf16 (+ optional residual) in, three E4M3 outputs with one f32 scale per row each",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cParoquantFusedQuantFp8Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_paroquant_rmsnorm_quant_fp8_row, nullptr, nullptr, nullptr,
+  r4d_shape_paroquant_rmsnorm_quant_fp8_row, nullptr, nullptr,
+  r4d_rad_paroquant_rmsnorm_quant_fp8_row_describe },
+
+{ "paroquant_gated_quant_fp8_row1", "paroquant_gated_quant_fp8_row1", "quant",
+  "silu/sigmoid gated product and ONE consumer's ParoQuant rotation+E4M3 quantiser in one launch",
+  "n a multiple of the 128-wide rotation group; `stages` Givens stages; P=1; the partition's "
+  "pairs/angles/1-channel_scales tables are weight operands of its consuming weight",
+  "bf16 [gate|up] in, one E4M3 output with one f32 scale per row",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cParoquantFusedQuantFp8Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_paroquant_gated_quant_fp8_row, nullptr, nullptr, nullptr,
+  r4d_shape_paroquant_gated_quant_fp8_row, nullptr, nullptr,
+  r4d_rad_paroquant_gated_quant_fp8_row_describe },
 
 /* The rotated twin. It exists for the FOUR-BIT expert weight and for nothing else: at E4M3 a
  * rotation is slightly WORSE, because four exponent bits already carry the outliers a rotation
@@ -4880,6 +5671,45 @@ static const RadKernelInfo kKernels[] = {
    * `x * sigmoid(x)` against this kernel's `x / (1 + exp(-x))`. */
   r4d_fuse_gate_quant_fp8, r4d_rad_gate_quant_fp8_describe },
 
+/* THE PER-ROW (OCP-MX) FORMS of the two fusions and the gated gate. Same producers, the whole-row
+ * scale planed as [M][1]; no fusion hook, because the MX architecture blocks DECLARE these ops
+ * directly rather than recomposing them from an unfused pair. */
+{ "rmsnorm_quant_fp8_row", "rmsnorm_quant_fp8_row", "quant",
+  "RMS norm and the per-row fp8 activation quantiser in one pass over the row, plus the bf16 norm "
+  "output the unfused pair wrote; the scale is one f32 per row, what the OCP-MX GEMMs read",
+  "n a multiple of 4; one workgroup per row; the gain is f32 or bf16 and the shim reads which off "
+  "the operand; an optional residual is the fused_add_rms_norm form and may ALIAS out_bf16",
+  "bf16 in, E4M3 out with one f32 scale per ROW and an optional bf16 out; the codes are taken over "
+  "the BF16-ROUNDED norm output",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRmsNormQuantFp8Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_rmsnorm_quant_fp8_row, nullptr, nullptr, nullptr,
+  r4d_shape_rmsnorm_quant_fp8_row, nullptr, nullptr, r4d_rad_rmsnorm_quant_fp8_row_describe },
+
+{ "gated_quant_fp8_row", "gated_quant_fp8_row", "quant",
+  "an elementwise gated product and the per-row fp8 activation quantiser in one pass; `act` silu "
+  "is down_proj's input and sigmoid is a gated o_proj's",
+  "n a multiple of 4; the gated operand is [M][2n], gate then up; no reduction across the row; "
+  "strides in elements",
+  "bf16 in, E4M3 out with one f32 scale per ROW and an optional bf16 out; the codes are taken over "
+  "the BF16-ROUNDED product",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGatedQuantFp8Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_gated_quant_fp8_row, nullptr, nullptr, nullptr,
+  r4d_shape_gated_quant_fp8_row, nullptr, nullptr, r4d_rad_gated_quant_fp8_row_describe },
+
+{ "gate_quant_fp8_row", "gate_quant_fp8_row", "quant",
+  "an elementwise gated product and the per-row fp8 activation quantiser in one pass, with the gate "
+  "in its own operand: a gated attention's gate is a column slice of the [q|gate] projection",
+  "n a multiple of 4; gate and x are both [M][n] and may have different pitches; no reduction "
+  "across the row; strides in elements",
+  "bf16 in, E4M3 out with one f32 scale per ROW and an optional bf16 out; the codes are taken over "
+  "the BF16-ROUNDED product",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGateQuantFp8Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_gate_quant_fp8_row, nullptr, nullptr, nullptr,
+  r4d_shape_gate_quant_fp8_row, nullptr, nullptr, r4d_rad_gate_quant_fp8_row_describe },
+
 /* ---------------------------------------------------------------------------------- sampling
  *
  * spec §13 requires sampling on device, and this is the project's only device sampler: libref
@@ -4970,6 +5800,26 @@ static const RadKernelInfo kKernels[] = {
    * absence propagates through the wiring. `ar_ln_had_quant_i8` gets no hook for the opposite
    * reason -- it reduces without the bf16 round its unfused pair stores. */
   r4d_fuse_ar_rmsnorm_quant_fp8 },
+
+{ "ar_rmsnorm_quant_fp8_row", "ar_rmsnorm_quant_fp8_row", "quant",
+  "the per-row (OCP-MX) twin of ar_rmsnorm_quant_fp8: the two-rank all-reduce and the residual "
+  "add, RMS norm and whole-row E4M3 quantisation that always follow it, in one kernel; the "
+  "all-reduce's output is never read back",
+  "exactly 2 ranks; n a multiple of 8 and x unpitched, because x is the message and a block pushes "
+  "its rows as 16B words; one f32 scale per ROW, no group; a block owns whole ROWS, so the block "
+  "count is clamped to M; either wire, chosen by `wire` -- the rotated 6-bit payload additionally "
+  "needs n to be a multiple of 512, so that a chunk never straddles a row; residual and out_bf16 "
+  "may be null",
+  "bf16 in, E4M3 out with one f32 scale per ROW and an optional bf16 out; codes taken over the "
+  "BF16-ROUNDED norm output, and the reduced sum rounded to bf16 exactly as the standalone "
+  "all-reduce of the SAME wire stores it -- byte-identical to all_reduce + rmsnorm_quant_fp8_row",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cArRmsNormQuantFp8Row), ROW(tAr), nullptr,
+  r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_quant_fp8_row, nullptr, nullptr, nullptr,
+  r4d_shape_ar_rmsnorm_quant_fp8_row, nullptr,
+  /* `all_reduce` + `rmsnorm_quant_fp8_row`, both wires -- the byte-identity made executable, as on
+   * the group=128 row. */
+  r4d_fuse_ar_rmsnorm_quant_fp8_row },
 
 { "ar_hc_write", "ar_hc_write", "norm",
   "the two-rank all-reduce and the gated residual's write that always follows it, in one kernel: "
@@ -5130,6 +5980,17 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_dflash_select, nullptr, nullptr, nullptr,
   r4d_shape_dflash_select },
 
+{ "dflash_select_q_fp8", "dflash_select_q", "dflash",
+  "DFlash2 candidate selector over E4M3 codebooks with an f32 scale a row: the same walk as "
+  "dflash_select_bf16, one workgroup a sequence, the codebook rows dequantised in registers",
+  "top_k <= 32 and rank a multiple of 32 and <= 512, both being LDS extents; the scale plane is "
+  "one f32 a row or one for the table; cand/unary/hp share one row numbering",
+  "i32 candidate ids, f32 unary logits, bf16 hp, E4M3 codebooks with f32 scales, i32 tokens out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDflashSelect), NOTUNE,
+  nullptr, nullptr, r4d_rad_dflash_select_q, nullptr, nullptr, nullptr,
+  r4d_shape_dflash_select_q },
+
 };
 
 /* ================================================================================== the exports */
@@ -5231,14 +6092,77 @@ const std::vector<HostTwin>& host_twins() {
 
 }  /* namespace */
 
+/* THE RUNTIME ROW SET: `kKernels` plus the host twins, with the native MXFP4 decode/tiled rows'
+ * priorities and band adjusted from the environment at REGISTRATION. The rows themselves are always
+ * present, so one binary holds every implementation and `r4d_selftest --case` can name any of them;
+ * only what the selector sees moves, which is what makes a refusal and a selection behave the same.
+ *
+ * Upstream's default already selects the native rows: `gemm_mxfp4a8_decode` (R4D_PRIO_GEMM_MXDEC)
+ * outranks the skinny row in its M <= 128 band and `gemm_mxfp4a8_tiled` takes prefill. The
+ * environment is therefore an OVERRIDE, not a switch:
+ *
+ * RADIANCE_MX_GEMM (comma-list, case-sensitive substrings):
+ *   pr_decode   raise gemm_mxfp4a8_decode to R4D_PRIO_GEMM_MXPR
+ *   pr_tiled    raise gemm_mxfp4a8_tiled  to R4D_PRIO_GEMM_MXPR
+ *   ablk        both -- shorthand for pr_decode,pr_tiled
+ *   (unset/ours) leave upstream's priorities
+ *
+ * RADIANCE_MX_TUNE=1 is the ONE SWITCH the A/B harness flips: it raises BOTH rows to the winning
+ * priority. A value is truthy unless it is exactly "0"; RADIANCE_MX_GEMM works on its own and the
+ * two are additive when both are set.
+ *
+ * RADIANCE_MX_HYBRID_M=<lo> (default 16 when decode is selected, "0" disables) is the M-BANDED
+ * DECODE HYBRID. The one cost of the native decode kernel is single-stream decode: it split-Ks for
+ * occupancy, a win at the batched M of concurrency and a ~9% loss at the M <= 16 spec-verify width.
+ * The decode row is NARROWED to M in [lo+1, 128] by a GE constraint, so the band that ends at 16
+ * (resolved at M=16, where decode now rejects) selects gemm_mxfp4a8_nt_m64, and every band above it
+ * still selects decode by priority. The skinny row keeps M <= 64, so a shape decode cannot take
+ * (its K % 64) still has a fallback.
+ *
+ * The copy is a function-local static, built once and never mutated after, so `rad_kernel_at`'s
+ * pointer stays valid for the process's life -- the loader reads rows once and holds them. The host
+ * twins are copied too, so the env adjustment applies over the whole set the loader sees. */
+static const std::vector<RadKernelInfo>& mx_rows(void) {
+    static const std::vector<RadKernelInfo> rows = [] {
+        std::vector<RadKernelInfo> r(kKernels, kKernels + sizeof(kKernels) / sizeof(kKernels[0]));
+        for (const HostTwin& h : host_twins()) r.push_back(h.info);
+        const char* e = std::getenv("RADIANCE_MX_GEMM");
+        const char* t = std::getenv("RADIANCE_MX_TUNE");
+        const char* h = std::getenv("RADIANCE_MX_HYBRID_M");
+        const bool tune = t && t[0] && std::strcmp(t, "0") != 0;
+        const bool pr_dec = tune || (e && e[0] && (std::strstr(e, "pr_decode") || std::strstr(e, "ablk")));
+        const bool pr_til = tune || (e && e[0] && (std::strstr(e, "pr_tiled")  || std::strstr(e, "ablk")));
+        static RadConstraint kDecHybrid[6] = {
+            C_LE("M", 128), C_GE("M", 17), C_LE("N", 36864), C_DIV("K", 64), C_DIV("N", 16),
+            C_IN("dtype", "mxfp4a8"),
+        };
+        long long hyb = 16;
+        if (h && h[0]) hyb = std::strtoll(h, nullptr, 10);
+        const bool hyb_on = pr_dec && hyb > 0 && hyb < 128;
+        if (hyb_on) kDecHybrid[1].ival = hyb + 1;
+        if (pr_dec || pr_til) {
+            for (RadKernelInfo& k : r) {
+                if (pr_dec && std::strcmp(k.name, "gemm_mxfp4a8_decode") == 0) {
+                    k.priority = R4D_PRIO_GEMM_MXPR;
+                    if (hyb_on) { k.constraints = kDecHybrid; k.n_constraints = 6; }
+                }
+                if (pr_til && std::strcmp(k.name, "gemm_mxfp4a8_tiled") == 0)
+                    k.priority = R4D_PRIO_GEMM_MXPR;
+            }
+            std::fprintf(stderr, "radiance: %s -> native MXFP4 rows selected (decode=%d tiled=%d)\n",
+                         tune ? "RADIANCE_MX_TUNE" : "RADIANCE_MX_GEMM", (int)pr_dec, (int)pr_til);
+        }
+        return r;
+    }();
+    return rows;
+}
+
 extern "C" int rad_kernel_count(void) {
-    return (int)(sizeof(kKernels) / sizeof(kKernels[0])) + (int)host_twins().size();
+    return (int)mx_rows().size();
 }
 extern "C" const RadKernelInfo* rad_kernel_at(int i) {
-    const int base = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
     if (i < 0 || i >= rad_kernel_count()) return nullptr;
-    if (i < base) return &kKernels[i];
-    return &host_twins()[(size_t)(i - base)].info;
+    return &mx_rows()[(size_t)i];
 }
 
 /* WHICH ROWS TOUCH NOTHING BUT THEIR OPERANDS AND SCRATCH (rad_abi.h). Nothing on an R4D launch

@@ -223,6 +223,21 @@ typedef struct RadBatch {
     int64_t        enc_n_seg;
     const int32_t* enc_cu;             /* [enc_n_seg + 1] device: segment boundaries in patches */
     int32_t        enc_max_seg;        /* host: the longest segment, which bands the attention */
+
+    /* THE DFLASH2 VERIFY-HEAD SAFETY GATE, computed once at BATCH-BUILD time by the builder from
+     * Request::sp and carried here with the batch. Non-zero means every row this step samples from
+     * is safe for a SPARSE target head -- the int2 head's reranked set is a superset of the
+     * sampler's support -- so a plugin may emit the target's logits through the coarse 2-bit head
+     * plus an exact rerank instead of the full fp8 logits GEMM.
+     *
+     * A row is safe iff it is GREEDY, or (top_k in [1, RERANK/4] and min_p == 0); and the batch
+     * carries no grammar and at most MAX_ROWS sampled rows. It is computed HERE, from the requests
+     * the step actually carries, and never in the sampler: the kIssueAll path builds the sampler
+     * step host-side while the model step is still in flight and the pipelined kIssueModel path
+     * issues a step early, so a sampler-side flag would race the batch it describes. Zero when the
+     * deployment declares no such head, on any draft/history/encoder pass, and for every
+     * construction of RadBatch that does not set it. */
+    int32_t        verify_head;
 } RadBatch;
 
 /* ================================================================== operands */

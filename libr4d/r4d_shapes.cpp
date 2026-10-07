@@ -32,7 +32,10 @@
  *       because rad-kbench hands it the container's metadata through `ShapeCtx`, which this hook's
  *       signature does not carry. A GDN case run at an invented head ratio is a check of a model
  *       nobody is running. (`gdn_gated_rmsnorm` and `gdn_gated_norm_had_quant_i8` ARE described:
- *       their rows are (token, head) pairs and their widths are parameters.)
+ *       their rows are (token, head) pairs and their widths are parameters. `gdn_recurrent_update`
+ *       and `gdn_conv_recurrent_update` are described PARTIALLY: the epilogue quantiser and the
+ *       value-side operands are, off `n_head_v`/`head_v`, while q/k/v/state stay declined because
+ *       the KEY-head count and the cache depth are not parameters -- see their hook.)
  *
  *   attn_dense
  *       No head count either. Its parameters are M, head_dim, gqa, causal and dtype; the vision
@@ -53,7 +56,7 @@
  *       point: a description here would supply the bytes ref refused to. The full argument is at
  *       the gap this leaves in the sampler section below.
  *
- *   gemm_nt_q at every grid but fp8
+ *   gemm_nt_q at the packed INTEGER grids (w4/w2/i8)
  *       The weight is a plugin-private fragment stream (R4D_DT_W4_FRAG and friends) whose byte
  *       count comes from `RadLayout::bytes`, and RadOpdDesc has only a dtype and a shape -- so a
  *       description here would be a SECOND source for a number r4d_layout.cpp already owns, and
@@ -62,6 +65,10 @@
  *       carries. The fp8 family is different and IS described -- its weight is the checkpoint's
  *       own E4M3 [N][K] bytes against a bf16 [ceil(N/128)][ceil(K/128)] plane, and the fragment
  *       reordering is a permutation of the same count (r4d_fp8_frag.h: `frag_bytes(N,K) == N*K`).
+ *       OCP-MX (mxfp4a8) is describable for the same reason `r4d_layout.cpp`'s mx_enc_layout states
+ *       its grid: `b` is the checkpoint's e2m1 [N][K] (two per byte, a permutation of N*K/2) and
+ *       the exponent planes are the checkpoint's E8M0 [N][K/32] again, with only the relayout's
+ *       transpose/fragment order on top -- all owned by the layout hook, not a second source.
  *
  *   logits_gemm at fp8
  *       THE DECLARED SHAPE AND THE STORED PLANE DIFFER, and only the container knows. The weight
@@ -1039,6 +1046,87 @@ extern "C" int r4d_shape_gdn_gated_rmsnorm(const RadParam* p, int n_p, int opera
 }
 
 /* ==========================================================================================
+ * The recurrent GDN pair, described PARTIALLY and deliberately.
+ *
+ * `gdn_recurrent_update` and `gdn_conv_recurrent_update` are the two rows the MX out-projection's
+ * quantiser is folded into, and the reason this hook exists is to PIN THE EPILOGUE OUTPUTS: `o_q`
+ * is E4M3 over the value width `n_head_v * head_v` and `o_scale` is one f32 per (row, value head),
+ * width `n_head_v`. The block that used to fold MX's per-row `[T, 1]` scale into this epilogue
+ * could not produce that plane -- it has one scale a row where the epilogue reduces over each
+ * head's channels -- so the fold was removed; writing these widths down is what makes a
+ * reintroduction a mismatch a tool reports by name instead of a silent run off the end of a [T,1]
+ * plane (the failure the removal fixed).
+ *
+ * WHAT IS DECLINED, AND WHY. `q`/`k` carry `n_head_k` and their width is `n_head_k * head_k`;
+ * `n_head_k` is not a parameter of either op (only `n_head_v` is), so those two operands -- and
+ * `x`/`conv_w`/`conv_b`, whose `conv_dim` is `2*n_head_k*head_k + n_head_v*head_v` -- cannot be
+ * sized without inventing a model. `state`/`conv_state`/`cu`/`state_idx`/`num_accepted` are
+ * cache- and sequence-shaped, and neither extent is in the geometry either. Those come back
+ * `opd_none()` (ABSENT), which a tool skips by name rather than sizing wrong.
+ *
+ * The leading row extent is `q_len`, read as its band HIGH bound by `pi` (the buffer bound, which
+ * is what a description is for). The `v`-side operands ARE described because `head_v` and
+ * `n_head_v` name them exactly. a/b are bf16 in both blocks; the shims accept f32 there as well
+ * and the geometry carries no dtype, so bf16 is the block's own choice written down. */
+extern "C" int r4d_shape_gdn_recurrent_update(const RadParam* p, int n_p, int operand,
+                                              RadOpdDesc* out) {
+    const int64_t T   = pi(p, n_p, "q_len");
+    const int64_t hv  = pi(p, n_p, "head_v");
+    const int64_t nhv = pi(p, n_p, "n_head_v");
+    if (T <= 0 || hv <= 0 || nhv <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t vd = nhv * hv;
+    const RadOpdDesc l[] = {
+        opd_none(),                              /* q       -- n_head_k is not in the geometry */
+        opd_none(),                              /* k       -- same */
+        opd((uint32_t)RAD_BF16, T, nhv, hv),     /* v       -- [rows, n_head_v, head_v] */
+        opd((uint32_t)RAD_BF16, T, nhv),         /* a */
+        opd((uint32_t)RAD_BF16, T, nhv),         /* b */
+        opd((uint32_t)RAD_F32,  nhv),            /* A_log   -- one per value head */
+        opd((uint32_t)RAD_F32,  nhv),            /* dt_bias */
+        opd_none(),                              /* state   -- cache-shaped */
+        opd_none(),                              /* state_idx */
+        opd_none(),                              /* num_accepted */
+        opd_none(),                              /* cu */
+        opd((uint32_t)RAD_BF16, T, vd),          /* z       -- gate, value width */
+        opd((uint32_t)RAD_F32,  hv),             /* norm_w  -- one per value channel */
+        opd((uint32_t)RAD_BF16, T, nhv, hv),     /* o */
+        opd((uint32_t)RAD_F8E4M3, T, vd),        /* o_q     -- the folded quantiser's codes */
+        opd((uint32_t)RAD_F32,    T, nhv),       /* o_scale -- one per (row, value head) */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_gdn_conv_recurrent_update(const RadParam* p, int n_p, int operand,
+                                                   RadOpdDesc* out) {
+    const int64_t T   = pi(p, n_p, "q_len");
+    const int64_t hv  = pi(p, n_p, "head_v");
+    const int64_t nhv = pi(p, n_p, "n_head_v");
+    if (T <= 0 || hv <= 0 || nhv <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t vd = nhv * hv;
+    const RadOpdDesc l[] = {
+        opd_none(),                              /* x          -- conv_dim needs n_head_k */
+        opd_none(),                              /* conv_w */
+        opd_none(),                              /* conv_b */
+        opd_none(),                              /* conv_state -- cache depth not in the geometry */
+        opd_none(),                              /* conv_idx */
+        opd((uint32_t)RAD_BF16, T, nhv),         /* a */
+        opd((uint32_t)RAD_BF16, T, nhv),         /* b */
+        opd((uint32_t)RAD_F32,  nhv),            /* A_log */
+        opd((uint32_t)RAD_F32,  nhv),            /* dt_bias */
+        opd_none(),                              /* state */
+        opd_none(),                              /* state_idx */
+        opd_none(),                              /* num_accepted */
+        opd_none(),                              /* cu */
+        opd((uint32_t)RAD_BF16, T, vd),          /* z */
+        opd((uint32_t)RAD_F32,  hv),             /* norm_w */
+        opd((uint32_t)RAD_BF16, T, nhv, hv),     /* o */
+        opd((uint32_t)RAD_F8E4M3, T, vd),        /* o_q */
+        opd((uint32_t)RAD_F32,    T, nhv),       /* o_scale */
+    };
+    R4D_PICK(l);
+}
+
+/* ==========================================================================================
  * Collectives (shims in r4d_ar.cpp).
  *
  * These need a real peer over IPC, so a single-process tool gets RAD_E_STATE from init long before
@@ -1123,6 +1211,24 @@ extern "C" int r4d_shape_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, int op
     R4D_PICK(l);
 }
 
+/* The per-row (OCP-MX) twin: the same message and the same producer operands, with the whole-row
+ * scale plane `[M, 1]` in place of the per-128 group one, and no `group` parameter. */
+extern "C" int r4d_shape_ar_rmsnorm_quant_fp8_row(const RadParam* p, int n_p, int operand,
+                                                  RadOpdDesc* out) {
+
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, n),      /* INOUT: the message AND the input */
+        opd((uint32_t)RAD_BF16, M, n),
+        opd((uint32_t)RAD_F32,  n),         /* f32 or bf16; the shim reads the operand's own */
+        opd((uint32_t)RAD_F8E4M3, M, n),
+        opd((uint32_t)RAD_F32, M, 1),       /* one f32 scale per ROW */
+        opd((uint32_t)RAD_BF16, M, n),
+    };
+    R4D_PICK(l);
+}
+
 /* ==========================================================================================
  * GEMM, dequant and the row top-R (shims in r4d_gemm.cpp and r4d_fp8.cpp).
  * ========================================================================================= */
@@ -1153,6 +1259,71 @@ extern "C" int r4d_shape_gemm_nt_q(const RadParam* p, int n_p, int operand,
     const int64_t K = pi(p, n_p, "K");
     const int64_t g = pi(p, n_p, "group", R4D_FP8_BLOCK);
     const char* q = r4d_pgets(p, n_p, "dtype");
+    /* OCP-MX (mxfp4a8). The operand list is longer than docs/OPS.md's positional prefix -- `a_sum`
+     * (asymmetric-integer only) and `b_ref` sit after `y` -- and both are stated, not skipped, so
+     * the schema's arity is described in full. THE THREE WEIGHT OPERANDS ARE LOGICAL/CANONICAL: `b`
+     * is the checkpoint's row-major e2m1 [N, K] (two codes a byte on the wire, which the element
+     * count already expresses), and `b_scale`/`b_ref` are the SAME E8M0 [N, K/32] plane reached
+     * through two views -- the kernel's stored forms are permutations/transposes/reductions of
+     * these, which the relayout hook owns (r4d_layout.cpp's mx_relayout) and the unrelayout hook
+     * inverts for the oracle. The description is a property of the operand, not of the packing, so
+     * it is the same for the decode and prefill rows. `a_scale` is one f32 per ROW, not fp8's
+     * per-128 grid. */
+    if (q && !std::strcmp(q, "mxfp4a8")) {
+        if (M <= 0 || N <= 0 || K <= 0 || K % R4D_MXFP4_GROUP || N % R4D_NTILE) return RAD_E_UNSUPPORTED;
+        const int64_t nblk = K / R4D_MXFP4_GROUP;
+        const RadOpdDesc mx[] = {
+            opd((uint32_t)RAD_F8E4M3,  M, K),     /* a       -- E4M3 activation */
+            opd((uint32_t)RAD_F32,     M, 1),     /* a_scale -- one per row */
+            opd((uint32_t)RAD_FP4E2M1, N, K),     /* b       -- canonical e2m1 codes [N, K] */
+            opd((uint32_t)RAD_E8M0,    N, nblk),  /* b_scale -- canonical exponent plane [N, K/32] */
+            opd((uint32_t)RAD_BF16,    M, N),     /* y */
+            opd_none(),                           /* a_sum   -- asymmetric-integer grids only */
+            opd((uint32_t)RAD_E8M0,    N, nblk),  /* b_ref   -- the same canonical plane */
+        };
+        R4D_PICK(mx);
+    }
+    /* OCP-MX (mxfp8a8 / mxfp6a8). As with mxfp4a8, the weight operands are described in their
+     * CANONICAL planes: `b` is row-major [N, K] and `b_scale` is the E8M0 [N, K/32] plane. The
+     * device-side fragment order lives in the relayout/unrelayout hooks, so the oracle can recover
+     * canonical bytes before libref reads them. These formats have no b_ref and no a_sum. */
+    if (q && (!std::strcmp(q, "mxfp8a8") || !std::strcmp(q, "mxfp6a8"))) {
+        const bool fp6 = !std::strcmp(q, "mxfp6a8");
+        if (M <= 0 || N <= 0 || K <= 0 || K % R4D_MXFP4_GROUP || N % R4D_NTILE ||
+            g != R4D_MXFP4_GROUP)
+            return RAD_E_UNSUPPORTED;
+        const int64_t nblk = K / R4D_MXFP4_GROUP;
+        const RadOpdDesc mx86[] = {
+            opd((uint32_t)RAD_F8E4M3, M, K),
+            opd((uint32_t)RAD_F32, M, 1),
+            opd((uint32_t)(fp6 ? RAD_FP6E2M3 : RAD_F8E4M3), N, K),
+            opd((uint32_t)RAD_E8M0, N, nblk),
+            opd((uint32_t)RAD_BF16, M, N),
+            opd_none(),
+            opd_none(),
+        };
+        R4D_PICK(mx86);
+    }
+    /* DENSE int5 (w5a8). The weight's canonical plane is a row-major signed 5-bit integer [N, K]
+     * and its scale is an f16 [N, K/32] plane -- an integer code cannot ride libquant's e8m0 mx
+     * rule (see r4d_layout.cpp's mxw_enc_layout and lq_grid.cpp); there is no b_ref. The fragment
+     * order the kernel reads lives in the relayout hook. */
+    if (q && !std::strcmp(q, "w5a8")) {
+        if (M <= 0 || N <= 0 || K <= 0 || K % R4D_MXFP4_GROUP || N % R4D_NTILE ||
+            g != R4D_MXFP4_GROUP)
+            return RAD_E_UNSUPPORTED;
+        const int64_t nblk = K / R4D_MXFP4_GROUP;
+        const RadOpdDesc w5[] = {
+            opd((uint32_t)RAD_F8E4M3, M, K),
+            opd((uint32_t)RAD_F32, M, 1),
+            opd((uint32_t)RAD_I5, N, K),
+            opd((uint32_t)RAD_F16, N, nblk),
+            opd((uint32_t)RAD_BF16, M, N),
+            opd_none(),
+            opd_none(),
+        };
+        R4D_PICK(w5);
+    }
     const bool a8  = q && !std::strcmp(q, "fp8a8");
     const bool a16 = q && !std::strcmp(q, "fp8a16");
     if ((!a8 && !a16) || g != R4D_FP8_BLOCK || K <= 0 || N <= 0) return RAD_E_UNSUPPORTED;
@@ -1170,6 +1341,43 @@ extern "C" int r4d_shape_gemm_nt_q(const RadParam* p, int n_p, int operand,
          * symmetric by construction and has neither. */
         opd_none(),
         opd_none(),
+    };
+    R4D_PICK(l);
+}
+
+/* gemm_nt_q_paro, the partition-select MXFP6 form. The weight side is mxfp6a8's -- b is the
+ * canonical e2m3 [N, K] and b_scale the E8M0 [N, K/32] plane -- and the activation side is the
+ * m64/mxfp6 producer's e4m3 codes with one f32 scale per row, repeated for up to three partitions.
+ * ALL THREE PARTITIONS ARE DESCRIBED, in the schema's order, and the core ignores the ones an issue
+ * does not pass: the general description is what a tool sizes buffers from, and one operand a caller
+ * withholds costs nothing. `pb1`/`pb2` are 16-aligned column offsets or absent/zero. */
+extern "C" int r4d_shape_gemm_nt_q_paro(const RadParam* p, int n_p, int operand,
+                                        RadOpdDesc* out) {
+
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t N = pi(p, n_p, "N");
+    const int64_t K = pi(p, n_p, "K");
+    const int64_t g  = pi(p, n_p, "group", R4D_MXFP4_GROUP);
+    const int64_t pb1 = pi(p, n_p, "pb1", 0);
+    const int64_t pb2 = pi(p, n_p, "pb2", 0);
+    const char* q = r4d_pgets(p, n_p, "dtype");
+    if (!q || std::strcmp(q, "mxfp6a8")) return RAD_E_UNSUPPORTED;
+    if (M <= 0 || N <= 0 || K <= 0 || K % R4D_MXFP4_GROUP || N % R4D_NTILE ||
+        g != R4D_MXFP4_GROUP)
+        return RAD_E_UNSUPPORTED;
+    if (pb1 < 0 || (pb1 % R4D_NTILE) || pb2 < 0 || (pb2 % R4D_NTILE))
+        return RAD_E_UNSUPPORTED;
+    const int64_t nblk = K / R4D_MXFP4_GROUP;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_F8E4M3, M, K),      /* a        -- activation below pb1 */
+        opd((uint32_t)RAD_F32,    M, 1),      /* a_scale  -- one f32 per row */
+        opd((uint32_t)RAD_F8E4M3, M, K),      /* a2       -- activation at/past pb1 */
+        opd((uint32_t)RAD_F32,    M, 1),      /* a_scale2 */
+        opd((uint32_t)RAD_F8E4M3, M, K),      /* a3       -- activation at/past pb2 */
+        opd((uint32_t)RAD_F32,    M, 1),      /* a_scale3 */
+        opd((uint32_t)RAD_FP6E2M3, N, K),     /* b        -- canonical e2m3 [N, K] */
+        opd((uint32_t)RAD_E8M0,    N, nblk),  /* b_scale  -- canonical exponent plane [N, K/32] */
+        opd((uint32_t)RAD_BF16,    M, N),     /* y */
     };
     R4D_PICK(l);
 }
@@ -1197,6 +1405,41 @@ extern "C" int r4d_shape_gemm_nt_q_gated(const RadParam* p, int n_p, int operand
         opd((uint32_t)RAD_F8E4M3, M, nout),
         opd((uint32_t)RAD_F32, M, (nout + g - 1) / g),
         opd((uint32_t)RAD_BF16, M, nout),
+    };
+    R4D_PICK(l);
+}
+
+/* gemm_nt_q_gated_mx -- the OCP-MX (mxfp4a8) gated fold. ALL EIGHT OPERANDS ARE DESCRIBED, including
+ * the three WEIGHT views, in their LOGICAL/CANONICAL form: `b` is the checkpoint's row-major e2m1
+ * [N, K] and `b_scale`/`b_ref` are the same E8M0 [N, K/32] exponent plane reached through two views
+ * (rad_mx.h's LinearMX declares ws and wref identically; only the OPERAND each is taken as differs,
+ * and that is the layout hook's business). The kernel's stored fragment order and [K/32][N]
+ * transpose are permutations of these bytes, so describing the logical form here is what lets the
+ * oracle invert them (r4d_layout.cpp's r4d_rad_unrelayout_mxfp4_gated). Describing nothing, as this
+ * function used to, made every gated MX weight un-invertible and the whole op NOT CHECKED.
+ *
+ * `N` IS THE WEIGHT'S ROWS and the quantiser's outputs are N/2 wide; there is no `group`, because
+ * the scale is one f32 per row. */
+extern "C" int r4d_shape_gemm_nt_q_gated_mx(const RadParam* p, int n_p, int operand,
+                                            RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t N = pi(p, n_p, "N");
+    const int64_t K = pi(p, n_p, "K");
+    const char* q = r4d_pgets(p, n_p, "dtype");
+    if (!q || std::strcmp(q, "mxfp4a8") || M <= 0 || N <= 0 || (N % R4D_MXFP4_GROUP) || K <= 0 ||
+        K % R4D_MXFP4_GROUP)
+        return RAD_E_UNSUPPORTED;
+    const int64_t nout = N / 2;
+    const int64_t nblk = K / R4D_MXFP4_GROUP;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_F8E4M3,  M, K),      /* a */
+        opd((uint32_t)RAD_F32,     M, 1),      /* a_scale, one per row */
+        opd((uint32_t)RAD_FP4E2M1, N, K),      /* b -- canonical e2m1 codes [N, K] */
+        opd((uint32_t)RAD_E8M0,    N, nblk),   /* b_scale -- canonical exponent plane [N, K/32] */
+        opd((uint32_t)RAD_F8E4M3,  M, nout),   /* q */
+        opd((uint32_t)RAD_F32,     M, 1),      /* scale, one per row */
+        opd((uint32_t)RAD_BF16,    M, nout),   /* out_bf16 */
+        opd((uint32_t)RAD_E8M0,    N, nblk),   /* b_ref -- the same canonical plane */
     };
     R4D_PICK(l);
 }
@@ -1431,9 +1674,10 @@ extern "C" int r4d_shape_moe_gather(const RadParam* p, int n_p, int operand, Rad
 
 /* row_topk -- exact per-row top-R of a wide bf16 matrix (shim in r4d_gemm.cpp).
  *
- * R is capped at 32 by the entry point (stage 2's PT, "a real limit, not a tuning choice") even
+ * R is capped at 128 by the entry point (stage 2's PT, "a real limit, not a tuning choice") even
  * though libr4d's own row says 1024; the constraint is transcribed as written and the shim refuses
- * above 32, so a band naming a wider R is declined here rather than described into a refusal. */
+ * above 128, so a band naming a wider R is declined here rather than described into a refusal. The
+ * cap was 32 until the DFlash2 verify head needed to rerank 80 candidates a row. */
 extern "C" int r4d_shape_row_topk(const RadParam* p, int n_p, int operand,
                                   RadOpdDesc* out) {
 
@@ -1441,7 +1685,7 @@ extern "C" int r4d_shape_row_topk(const RadParam* p, int n_p, int operand,
     const int64_t N = pi(p, n_p, "N");
     const int64_t R = pi(p, n_p, "R");
     const uint32_t D = dt_act(p, n_p, "dtype");
-    if (R > 32) return RAD_E_UNSUPPORTED;
+    if (R > 128) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd(D, M, N),
         opd((uint32_t)RAD_I32, M, R),
@@ -1464,7 +1708,7 @@ extern "C" int r4d_shape_row_topk_merge(const RadParam* p, int n_p, int operand,
     const int64_t M = pi(p, n_p, "M");
     const int64_t R = pi(p, n_p, "R");
     const int64_t W = pi(p, n_p, "world_size");
-    if (R > 32) return RAD_E_UNSUPPORTED;
+    if (R > 128) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         /* [M, world_size * R, 2] f32 pairs with rank r's at [r*R, (r+1)*R), an int32 id in the
          * first slot of each. THE PLANE IS f32 AND THAT IS WHY THIS ONE IS DESCRIBABLE where
@@ -1478,6 +1722,22 @@ extern "C" int r4d_shape_row_topk_merge(const RadParam* p, int n_p, int operand,
         opd((uint32_t)RAD_F32, M, W * R, 2),
         opd((uint32_t)RAD_I32, M, R),
         opd((uint32_t)RAD_F32, M, R),
+    };
+    R4D_PICK(l);
+}
+
+/* The DFlash2 verify head's sparse write: the target's logits row, filled -inf and then scattered
+ * with the R reranked (global id, value) pairs. `logits` is the full local-vocabulary width. */
+extern "C" int r4d_shape_logits_scatter(const RadParam* p, int n_p, int operand,
+                                        RadOpdDesc* out) {
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t R  = pi(p, n_p, "R");
+    const int64_t NV = pi(p, n_p, "n_vocab");
+    if (M <= 0 || R <= 0 || R > 128 || NV <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_I32, M, R),
+        opd((uint32_t)RAD_F32, M, R),
+        opd((uint32_t)RAD_F32, M, NV),
     };
     R4D_PICK(l);
 }
@@ -1611,6 +1871,23 @@ extern "C" int r4d_shape_quant_act_fp8(const RadParam* p, int n_p, int operand,
         opd(D, M, n),
         opd((uint32_t)RAD_F8E4M3, M, n),
         opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
+    };
+    R4D_PICK(l);
+}
+
+/* The per-row form: the scale plane is [M, 1] rather than [M, n/128]. The OCP-MX (mxfp4a8) GEMMs
+ * read one f32 activation scale per token, so a description that kept the per-128 grid would size
+ * a buffer the kernel never fills and the GEMM never reads. */
+extern "C" int r4d_shape_quant_act_fp8_row(const RadParam* p, int n_p, int operand,
+                                           RadOpdDesc* out) {
+
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const uint32_t D = dt_act(p, n_p, "dtype");   /* the INPUT's width; the output is E4M3 */
+    const RadOpdDesc l[] = {
+        opd(D, M, n),
+        opd((uint32_t)RAD_F8E4M3, M, n),
+        opd((uint32_t)RAD_F32, M, 1),             /* one scale per ROW */
     };
     R4D_PICK(l);
 }
@@ -1829,6 +2106,144 @@ extern "C" int r4d_shape_gate_quant_fp8(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+/* THE PER-ROW (OCP-MX) FORMS. Same operand extents as the group=128 shapes above except the scale,
+ * which is one f32 per row: `[M, 1]`, not `[M, ceil(n/128)]`. There is no `group` parameter. */
+extern "C" int r4d_shape_rmsnorm_quant_fp8_row(const RadParam* p, int n_p, int operand,
+                                               RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, n),
+        opd(D, M, n),
+        opd((uint32_t)RAD_F32, n),
+        opd((uint32_t)RAD_F8E4M3, M, n),
+        opd((uint32_t)RAD_F32, M, 1),
+        opd(D, M, n),
+    };
+    R4D_PICK(l);
+}
+
+/* The path-A producer: the activation is [M, n], its rotation tables are [S, n] i32 pairs,
+ * [S, n/2] f32 angles and a [1, n] f32 1/channel_scales plane, and the outputs are the E4M3 codes
+ * and one f32 scale per row -- the same activation a `mxfp6a8` GEMM reads. */
+extern "C" int r4d_shape_paroquant_quant_fp8_row(const RadParam* p, int n_p, int operand,
+                                                 RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t S = pi(p, n_p, "stages");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, n),
+        opd((uint32_t)RAD_I32, S, n),
+        opd((uint32_t)RAD_F32, S, n / 2),
+        opd((uint32_t)RAD_F32, 1, n),
+        opd((uint32_t)RAD_F8E4M3, M, n),
+        opd((uint32_t)RAD_F32, M, 1),
+    };
+    R4D_PICK(l);
+}
+
+/* The multi2 producer: one input, then two partitions' {pairs, angle, t_scale} weights, then two
+ * partitions' {q, scale} outputs. */
+extern "C" int r4d_shape_paroquant_quant_fp8_row_multi2(const RadParam* p, int n_p, int operand,
+                                                        RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t S = pi(p, n_p, "stages");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, n),
+        opd((uint32_t)RAD_I32, S, n), opd((uint32_t)RAD_F32, S, n / 2), opd((uint32_t)RAD_F32, 1, n),
+        opd((uint32_t)RAD_I32, S, n), opd((uint32_t)RAD_F32, S, n / 2), opd((uint32_t)RAD_F32, 1, n),
+        opd((uint32_t)RAD_F8E4M3, M, n), opd((uint32_t)RAD_F32, M, 1),
+        opd((uint32_t)RAD_F8E4M3, M, n), opd((uint32_t)RAD_F32, M, 1),
+    };
+    R4D_PICK(l);
+}
+
+/* The FUSED path-A producers: the operand list is the fused row op's (input, optional residual,
+ * norm gain for the norm form) followed by P x {pairs, angle, t_scale} weight views and P x
+ * {q, scale} outputs. P comes off the parameter, so one hook serves every arity. */
+extern "C" int r4d_shape_paroquant_rmsnorm_quant_fp8_row(const RadParam* p, int n_p, int operand,
+                                                         RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t S = pi(p, n_p, "stages");
+    const int64_t P = pi(p, n_p, "P");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    if (P < 1 || P > 3) return RAD_E_UNSUPPORTED;
+    RadOpdDesc l[24];
+    int k = 0;
+    l[k++] = opd(D, M, n);                       /* x */
+    l[k++] = opd(D, M, n);                       /* res (optional; absence is the caller's) */
+    l[k++] = opd((uint32_t)RAD_F32, n);          /* norm gain (f32 in this family) */
+    for (int64_t i = 0; i < P; ++i) {
+        l[k++] = opd((uint32_t)RAD_I32, S, n);
+        l[k++] = opd((uint32_t)RAD_F32, S, n / 2);
+        l[k++] = opd((uint32_t)RAD_F32, 1, n);
+    }
+    for (int64_t i = 0; i < P; ++i) {
+        l[k++] = opd((uint32_t)RAD_F8E4M3, M, n);
+        l[k++] = opd((uint32_t)RAD_F32, M, 1);
+    }
+    l[k++] = opd(D, M, n);                       /* y, the norm's bf16 output (optional) */
+    return pick(out, operand, l, k);
+}
+
+extern "C" int r4d_shape_paroquant_gated_quant_fp8_row(const RadParam* p, int n_p, int operand,
+                                                       RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t S = pi(p, n_p, "stages");
+    const int64_t P = pi(p, n_p, "P");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    if (P < 1 || P > 3) return RAD_E_UNSUPPORTED;
+    RadOpdDesc l[16];
+    int k = 0;
+    l[k++] = opd(D, M, 2 * n);                   /* [gate|up] */
+    for (int64_t i = 0; i < P; ++i) {
+        l[k++] = opd((uint32_t)RAD_I32, S, n);
+        l[k++] = opd((uint32_t)RAD_F32, S, n / 2);
+        l[k++] = opd((uint32_t)RAD_F32, 1, n);
+    }
+    for (int64_t i = 0; i < P; ++i) {
+        l[k++] = opd((uint32_t)RAD_F8E4M3, M, n);
+        l[k++] = opd((uint32_t)RAD_F32, M, 1);
+    }
+    l[k++] = opd(D, M, n);                       /* gu2, up in its own buffer (optional) */
+    return pick(out, operand, l, k);
+}
+
+extern "C" int r4d_shape_gated_quant_fp8_row(const RadParam* p, int n_p, int operand,
+                                             RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, 2 * n),
+        opd((uint32_t)RAD_F8E4M3, M, n),
+        opd((uint32_t)RAD_F32, M, 1),
+        opd(D, M, n),
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_gate_quant_fp8_row(const RadParam* p, int n_p, int operand,
+                                            RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, n),
+        opd(D, M, n),
+        opd((uint32_t)RAD_F8E4M3, M, n),
+        opd((uint32_t)RAD_F32, M, 1),
+        opd(D, M, n),
+    };
+    R4D_PICK(l);
+}
+
 /* ==========================================================================================
  * DFlash2 (shims in r4d_gdn.cpp). Neither op has an unfused equivalent in the vocabulary and
  * neither has a ref implementation, so a tool's only description of them is this one.
@@ -1890,6 +2305,33 @@ extern "C" int r4d_shape_dflash_select(const RadParam* p, int n_p, int operand,
         opd_idx((M - 1) * astr + 1, 0, V),
         opd(D, V, R),
         opd(D, V, R),
+        opd((uint32_t)RAD_I32, M, steps),
+    };
+    R4D_PICK(l);
+}
+
+/* The same walk over E4M3 codebooks. The scale is described one f32 a row; the launch also takes a
+ * single scale for the whole table, which a description has no reason to draw. */
+extern "C" int r4d_shape_dflash_select_q(const RadParam* p, int n_p, int operand,
+                                         RadOpdDesc* out) {
+    const int64_t M     = pi(p, n_p, "M");
+    const int64_t steps = pi(p, n_p, "steps");
+    const int64_t K     = pi(p, n_p, "top_k");
+    const int64_t R     = pi(p, n_p, "rank");
+    const int64_t V     = pi(p, n_p, "n_vocab");
+    const int64_t astr  = pi(p, n_p, "anchor_stride", 1);
+    const uint32_t D    = dt_act(p, n_p, "dtype");
+    if (M <= 0 || astr < 1) return RAD_E_UNSUPPORTED;
+    const int64_t rows = M * steps;
+    const RadOpdDesc l[] = {
+        opd_idx(rows, K, V),
+        opd((uint32_t)RAD_F32, rows, K),
+        opd(D, rows, R),
+        opd_idx((M - 1) * astr + 1, 0, V),
+        opd((uint32_t)RAD_F8E4M3, V, R),     /* pred codes */
+        opd((uint32_t)RAD_F32, V, 1),        /* pred scale, a row */
+        opd((uint32_t)RAD_F8E4M3, V, R),     /* succ codes */
+        opd((uint32_t)RAD_F32, V, 1),        /* succ scale, a row */
         opd((uint32_t)RAD_I32, M, steps),
     };
     R4D_PICK(l);

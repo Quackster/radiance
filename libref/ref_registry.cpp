@@ -154,6 +154,11 @@ static const RadParamSpec pCast[] = { P_INT("M"), P_INT("n"), P_STR("from"), P_S
 
 /* ---- quantisation and rotation ------------------------------------------------------------ */
 static const RadParamSpec pQuant[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype") };
+/* The per-row form: quant_act_fp8 with the group dropped. The OCP-MX (mxfp4a8) GEMMs read one
+ * f32 activation scale per token, so there is no `group` parameter -- the group is the whole row
+ * by the op's meaning. The implementation is ref_quant_act_fp8, which reads an absent group as 0
+ * and clamps it to n, which is exactly one scale per row. */
+static const RadParamSpec pQuantRow[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 /* `asum` is libr4d's third output: the group-major per-row code sums an ASYMMETRIC weight grid
  * subtracts to remove the stored zero point. Optional, because whether the caller wants them is a
  * property of the call and not of the model. Ref does not produce them -- it has no asymmetric
@@ -176,6 +181,12 @@ static const RadParamSpec pGatedQuantFp8[] = { P_INT("M"), P_INT("n"), P_INT("gr
                                                P_STR("dtype"), P_STRO("act") };
 static const RadOperandSpec oGatedQuantFp8[] = { OPD("gate_up"), OUT("q"), OUT("scale"),
                                                  OUT_O("out_bf16") };
+/* THE PER-ROW (OCP-MX) FORMS: the same operands with no `group`, so the shared implementation reads
+ * the absent group as 0 and clamps it to n -- one scale per row. `scale` is [M, 1]. */
+static const RadParamSpec pRmsQuantFp8Row[] = { P_INT("M"), P_INT("n"), P_F64("eps"),
+                                                P_STR("dtype"), P_F64O("wadd") };
+static const RadParamSpec pGatedQuantFp8Row[] = { P_INT("M"), P_INT("n"), P_STR("dtype"),
+                                                  P_STRO("act") };
 /* `act` is REQUIRED here and optional on the quantiser, for the reason docs/OPS.md gives: an
  * implementation is free to compile one gate, and an optional parameter would let it resolve
  * for another. `N` is the WEIGHT's rows -- twice the fused width -- so the output is [M, N/2]. */
@@ -184,12 +195,25 @@ static const RadParamSpec pGemmQGated[] = { P_INT("M"), P_INT("N"), P_INT("K"),
 static const RadOperandSpec oGemmQGated[] = { OPD("a"), OPD("a_scale"), WGT("b"),
                                               WGT("b_scale"), OUT("q"), OUT("scale"),
                                               OUT_O("out_bf16") };
+/* THE OCP-MX (mxfp4a8) FORM OF THE FOLD. A NEW OP for the reason libr4d's new op gives: the MX
+ * weight carries an eighth `b_ref` operand and operands are positional with an exact arity check,
+ * so the slot cannot ride on the seven-operand op. No `group`: the scale is one per row. */
+static const RadParamSpec pGemmQGatedMx[] = { P_INT("M"), P_INT("N"), P_INT("K"),
+                                              P_STR("dtype"), P_STR("act") };
+static const RadOperandSpec oGemmQGatedMx[] = { OPD("a"), OPD("a_scale"), WGT("b"),
+                                                WGT("b_scale"), OUT("q"), OUT("scale"),
+                                                OUT_O("out_bf16"), WGT_O("b_ref") };
 static const RadParamSpec pDflashSelect[] = { P_INT("M"), P_INT("steps"), P_INT("top_k"),
                                               P_INT("rank"), P_INT("n_vocab"),
                                               P_INTO("anchor_stride"), P_STR("dtype") };
 static const RadOperandSpec oDflashSelect[] = { OPD("cand"), OPD("unary"), OPD_O("hp"),
                                                 OPD("anchor"), WGT("pred"), WGT("succ"),
                                                 OUT("tokens") };
+/* The E4M3 codebooks: codes and their f32 scales, so a separate op and not a dtype on the above --
+ * the operand list differs and operands are positional, the argument embed_lookup_q makes. */
+static const RadOperandSpec oDflashSelectQ[] = { OPD("cand"), OPD("unary"), OPD_O("hp"),
+                                                 OPD("anchor"), WGT("pred"), WGT("pred_scale"),
+                                                 WGT("succ"), WGT("succ_scale"), OUT("tokens") };
 
 static const RadParamSpec pRmsHadQuant[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
                                              P_STR("dtype"), P_F64O("wadd") };
@@ -676,11 +700,16 @@ static const RadOpSchema kSchemas[] = {
  * has an ORACLE -- without one, the activation format the production checkpoints ship in is the
  * one format rad-kbench cannot measure. */
 { "quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
-  "Symmetric E4M3 per group of `group` contiguous elements: scale = amax / 448 (a DEQUANT "
-  "multiplier, the same sense as a checkpoint's weight_scale_inv), q = clamp(x / scale, +-448), "
-  "scale shaped [M, ceil(n/group)] in f32. An all-zero group gets scale 1, not scale 0: the GEMM "
-  "multiplies this scale by the weight's block scale, and a zero here would erase that one. Rows "
-  "are dim 0, so a rank-3 activation is one row per token and not one per head." },
+   "Symmetric E4M3 per group of `group` contiguous elements: scale = amax / 448 (a DEQUANT "
+   "multiplier, the same sense as a checkpoint's weight_scale_inv), q = clamp(x / scale, +-448), "
+   "scale shaped [M, ceil(n/group)] in f32. An all-zero group gets scale 1, not scale 0: the GEMM "
+   "multiplies this scale by the weight's block scale, and a zero here would erase that one. Rows "
+   "are dim 0, so a rank-3 activation is one row per token and not one per head." },
+{ "quant_act_fp8_row", ARR(pQuantRow), ARR(oQuantFp8),
+   "Symmetric E4M3 per ROW: scale = amax / 448 (a DEQUANT multiplier), q = clamp(x / scale, "
+   "+-448), scale shaped [M, 1] in f32. quant_act_fp8 at a group of the whole row, for the "
+   "OCP-MX (mxfp4a8) GEMMs, which read one activation scale per token and no per-128 group. An "
+   "all-zero row gets scale 1, not scale 0, for the reason the per-group form gives." },
 /* The rotated fp8 twin, and its scale convention is NOT had_quant_act_i8's: the group is both the
  * rotation width and the scale granularity, and the residual factor of `group` is NOT normalised
  * here at all -- the weight plane it pairs with (dtype w4a8h) carries the whole of it, where the
@@ -695,10 +724,21 @@ static const RadOpSchema kSchemas[] = {
   "act(gate) * up over a packed [M, 2n] plane, gate half first, then the E4M3 quantiser. "
   "`act` is silu (down_proj's input) or sigmoid (a gated attention o_proj's) and defaults to "
   "silu, which is what docs/OPS.md's `silu_mul` names." },
+{ "rmsnorm_quant_fp8_row", ARR(pRmsQuantFp8Row), ARR(oRmsQuantFp8),
+  "the per-row (OCP-MX) form of rmsnorm_quant_fp8: one f32 scale per row in `scale` [M, 1] rather "
+  "than one per 128-column group." },
+{ "gated_quant_fp8_row", ARR(pGatedQuantFp8Row), ARR(oGatedQuantFp8),
+  "the per-row (OCP-MX) form of gated_quant_fp8: act(gate) * up over a packed [M, 2n] plane, then "
+  "one f32 scale per row in `scale` [M, 1]." },
 { "gemm_nt_q_gated", ARR(pGemmQGated), ARR(oGemmQGated),
   "gemm_nt_q over a [N, K] gate_up plane with gated_quant_fp8's pass in the epilogue, so the "
   "[M, N] bf16 tensor between them is never written. `N` is the WEIGHT's rows, twice the fused "
   "width; the output is [M, N/2]." },
+{ "gemm_nt_q_gated_mx", ARR(pGemmQGatedMx), ARR(oGemmQGatedMx),
+  "the OCP-MX (mxfp4a8) gated fold: gemm_nt_q over a [2n, K] e2m1 gate_up plane with "
+  "gated_quant_fp8_row's pass in the epilogue -- silu(gate)*up rounded to bf16, then the whole-row "
+  "E4M3 quantiser. `N` is the weight's rows; the output is [M, N/2] with one f32 scale per row. "
+  "`b_ref` is the per-output-row reference exponent and cancels in the reference." },
 { "dflash_select", ARR(pDflashSelect), ARR(oDflashSelect),
   "A greedy walk over a candidate lattice: score[l, c] = unary[l, c] + sum_r pred[pid(l)][r] * "
   "hp[l][r] * succ[cand[l, c]][r], where pid(0) is the anchor token and pid(l) the walk's own "
@@ -895,6 +935,10 @@ static const RadOpSchema kSchemas[] = {
   "[rows][row] and y is [rows][world_size][row], so one row of y carries every rank's words for "
   "that row. The vocab-parallel candidate merge reads exactly that." },
 
+{ "dflash_select_q", ARR(pDflashSelect), ARR(oDflashSelectQ),
+  "dflash_select over codebooks held as E4M3 codes with an f32 scale a row (or one for the "
+  "table): codebook[v][r] = codes[v][r] * scale[v]. The same walk, the same guards, half the "
+  "bytes of the bf16 codebooks." },
 { "embed_lookup", ARR(pEmbed), ARR(oEmbed),
   "A gather from wte[n_vocab, n_embd]. A negative token id writes a zero row (padding); an id at "
   "or above n_vocab fails the launch." },
@@ -1026,6 +1070,13 @@ SIMPLE("ref_quant_act_i8", "quant_act_i8", "quant", "symmetric int8 activation q
        "float in, i8 out, f32 scale", ref_quant_act_i8),
 SIMPLE("ref_quant_act_fp8", "quant_act_fp8", "quant", "symmetric block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale", ref_quant_act_fp8),
+/* THE PER-ROW FORM, and it reuses ref_quant_act_fp8 rather than restating it: that function reads
+ * an absent `group` as 0 and clamps it to n, which is exactly one scale per row, and its shape
+ * hook does the same via scale_groups(n, 0) == 1. A second copy would be the same arithmetic with
+ * a second chance to drift. */
+SIMPLE("ref_quant_act_fp8_row", "quant_act_fp8_row", "quant",
+       "symmetric per-row E4M3 quantiser, one f32 scale per row",
+       "float in, fp8_e4m3 out, f32 scale per row", ref_quant_act_fp8),
 /* THE FUSED FORMS, AND THEY EXIST SO A HOST RUN IS POSSIBLE AT ALL. libr4d fuses the fp8
  * activation quantiser into whichever kernel already has the row in registers and declares the
  * fused op as its own; without host kernels for those names, RADIANCE_HOST_DOMAIN -- the only
@@ -1037,12 +1088,24 @@ SIMPLE("ref_rmsnorm_quant_fp8", "rmsnorm_quant_fp8", "quant",
 SIMPLE("ref_gated_quant_fp8", "gated_quant_fp8", "quant",
        "act(gate) * up over a packed [M, 2n] plane, then the E4M3 quantiser",
        "bf16 in, fp8_e4m3 out, f32 scale", ref_gated_quant_fp8),
+SIMPLE("ref_rmsnorm_quant_fp8_row", "rmsnorm_quant_fp8_row", "quant",
+       "RMS norm, optional residual add, and the per-row E4M3 quantiser in one pass",
+       "bf16 in, fp8_e4m3 out, f32 scale per row", ref_rmsnorm_quant_fp8_row),
+SIMPLE("ref_gated_quant_fp8_row", "gated_quant_fp8_row", "quant",
+       "act(gate) * up over a packed [M, 2n] plane, then the per-row E4M3 quantiser",
+       "bf16 in, fp8_e4m3 out, f32 scale per row", ref_gated_quant_fp8_row),
 SIMPLE("ref_gemm_nt_q_gated", "gemm_nt_q_gated", "gemm",
        "gemm_nt_q over a gate_up plane with the gated quantiser in the epilogue",
        "fp8_e4m3 operands, fp8_e4m3 out, f32 scale", ref_gemm_nt_q_gated),
+SIMPLE("ref_gemm_nt_q_gated_mx", "gemm_nt_q_gated_mx", "gemm",
+       "gemm_nt_q over an OCP-MX gate_up plane with the per-row gated quantiser in the epilogue",
+       "e2m1 weight, e4m3 activation, fp8_e4m3 out, f32 scale per row", ref_gemm_nt_q_gated_mx),
 SIMPLE("ref_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates, bf16 codebooks, i32 tokens out", ref_dflash_select),
+SIMPLE("ref_dflash_select_q", "dflash_select_q", "draft",
+       "DFlash2's greedy walk over the candidate lattice, E4M3 codebooks",
+       "i32 candidates, E4M3 codebooks and f32 scales, i32 tokens out", ref_dflash_select_q),
 SIMPLE("ref_had_quant_act_fp8", "had_quant_act_fp8", "quant",
        "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale per group; n a multiple of group",
@@ -1068,9 +1131,11 @@ SIMPLE("ref_gemm_nt", "gemm_nt", "gemm", "C = A B^T, f32 accumulate", DT_FLOAT, 
 SIMPLE("ref_gemm_nt_bias", "gemm_nt_bias", "gemm", "C = A B^T + bias", DT_FLOAT,
        ref_gemm_nt_bias),
 SIMPLE("ref_gemm_nt_q", "gemm_nt_q", "gemm", "C = A B^T with group-scaled quantised operands",
-       "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; f32 accumulate", ref_gemm_nt_q),
+        "i8 / fp8 / float A; w4, w2, mxfp4, mxfp6, mxfp8, i8 or float B; f32 accumulate",
+        ref_gemm_nt_q),
 SIMPLE("ref_gemm_nt_q_bias", "gemm_nt_q_bias", "gemm", "quantised C = A B^T + bias",
-       "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; f32 accumulate", ref_gemm_nt_q_bias),
+        "i8 / fp8 / float A; w4, w2, mxfp4, mxfp6, mxfp8, i8 or float B; f32 accumulate",
+        ref_gemm_nt_q_bias),
 
 ROW("ref_attn_paged", "attn_paged", "attn",
     "paged causal / sliding-window attention, any query length",

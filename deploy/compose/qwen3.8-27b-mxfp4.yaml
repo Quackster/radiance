@@ -1,6 +1,7 @@
 # Qwen3.8-27B with AMD's Quark AWQ-MXFP4 trunk (4-bit weights, E4M3 activations) and its DFlash2
 # block-diffusion drafter merged into the container; the speculation depth is the drafter's own
-# operating point.
+# operating point. The MTP variant of the container is served the same way with
+# `--num-speculative-tokens 3` and no second checkpoint.
 name: radiance-qwen3.8-27b-mxfp4
 services:
   radiance:

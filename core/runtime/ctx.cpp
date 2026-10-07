@@ -119,6 +119,20 @@ int Ctx::prepare() {
      * each issue: the per-op profile, the oracle, and the argument digest. */
     tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_ &&
                std::getenv("RADIANCE_DEBUG_ARGSHA") == nullptr;
+    /* RADIANCE_TAPES: how many recorded passes to keep (default kTapesDefault). A bad value is
+     * ignored with a warning rather than read as 0, which would turn recording off silently. */
+    if (const char* e = std::getenv("RADIANCE_TAPES")) {
+        char* end = nullptr;
+        const long long v = std::strtoll(e, &end, 10);
+        if (end != e && *end == 0 && v >= 1 && v <= 4096) {
+            tape_cap_ = (size_t)v;
+            if (rank_ == 0) RAD_INFO("RADIANCE_TAPES=%lld: keeping up to %lld recorded passes "
+                                     "(default %zu)", v, v, kTapesDefault);
+        } else if (rank_ == 0) {
+            RAD_WARN("RADIANCE_TAPES=\"%s\" is not an integer in 1..4096; keeping %zu", e,
+                     tape_cap_);
+        }
+    }
     return RAD_OK;
 }
 
@@ -1319,11 +1333,20 @@ int Ctx::run_pass(const RadBatch* b) {
     PassTape nt;
     if (!record_pass(b, key, &nt)) return RAD_OK;
     nt.used = ++tape_clock_;
-    if (tapes_.size() < kTapes) {
+    if (tapes_.size() < tape_cap_) {
         tapes_.push_back(std::move(nt));
     } else {
         PassTape* lru = &tapes_[0];
         for (PassTape& x : tapes_) if (x.used < lru->used) lru = &x;
+        bump(pc_evicted_);
+        /* ONCE, and on rank 0: the first eviction is the moment the cache stopped holding every
+         * live pass shape. The running count is /stats `passes.evicted`. */
+        if (rank_ == 0 && !tape_evict_told_) {
+            tape_evict_told_ = true;
+            RAD_INFO("pass tape cache is full (%zu tapes) and is now evicting the least recently "
+                     "used one; if `passes.recorded` in /stats keeps climbing, raise RADIANCE_TAPES",
+                     tape_cap_);
+        }
         tape_drop(*lru);
         *lru = std::move(nt);
     }

@@ -170,6 +170,7 @@ const Hooks nW8a16     { r4d_rad_layout_w8a16, r4d_rad_relayout_w8a16, nullptr }
 const Hooks nW8a8      { r4d_rad_layout_w8a8, r4d_rad_relayout_w8a8, nullptr };
 const Hooks nW2        { r4d_rad_layout_w2a8, r4d_rad_relayout_w2a8, r4d_rad_unrelayout_w2a8 };
 const Hooks nMx        { r4d_rad_layout_mxfp4, r4d_rad_relayout_mxfp4, nullptr };
+const Hooks nMxGated   { r4d_rad_layout_mxfp4_gated, r4d_rad_relayout_mxfp4_gated, nullptr };
 const Hooks nMoeW4     { r4d_rad_layout_moe_w4, r4d_rad_relayout_moe_w4,
                        r4d_rad_unrelayout_moe_w4 };
 const Hooks nMoeW4Mod4 { r4d_rad_layout_moe_w4_mod4, r4d_rad_relayout_moe_w4_mod4,
@@ -177,6 +178,9 @@ const Hooks nMoeW4Mod4 { r4d_rad_layout_moe_w4_mod4, r4d_rad_relayout_moe_w4_mod
 
 /* gemm_nt_q's operands and the other ops' weight slots, as the kernels number them */
 enum { B = 2, BSCALE = 3, BREF = 6, LM_W = 1, HC_DOWN = 2, HC_UP = 3, MTP_FCH = 4, MTP_FCE = 5 };
+/* `gemm_nt_q_gated_mx` appends `b_ref` AFTER the quantiser's two outputs, so its reference operand
+ * is 7 where gemm_nt_q's is 6 (r4d_rows.cpp's oGemmNtQGatedMx). */
+enum { BREF_GATED = 7 };
 
 Opts fp8_grid() {
     Opts o;
@@ -321,6 +325,218 @@ TEST(mxfp4_codes_exponents_and_the_row_reference) {
     golden("mxfp4", stored("mxfp4", nMx, kp, "rtn", g, "blk.0.ffn_up.weight", N, K, w,
                            { { B, { "codes" } }, { BSCALE, { "scale" } }, { BREF, { "scale" } } }),
            0xc35d26b146836d77ull);
+}
+
+/* MXFP8 AND MXFP6, THE TWO MEMBERS OF THE OCP-MX FAMILY WITHOUT A FOLD, pinned to libr4d's frozen
+ * byte map rather than to a hash. No golden is recorded here on purpose: the goldens above are what
+ * the containers IN SERVICE were quantised to, and no mxfp8/mxfp6 container is in service, so a hash
+ * would only freeze whatever the hook happened to do the day this was written. What is pinned instead
+ * is the map the kernels were told to read (board_68a4f7e8), element by element:
+ *
+ *   idx = (((n/16)*(K/16) + k/16)*32 + 16*((k%16)/8) + (n%16))*8 + (k%8)
+ *
+ * one e4m3 byte at that index for mxfp8, and that index as an ELEMENT of a 6-bit stream for mxfp6,
+ * packed with the ABI's own 4-codes-per-3-bytes rule -- which is also the checkpoint's rule, so the
+ * same reader inverts the canonical plane and the fragment plane and the comparison is of codes and
+ * not of values. `b_scale` is the e8m0 plane transposed to [K/32][N], unchanged from mxfp4, and
+ * `b_ref` -- the per-row reference the e2m1 fold needs -- is DECLINED, because e2m3 and e4m3 codes
+ * carry their own exponent. The row's own unrelayout then has to give both canonical planes back
+ * byte for byte.
+ *
+ * THE HOOKS ARE dlopen'd, not called directly: this binary compiles in only the host layout sources
+ * that existed when the hook list above was written, and a weak reference to a function the plugin
+ * does not export is a PLT stub rather than a null pointer -- taking its address "succeeds" and the
+ * call then faults. So the absence of a hook is the named skip it should be. */
+TEST(mxfp8_and_mxfp6_codes_and_exponents_without_a_fold) {
+    NEED_LIBQUANT();
+    void* so = dlopen((home() + "/kernels/libr4d.so").c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!so) {
+        std::fprintf(stderr, "  SKIP no libr4d under %s\n", home().c_str());
+        return;
+    }
+    Hooks mx8, mx6;
+    mx8.layout     = (RadLayoutFn)     dlsym(so, "r4d_rad_layout_mxfp8");
+    mx8.relayout   = (RadRelayoutFn)   dlsym(so, "r4d_rad_relayout_mxfp8");
+    mx8.unrelayout = (RadUnrelayoutFn) dlsym(so, "r4d_rad_unrelayout_mxfp8");
+    mx6.layout     = (RadLayoutFn)     dlsym(so, "r4d_rad_layout_mxfp6");
+    mx6.relayout   = (RadRelayoutFn)   dlsym(so, "r4d_rad_relayout_mxfp6");
+    mx6.unrelayout = (RadUnrelayoutFn) dlsym(so, "r4d_rad_unrelayout_mxfp6");
+    if (!mx8.layout || !mx8.relayout || !mx6.layout || !mx6.relayout) {
+        std::fprintf(stderr, "  SKIP libr4d under %s exports no mxfp8/mxfp6 layout hooks\n",
+                     home().c_str());
+        dlclose(so);
+        return;
+    }
+
+    struct Fmt {
+        const char* name;
+        const char* codes;       /* libquant's code dtype */
+        const char* tag;         /* the layout tag libr4d states for `b` */
+        const char* stag;        /* ... and for the e8m0 plane */
+        const Hooks* nf;
+        uint32_t bdt;            /* the dtype `b` is stored as */
+        int bits;                /* code width: 8 for e4m3, 6 for e2m3 */
+        int num, den;            /* bytes of `b` = num * N * K / den */
+        int seed;
+    };
+    const Fmt fmts[] = {
+        { "mxfp8", "fp8_e4m3", "r4d.mxfp8.frag.g32", "r4d.mxfp8.e8m0", &mx8,
+          (uint32_t)RAD_F8E4M3,   8, 1, 1, 24 },
+        { "mxfp6", "fp6_e2m3", "r4d.mxfp6.frag.g32", "r4d.mxfp6.e8m0", &mx6,
+          (uint32_t)RAD_FP6E2M3,  6, 3, 4, 25 },
+    };
+    const int64_t N = 32, K = 256, nblk = K / 32, nb16 = K / 16;
+    for (const Fmt& f : fmts) {
+        const std::vector<float> w = weight(N, K, f.seed, 1, 32);
+        Opts kp, g;
+        kp.i("N", N).i("K", K);
+        g.s("codes", f.codes).i("group", 32).s("scale", "e8m0");
+        const Quantised q = quantise(quantizer("rtn"), g, "blk.0.ffn_up.weight", N, K, w);
+        REQUIRE_EQ(q.status, RAD_OK);
+        if (q.status != RAD_OK) continue;
+
+        /* ---- b: the canonical code plane, laid by the frozen map ---- */
+        Selection s = select(q, N, K, { "codes" });
+        RadLayout L{};
+        REQUIRE_EQ(f.nf->layout(kp.data(), kp.n(), B, &q.enc, s.sel.data(), s.t.data(),
+                                (int)s.t.size(), &L), RAD_OK);
+        CHECK(L.tag && std::strcmp(L.tag, f.tag) == 0);
+        CHECK_EQ(L.dtype, f.bdt);
+        CHECK_EQ(L.bytes, (int64_t)f.num * N * K / f.den);
+        std::vector<uint8_t> got((size_t)(L.bytes > 0 ? L.bytes : 0), 0xA5);
+        REQUIRE_EQ(f.nf->relayout(kp.data(), kp.n(), B, &q.enc, s.sel.data(), s.t.data(),
+                                  (int)s.t.size(), got.data(), L.bytes), RAD_OK);
+        const uint8_t* canon = q.planes[(size_t)s.sel[0]].data();
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t k = 0; k < K; ++k) {
+                const int64_t dst = (((n / 16) * nb16 + k / 16) * 32 + 16 * ((k % 16) / 8) +
+                                     (n % 16)) * 8 + (k % 8);
+                if (f.bits == 8)
+                    CHECK_EQ((int)got[(size_t)dst], (int)canon[(size_t)(n * K + k)]);
+                else
+                    /* One index serves both planes: a row of K six-bit codes is 6K bits and K % 32
+                     * is zero, so 6K is a whole number of bytes and the canonical row-major stream
+                     * and the fragment stream have the same element stride. */
+                    CHECK_EQ((int)rad_load_bits(got.data(), 6, dst),
+                             (int)rad_load_bits(canon, 6, n * K + k));
+            }
+        if (f.nf->unrelayout) {
+            std::vector<std::vector<uint8_t>> bufs;
+            Selection back = select(q, N, K, { "codes" }, &bufs);
+            CHECK_EQ(f.nf->unrelayout(kp.data(), kp.n(), B, &q.enc, back.sel.data(), got.data(),
+                                      (int64_t)got.size(), back.t.data(),
+                                      (int)back.t.size()), RAD_OK);
+            CHECK(bufs[0] == q.planes[(size_t)s.sel[0]]);
+        }
+
+        /* ---- b_scale: the same e8m0 plane mxfp4 stores, transposed to [K/32][N] ---- */
+        Selection ss = select(q, N, K, { "scale" });
+        RadLayout Ls{};
+        REQUIRE_EQ(f.nf->layout(kp.data(), kp.n(), BSCALE, &q.enc, ss.sel.data(), ss.t.data(),
+                                (int)ss.t.size(), &Ls), RAD_OK);
+        CHECK(Ls.tag && std::strcmp(Ls.tag, f.stag) == 0);
+        CHECK_EQ(Ls.dtype, (uint32_t)R4D_DT_E8M0);
+        CHECK_EQ(Ls.bytes, nblk * N);
+        std::vector<uint8_t> gs((size_t)(Ls.bytes > 0 ? Ls.bytes : 0), 0xA5);
+        REQUIRE_EQ(f.nf->relayout(kp.data(), kp.n(), BSCALE, &q.enc, ss.sel.data(), ss.t.data(),
+                                  (int)ss.t.size(), gs.data(), Ls.bytes), RAD_OK);
+        const uint8_t* e8 = q.planes[(size_t)ss.sel[0]].data();
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t b = 0; b < nblk; ++b)
+                CHECK_EQ((int)gs[(size_t)(b * N + n)], (int)e8[(size_t)(n * nblk + b)]);
+        if (f.nf->unrelayout) {
+            std::vector<std::vector<uint8_t>> bufs;
+            Selection back = select(q, N, K, { "scale" }, &bufs);
+            CHECK_EQ(f.nf->unrelayout(kp.data(), kp.n(), BSCALE, &q.enc, back.sel.data(), gs.data(),
+                                      (int64_t)gs.size(), back.t.data(),
+                                      (int)back.t.size()), RAD_OK);
+            CHECK(bufs[0] == q.planes[(size_t)ss.sel[0]]);
+        }
+
+        /* ---- no fold: the reference operand is declined, not sized ---- */
+        RadLayout Lr{};
+        CHECK_EQ(f.nf->layout(kp.data(), kp.n(), BREF, &q.enc, ss.sel.data(), ss.t.data(),
+                              (int)ss.t.size(), &Lr), RAD_E_UNSUPPORTED);
+    }
+    dlclose(so);
+}
+
+/* THE GATED MX ROW'S `b_ref` IS AT OPERAND 7, AND ITS STORED FORM IS THE OPERAND-ROLE CHECK. The
+ * ungated hook's operand enum puts `b_ref` at 6, so a gated row registered with that hook asks it
+ * about 7, gets RAD_E_UNSUPPORTED, and leaves `wref` with no layout tag -- it is then stored as the
+ * canonical [N, K/32] e8m0 plane instead of the per-row [N] reference the kernel reads, which is a
+ * silent wrong-exponent bug. This asserts the gated hook resolves 7 to the reference (tag, dtype,
+ * shape, byte count) and writes exactly the per-row maximum of the e8m0 plane, and it pins that the
+ * ungated hook still refuses 7 -- the seam the gated pair exists to close. */
+TEST(gated_mx_reference_is_relaid_at_its_own_operand) {
+    NEED_LIBQUANT();
+    const int64_t N = 32, K = 256;
+    const std::vector<float> w = weight(N, K, 23, 1, 32);
+    Opts kp, g;
+    kp.i("N", N).i("K", K);
+    g.s("codes", "fp4_e2m1").i("group", 32).s("scale", "e8m0");
+    const Quantised q = quantise(quantizer("rtn"), g, "blk.0.ffn_up.weight", N, K, w);
+    CHECK_EQ(q.status, RAD_OK);
+    if (q.status != RAD_OK) return;
+
+    Selection s = select(q, N, K, { "scale" });
+    RadLayout L{};
+    CHECK_EQ(nMxGated.layout(kp.data(), kp.n(), BREF_GATED, &q.enc, s.sel.data(), s.t.data(),
+                             (int)s.t.size(), &L), RAD_OK);
+    CHECK(L.tag && std::strcmp(L.tag, "r4d.mxfp4.wref") == 0);
+    CHECK_EQ(L.dtype, R4D_DT_E8M0);
+    CHECK_EQ((int)L.rank, 2);
+    CHECK_EQ(L.shape[0], N);
+    CHECK_EQ(L.shape[1], 1);
+    CHECK_EQ((int64_t)L.bytes, N);
+
+    std::vector<uint8_t> got((size_t)(L.bytes > 0 ? L.bytes : 0), 0xA5);
+    if (L.bytes <= 0) return;
+    CHECK_EQ(nMxGated.relayout(kp.data(), kp.n(), BREF_GATED, &q.enc, s.sel.data(), s.t.data(),
+                               (int)s.t.size(), got.data(), L.bytes), RAD_OK);
+    const uint8_t* e = q.planes[(size_t)s.sel[0]].data();
+    const int64_t nblk = K / 32;
+    for (int64_t n = 0; n < N; ++n) {
+        uint8_t mx = 0;
+        for (int64_t b = 0; b < nblk; ++b) {
+            const uint8_t v = e[(size_t)(n * nblk + b)];
+            if (v > mx) mx = v;
+        }
+        CHECK_EQ((int)got[(size_t)n], (int)mx);
+    }
+
+    RadLayout Lg{};
+    CHECK_EQ(r4d_rad_layout_mxfp4(kp.data(), kp.n(), BREF_GATED, &q.enc, s.sel.data(), s.t.data(),
+                                  (int)s.t.size(), &Lg), RAD_E_UNSUPPORTED);
+}
+
+/* THE REGISTRATION IS HALF THE FIX, so this pins it: `gemm_mxfp4a8_gated_nt_m64` must be the row
+ * that carries the GATED hooks. The operand test above proves the hooks are correct; this proves
+ * the row actually points at them, so a revert to the ungated pair fails here and not silently at
+ * load. libr4d.so is a device module, so on a host-only build this is a named skip. */
+TEST(gated_mx_row_is_registered_with_the_gated_hooks) {
+    void* h = dlopen((home() + "/kernels/libr4d.so").c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+        std::fprintf(stderr, "  SKIP no libr4d under %s\n", home().c_str());
+        return;
+    }
+    auto kernel_at    = (const RadKernelInfo* (*)(int))dlsym(h, "rad_kernel_at");
+    auto kernel_count = (int (*)(void))dlsym(h, "rad_kernel_count");
+    auto lay          = (RadLayoutFn)dlsym(h, "r4d_rad_layout_mxfp4_gated");
+    auto rel          = (RadRelayoutFn)dlsym(h, "r4d_rad_relayout_mxfp4_gated");
+    const RadKernelInfo* row = nullptr;
+    if (kernel_at && kernel_count) {
+        for (int i = 0, n = kernel_count(); i < n; ++i) {
+            const RadKernelInfo* k = kernel_at(i);
+            if (k && k->name && std::strcmp(k->name, "gemm_mxfp4a8_gated_nt_m64") == 0) { row = k; break; }
+        }
+    }
+    CHECK(row != nullptr);
+    if (row) {
+        CHECK(row->layout   == lay);
+        CHECK(row->relayout == rel);
+    }
+    dlclose(h);
 }
 
 TEST(moe_int4_experts_plain_and_rotated_both_classes) {

@@ -621,7 +621,12 @@ int mx_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
     WGeom g;
     int rc = wgeom(p, n_p, R4D_MXFP4_GROUP, &g);
     if (rc != RAD_OK) return rc;
-    if (g.group != R4D_MXFP4_GROUP || g.K % 16) return RAD_E_SHAPE;
+    /* THE EXPONENT GROUP IS THE PACKING UNIT TOO. The relayouts below floor `nblk = K / 32` and
+     * address the exponent plane on that grid, so a K that is a multiple of 16 but not 32 would
+     * silently drop a half-group's exponents and mis-scale every code past it. Requiring the MX
+     * group itself (not the fp4 packing's 16) is what makes the K % 32 the rows gate redundant-but-
+     * consistent rather than load-bearing. */
+    if (g.group != R4D_MXFP4_GROUP || g.K % R4D_MXFP4_GROUP) return RAD_E_SHAPE;
     if (!r4d_enc::affine(enc, RAD_FP4E2M1, RAD_E8M0, 1, R4D_MXFP4_GROUP)) return RAD_E_DTYPE;
     if (gout) *gout = g;
     const long long nblk = g.K / R4D_MXFP4_GROUP;
@@ -652,9 +657,24 @@ extern "C" int r4d_rad_layout_mxfp4(const RadParam* p, int n_p, int operand,
     return mx_enc_layout(p, n_p, operand, enc, sel, pl, n, out, nullptr);
 }
 
-extern "C" int r4d_rad_relayout_mxfp4(const RadParam* p, int n_p, int operand,
-                                      const RadEncoding* enc, const int* sel, const RadTensor* pl,
-                                      int n, void* dst, int64_t dst_bytes) {
+/* THE GATED ROW'S OPERAND MAP. The MX hooks resolve a weight's ROLE from its operand index, and
+ * `gemm_nt_q_gated_mx` carries `b_ref` at operand 7 -- its schema appends the reference after the
+ * quantiser's two outputs -- where `gemm_nt_q` has it at 6 (r4d_rows.cpp's oGemmNtQGatedMx vs
+ * oGemmNtQ). The builder hands the hook `oi.weight_opd[wi]`, so without this renumbering the
+ * shared mx_enc_layout sees 7, does not match Q_B, and returns RAD_E_UNSUPPORTED: `wref` then keeps
+ * NO layout tag and is stored as its canonical [N, K/32] plane instead of the per-row [N] reference
+ * the kernel reads (Wref[n]), which is silent wrong exponents once the op is wired. The gated row
+ * therefore registers this pair rather than the ungated one. */
+static int mx_gated_operand(int operand) { return operand == Q_BREF + 1 ? Q_BREF : operand; }
+
+extern "C" int r4d_rad_layout_mxfp4_gated(const RadParam* p, int n_p, int operand,
+                                          const RadEncoding* enc, const int* sel,
+                                          const RadTensor* pl, int n, RadLayout* out) {
+    return mx_enc_layout(p, n_p, mx_gated_operand(operand), enc, sel, pl, n, out, nullptr);
+}
+
+static int mx_relayout(int operand, const RadParam* p, int n_p, const RadEncoding* enc,
+                       const int* sel, const RadTensor* pl, int n, void* dst, int64_t dst_bytes) {
     RadLayout L;
     WGeom g;
     const int rc = mx_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g);
@@ -686,6 +706,303 @@ extern "C" int r4d_rad_relayout_mxfp4(const RadParam* p, int n_p, int operand,
         }
     }
     return RAD_OK;
+}
+
+extern "C" int r4d_rad_relayout_mxfp4(const RadParam* p, int n_p, int operand,
+                                      const RadEncoding* enc, const int* sel, const RadTensor* pl,
+                                      int n, void* dst, int64_t dst_bytes) {
+    return mx_relayout(operand, p, n_p, enc, sel, pl, n, dst, dst_bytes);
+}
+
+extern "C" int r4d_rad_relayout_mxfp4_gated(const RadParam* p, int n_p, int operand,
+                                            const RadEncoding* enc, const int* sel,
+                                            const RadTensor* pl, int n, void* dst,
+                                            int64_t dst_bytes) {
+    return mx_relayout(mx_gated_operand(operand), p, n_p, enc, sel, pl, n, dst, dst_bytes);
+}
+
+/* THE INVERSE OF mx_relayout, for the oracle (core/runtime/oracle.cpp's oracle_unrelayout): it
+ * holds the STORED bytes and has to reconstruct the canonical PLANES the encoding's selections
+ * decode from, so a dense reference can read the weight row-major. Every branch below is
+ * mx_relayout run backwards, and the only one that cannot be exact is `b_ref`.
+ *
+ * a) CODES. mx_relayout put code (nn,k) at byte `mx_slot(g,nn,k)`, low nibble for even k and high
+ *    for odd, because one stored byte holds the (2j, 2j+1) pair. The inverse reads that nibble
+ *    back and re-packs the canonical row-major plane d[nn*(K/2) + (k>>1)] in the same nibble
+ *    convention (low = even k), which is what `enc_selection_logical` and libref expect.
+ *
+ * b) BSCALE. The stored plane is the transpose [K/32][N]; the canonical one is [N][K/32]. Undo
+ *    the swap: d[nn*nblk + b] = src[b*N + nn].
+ *
+ * c) BREF. THE ONE THAT IS LOSSY, AND DELIBERATELY SO. The stored form is the per-row maximum of
+ *    the canonical exponent plane -- a reduction, so it cannot be inverted: many planes share a
+ *    max. But the shape that describes this operand is `b_ref` as E8M0 [N, K/32] (the canonical
+ *    plane the `wref` view derives from), and `enc_selection_logical` decodes the plane this hook
+ *    fills -- so the plane must EXIST at [N, K/32] or the selection has nothing to read. We
+ *    broadcast the row's max across its whole row (d[nn*nblk + b] = src[nn]), which is the only
+ *    reconstruction that preserves the reduction's one recoverable invariant (Max(row) == b_ref)
+ *    and is exactly neutral for the reference, which does not read `b_ref` at all. It is lossy in
+ *    the individual exponents but those were already lost at relayout time; there is no better
+ *    inverse, and inventing one would be a second source for a number the stored form does not
+ *    carry. */
+static int mx_unrelayout(int operand, const RadParam* p, int n_p, const RadEncoding* enc,
+                         const int* sel, const void* src, int64_t src_bytes,
+                         const RadTensor* pl, int n) {
+    RadLayout L;
+    WGeom g;
+    const int rc = mx_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g);
+    if (rc != RAD_OK) return rc;
+    if (src_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
+    const long long nblk = g.K / R4D_MXFP4_GROUP;
+    const uint8_t* s = (const uint8_t*)src;
+    uint8_t* d = (uint8_t*)pl[0].data;
+    if (operand == Q_BSCALE || operand == Q_BREF) {
+        for (long long nn = 0; nn < g.N; ++nn) {
+            if (operand == Q_BSCALE) {
+                for (long long b = 0; b < nblk; ++b) d[nn * nblk + b] = s[b * g.N + nn];
+            } else {
+                /* SEE (c) ABOVE: the plane's max is the only recoverable value. */
+                for (long long b = 0; b < nblk; ++b) d[nn * nblk + b] = s[nn];
+            }
+        }
+        return RAD_OK;
+    }
+    if (operand != Q_B) return RAD_E_UNSUPPORTED;
+    std::memset(d, 0, (size_t)(g.N * (g.K / 2)));
+    for (long long nn = 0; nn < g.N; ++nn) {
+        for (long long k = 0; k < g.K; ++k) {
+            const long long idx = mx_slot(g, nn, k);
+            const uint8_t code = (uint8_t)((k & 1) ? ((s[idx] >> 4) & 0x0Fu) : (s[idx] & 0x0Fu));
+            uint8_t* at = &d[nn * (g.K / 2) + (k >> 1)];
+            if (k & 1) *at = (uint8_t)((*at & 0x0Fu) | (uint8_t)(code << 4));
+            else       *at = (uint8_t)((*at & 0xF0u) | code);
+        }
+    }
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_unrelayout_mxfp4(const RadParam* p, int n_p, int operand,
+                                        const RadEncoding* enc, const int* sel, const void* src,
+                                        int64_t src_bytes, const RadTensor* pl, int n) {
+    return mx_unrelayout(operand, p, n_p, enc, sel, src, src_bytes, pl, n);
+}
+
+extern "C" int r4d_rad_unrelayout_mxfp4_gated(const RadParam* p, int n_p, int operand,
+                                              const RadEncoding* enc, const int* sel,
+                                              const void* src, int64_t src_bytes,
+                                              const RadTensor* pl, int n) {
+    return mx_unrelayout(mx_gated_operand(operand), p, n_p, enc, sel, src, src_bytes, pl, n);
+}
+
+/* ---- MXFP8 and MXFP6. The same OCP-MX exponent grid as mxfp4a8, but the codes are an E4M3 byte
+ * stream and an E2M3 six-bit stream. There is no b_ref and no wref/dsh fold: these formats are
+ * self-scaled, so the stored weight has exactly two views -- fragment-ordered codes and the E8M0
+ * exponent plane transposed to [K/32][N].
+ *
+ * ---- AND THE DENSE INT5 (w5a8) ROW rides the same grid with a third code plane. It is NOT an MX
+ * code -- the codes are linear signed 5-bit integers (RAD_I5, two's complement -16..15) -- but it
+ * borrows the E8M0 [K/32][N] scale and the mxfp6 fragment element index (mxw_slot), because an
+ * int5 element promoted to e4m3 is exactly what the same fp8 WMMA consumes. So the SAME three
+ * helpers take a `kind`: 0 = e4m3 (mxfp8), 1 = e2m3 (mxfp6), 2 = int5 (w5a8). */
+enum { MXW_E4M3 = 0, MXW_E2M3 = 1, MXW_I5 = 2 };
+
+inline int mxw_bits(int kind) { return kind == MXW_E2M3 ? 6 : kind == MXW_I5 ? 5 : 8; }
+
+namespace {
+int mxw_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                   const RadTensor* pl, int n, RadLayout* out, WGeom* gout, int kind) {
+    if (!out || !pl) return RAD_E_INVAL;
+    if (operand == Q_BREF) return RAD_E_UNSUPPORTED;
+    WGeom g;
+    int rc = wgeom(p, n_p, R4D_MXFP4_GROUP, &g);
+    if (rc != RAD_OK) return rc;
+    if (g.group != R4D_MXFP4_GROUP || g.K % R4D_MXFP4_GROUP) return RAD_E_SHAPE;
+    const uint32_t cdt = kind == MXW_E2M3 ? RAD_FP6E2M3 : kind == MXW_I5 ? RAD_I5 : RAD_F8E4M3;
+    /* w5a8 is a LINEAR integer code, and libquant's mx rule (its e8m0 shared exponent) is defined
+     * only over a float code -- see lq_grid.cpp. So the dense int5 grid takes an f16 scale per 32,
+     * which is producible and is the w4a8 family's second level. The MX formats keep E8M0. */
+    const uint32_t sdt = kind == MXW_I5 ? RAD_F16 : RAD_E8M0;
+    /* A plain affine encoding, OR -- for e2m3 only -- a `givens` one whose rotation tables ride as
+     * trailing planes: the ParoQuant path-A weight a geometry `mxfp6a8` GEMM reads while the
+     * producer rotates the activation. The tables are the producer's operands, never this hook's. */
+    const bool plain = r4d_enc::affine(enc, cdt, sdt, 1, R4D_MXFP4_GROUP);
+    const bool rotated = kind == MXW_E2M3 &&
+                         r4d_enc::affine_extra(enc, cdt, sdt, 1, R4D_MXFP4_GROUP, "givens");
+    if (!plain && !rotated) return RAD_E_DTYPE;
+    if (gout) *gout = g;
+    const long long nblk = g.K / R4D_MXFP4_GROUP;
+    if (operand == Q_BSCALE) {
+        if (!selects(enc, sel, n, "scale") || !dims(pl[0], g.N, nblk)) return RAD_E_SHAPE;
+        if (kind == MXW_I5) {
+            fill(out, "r4d.w5a8.f16", RAD_F16, nblk, g.N, nblk * g.N * 2);
+        } else {
+            fill(out, kind == MXW_E2M3 ? "r4d.mxfp6.e8m0" : "r4d.mxfp8.e8m0",
+                 R4D_DT_E8M0, nblk, g.N, nblk * g.N);
+        }
+        return RAD_OK;
+    }
+    if (operand != Q_B) return RAD_E_UNSUPPORTED;
+    if (!selects(enc, sel, n, "codes") || !dims(pl[0], g.N, g.K)) return RAD_E_SHAPE;
+    if (kind == MXW_E2M3) {
+        /* The stored stream is N*K six-bit codes in fragment order, then the ABI's four-codes-per-
+         * three-bytes little-endian bitstream. K is a multiple of 32 here, so each canonical row
+         * also closes on a byte and [N][K] is the canonical extent the planes are given. */
+        fill(out, "r4d.mxfp6.frag.g32", RAD_FP6E2M3, g.N, g.K, g.N * g.K * 6 / 8);
+    } else if (kind == MXW_I5) {
+        /* Same fragment index in a five-bit stream: eight int5 codes are five bytes a lane, and K
+         * being a multiple of 32 closes every row on a byte. */
+        fill(out, "r4d.w5a8.frag.g32", RAD_I5, g.N, g.K, g.N * g.K * 5 / 8);
+    } else {
+        fill(out, "r4d.mxfp8.frag.g32", RAD_F8E4M3, g.N, g.K, g.N * g.K);
+    }
+    return RAD_OK;
+}
+
+/* The byte index in the mxfp8 fragment stream, transcribed from the frozen contract map:
+ *
+ *   (((n/16)*(K/16) + k/16)*32 + 16*((k%16)/8) + (n%16))*8 + (k%8)
+ *
+ * The same index is an ELEMENT index in mxfp6's 6-bit and w5a8's 5-bit streams before bit packing. */
+long long mxw_slot(const WGeom& g, long long n, long long k) {
+    const long long ks = g.K / 16;
+    const long long t = n / R4D_NTILE, r = n % R4D_NTILE;
+    const long long ksi = k / 16, kin = k % 16;
+    const long long lh = kin / 8;
+    return ((t * ks + ksi) * R4D_WAVE + lh * R4D_NTILE + r) * 8 + (kin % 8);
+}
+
+int mxw_relayout(int operand, const RadParam* p, int n_p, const RadEncoding* enc, const int* sel,
+                 const RadTensor* pl, int n, void* dst, int64_t dst_bytes, int kind) {
+    RadLayout L;
+    WGeom g;
+    const int rc = mxw_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g, kind);
+    if (rc != RAD_OK) return rc;
+    if (dst_bytes != L.bytes) return RAD_E_SHAPE;
+    std::memset(dst, 0, (size_t)dst_bytes);
+    const long long nblk = g.K / R4D_MXFP4_GROUP;
+    uint8_t* d = (uint8_t*)dst;
+    if (operand == Q_BSCALE) {
+        if (kind == MXW_I5) {
+            /* f16, two bytes an element, transposed to [K/32][N]. */
+            const uint16_t* e = (const uint16_t*)pdata(pl[0]);
+            uint16_t* dd = (uint16_t*)d;
+            for (long long nn = 0; nn < g.N; ++nn)
+                for (long long b = 0; b < nblk; ++b) dd[b * g.N + nn] = e[nn * nblk + b];
+            return RAD_OK;
+        }
+        const uint8_t* e = pdata(pl[0]);
+        for (long long nn = 0; nn < g.N; ++nn)
+            for (long long b = 0; b < nblk; ++b) d[b * g.N + nn] = e[nn * nblk + b];
+        return RAD_OK;
+    }
+    if (operand != Q_B) return RAD_E_UNSUPPORTED;
+    const uint8_t* row = pdata(pl[0]);
+    const int bits = mxw_bits(kind);
+    if (bits < 8) {
+        for (long long nn = 0; nn < g.N; ++nn)
+            for (long long k = 0; k < g.K; ++k) {
+                const uint32_t code = rad_load_bits(row, bits, nn * g.K + k);
+                rad_store_bits(d, bits, mxw_slot(g, nn, k), code);
+            }
+    } else {
+        for (long long nn = 0; nn < g.N; ++nn)
+            for (long long k = 0; k < g.K; ++k) d[mxw_slot(g, nn, k)] = row[nn * g.K + k];
+    }
+    return RAD_OK;
+}
+
+int mxw_unrelayout(int operand, const RadParam* p, int n_p, const RadEncoding* enc, const int* sel,
+                   const void* src, int64_t src_bytes, const RadTensor* pl, int n, int kind) {
+    RadLayout L;
+    WGeom g;
+    const int rc = mxw_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g, kind);
+    if (rc != RAD_OK) return rc;
+    if (src_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
+    const long long nblk = g.K / R4D_MXFP4_GROUP;
+    const uint8_t* s = (const uint8_t*)src;
+    if (operand == Q_BSCALE) {
+        if (kind == MXW_I5) {
+            uint16_t* d = (uint16_t*)pl[0].data;
+            const uint16_t* ss = (const uint16_t*)s;
+            for (long long nn = 0; nn < g.N; ++nn)
+                for (long long b = 0; b < nblk; ++b) d[nn * nblk + b] = ss[b * g.N + nn];
+            return RAD_OK;
+        }
+        uint8_t* d = (uint8_t*)pl[0].data;
+        for (long long nn = 0; nn < g.N; ++nn)
+            for (long long b = 0; b < nblk; ++b) d[nn * nblk + b] = s[b * g.N + nn];
+        return RAD_OK;
+    }
+    if (operand != Q_B) return RAD_E_UNSUPPORTED;
+    uint8_t* d = (uint8_t*)pl[0].data;
+    std::memset(d, 0, (size_t)L.bytes);
+    const int bits = mxw_bits(kind);
+    if (bits < 8) {
+        for (long long nn = 0; nn < g.N; ++nn)
+            for (long long k = 0; k < g.K; ++k) {
+                const uint32_t code = rad_load_bits(s, bits, mxw_slot(g, nn, k));
+                rad_store_bits(d, bits, nn * g.K + k, code);
+            }
+    } else {
+        for (long long nn = 0; nn < g.N; ++nn)
+            for (long long k = 0; k < g.K; ++k) d[nn * g.K + k] = s[mxw_slot(g, nn, k)];
+    }
+    return RAD_OK;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_mxfp8(const RadParam* p, int n_p, int operand,
+                                     const RadEncoding* enc, const int* sel,
+                                     const RadTensor* pl, int n, RadLayout* out) {
+    return mxw_enc_layout(p, n_p, operand, enc, sel, pl, n, out, nullptr, MXW_E4M3);
+}
+
+extern "C" int r4d_rad_layout_mxfp6(const RadParam* p, int n_p, int operand,
+                                     const RadEncoding* enc, const int* sel,
+                                     const RadTensor* pl, int n, RadLayout* out) {
+    return mxw_enc_layout(p, n_p, operand, enc, sel, pl, n, out, nullptr, MXW_E2M3);
+}
+
+extern "C" int r4d_rad_layout_w5a8(const RadParam* p, int n_p, int operand,
+                                    const RadEncoding* enc, const int* sel,
+                                    const RadTensor* pl, int n, RadLayout* out) {
+    return mxw_enc_layout(p, n_p, operand, enc, sel, pl, n, out, nullptr, MXW_I5);
+}
+
+extern "C" int r4d_rad_relayout_mxfp8(const RadParam* p, int n_p, int operand,
+                                      const RadEncoding* enc, const int* sel,
+                                      const RadTensor* pl, int n, void* dst, int64_t dst_bytes) {
+    return mxw_relayout(operand, p, n_p, enc, sel, pl, n, dst, dst_bytes, MXW_E4M3);
+}
+
+extern "C" int r4d_rad_relayout_mxfp6(const RadParam* p, int n_p, int operand,
+                                      const RadEncoding* enc, const int* sel,
+                                      const RadTensor* pl, int n, void* dst, int64_t dst_bytes) {
+    return mxw_relayout(operand, p, n_p, enc, sel, pl, n, dst, dst_bytes, MXW_E2M3);
+}
+
+extern "C" int r4d_rad_relayout_w5a8(const RadParam* p, int n_p, int operand,
+                                     const RadEncoding* enc, const int* sel,
+                                     const RadTensor* pl, int n, void* dst, int64_t dst_bytes) {
+    return mxw_relayout(operand, p, n_p, enc, sel, pl, n, dst, dst_bytes, MXW_I5);
+}
+
+extern "C" int r4d_rad_unrelayout_mxfp8(const RadParam* p, int n_p, int operand,
+                                        const RadEncoding* enc, const int* sel, const void* src,
+                                        int64_t src_bytes, const RadTensor* pl, int n) {
+    return mxw_unrelayout(operand, p, n_p, enc, sel, src, src_bytes, pl, n, MXW_E4M3);
+}
+
+extern "C" int r4d_rad_unrelayout_mxfp6(const RadParam* p, int n_p, int operand,
+                                        const RadEncoding* enc, const int* sel, const void* src,
+                                        int64_t src_bytes, const RadTensor* pl, int n) {
+    return mxw_unrelayout(operand, p, n_p, enc, sel, src, src_bytes, pl, n, MXW_E2M3);
+}
+
+extern "C" int r4d_rad_unrelayout_w5a8(const RadParam* p, int n_p, int operand,
+                                       const RadEncoding* enc, const int* sel, const void* src,
+                                       int64_t src_bytes, const RadTensor* pl, int n) {
+    return mxw_unrelayout(operand, p, n_p, enc, sel, src, src_bytes, pl, n, MXW_I5);
 }
 
 /* ---- the MoE experts. Their weight is staged through LDS, so it is not permuted: the int4 plane

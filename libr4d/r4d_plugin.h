@@ -44,6 +44,9 @@ enum {
     R4D_PRIO_GEMM_SKINNY  = 50,
     /* The MXFP4 decode row outranks the MXFP4 skinny row, whose band it shares up to N = 36864. */
     R4D_PRIO_GEMM_MXDEC   = 55,
+    /* RADIANCE_MX_GEMM / RADIANCE_MX_TUNE raise the canonical MXFP4 decode/tiled rows to this, so
+     * the A/B harness can force them over every other gemm_nt_q row (r4d_rows.cpp's mx_rows). */
+    R4D_PRIO_GEMM_MXPR    = 65,
     /* The skinny m64 row has no upper bound on M, so the tiled bf16 row -- M > 64 only -- has to
      * outrank it to be reached, and stays below m16 whose band it never enters. */
     R4D_PRIO_GEMM_BF16_TILED = 55,
@@ -191,6 +194,7 @@ int  r4d_rad_ar_twoshot_4rank_ti8  (const RadArgs*, RadStream);
 int  r4d_rad_ar_ln_init(const RadParam*, int, int rank, int world, void** out);
 int  r4d_rad_ar_ln_had_quant_i8(const RadArgs*, RadStream);
 int  r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs*, RadStream);
+int  r4d_rad_ar_rmsnorm_quant_fp8_row(const RadArgs*, RadStream);
 int  r4d_rad_ar_hc_write(const RadArgs*, RadStream);
 /* ar_hc_write at four ranks, exact wire only, on an instance of the wide family keyed by its own
  * M bound. */
@@ -218,6 +222,25 @@ int r4d_rad_gemm_mxfp4a8_tiled(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_mxfp4a8_tiled_scratch(const RadArgs*);
 int r4d_rad_gemm_mxfp4a8_decode(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_mxfp4a8_decode_scratch(const RadArgs*);
+/* Our gated fold of the decode MX row: the decode MXFP4 GEMM with SwiGLU and the whole-row fp8
+ * quantiser in its epilogue. Kept alongside upstream's native MXFP4 family. */
+/* The OCP-MXFP6 sibling (r4d_gemm_mxfp6a8_nt_m64.hip). The partition-select (paro) entry runs a
+ * MERGED weight as one GEMM launch whose output-column partitions take different activations; the
+ * launch picks the decode or prefill band by M. */
+int r4d_rad_gemm_mxfp6a8_m64(const RadArgs*, RadStream);
+int r4d_rad_gemm_mxfp6a8_tiled(const RadArgs*, RadStream);
+int r4d_rad_gemm_mxfp6a8_paro_m64(const RadArgs*, RadStream);
+/* The ported upstream PR #30 MXFP4 GEMMs (libr4d/r4d_gemm_mxfp4a8_decode.hip and
+ * r4d_gemm_mxfp4a8_tiled.hip), registered as selectable rows. They read the same fragment-order
+ * weight, [K/32][N] E8M0 plane and per-row reference exponent as r4d_rad_gemm_mxfp4a8_m64, and the
+ * same one-f32-per-row activation scale; the `_pr` suffix keeps their symbols and row names distinct
+ * from ours so one binary holds both. */
+int r4d_rad_gemm_mxfp4a8_decode_pr(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_mxfp4a8_decode_pr_scratch(const RadArgs*);
+int r4d_rad_gemm_mxfp4a8_tiled_pr(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_mxfp4a8_tiled_pr_scratch(const RadArgs*);
+int r4d_rad_gemm_mxfp4a8_gated_m64(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_mxfp4a8_gated_m64_scratch(const RadArgs*);
 int r4d_rad_dequant_w4      (const RadArgs*, RadStream);
 int r4d_rad_rowtopk         (const RadArgs*, RadStream);
 int r4d_rad_rowtopk_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
@@ -227,6 +250,9 @@ int r4d_rad_logit_rerank    (const RadArgs*, RadStream);
 int r4d_rad_logit_rerank_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_logit_rerank_i8 (const RadArgs*, RadStream);
 int r4d_rad_logit_rerank_i8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+/* The sparse target head's write: fill a full-vocabulary row with -inf then scatter the reranked
+ * (global id, value) pairs. See r4d_rowtopk_bf16.hip. */
+int r4d_rad_logits_scatter (const RadArgs*, RadStream);
 
 /* -- the routed mixture of experts (r4d_moe.hip) --
  *
@@ -307,6 +333,22 @@ int r4d_rad_had_quant_act_i8g(const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_i8g_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_quant_act_fp8   (const RadArgs*, RadStream);
 int r4d_rad_quant_act_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+int r4d_rad_quant_act_fp8_row(const RadArgs*, RadStream);
+int r4d_rad_quant_act_fp8_row_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+/* The ParoQuant path-A producer (r4d_paroquant_quant_fp8_row.hip). */
+int r4d_rad_paroquant_quant_fp8_row(const RadArgs*, RadStream);
+int r4d_rad_paroquant_quant_fp8_row_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+int r4d_rad_paroquant_quant_fp8_row_multi(const RadArgs*, RadStream);
+int r4d_rad_paroquant_quant_fp8_row_multi_describe(const RadArgs*, RadStream, RadLaunchDesc*,
+                                                   int, int*);
+/* The FUSED path-A producers (r4d_paroquant_fused_row.hip): the fused row op with the rotation and
+ * per-row quantiser in the same launch, once per consumer partition. */
+int r4d_rad_paroquant_rmsnorm_quant_fp8_row(const RadArgs*, RadStream);
+int r4d_rad_paroquant_rmsnorm_quant_fp8_row_describe(const RadArgs*, RadStream, RadLaunchDesc*,
+                                                     int, int*);
+int r4d_rad_paroquant_gated_quant_fp8_row(const RadArgs*, RadStream);
+int r4d_rad_paroquant_gated_quant_fp8_row_describe(const RadArgs*, RadStream, RadLaunchDesc*,
+                                                   int, int*);
 int r4d_rad_had_quant_act_fp8 (const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_rmsnorm_quant_fp8(const RadArgs*, RadStream);
@@ -316,6 +358,14 @@ int r4d_rad_gated_had_quant_fp8(const RadArgs*, RadStream);
 int r4d_rad_gated_had_quant_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_gate_quant_fp8  (const RadArgs*, RadStream);
 int r4d_rad_gate_quant_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+/* The per-row (OCP-MX) forms of the fused producers and the gated gate: same operands, a whole-row
+ * f32 scale per row instead of one per 128-column group. */
+int r4d_rad_rmsnorm_quant_fp8_row(const RadArgs*, RadStream);
+int r4d_rad_rmsnorm_quant_fp8_row_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+int r4d_rad_gated_quant_fp8_row (const RadArgs*, RadStream);
+int r4d_rad_gated_quant_fp8_row_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+int r4d_rad_gate_quant_fp8_row  (const RadArgs*, RadStream);
+int r4d_rad_gate_quant_fp8_row_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_gram_accum      (const RadArgs*, RadStream);
 /* The same accumulator over a plain bf16 activation, no scale operand. */
 int r4d_rad_gram_accum_bf16 (const RadArgs*, RadStream);
@@ -379,6 +429,12 @@ int r4d_rad_layout_mxfp4(const RadParam*, int, int, const RadEncoding*, const in
                          const RadTensor*, int, RadLayout*);
 int r4d_rad_relayout_mxfp4(const RadParam*, int, int, const RadEncoding*, const int*,
                            const RadTensor*, int, void*, int64_t);
+/* The gated form's operand map: `gemm_nt_q_gated_mx` carries `b_ref` at operand 7, not 6 (see
+ * r4d_layout.cpp's mx_gated_operand). */
+int r4d_rad_layout_mxfp4_gated(const RadParam*, int, int, const RadEncoding*, const int*,
+                               const RadTensor*, int, RadLayout*);
+int r4d_rad_relayout_mxfp4_gated(const RadParam*, int, int, const RadEncoding*, const int*,
+                                 const RadTensor*, int, void*, int64_t);
 
 /* -- the small bf16 model ops (r4d_model_bf16.hip) --
  *
@@ -498,12 +554,15 @@ int r4d_shape_all_reduce           (const RadParam*, int, int operand, RadOpdDes
 int r4d_shape_all_gather           (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_ar_ln_had_quant_i8   (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_ar_rmsnorm_quant_fp8 (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_ar_rmsnorm_quant_fp8_row(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_ar_hc_write          (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_ar_gather_hc_write   (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_gemm_nt        (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gemm_nt_q      (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_gemm_nt_q_paro (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gemm_nt_q_gated(const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_gemm_nt_q_gated_mx(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_dequant_w4     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_row_topk       (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_router_topk    (const RadParam*, int, int operand, RadOpdDesc*);
@@ -515,6 +574,7 @@ int r4d_shape_moe_gemm_q_mod4(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gather     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_scale_rows     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_row_topk_merge (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_logits_scatter (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_quant_act_i8       (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_had_quant_act_i8   (const RadParam*, int, int operand, RadOpdDesc*);
@@ -523,9 +583,17 @@ int r4d_shape_gated_had_quant_i8 (const RadParam*, int, int operand, RadOpdDesc*
 int r4d_shape_gdn_gated_norm_had_quant_i8(const RadParam*, int, int operand,
                                           RadOpdDesc*);
 int r4d_shape_quant_act_fp8      (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_quant_act_fp8_row  (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_rmsnorm_quant_fp8  (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gated_quant_fp8    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gate_quant_fp8     (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_rmsnorm_quant_fp8_row(const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_gated_quant_fp8_row  (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_gate_quant_fp8_row   (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_paroquant_quant_fp8_row(const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_paroquant_quant_fp8_row_multi2(const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_paroquant_rmsnorm_quant_fp8_row(const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_paroquant_gated_quant_fp8_row(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gram_accum         (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_block_key      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_score          (const RadParam*, int, int operand, RadOpdDesc*);
@@ -559,6 +627,7 @@ int r4d_fuse_gemm_nt_q_gated     (const RadParam*, int, uint64_t, int, RadFuseSt
 int r4d_fuse_gdn_conv_recurrent_update(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qk_norm_rope_gate_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_ar_rmsnorm_quant_fp8_row(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_ar_gather_hc_write  (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_attn_paged_gate_quant(const RadParam*, int, uint64_t, int, RadFuseStep*);
 

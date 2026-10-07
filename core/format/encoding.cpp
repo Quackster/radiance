@@ -102,7 +102,11 @@ Rd plane(const EncodedView& v, int idx) {
     return r;
 }
 
-/* Undo a "givens" transform on one row in place: w = v . G_S^T ... G_1^T . D^-1. */
+/* Undo a "givens" transform on one row in place: w = v . G_S^T ... G_1^T . D^-1, the stages
+ * descending and the angles positive. D = diag(t.scale) and it DIVIDES -- the encoding's own
+ * convention is v = w . D . G_1 ... G_S -- so a ParoQuant checkpoint, whose transform is
+ * w = R(v) . D with D on the right, is read by storing 1/channel_scales in t.scale: the divide
+ * then multiplies by D and the decode is exactly R(v) . D (enc_givens_paro_tables). */
 int givens_inverse(const EncodedView& v, float* row, std::string* why) {
     const Rd pairs = plane(v, rad_enc_find(&v.enc, "t.pairs"));
     const Rd angle = plane(v, rad_enc_find(&v.enc, "t.angle"));
@@ -131,6 +135,90 @@ int givens_inverse(const EncodedView& v, float* row, std::string* why) {
 }
 
 }  /* namespace */
+
+/* THE FORWARD DIRECTION OF THE SAME TABLES: the activation-side rotation a ParoQuant weight needs
+ * at serve time (path A). A container whose trunk is still rotated stores v with w = R(v) . D -- the
+ * base weight the GEMM must reproduce is w = v . M_dec . D^-1 in the encoding's terms, where M_dec is
+ * givens_inverse's rotation product. A GEMM that reads the stored codes v computes a . v^T, so the
+ * activation it must be fed is
+ *
+ *     a = x . D . M_dec^T = (x / t.scale) . M_dec^T   (t.scale holds 1/D)
+ *
+ * -- multiply each column by the inverse of t.scale, then apply givens_inverse's stages in ASCENDING
+ * order and transposed: rows (a, b) -> (c*a + s*b, -s*a + c*b). The scale is applied BEFORE the
+ * rotation (the two do not commute), matching PARO-SERVING.md §1; unlike givens_inverse, whose divide
+ * comes last. This is the loop a givens-fused producer must run before quantising. */
+int enc_givens_forward(const EncodedView& v, float* row, std::string* why) {
+    const Rd pairs = plane(v, rad_enc_find(&v.enc, "t.pairs"));
+    const Rd angle = plane(v, rad_enc_find(&v.enc, "t.angle"));
+    const Rd scale = plane(v, rad_enc_find(&v.enc, "t.scale"));
+    const int64_t S = pairs.v->rows, K = v.cols;
+    if (pairs.v->cols != K || angle.v->rows != S || angle.v->cols != K / 2 || (K & 1) ||
+        (scale && (scale.v->rows != 1 || scale.v->cols != K))) {
+        if (why) *why = fmt("a givens transform's tables do not fit a %lld-column row", K);
+        return RAD_E_SHAPE;
+    }
+    if (scale)
+        for (int64_t k = 0; k < K; ++k) row[k] /= scale.at(0, k);
+    for (int64_t s = 0; s < S; ++s)
+        for (int64_t p = 0; p < K / 2; ++p) {
+            const int64_t a = (int64_t)pairs.at(s, 2 * p), b = (int64_t)pairs.at(s, 2 * p + 1);
+            if (a < 0 || a >= K || b < 0 || b >= K || a == b) {
+                if (why) *why = fmt("givens stage %lld pairs columns %lld and %lld", s, a, b);
+                return RAD_E_SHAPE;
+            }
+            const double t = angle.at(s, p), c = std::cos(t), sn = std::sin(t);
+            const double x = row[a], y = row[b];
+            row[a] = (float)(c * x + sn * y);
+            row[b] = (float)(-sn * x + c * y);
+        }
+    return RAD_OK;
+}
+
+int enc_givens_paro_tables(int64_t stages, int64_t cols, int64_t group, const int16_t* pairs,
+                           const uint16_t* theta, const uint16_t* channel_scales,
+                           std::vector<uint8_t>* pairs_i32, std::vector<uint8_t>* angle_f32,
+                           std::vector<uint8_t>* scale_f32, std::string* why) {
+    auto refuse = [&](int rc, std::string m) {
+        if (why) *why = std::move(m);
+        return rc;
+    };
+    if (stages < 1 || cols < 2 || group < 2 || (group & 1) || cols % group)
+        return refuse(RAD_E_SHAPE, fmt("a paroquant transform's tables do not fit a %lld-column "
+                                       "row in %lld-wide rotation groups", (long long)cols,
+                                       (long long)group));
+    const int64_t half = group / 2;                    /* pairs a rotation group */
+    const int64_t npair = cols / 2;
+    std::vector<int32_t> pa((size_t)(stages * cols));
+    std::vector<float>   an((size_t)(stages * npair));
+    std::vector<float>   sc((size_t)cols);
+    for (int64_t s = 0; s < stages; ++s)
+        for (int64_t p = 0; p < npair; ++p) {
+            /* the checkpoint's pair is LOCAL to its group and laid out one group after another,
+             * `half` pairs each, so the group is p / half and the base is group * that. */
+            const int64_t base = group * (p / half);
+            const int64_t a = pairs[s * cols + 2 * p], b = pairs[s * cols + 2 * p + 1];
+            if (a < 0 || a >= group || b < 0 || b >= group || a == b)
+                return refuse(RAD_E_FORMAT, fmt("a paroquant stage %lld pairs local columns %lld "
+                                                "and %lld outside a %lld-wide group",
+                                                (long long)s, (long long)a, (long long)b,
+                                                (long long)group));
+            pa[(size_t)(s * cols + 2 * p)]     = (int32_t)(base + a);
+            pa[(size_t)(s * cols + 2 * p + 1)] = (int32_t)(base + b);
+            an[(size_t)(s * npair + p)]        = rad_f16_to_f32(theta[s * npair + p]);
+        }
+    /* D on the right of the rotation: dividing by 1/channel_scales multiplies by it. */
+    for (int64_t k = 0; k < cols; ++k) {
+        const float d = rad_f16_to_f32(channel_scales[k]);
+        if (!(std::fabs(d) > 1e-30f))
+            return refuse(RAD_E_FORMAT, fmt("paroquant channel scale %lld is zero", (long long)k));
+        sc[(size_t)k] = 1.0f / d;
+    }
+    pairs_i32->assign((const uint8_t*)pa.data(), (const uint8_t*)(pa.data() + pa.size()));
+    angle_f32->assign((const uint8_t*)an.data(), (const uint8_t*)(an.data() + an.size()));
+    scale_f32->assign((const uint8_t*)sc.data(), (const uint8_t*)(sc.data() + sc.size()));
+    return RAD_OK;
+}
 
 namespace {
 std::mutex                     g_dec_mu;

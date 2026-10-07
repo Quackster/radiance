@@ -500,7 +500,7 @@ struct Fixture {
         g_gdn_ki.n_constraints = 1;
         g_gdn_row = KernelRow{ &g_gdn_ki, "fake", 0, 0 };
 
-        prog.meta.n_ctx_train = 4096;
+        prog.meta.n_ctx_train = max_ctx;
 
         /* index 0 is the sentinel every handle table in Program carries */
         prog.ops.emplace_back();
@@ -528,7 +528,7 @@ struct Fixture {
         op.op = "gdn_chunk_scan";
         op.schema = &g_gdn_schema;
         Band b;
-        b.hi = 4096;
+        b.hi = max_ctx;
         b.dom[RAD_DOMAIN_DEVICE].row = &g_gdn_row;
         /* The architecture plugin's own declared geometry, in arch/common/rad_block_gdn.h's
          * spelling, which is the key its schema marks RAD_PROLE_SEQ_CHUNK. Both this and the
@@ -1285,7 +1285,9 @@ struct RefillRun {
     int rows = -1;                 /* drafting rows block_begin offers at the first decode step */
     SchedMetrics m;
 };
-RefillRun refill_run(int n_prompt, int32_t seeded, int64_t ckpt_lo = 0) {
+/* `refill` < 0 leaves the scheduler's own derivation (one drafter window, Scheduler::init); >= 0
+ * overrides it through set_draft_refill, which is the production knob (RADIANCE_DRAFT_REFILL). */
+RefillRun refill_run(int n_prompt, int32_t seeded, int64_t ckpt_lo = 0, int64_t refill = -1) {
     Fixture f;
     f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192);
     f.cfg.n_spec = 7;
@@ -1301,6 +1303,7 @@ RefillRun refill_run(int n_prompt, int32_t seeded, int64_t ckpt_lo = 0) {
     f.pc.groups = { 0 };
     f.pc.ckpt_lo = ckpt_lo;
     CHECK_OK(f.start());
+    if (refill >= 0) CHECK_OK(f.sch.set_draft_refill(512, refill));
     if (seeded > 0) { f.pc.seed(seeded); f.pc.lin = seeded; f.pc.src = 3; }
     RefillRun r;
     const uint64_t a = f.submit(n_prompt, 64);
@@ -1326,6 +1329,19 @@ TEST(a_prefix_hit_ends_a_drafter_window_before_the_prompt_and_the_drafter_drafts
     CHECK_EQ(r.m.draft_refills, (int64_t)1);
     CHECK_EQ(r.m.draft_refill_tokens, (int64_t)512);
     CHECK_EQ(r.m.linear_cached_tokens, (int64_t)512);    /* what was actually skipped */
+}
+
+TEST(a_prefix_hit_leaves_a_windowed_drafter_silent_without_refill) {
+    const RefillRun r = refill_run(/*prompt=*/1100, /*seeded=*/1024, /*ckpt_lo=*/0, /*refill=*/0);
+    CHECK_EQ(r.n_after_first, 1024 + 0);       /* the whole hit was taken */
+    CHECK_EQ(r.rows, 0);                       /* reach: 1100 - 511 < 1024 */
+    CHECK_EQ(r.m.draft_refills, (int64_t)0);
+}
+
+TEST(draft_refill_is_clamped_to_the_window) {
+    const RefillRun r = refill_run(1100, 1024, /*ckpt_lo=*/0, /*refill=*/100000);
+    CHECK_EQ(r.n_after_first, 512);
+    CHECK_EQ(r.rows, 1);
 }
 
 TEST(a_prefix_hit_already_a_window_back_is_kept_whole) {
@@ -2957,4 +2973,499 @@ TEST(a_sink_carries_its_requests_admission_and_draft_counts) {
     CHECK_EQ(sink.n_draft_accepted(), accepted);
 }
 
+/* ================================================================== adaptive verify length
+ * sched/adaptive_k.h: which prefix of a block drafter's proposal each sequence verifies. */
+namespace {
+AdaptiveK::Params ak_params() {
+    AdaptiveK::Params p;
+    p.enabled = true;                 /* defaults otherwise: lengths 1,3,5,7; a=30.57 b=0.4286 */
+    return p;
+}
+bool ak_in_set(int k, int n) { return k == 1 || k == 3 || k == 5 || k == 7 || k == n; }
+}  /* namespace */
+
+TEST(adaptive_k_is_deterministic_bounded_and_on_the_length_set) {
+    AdaptiveK a, b;
+    CHECK_OK(a.configure(ak_params(), 7, 16));
+    CHECK_OK(b.configure(ak_params(), 7, 16));
+    uint64_t rng = 99;
+    auto u = [&]() { rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+                     return (double)((rng >> 33) & 0xFFFFFF) / (double)0x1000000; };
+    for (int t = 0; t < 2000; ++t) {
+        const int n = 1 + (int)(u() * 15);
+        AdaptiveK::Cand c[16];
+        for (int i = 0; i < n; ++i) { c[i].q = u(); c[i].n = u() < 0.2 ? 1 + (int)(u() * 7) : 7; }
+        const int base = (int)(u() * 3);
+        int k1[16], k2[16];
+        const int r1 = a.choose(c, n, base, k1);
+        const int r2 = b.choose(c, n, base, k2);
+        CHECK_EQ(r1, r2);
+        int rows = base;
+        for (int i = 0; i < n; ++i) {
+            CHECK_EQ(k1[i], k2[i]);
+            CHECK(k1[i] >= 1 && k1[i] <= c[i].n);
+            CHECK(ak_in_set(k1[i], c[i].n));
+            rows += 1 + k1[i];
+        }
+        CHECK_EQ(rows, r1);
+    }
+}
+
+TEST(adaptive_k_leaves_a_single_stream_and_small_batches_alone) {
+    AdaptiveK a;
+    CHECK_OK(a.configure(ak_params(), 7, 8));
+    for (double q : { 0.0, 0.1, 0.3, 0.6, 0.95 }) {
+        for (int n = 1; n <= 3; ++n) {           /* 8, 16, 24 rows: under min_rows 32 */
+            AdaptiveK::Cand c[3];
+            int k[3];
+            for (int i = 0; i < n; ++i) { c[i].q = q; c[i].n = 7; }
+            CHECK_EQ(a.choose(c, n, 0, k), 8 * n);
+            for (int i = 0; i < n; ++i) CHECK_EQ(k[i], 7);
+        }
+    }
+    /* Off means off, at any size. */
+    AdaptiveK off;
+    AdaptiveK::Params p = ak_params();
+    p.enabled = false;
+    CHECK_OK(off.configure(p, 7, 8));
+    AdaptiveK::Cand c[8];
+    int k[8];
+    for (int i = 0; i < 8; ++i) { c[i].q = 0.05; c[i].n = 7; }
+    CHECK_EQ(off.choose(c, 8, 0, k), 64);
+    for (int i = 0; i < 8; ++i) CHECK_EQ(k[i], 7);
+}
+
+TEST(adaptive_k_shortens_the_poor_sequences_and_keeps_the_good_ones) {
+    AdaptiveK a;
+    CHECK_OK(a.configure(ak_params(), 7, 8));
+    AdaptiveK::Cand c[8];
+    int k[8];
+    for (int i = 0; i < 4; ++i) { c[i].q = 0.92; c[i].n = 7; }     /* code-like */
+    for (int i = 4; i < 8; ++i) { c[i].q = 0.45; c[i].n = 7; }     /* prose-like */
+    const int rows = a.choose(c, 8, 0, k);
+    for (int i = 0; i < 4; ++i) CHECK_EQ(k[i], 7);
+    for (int i = 4; i < 8; ++i) CHECK(k[i] <= 3);
+    CHECK(rows < 64);
+    CHECK_EQ(rows % 8, 0);                                         /* the quantum */
+
+    /* Everyone good: nothing to cut. */
+    for (int i = 0; i < 8; ++i) c[i].q = 0.95;
+    CHECK_EQ(a.choose(c, 8, 0, k), 64);
+
+    /* Everyone poor: all cut, and never below one draft. */
+    for (int i = 0; i < 8; ++i) c[i].q = 0.2;
+    const int r2 = a.choose(c, 8, 0, k);
+    for (int i = 0; i < 8; ++i) CHECK(k[i] >= 1 && k[i] <= 3);
+    CHECK(r2 <= 32);
+
+    /* Monotone in q: a better sequence never gets a shorter verify than a worse one. */
+    for (int i = 0; i < 8; ++i) c[i].q = 0.3 + 0.08 * i;
+    a.choose(c, 8, 0, k);
+    for (int i = 1; i < 8; ++i) CHECK(k[i] >= k[i - 1]);
+}
+
+TEST(adaptive_k_total_rows_stay_on_the_quantum_or_unshrunk) {
+    AdaptiveK a;
+    CHECK_OK(a.configure(ak_params(), 7, 12));
+    uint64_t rng = 7;
+    auto u = [&]() { rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+                     return (double)((rng >> 33) & 0xFFFFFF) / (double)0x1000000; };
+    for (int t = 0; t < 3000; ++t) {
+        const int n = 4 + (int)(u() * 8);
+        AdaptiveK::Cand c[12];
+        int k[12], full = 0;
+        for (int i = 0; i < n; ++i) { c[i].q = u(); c[i].n = 7; full += 8; }
+        const int rows = a.choose(c, n, 0, k);
+        CHECK(rows == full || rows % 8 == 0);
+    }
+}
+
+TEST(adaptive_k_cost_model_and_table) {
+    AdaptiveK a;
+    CHECK_OK(a.configure(ak_params(), 7, 4));
+    CHECK_NEAR(a.cost_ms(8), 34.0, 0.05);
+    CHECK_NEAR(a.cost_ms(64), 58.0, 0.05);
+    AdaptiveK::Params p = ak_params();
+    p.n_pts = 3;
+    p.pt_m[0] = 8;  p.pt_ms[0] = 34;
+    p.pt_m[1] = 32; p.pt_ms[1] = 40;
+    p.pt_m[2] = 64; p.pt_ms[2] = 58;
+    AdaptiveK t;
+    CHECK_OK(t.configure(p, 7, 4));
+    CHECK_NEAR(t.cost_ms(8), 34.0, 1e-9);
+    CHECK_NEAR(t.cost_ms(20), 37.0, 1e-9);
+    CHECK_NEAR(t.cost_ms(64), 58.0, 1e-9);
+    CHECK_NEAR(t.cost_ms(80), 67.0, 1e-9);        /* extrapolates the last segment */
+
+    /* A flat cost makes every row free, so nothing is cut; a steep one cuts hard. */
+    AdaptiveK::Params flat = ak_params();
+    flat.cost_b = 0.0;
+    AdaptiveK f;
+    CHECK_OK(f.configure(flat, 7, 8));
+    AdaptiveK::Cand c[8];
+    int k[8];
+    for (int i = 0; i < 8; ++i) { c[i].q = 0.5; c[i].n = 7; }
+    CHECK_EQ(f.choose(c, 8, 0, k), 64);
+    AdaptiveK::Params steep = ak_params();
+    steep.cost_a = 1.0; steep.cost_b = 5.0;
+    AdaptiveK s;
+    CHECK_OK(s.configure(steep, 7, 8));
+    CHECK(s.choose(c, 8, 0, k) <= 24);
+}
+
+TEST(adaptive_k_estimates_acceptance_with_the_censoring_a_short_verify_implies) {
+    AdaptiveK a;
+    CHECK_OK(a.configure(ak_params(), 7, 4));
+    /* A fresh sequence is the pool's, which starts at 0.75. */
+    AdaptiveK::Stat s;
+    CHECK_NEAR(a.q_of(s), 0.75, 1e-9);
+    /* A verify of 1 draft that hit: one position evaluated, one taken. A miss: evaluated, not taken. */
+    uint64_t rng = 5;
+    auto coin = [&](double pr) { rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+                                 return (double)((rng >> 33) & 0xFFFFFF) / (double)0x1000000 < pr; };
+    AdaptiveK::Stat g;
+    double qsum = 0.0;
+    int qn = 0;
+    for (int t = 0; t < 2000; ++t) {
+        const int k = (t % 3 == 0) ? 7 : 3;                    /* lengths vary, q is 0.7 */
+        int acc = 0;
+        while (acc < k && coin(0.7)) ++acc;
+        a.observe(g, k, acc);
+        if (t >= 200) { qsum += a.q_of(g); ++qn; }
+    }
+    /* the mean estimate is unbiased (a short window is noisy, so the mean, not the last value) */
+    CHECK_NEAR(qsum / qn, 0.7, 0.04);
+    /* A full accept evaluates `drafted` positions; a rejection at 0 evaluates one. */
+    AdaptiveK b;
+    AdaptiveK::Params p = ak_params();
+    p.prior = 0.0;
+    p.alpha = 1.0;
+    CHECK_OK(b.configure(p, 7, 4));
+    AdaptiveK::Stat h;
+    b.observe(h, 7, 7);
+    CHECK_NEAR(b.q_of(h), 1.0, 1e-9);
+    b.observe(h, 7, 0);
+    CHECK_NEAR(b.q_of(h), 0.0, 1e-9);
+}
+
+/* THE SCHEDULER END: the step verifies the capped prefix, the stream is still the target's, and a
+ * lone sequence is untouched. The fake target emits tgt(id, index); a drafter is right for its
+ * first g tokens of each proposal. */
+namespace {
+int32_t ak_tgt(uint64_t id, int64_t idx) { return (int32_t)(5000 + (id * 131 + (uint64_t)idx * 7) % 997); }
+
+struct AkRun {
+    std::vector<std::vector<int32_t>> out;
+    int64_t rows = 0, steps = 0, tokens = 0;
+    int last_cap_good = 0, last_cap_poor = 0, lone_rows = 0;
+};
+
+AkRun ak_run(bool adaptive, int n_seq, const int* g, int n_steps) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/1024, /*max_ctx=*/4096);
+    f.cfg.n_spec = 7;
+    f.cfg.max_seqs = 16;
+    CHECK_OK(f.start());
+    if (adaptive) CHECK_OK(f.sch.set_adaptive_k(ak_params()));
+    std::vector<uint64_t> ids;
+    for (int i = 0; i < n_seq; ++i) ids.push_back(f.submit(16, 4000));
+    AkRun r;
+    for (int st = 0; st < n_steps; ++st) {
+        const RadBatch* b = f.sch.step();
+        if (!b) { CHECK(b != nullptr); break; }
+        const StepPlan& p = f.sch.plan();
+        std::vector<int32_t> acc(p.e.size(), 0), tok(p.e.size(), 0);
+        std::vector<uint8_t> eos(p.e.size(), 0);
+        for (size_t i = 0; i < p.e.size(); ++i) {
+            const StepEntry& e = p.e[i];
+            const Request* q = f.sch.find(e.seq);
+            const int64_t L = (int64_t)q->output.size();
+            int gi = 0;
+            for (int j = 0; j < n_seq; ++j) if (ids[(size_t)j] == e.seq) gi = g[j];
+            int a = e.n_spec < gi ? e.n_spec : gi;
+            if (e.is_prefill) a = 0;
+            /* the proposal the drafter published for THIS step must have been verified against
+             * the target: tokens past `a` are wrong */
+            if (!e.is_prefill) {
+                for (int j = 0; j < e.n_spec; ++j)
+                    CHECK_EQ(q->draft[j], j < gi ? ak_tgt(e.seq, L + j) : ak_tgt(e.seq, L + j) + 1);
+                r.rows += 1 + e.n_spec;
+                ++r.steps;
+            }
+            acc[i] = a;
+            tok[i] = ak_tgt(e.seq, L + a);
+        }
+        Scheduler::StepResult res;
+        res.n_seq = (int)p.e.size();
+        res.n_accepted = acc.data(); res.token = tok.data(); res.eos = eos.data();
+        CHECK_OK(f.sch.commit(res));
+        for (int i = 0; i < n_seq; ++i) {
+            const Request* q = f.sch.find(ids[(size_t)i]);
+            if (q->output.empty()) continue;
+            const int64_t L = (int64_t)q->output.size();
+            int32_t d[7];
+            for (int j = 0; j < 7; ++j) d[j] = j < g[i] ? ak_tgt(ids[(size_t)i], L + j)
+                                                         : ak_tgt(ids[(size_t)i], L + j) + 1;
+            CHECK_OK(f.sch.set_draft(ids[(size_t)i], d, 7));
+        }
+    }
+    for (int i = 0; i < n_seq; ++i) {
+        const Request* q = f.sch.find(ids[(size_t)i]);
+        r.out.push_back(q->output);
+        r.tokens += (int64_t)q->output.size();
+    }
+    return r;
+}
+}  /* namespace */
+
+TEST(adaptive_k_is_lossless_and_cuts_the_rows_of_a_batch_that_accepts_poorly) {
+    /* eight sequences: four whose drafter is right to the end, four that stop after one token */
+    const int g[8] = { 7, 7, 7, 7, 1, 1, 1, 1 };
+    AkRun off = ak_run(false, 8, g, 60);
+    AkRun on  = ak_run(true,  8, g, 60);
+    /* every emitted token is the target's own, in both runs */
+    for (const AkRun* r : { &off, &on })
+        for (size_t i = 0; i < r->out.size(); ++i)
+            for (size_t t = 0; t < r->out[i].size(); ++t)
+                CHECK_EQ(r->out[i][t], t == 0 ? r->out[i][0] : ak_tgt((uint64_t)i + 1, (int64_t)t));
+    /* the unshrunk run verifies 8 rows a sequence; the adaptive run learned to spend fewer */
+    CHECK_EQ(off.rows, off.steps * 8);
+    CHECK(on.rows < off.rows * 85 / 100);
+    /* and what the poor sequences lose is the rows they were wasting, not tokens: the good ones
+     * commit the same per step, the poor ones commit 2 either way */
+    CHECK(on.tokens * 100 >= off.tokens * 97);
+
+    /* a lone sequence is never shortened, whatever its acceptance */
+    const int g1[1] = { 0 };
+    AkRun one = ak_run(true, 1, g1, 30);
+    CHECK_EQ(one.rows, one.steps * 8);
+}
+
+/* ================================================================== whole-context lookup draft
+ * sched/lookup_draft.h through the scheduler: the proposal the drafter published is replaced by the
+ * continuation of a far match, the verify is unchanged, so the stream is the target's own. */
+namespace {
+/* The prompt is a 400-token text T (no 8-gram repeats). The target copies it: output index i is T[i], except
+ * that every `edit_every`-th token (0 = none) is replaced by a token the text does not contain. The drafter
+ * proposes junk, always wrong. */
+static std::string lk_data_dir() { std::string f = __FILE__; return f.substr(0, f.rfind('/')) + "/data"; }
+static std::vector<int32_t> lk_readids(const std::string& path) {
+    std::vector<int32_t> v;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return v;
+    int32_t x;
+    while (std::fread(&x, 4, 1, f) == 1) v.push_back(x);
+    std::fclose(f);
+    return v;
+}
+int32_t lk_text(int64_t i) { return 3000 + (int32_t)((i * 2654435761ull >> 7) % 4001); }
+std::vector<int32_t> lk_rp, lk_ra;   /* a recorded prompt and answer (real token ids), when set */
+int lk_prompt_len = 400, lk_pre = 0, lk_off = 0, lk_mind = 64, lk_blocks = 4096, lk_ctx = 4096;   /* knobs of lk_run, reset by LkKnobs */
+bool lk_silent = false;                 /* the drafter declines every sequence: set_draft is never called */
+struct LkKnobs { ~LkKnobs() { lk_prompt_len = 400; lk_pre = 0; lk_off = 0; lk_mind = 64; lk_blocks = 4096; lk_ctx = 4096; lk_silent = false; lk_rp.clear(); lk_ra.clear(); } };
+int32_t lk_tgt(uint64_t id, int64_t idx, int edit_every) {
+    if (!lk_ra.empty()) return idx < (int64_t)lk_ra.size() ? lk_ra[(size_t)idx] : 20000 + (int32_t)(idx % 977);
+    if (idx < lk_pre) return 15000 + (int32_t)((idx * 31 + (int64_t)id) % 97);        /* the answer starts with text the prompt does not hold */
+    idx = idx - lk_pre + lk_off;
+    if (edit_every > 0 && idx % edit_every == edit_every - 1) return 9000 + (int32_t)(idx % 50) + (int32_t)id;
+    return lk_text(idx);
+}
+
+struct LkRun {
+    std::vector<std::vector<int32_t>> out;
+    int64_t steps = 0, tokens = 0, rows = 0;
+    SchedMetrics m;
+};
+
+/* n_seq sequences; sequence i copies the text when copy[i], else it is a stream the prompt does not contain */
+LkRun lk_run(bool lookup, bool adaptive, int n_seq, const bool* copy, int edit_every, int n_steps,
+             int hot = 3, int enter = 8, int stay = 3) {
+    Fixture f;
+    f.build(/*blocks=*/lk_blocks, /*states=*/64, /*max_tok=*/1024, /*max_ctx=*/lk_ctx);
+    f.cfg.n_spec = 7;
+    f.cfg.max_seqs = 16;
+    CHECK_OK(f.start());
+    if (adaptive) CHECK_OK(f.sch.set_adaptive_k(ak_params()));
+    if (lookup) {
+        LookupParams lp;
+        lp.enabled = true; lp.enter = enter; lp.stay = stay; lp.hot = hot; lp.min_dist = lk_mind;
+        CHECK_OK(f.sch.set_lookup_draft(lp, 0));
+    }
+    std::vector<uint64_t> ids;
+    for (int i = 0; i < n_seq; ++i) {
+        auto r = std::make_unique<Request>();
+        r->id = f.next_id++;
+        r->max_tokens = 300;
+        r->prompt.resize((size_t)lk_prompt_len);
+        if (!lk_rp.empty()) r->prompt = lk_rp; else
+        for (int j = 0; j < lk_prompt_len; ++j) r->prompt[(size_t)j] = j < 400 ? lk_text(j) : 40000 + (int32_t)((j * 2246822519ull >> 5) % 100003);
+        ids.push_back(r->id);
+        CHECK_OK(f.sch.add(std::move(r)));
+    }
+    auto tgt = [&](int seq_idx, uint64_t id, int64_t idx) {
+        return copy[seq_idx] ? lk_tgt(id, idx, edit_every) : 20000 + (int32_t)((id * 977 + (uint64_t)idx * 131) % 997);
+    };
+    LkRun r;
+    for (int st = 0; st < n_steps; ++st) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        const StepPlan& p = f.sch.plan();
+        std::vector<int32_t> acc(p.e.size(), 0), tok(p.e.size(), 0);
+        std::vector<uint8_t> eos(p.e.size(), 0);
+        for (size_t i = 0; i < p.e.size(); ++i) {
+            const StepEntry& e = p.e[i];
+            const Request* q = f.sch.find(e.seq);
+            const int64_t L = (int64_t)q->output.size();
+            int si = 0;
+            for (int j = 0; j < n_seq; ++j) if (ids[(size_t)j] == e.seq) si = j;
+            int a = 0;
+            if (!e.is_prefill) {
+                /* greedy verify: a draft token is taken iff it is the target's own pick */
+                while (a < e.n_spec && q->draft[a] == tgt(si, e.seq, L + a)) ++a;
+                r.rows += 1 + e.n_spec;
+                ++r.steps;
+            }
+            acc[i] = a;
+            tok[i] = tgt(si, e.seq, L + a);
+        }
+        Scheduler::StepResult res;
+        res.n_seq = (int)p.e.size();
+        res.n_accepted = acc.data(); res.token = tok.data(); res.eos = eos.data();
+        CHECK_OK(f.sch.commit(res));
+        for (int i = 0; i < n_seq; ++i) {
+            const Request* q = f.sch.find(ids[(size_t)i]);
+            if (!q || q->output.empty() || q->state != ReqState::Running) continue;
+            int32_t d[7];
+            for (int j = 0; j < 7; ++j) d[j] = 1 + j;            /* junk: the drafter is always wrong */
+            if (!lk_silent) CHECK_OK(f.sch.set_draft(ids[(size_t)i], d, 7));
+        }
+    }
+    for (int i = 0; i < n_seq; ++i) {
+        const Request* q = f.sch.find(ids[(size_t)i]);
+        r.out.push_back(q->output);
+        r.tokens += (int64_t)q->output.size();
+    }
+    r.m = f.sch.metrics();
+    return r;
+}
+}  /* namespace */
+
+TEST(lookup_draft_is_lossless_and_lifts_a_far_copy_to_full_acceptance) {
+    const bool copy[1] = { true };
+    LkRun off = lk_run(false, false, 1, copy, 0, 200);
+    LkRun on  = lk_run(true,  false, 1, copy, 0, 200);
+    /* both streams are the target's own, token for token */
+    for (const LkRun* r : { &off, &on })
+        for (size_t t = 0; t < r->out[0].size(); ++t) CHECK_EQ(r->out[0][t], lk_tgt(1, (int64_t)t, 0));
+    CHECK_EQ(on.out[0].size(), (size_t)300);              /* the lookup run finished within the steps given */
+    CHECK(off.out[0].size() < on.out[0].size());          /* the junk-draft run did not */
+    /* junk drafts: one token a step; lookup copies 7 + 1 a step after the 8-token entry */
+    CHECK(off.tokens * 100 <= off.steps * 105);
+    CHECK(on.steps * 4 < off.steps);
+    CHECK(on.m.lookup_steps > 20);
+    CHECK(on.m.lookup_accepted * 100 >= on.m.lookup_drafted * 95);
+    CHECK(on.m.lookup_taken >= on.m.lookup_steps);
+    CHECK_EQ(off.m.lookup_taken, (int64_t)0);
+}
+
+TEST(lookup_draft_with_edits_stays_lossless_and_only_gains) {
+    const bool copy[1] = { true };
+    for (int edit_every : { 5, 11, 40 }) {
+        LkRun off = lk_run(false, false, 1, copy, edit_every, 400);
+        LkRun on  = lk_run(true,  false, 1, copy, edit_every, 400);
+        for (const LkRun* r : { &off, &on })
+            for (size_t t = 0; t < r->out[0].size(); ++t) CHECK_EQ(r->out[0][t], lk_tgt(1, (int64_t)t, edit_every));
+        CHECK_EQ(off.out[0].size(), on.out[0].size());
+        CHECK(on.steps <= off.steps);
+        /* edits every 40 leave long copies between them; every 5 breaks the entry threshold (8) most of the time */
+        if (edit_every == 40) CHECK(on.steps * 2 < off.steps);
+    }
+}
+
+TEST(lookup_draft_stay_threshold_keeps_a_short_match_going_only_while_hot) {
+    /* An edit every 11 tokens: after an edit the suffix matches for < 8 tokens until 8 more tokens are
+     * written, so only STAY (3) after a hot step keeps lookup going through. With HOT = 8 (never reached:
+     * at most 7 drafts are accepted) the mode can never stay, so it needs a fresh 8-match after every edit. */
+    const bool copy[1] = { true };
+    LkRun hot3 = lk_run(true, false, 1, copy, 11, 400, /*hot=*/3);
+    LkRun hot8 = lk_run(true, false, 1, copy, 11, 400, /*hot=*/8);
+    LkRun off  = lk_run(false, false, 1, copy, 11, 400);
+    for (const LkRun* r : { &hot3, &hot8 })
+        for (size_t t = 0; t < r->out[0].size(); ++t) CHECK_EQ(r->out[0][t], lk_tgt(1, (int64_t)t, 11));
+    CHECK(hot3.steps <= hot8.steps);
+    CHECK(hot8.steps <= off.steps);
+    CHECK(hot3.m.lookup_taken >= hot8.m.lookup_taken);
+}
+
+TEST(lookup_draft_runs_per_sequence_in_a_batch_and_beside_adaptive_k) {
+    /* eight sequences: four copy the text, four write something the prompt does not contain */
+    const bool copy[8] = { true, true, true, true, false, false, false, false };
+    LkRun off = lk_run(false, true, 8, copy, 0, 120);
+    LkRun on  = lk_run(true,  true, 8, copy, 0, 120);
+    for (const LkRun* r : { &off, &on })
+        for (int i = 0; i < 8; ++i)
+            for (size_t t = 0; t < r->out[(size_t)i].size(); ++t)
+                CHECK_EQ(r->out[(size_t)i][t], copy[i] ? lk_tgt((uint64_t)i + 1, (int64_t)t, 0)
+                                                       : 20000 + (int32_t)(((uint64_t)i + 1) * 977 + (uint64_t)t * 131) % 997);
+    /* the copies finish in far fewer steps, and what they accepted never fed the adaptive estimate: the
+     * four poor sequences are still shortened (rows saved) exactly as without lookup */
+    CHECK(on.m.lookup_steps > 40);
+    CHECK(on.m.lookup_accepted * 100 >= on.m.lookup_drafted * 95);
+    CHECK(on.tokens > off.tokens);
+    CHECK(on.m.adaptive_k_rows_saved > 0);
+    /* lookup rows are full length: 8 rows a lookup step, so the batch never verified fewer than 8 rows of a copy */
+    CHECK(on.rows > 0);
+}
+
 RAD_TEST_MAIN()
+
+
+/* THE BUG THESE TWO PIN (found by the first GPU A/B: 0 lookup steps in every workload). A block drafter declines a
+ * sequence whose draft cache has a hole -- every prefix-cache hit leaves one, and a long context is cached -- and
+ * then set_draft() is never called for it, so the override living there never ran; the n-gram fallback filled the
+ * proposal instead. The lookup is decided in step() for those sequences too. */
+TEST(lookup_draft_serves_a_sequence_the_drafter_declined_far_copy_after_a_long_prompt) {
+    LkKnobs reset;
+    lk_prompt_len = 9000; lk_pre = 6; lk_off = 100; lk_mind = -1; lk_blocks = 16384; lk_ctx = 16384;   /* window: 2048 */
+    lk_silent = true;
+    const bool copy[1] = { true };
+    LkRun on = lk_run(true, true, 1, copy, 0, 200);
+    for (size_t t = 0; t < on.out[0].size(); ++t) CHECK_EQ(on.out[0][t], lk_tgt(1, (int64_t)t, 0));   /* lossless */
+    CHECK_EQ(on.out[0].size(), (size_t)300);
+    CHECK(on.m.lookup_taken >= 30);
+    CHECK(on.m.lookup_steps >= 30);
+    CHECK(on.m.lookup_accepted * 100 >= on.m.lookup_drafted * 95);
+    CHECK(on.steps < 70);                                  /* one token a step would be 300 */
+    LkRun off = lk_run(false, true, 1, copy, 0, 400);      /* the same drafter-less sequence without it */
+    CHECK_EQ(off.m.lookup_taken, (int64_t)0);
+}
+
+/* The same with REAL token ids: tests/data/lookup/ holds the Qwen3.5 tokenisation of a chat prompt (11042 tokens:
+ * a Python file's 30-line class head, then 30 KB of other standard-library source, then "copy the first 30 lines")
+ * and of the answer a model gives (266 tokens: the head in a code block). The source starts within the first
+ * 400 tokens; the answer starts with text the prompt does not hold. Code repeats its own 4-grams, so the hash
+ * chains are long here -- the synthetic text above has none. */
+TEST(lookup_draft_finds_a_far_copy_in_a_real_token_stream) {
+    LkKnobs reset;
+    lk_rp = lk_readids(lk_data_dir() + "/lookup/copy-prompt.ids");
+    lk_ra = lk_readids(lk_data_dir() + "/lookup/copy-answer.ids");
+    CHECK(lk_rp.size() >= 8192);
+    CHECK(lk_ra.size() > 200);
+    lk_prompt_len = (int)lk_rp.size(); lk_mind = -1; lk_blocks = 16384; lk_ctx = 16384;
+    const bool copy[1] = { true };
+    for (int silent = 0; silent < 2; ++silent) {
+        lk_silent = silent != 0;
+        LkRun off = lk_run(false, true, 1, copy, 0, 400);
+        LkRun on  = lk_run(true,  true, 1, copy, 0, 400);
+        for (const LkRun* r : { &off, &on }) {
+            CHECK_EQ(r->out[0].size(), (size_t)300);
+            for (size_t t = 0; t < r->out[0].size(); ++t) CHECK_EQ(r->out[0][t], lk_tgt(1, (int64_t)t, 0));
+        }
+        CHECK_EQ(off.m.lookup_taken, (int64_t)0);
+        CHECK(on.m.lookup_taken >= 20);
+        CHECK(on.m.lookup_steps >= 20);
+        CHECK(on.m.lookup_accepted * 100 >= on.m.lookup_drafted * 90);
+        CHECK(on.steps * 2 < off.steps || silent);          /* junk drafter: 1 token a step -> lookup's long drafts */
+        CHECK(on.steps < 100);
+    }
+}

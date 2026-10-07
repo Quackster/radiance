@@ -183,13 +183,49 @@ struct Scales {
     uint32_t dt;
     int64_t rs, cs, group, rblk;
     bool e8m0;
-    inline float grp(int64_t row, int64_t g) const {
+    /* The OCP-MX `b_ref` reference, exactly libref/ref_gemm.h's: attached only for an mxfp4 weight
+     * whose e8m0 plane has one, it makes a folded product reproduce the device's element fold --
+     * E4M3_RNE(code * 2^-dsh) per element and 2^(Wref-127) once per row -- instead of reading
+     * 2^(E8M0-127). Without it the direct read stands, so every fp8 and b_ref-less path is
+     * unchanged. */
+    const uint8_t* ref;
+    int64_t ref_rs, ref_cs, ref_n;
+    inline int wref_at(int64_t row) const {
+        int w = 0;
+        for (int64_t b = 0; b < ref_n; ++b) {
+            const int v = (int)ref[row * ref_rs + b * ref_cs];
+            if (v > w) w = v;
+        }
+        return w;
+    }
+    inline int dsh_at(int64_t row, int64_t i, int wref) const {
+        int d = wref - (int)((const uint8_t*)p)[i];
+        return d < 0 ? 0 : (d > 15 ? 15 : d);
+    }
+    /* The device's folded E4M3 magnitude of one code (see libref/ref_gemm.h::fold_mag): E4M3_RNE
+     * of code * 2^-dsh, underflowing to zero, with the row factor applied once by the caller. */
+    inline float fold_mag(float code, int dsh) const {
+        return rad_fp8e4m3_to_f32(rad_f32_to_fp8e4m3(code * std::ldexp(1.0f, -dsh)));
+    }
+    inline float row_factor(int wref) const { return std::ldexp(1.0f, wref - 127); }
+    inline int group_dsh(int64_t row, int64_t g, int wref) const {
+        const int64_t i = (rblk > 1 ? row / rblk : row) * rs + g * cs;
+        return dsh_at(row, i, wref);
+    }
+    inline float grp(int64_t row, int64_t g, int wref) const {
         const int64_t i = (rblk > 1 ? row / rblk : row) * rs + g * cs;
         if (e8m0) {
             const uint8_t e = ((const uint8_t*)p)[i];
+            if (ref) {
+                const uint8_t we = (uint8_t)(wref - dsh_at(row, i, wref));
+                return we == 0xff ? std::nanf("") : std::ldexp(1.0f, (int)we - 127);
+            }
             return e == 0xff ? std::nanf("") : std::ldexp(1.0f, (int)e - 127);
         }
         return rad_load_f32(p, dt, i);
+    }
+    inline float grp(int64_t row, int64_t g) const {
+        return grp(row, g, ref ? wref_at(row) : 0);
     }
 };
 
@@ -222,6 +258,22 @@ static Scales make_scales(const RadTensor* s, int64_t rows, int64_t K, bool mxfp
     return q;
 }
 
+/* Attach an OCP-MX `b_ref` (per-output-row E8M0 reference byte) to a weight's e8m0 grid, mirroring
+ * libref/ref_gemm.h's `scales_ref` so the host pair stays clamp-aware together. Untouched unless the
+ * weight is mxfp4, its b_scale is e8m0, and the reference is a u8 stream at least N wide. */
+static void scales_ref(Scales& s, const RadTensor* r, int64_t rows) {
+    if (!s.e8m0 || !s.p || !r || !r->data || r->dtype != RAD_U8) return;
+    const int64_t nel = numel(r);
+    if (rows <= 0 || nel < rows) return;
+    s.ref    = (const uint8_t*)r->data;
+    s.ref_rs = r->rank >= 2 ? r->stride[r->rank - 2] : 1;
+    s.ref_cs = r->rank >= 2 ? r->stride[r->rank - 1] : 1;
+    const int64_t inner = r->rank >= 2 ? r->shape[r->rank - 1] : 1;
+    s.ref_n  = (inner > 1 && nel >= rows * inner) ? inner : 1;
+    if (s.ref_rs <= 0) s.ref_rs = 1;
+    if (s.ref_cs <= 0) s.ref_cs = 1;
+}
+
 /* ================================================================== packing
  * A row of an operand, widened into f32 and made contiguous. Returns the caller's own pointer when
  * the operand is ALREADY dense f32 -- the one case where the pack is skipped entirely, and the
@@ -234,8 +286,12 @@ static const float* pack_rows(const Mat& m, int64_t r0, int64_t nrows, int64_t K
     for (int64_t r = 0; r < nrows; ++r) {
         const int64_t base = (r0 + r) * m.rs;
         if (m.cs == 1) {
+            /* Byte-alignment mask: I4/e2m1 need an even element, I2 and e2m3 a multiple of four
+             * (a 6-bit code is at a byte boundary exactly when 6i % 8 == 0). A misaligned start
+             * goes to the scalar gather rather than reading the row bit-shifted. */
             const int sub = (t->dtype == RAD_I4 || t->dtype == RAD_FP4E2M1) ? 1
-                          : (t->dtype == RAD_I2) ? 3 : 0;
+                          : (t->dtype == RAD_I2 || t->dtype == RAD_FP6E2M3) ? 3
+                          : (t->dtype == RAD_I5) ? 7 : 0;
             if (!sub || (base & sub) == 0) {
                 row_to_f32(t->dtype, byte_at(t->data, t->dtype, base), dst + r * ldd, K);
                 continue;
@@ -298,70 +354,89 @@ static int gemm_drive(const Mat& ma, const Mat& mb, const Scales* SA, const Scal
      * occupancy limit -- which is why avx_registry.cpp declares no tunable axes. The target is
      * stated rather than probed from CPUID because the cache descriptors there are a fiction on
      * more parts than they are a fact, and the sweep above shows the curve is flat enough that
-     * being wrong about it costs ten percent rather than an order. */
-    enum { AVX_L2_PANEL = 256 * 1024 };
-    int64_t MB = (int64_t)AVX_L2_PANEL / ((int64_t)K * (int64_t)sizeof(float));
-    if (MB < MR) MB = MR;
-    if (MB > M) MB = M;
+     * being wrong about it costs ten percent rather than an order. The paneling below was replaced
+     * by a whole-A pack with n-blocks outer so B is folded once (see the fold pre-pass); the
+     * measurement above is kept as the reason the panel shape was never a large factor. */
 
     const int64_t lda = K;
-    float* apack = (float*)scratch_raw((size_t)MB * (size_t)K * sizeof(float) + 64);
+    /* Pack the WHOLE A once and loop n-blocks OUTER, so B is packed and (when folded) folded once
+     * per n-block instead of once per M-block. The per-element E4M3 fold is O(N*K), so re-running it
+     * inside the paneled A loop multiplied it by ceil(M/MB). */
+    float* apack = (float*)scratch_raw((size_t)M * (size_t)K * sizeof(float) + 64);
+    /* Packed on the calling thread, before the parallel region: every worker reads it, and nothing
+     * inside the region touches this arena, so the pointer cannot move under them. */
+    const float* Ap = pack_rows(ma, 0, M, K, apack, lda);
     const int64_t nblocks = (N + NR - 1) / NR;
 
-    for (int64_t mb0 = 0; mb0 < M; mb0 += MB) {
-        const int64_t mrows = (M - mb0) < MB ? (M - mb0) : MB;
-        /* Packed on the calling thread, before the parallel region: every worker reads it, and
-         * nothing inside the region touches this arena, so the pointer cannot move under them. */
-        const float* Ap = pack_rows(ma, mb0, mrows, K, apack, lda);
+    AVX_PARALLEL_FOR_IF((int64_t)M * N * K >= 65536)
+    for (int64_t nb = 0; nb < nblocks; ++nb) {
+        const int64_t n0 = nb * NR;
+        const int64_t nn = (N - n0) < NR ? (N - n0) : NR;
+        const int64_t ldb = K;
+        float* bbuf = scratch_f32((size_t)NR * (size_t)K);
+        const float* Bp = pack_rows(mb, n0, nn, K, bbuf, ldb);
 
-        AVX_PARALLEL_FOR_IF(mrows * N * K >= 65536)
-        for (int64_t nb = 0; nb < nblocks; ++nb) {
-            const int64_t n0 = nb * NR;
-            const int64_t nn = (N - n0) < NR ? (N - n0) : NR;
-            const int64_t ldb = K;
-            float* bbuf = scratch_f32((size_t)NR * (size_t)K);
-            const float* Bp = pack_rows(mb, n0, nn, K, bbuf, ldb);
-
-            for (int64_t m0 = 0; m0 < mrows; m0 += MR) {
-                const int64_t mm = (mrows - m0) < MR ? (mrows - m0) : MR;
-                float acc[MR][NR];
-                for (int i = 0; i < MR; ++i)
-                    for (int j = 0; j < NR; ++j) acc[i][j] = 0.0f;
-
+        /* A folded mxfp4 weight (`b_ref` attached): fold 2^-dsh into each B element as an E4M3
+         * magnitude -- libref's per-element fold -- and apply 2^(Wref-127) once per row as the
+         * group scale. Only the packed branch reaches here (an e2m1 weight is never dense f32),
+         * so `bbuf` holds the codes. */
+        const bool folded = SB && SB->ref && mb.t->dtype == RAD_FP4E2M1;
+        float brf[NR];
+        if (folded) {
+            float* bm = bbuf;
+            for (int64_t j = 0; j < nn; ++j) {
+                const int wref = SB->wref_at(n0 + j);
+                brf[j] = SB->row_factor(wref);
                 for (int64_t gi = 0; gi < ngrp; ++gi) {
-                    const int64_t k0 = gi * g, k1 = (k0 + g < K) ? k0 + g : K;
-                    if (mm == MR && nn == NR) {
-                        float sub[MR][NR];
-                        for (int i = 0; i < MR; ++i)
-                            for (int j = 0; j < NR; ++j) sub[i][j] = 0.0f;
-                        dot_block<MR, NR>(Ap + m0 * lda, lda, Bp, ldb, k0, k1, sub);
-                        for (int j = 0; j < NR; ++j) {
-                            const float sb = (SB && SB->p) ? SB->grp(n0 + j, gi) : 1.0f;
-                            for (int i = 0; i < MR; ++i) {
-                                const float sa = (SA && SA->p)
-                                                     ? SA->grp(mb0 + m0 + i, k0 / SA->group) : 1.0f;
-                                acc[i][j] += sub[i][j] * sa * sb;
-                            }
+                    const int64_t kk0 = gi * g, kk1 = (kk0 + g < K) ? kk0 + g : K;
+                    const int dsh = SB->group_dsh(n0 + j, gi, wref);
+                    for (int64_t k = kk0; k < kk1; ++k)
+                        bm[j * ldb + k] = SB->fold_mag(bm[j * ldb + k], dsh);
+                }
+            }
+        }
+
+        for (int64_t m0 = 0; m0 < M; m0 += MR) {
+            const int64_t mm = (M - m0) < MR ? (M - m0) : MR;
+            float acc[MR][NR];
+            for (int i = 0; i < MR; ++i)
+                for (int j = 0; j < NR; ++j) acc[i][j] = 0.0f;
+
+            for (int64_t gi = 0; gi < ngrp; ++gi) {
+                const int64_t k0 = gi * g, k1 = (k0 + g < K) ? k0 + g : K;
+                if (mm == MR && nn == NR) {
+                    float sub[MR][NR];
+                    for (int i = 0; i < MR; ++i)
+                        for (int j = 0; j < NR; ++j) sub[i][j] = 0.0f;
+                    dot_block<MR, NR>(Ap + m0 * lda, lda, Bp, ldb, k0, k1, sub);
+                    for (int j = 0; j < NR; ++j) {
+                        const float sb = (SB && SB->p)
+                                             ? (folded ? brf[j] : SB->grp(n0 + j, gi)) : 1.0f;
+                        for (int i = 0; i < MR; ++i) {
+                            const float sa = (SA && SA->p)
+                                                 ? SA->grp(m0 + i, k0 / SA->group) : 1.0f;
+                            acc[i][j] += sub[i][j] * sa * sb;
                         }
-                    } else {
-                        for (int64_t j = 0; j < nn; ++j) {
-                            const float sb = (SB && SB->p) ? SB->grp(n0 + j, gi) : 1.0f;
-                            for (int64_t i = 0; i < mm; ++i) {
-                                const float sa = (SA && SA->p)
-                                                     ? SA->grp(mb0 + m0 + i, k0 / SA->group) : 1.0f;
-                                acc[i][j] +=
-                                    dot1(Ap + (m0 + i) * lda, Bp + j * ldb, k0, k1) * sa * sb;
-                            }
+                    }
+                } else {
+                    for (int64_t j = 0; j < nn; ++j) {
+                        const float sb = (SB && SB->p)
+                                             ? (folded ? brf[j] : SB->grp(n0 + j, gi)) : 1.0f;
+                        for (int64_t i = 0; i < mm; ++i) {
+                            const float sa = (SA && SA->p)
+                                                 ? SA->grp(m0 + i, k0 / SA->group) : 1.0f;
+                            acc[i][j] +=
+                                dot1(Ap + (m0 + i) * lda, Bp + j * ldb, k0, k1) * sa * sb;
                         }
                     }
                 }
-                for (int64_t i = 0; i < mm; ++i)
-                    for (int64_t j = 0; j < nn; ++j) {
-                        float v = acc[i][j];
-                        if (bias) v += ldt(bias, (n0 + j) * laststride(bias));
-                        stt(Y, (mb0 + m0 + i) * ys_r + (n0 + j) * ys_c, v);
-                    }
             }
+            for (int64_t i = 0; i < mm; ++i)
+                for (int64_t j = 0; j < nn; ++j) {
+                    float v = acc[i][j];
+                    if (bias) v += ldt(bias, (n0 + j) * laststride(bias));
+                    stt(Y, (m0 + i) * ys_r + (n0 + j) * ys_c, v);
+                }
         }
     }
     return RAD_OK;
@@ -431,9 +506,15 @@ static int gemm_ntq_impl(const RadArgs* a, bool bias_operand) {
     if (numel(A) < M * K || numel(B) < N * K) return RAD_E_SHAPE;
     if (bias && numel(bias) < N) return RAD_E_SHAPE;
 
-    const bool mx = B->dtype == RAD_FP4E2M1;
+    /* OCP-MX weights -- e2m1, e2m3 or an e4m3 plane with an e8m0 grid -- read b_scale as exponent
+     * bytes; like libref's, the flag only bites when the stream is u8, so block-fp8's bf16
+     * weight_scale_inv is unaffected. The e2m3/e4m3 codes are self-scaling and carry no b_ref, so
+     * the folded path below stays keyed to RAD_FP4E2M1. Gated ops stay fp4-only this phase. */
+    const bool mx = B->dtype == RAD_FP4E2M1 || B->dtype == RAD_FP6E2M3 || B->dtype == RAD_F8E4M3;
     Scales SA = make_scales(as_, M, K, false);
     Scales SB = make_scales(bs_, N, K, mx);
+    /* The OCP-MX fold's reference exponent is gemm_nt_q's operand 6; the bias form has no such slot. */
+    if (!bias_operand) scales_ref(SB, rad_arg_in(a, 6), N);
     /* `group` is what the SELECTOR matches on; the loop uses the group the scale stream actually
      * implies. They agree in every well-formed call, and where they do not the stream is the one
      * that describes the bytes -- so a disagreement is refused rather than silently resolved. */
@@ -487,8 +568,10 @@ AVX_KERNEL(gemm_nt_q_gated) {
     if (ob && numel(ob) < M * n) return RAD_E_SHAPE;
 
     const bool mx = B->dtype == RAD_FP4E2M1;
-    const Scales SA = make_scales(as_, M, K, false);
-    const Scales SB = make_scales(bs_, N, K, mx);
+    Scales SA = make_scales(as_, M, K, false);
+    Scales SB = make_scales(bs_, N, K, mx);
+    /* gemm_nt_q_gated_mx appends b_ref at operand 7; the fp8 form has none. */
+    scales_ref(SB, rad_arg_in(a, 7), N);
     const Mat ma = as_mat(A, K), mb = as_mat(B, K);
 
     static thread_local std::vector<float> plane;
@@ -514,6 +597,14 @@ AVX_KERNEL(gemm_nt_q_gated) {
     }
     return RAD_OK;
 }
+
+/* The OCP-MX (mxfp4a8) gated fold, a separate op for the reason libr4d's new op gives: the MX
+ * weight carries an eighth `b_ref` operand, and the positional operand list has an exact arity
+ * check, so it cannot ride on the seven-operand op. The arithmetic is gemm_nt_q_gated's -- the same
+ * driver, the same bf16 narrowing of both halves, the same whole-row quantiser when `group` is
+ * absent -- and the shared implementation attaches operand 7 (`b_ref`) through `scales_ref`, so the
+ * MX block scale is the device's saturated fold 2^(Wref-127-dsh), as libref's is. */
+AVX_KERNEL(gemm_nt_q_gated_mx) { return AVX_FN(avx_gemm_nt_q_gated)(a, stream); }
 
 /* The same arithmetic as gemm_nt, and a separate op anyway: lm_head is its own access class
  * (RAD_ACCESS_VOCAB) and the sampler wants to fuse against it, so the two have to be selectable

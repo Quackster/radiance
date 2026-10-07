@@ -128,6 +128,17 @@ struct SchedMetrics {
     int64_t draft_refills = 0;
     int64_t draft_refill_tokens = 0;
     float   draft_acceptance = 0.0f;
+    /* Adaptive verify length (adaptive_k.h): steps it shortened a draft in, and the verify rows
+     * that saved against verifying every draft in full. Both 0 when it is off. */
+    int64_t adaptive_k_steps = 0;
+    int64_t adaptive_k_rows_saved = 0;
+    /* Whole-context lookup draft (lookup_draft.h): proposals it looked at, proposals it replaced, and the
+     * verify steps / tokens / accepted tokens of the steps that carried one. All 0 when it is off. */
+    int64_t lookup_considered = 0;
+    int64_t lookup_taken = 0;
+    int64_t lookup_steps = 0;
+    int64_t lookup_drafted = 0;
+    int64_t lookup_accepted = 0;
     int     draft_depth = 0;          /* what the controller would choose right now */
     /* Per draft POSITION, so a cliff can be told from a decay: `reached` is how often every
      * earlier position was accepted and this one was therefore evaluated, `accepted` how often it

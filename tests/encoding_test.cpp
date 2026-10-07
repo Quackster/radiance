@@ -433,6 +433,40 @@ TEST(a_givens_transform_with_channel_scales_inverts) {
     for (int k = 0; k < K; ++k) CHECK(std::fabs(out[k] - w[k]) < 1e-5f);
 }
 
+TEST(givens_forward_turns_a_base_activation_into_the_stored_code_domain) {
+    /* The identity path A leans on: with the same tables, a = enc_givens_forward(x) satisfies
+     * dot(a, v) == dot(x, w) for every stored code row v, w being what givens_inverse decodes from
+     * v. A GEMM that reads v then reproduces exactly the base weight's output. */
+    const int K = 4;
+    const float v[4] = { 1.0f, -2.0f, 0.5f, 3.0f };
+    const float dsc[4] = { 2.0f, 0.5f, 1.0f, 4.0f };          /* t.scale = 1/channel_scales */
+    const int32_t pairs[2][4] = { { 0, 1, 2, 3 }, { 0, 2, 1, 3 } };
+    const float ang[2][2] = { { 0.3f, -1.1f }, { 0.7f, 2.0f } };
+    RadEncoding e = rad_enc_plain(RAD_F32);
+    rad_enc_copy_str(e.scheme, "affine");
+    rad_enc_add_plane(&e, "scale", RAD_F32, 0, 0);
+    rad_enc_add_table(&e, "t.pairs", RAD_I32, 2, 4);
+    rad_enc_add_table(&e, "t.angle", RAD_F32, 2, 2);
+    rad_enc_add_table(&e, "t.scale", RAD_F32, 1, 4);
+    rad_enc_copy_str(e.transform, "givens");
+    const float one = 1.0f;
+    const void* planes[5] = { v, &one, pairs, ang, dsc };
+    EncodedView ev;
+    enc_view(e, 1, 4, planes, &ev);
+    float w[4];
+    REQUIRE_EQ(enc_decode_rows(ev, 0, 1, w), RAD_OK);
+    const float x[4] = { 0.7f, -1.3f, 2.1f, 0.4f };
+    float a[4];
+    for (int k = 0; k < K; ++k) a[k] = x[k];
+    REQUIRE_EQ(enc_givens_forward(ev, a), RAD_OK);
+    double dot_av = 0, dot_xw = 0;
+    for (int k = 0; k < K; ++k) {
+        dot_av += (double)a[k] * v[k];
+        dot_xw += (double)x[k] * w[k];
+    }
+    CHECK(std::fabs(dot_av - dot_xw) < 1e-5);
+}
+
 TEST(the_core_declines_a_scheme_it_did_not_define) {
     RadEncoding e;
     rad_enc_clear(&e);

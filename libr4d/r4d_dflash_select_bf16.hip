@@ -56,10 +56,31 @@
 // the codebook reads are guarded exactly as ref_dflash_select guards them -- a predecessor out of
 // range contributes nothing, and a candidate out of range scores its unary term alone -- rather
 // than gathering a row from before or past the codebook.
+// THE CODEBOOK ELEMENT, AS A TEMPLATE PARAMETER. Q = false is the bf16 codebook the checkpoint
+// ships; Q = true is the same numbers held as E4M3 codes with an f32 scale a row (psc / ssc, a
+// stride of 1 row apiece or 0 for one scale for the whole table). The scale is applied where it
+// costs least: the predecessor's into `sa` once a step, the candidate's onto the finished wave
+// sum. Q = false never touches psc / ssc and compiles to the kernel it always was.
+__device__ __forceinline__ float ds_e4m3(unsigned int v) {
+  const unsigned int sgn = v >> 7, e = (v >> 3) & 15u, m = v & 7u;
+  float f;
+  if (e == 0) f = (float)m * 0.001953125f;                          // m * 2^-9
+  else if (e == 15 && m == 7) f = __int_as_float(0x7fc00000);       // NaN, never written by a quantiser
+  else f = __uint_as_float(((e + 120u) << 23) | (m << 20));
+  return sgn ? -f : f;
+}
+template <bool Q>
+__device__ __forceinline__ float ds_cb(const void* __restrict__ p, long i) {
+  if constexpr (Q) return ds_e4m3(((const unsigned char*)p)[i]);
+  else return r4d_bf2f(((const r4d_u16*)p)[i]);
+}
+
+template <bool Q>
 __global__ __launch_bounds__(DSL_THREADS) void r4d_dflash_select_kernel(
     const int* __restrict__ cand, const float* __restrict__ unary,
     const r4d_u16* __restrict__ hp, const int* __restrict__ anchor,
-    const r4d_u16* __restrict__ pred, const r4d_u16* __restrict__ succ,
+    const void* __restrict__ pred, const void* __restrict__ succ,
+    const float* __restrict__ pscl_p, const float* __restrict__ sscl_p, int psc_row, int ssc_row,
     int* __restrict__ out, int steps, int K, int R, int V,
     int cand_ld, int hp_ld, int out_ld, int anchor_stride)
 {
@@ -82,7 +103,9 @@ __global__ __launch_bounds__(DSL_THREADS) void r4d_dflash_select_kernel(
                              : cand[(row - 1) * cand_ld + schosen];
     const bool pid_ok = pid >= 0 && pid < V;
 
-    const r4d_u16* __restrict__ prow = pred + (long)(pid_ok ? pid : 0) * R;
+    const long prow = (long)(pid_ok ? pid : 0) * R;
+    float pscl = 1.0f;
+    if constexpr (Q) { if (pid_ok) pscl = pscl_p[(long)pid * psc_row]; }
     /* hp absent is hp == 1: the predecessor's codebook row goes in untouched. Branching outside
      * the loop rather than multiplying by a materialised plane of ones keeps the bigram case from
      * reading R bf16 a step for a number it already knows. */
@@ -91,10 +114,10 @@ __global__ __launch_bounds__(DSL_THREADS) void r4d_dflash_select_kernel(
     } else if (hp) {
       const r4d_u16* __restrict__ hrow = hp + row * hp_ld;
       for (int r = tid; r < R; r += DSL_THREADS)
-        sa[r] = r4d_bf2f(prow[r]) * r4d_bf2f(hrow[r]);
+        sa[r] = ds_cb<Q>(pred, prow + r) * pscl * r4d_bf2f(hrow[r]);
     } else {
       for (int r = tid; r < R; r += DSL_THREADS)
-        sa[r] = r4d_bf2f(prow[r]);
+        sa[r] = ds_cb<Q>(pred, prow + r) * pscl;
     }
     __syncthreads();
 
@@ -104,8 +127,9 @@ __global__ __launch_bounds__(DSL_THREADS) void r4d_dflash_select_kernel(
       const int cid = cand[row * cand_ld + c];
       float acc = 0.0f;
       if (cid >= 0 && cid < V) {
-        const r4d_u16* __restrict__ srow = succ + (long)cid * R;
-        for (int r = lane; r < R; r += DSL_WAVE) acc += sa[r] * r4d_bf2f(srow[r]);
+        const long srow = (long)cid * R;
+        for (int r = lane; r < R; r += DSL_WAVE) acc += sa[r] * ds_cb<Q>(succ, srow + r);
+        if constexpr (Q) acc *= sscl_p[(long)cid * ssc_row];   // per lane, before the sum: it is linear
       }
       acc = r4d_wave_sum(acc);
       if (lane == 0) ssc[c] = acc + unary[row * cand_ld + c];
@@ -143,9 +167,37 @@ extern "C" int r4d_dflash_select_bf16(
   /* `hp` may be null -- the bigram form -- and then there is no plane to have a pitch. */
   if (hp && hp_ld < R) return -1;
 
-  hipLaunchKernelGGL(r4d_dflash_select_kernel, dim3(M), dim3(DSL_THREADS), 0, (hipStream_t)stream,
+  hipLaunchKernelGGL(r4d_dflash_select_kernel<false>, dim3(M), dim3(DSL_THREADS), 0,
+                     (hipStream_t)stream,
                      (const int*)cand, (const float*)unary, (const r4d_u16*)hp,
-                     (const int*)anchor, (const r4d_u16*)pred, (const r4d_u16*)succ,
+                     (const int*)anchor, pred, succ,
+                     (const float*)nullptr, (const float*)nullptr, 0, 0,
+                     (int*)out, steps, K, R, V, cand_ld, hp_ld, out_ld, anchor_stride);
+  return (int)hipGetLastError();
+}
+
+// The E4M3 codebook spelling: `pred` and `succ` are [V, R] E4M3 codes and `psc` / `ssc` their f32
+// scales -- `*_row` is the stride between one row's scale and the next's, 1 for a scale a row and
+// 0 for one scale across the whole table. Everything else is r4d_dflash_select_bf16's.
+extern "C" int r4d_dflash_select_q_fp8(
+    const void* cand, const void* unary, const void* hp, const void* anchor,
+    const void* pred, const void* psc, const void* succ, const void* ssc, void* out,
+    int M, int steps, int K, int R, int V, int cand_ld, int hp_ld, int out_ld,
+    int anchor_stride, int psc_row, int ssc_row, void* stream)
+{
+  if (M <= 0 || steps <= 0) return 0;
+  if (K < 1 || K > DSL_MAX_K) return -1;
+  if (R < DSL_WAVE || R > DSL_MAX_R || (R % DSL_WAVE)) return -1;
+  if (V < 1) return -1;
+  if (cand_ld < K || out_ld < steps || anchor_stride < 1) return -1;
+  if (hp && hp_ld < R) return -1;
+  if ((psc_row != 0 && psc_row != 1) || (ssc_row != 0 && ssc_row != 1)) return -1;
+  if (!psc || !ssc) return -1;
+  hipLaunchKernelGGL(r4d_dflash_select_kernel<true>, dim3(M), dim3(DSL_THREADS), 0,
+                     (hipStream_t)stream,
+                     (const int*)cand, (const float*)unary, (const r4d_u16*)hp,
+                     (const int*)anchor, pred, succ, (const float*)psc, (const float*)ssc,
+                     psc_row, ssc_row,
                      (int*)out, steps, K, R, V, cand_ld, hp_ld, out_ld, anchor_stride);
   return (int)hipGetLastError();
 }
@@ -229,5 +281,66 @@ extern "C" int r4d_rad_dflash_select(const RadArgs* a, RadStream s) {
                                   anc->data, pr->data, sc->data,
                                   out->data, (int)M, (int)steps, (int)K, (int)R, (int)V,
                                   (int)cand_ld, (int)hp_ld, (int)out_ld, (int)astr, s) == 0
+               ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* ------------------------------------------------------------------ dflash select, E4M3 codebooks */
+
+/* `dflash_select_q`: `cand`, `unary`, `hp`?, `anchor`, `pred`w, `pred_scale`w, `succ`w,
+ * `succ_scale`w -> `tokens`. The operand list is dflash_select's with each codebook followed by its
+ * f32 scale, so the checks on the four planes and the output are the same ones. The scale is one
+ * f32 a codebook row (a [V, 1] plane) or a single one for the table; anything else is refused, as
+ * a plane of the wrong extent would be read at a stride it was never written at. */
+enum { DQ_CAND = 0, DQ_UNARY, DQ_HP, DQ_ANCHOR, DQ_PRED, DQ_PSC, DQ_SUCC, DQ_SSC, DQ_OUT };
+
+extern "C" int r4d_rad_dflash_select_q(const RadArgs* a, RadStream s) {
+    const RadTensor* cand = r4d_opt(a, DQ_CAND);
+    const RadTensor* un   = r4d_opt(a, DQ_UNARY);
+    const RadTensor* hp   = r4d_opt(a, DQ_HP);
+    const RadTensor* anc  = r4d_opt(a, DQ_ANCHOR);
+    const RadTensor* pr   = r4d_opt(a, DQ_PRED);
+    const RadTensor* ps   = r4d_opt(a, DQ_PSC);
+    const RadTensor* sc   = r4d_opt(a, DQ_SUCC);
+    const RadTensor* ss   = r4d_opt(a, DQ_SSC);
+    const RadTensor* out  = r4d_opt(a, DQ_OUT);
+    if (!cand || !un || !anc || !pr || !ps || !sc || !ss || !out) return R4D_NO(RAD_E_INVAL);
+
+    const long long steps = r4d_geti_or(a, "steps", 0);
+    const long long K     = r4d_geti_or(a, "top_k", 0);
+    const long long R     = r4d_geti_or(a, "rank", 0);
+    const long long V     = r4d_geti_or(a, "n_vocab", 0);
+    /* M is the OUTPUT's row count, for the reason r4d_rad_dflash_select spells out. */
+    if (out->rank != 2) return R4D_NO(RAD_E_SHAPE);
+    const long long M = out->shape[0];
+    if (M <= 0 || steps <= 0 || K <= 0 || R <= 0 || V <= 0) return R4D_NO(RAD_E_INVAL);
+
+    const long long rows    = M * steps;
+    const long long cand_ld = ds_plane(cand, RAD_I32,  K, rows);
+    const long long un_ld   = ds_plane(un,   RAD_F32,  K, rows);
+    const long long out_ld  = ds_plane(out,  RAD_I32,  steps, M);
+    const bool     has_hp = hp && hp->data;
+    const long long hp_ld = has_hp ? ds_plane(hp, RAD_BF16, R, rows) : 0;
+    if (cand_ld < 0 || un_ld < 0 || hp_ld < 0 || out_ld < 0) return R4D_NO(RAD_E_SHAPE);
+    if (cand_ld != un_ld) return R4D_NO(RAD_E_STRIDE);
+
+    if (pr->dtype != RAD_F8E4M3 || sc->dtype != RAD_F8E4M3) return R4D_NO(RAD_E_DTYPE);
+    if (ps->dtype != RAD_F32 || ss->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(pr) || !r4d_contig(sc) || !r4d_contig(ps) || !r4d_contig(ss))
+        return R4D_NO(RAD_E_STRIDE);
+    if (r4d_numel(pr) < V * R || r4d_numel(sc) < V * R) return R4D_NO(RAD_E_SHAPE);
+    /* One a row, or one for all of it. A plane of any other length is somebody else's layout. */
+    const long long pn = r4d_numel(ps), sn = r4d_numel(ss);
+    if (!((pn == 1) || (pn >= V)) || !((sn == 1) || (sn >= V))) return R4D_NO(RAD_E_SHAPE);
+
+    const long long astr = r4d_geti_or(a, "anchor_stride", 1);
+    if (anc->dtype != RAD_I32 && anc->dtype != RAD_U32) return R4D_NO(RAD_E_DTYPE);
+    if (astr < 1 || !r4d_contig(anc)) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(anc) < (M - 1) * astr + 1) return R4D_NO(RAD_E_SHAPE);
+
+    return r4d_dflash_select_q_fp8(cand->data, un->data, has_hp ? hp->data : nullptr, anc->data,
+                                   pr->data, ps->data, sc->data, ss->data, out->data,
+                                   (int)M, (int)steps, (int)K, (int)R, (int)V,
+                                   (int)cand_ld, (int)hp_ld, (int)out_ld, (int)astr,
+                                   pn == 1 ? 0 : 1, sn == 1 ? 0 : 1, s) == 0
                ? RAD_OK : RAD_E_DEVICE;
 }

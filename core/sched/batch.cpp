@@ -21,6 +21,14 @@ static const int64_t k_carve_align = 256;
  * are all in flight before its first store (rad_memcpy_ranges_async). */
 static const int64_t k_range_max = 16384;
 
+/* THE DFLASH2 VERIFY-HEAD GATE'S TWO CONSTANTS. RERANK is the width of the exact-reranked
+ * candidate set the sparse target head writes (the fork's RADIANCE_DRAFT_RERANK); the sampler's
+ * support must fit inside it, and the fork's 4x margin is what makes its truncation lossless, so a
+ * sampled row is safe only when top_k <= RERANK/4. MAX_ROWS is the widest batch the int2 head is
+ * known to win on: beyond it the coarse pass is compute-bound and the fp8 GEMM can be cheaper. */
+static const int k_verify_head_rerank = 80;
+static const int k_verify_head_max_rows = 4096;
+
 /* A HOST-SIDE BOUND, ROUNDED UP ONTO A COARSE GRID: to a multiple of `min_q`, and above 64 of
  * 1/32 to 1/64 of the value's power of two if that is coarser -- so ~3% over at a long context and
  * at most `min_q` over at a short one.
@@ -1079,6 +1087,32 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         }
     }
 
+    /* THE DFLASH2 VERIFY-HEAD SAFETY GATE, from the requests the step actually carries. It is a
+     * property of the SAMPLING TRAFFIC and not of the model, so it is computed here -- where the
+     * Request::sp of every entry is in hand -- and transported on the batch. The sampler must NOT
+     * compute it: the kIssueAll path builds the sampler step host-side while the model step is
+     * still in flight and the pipelined kIssueModel path issues a step early, so a sampler-side
+     * flag would describe a batch other than the one its logits belong to. A trunk pass only: a
+     * draft/history pass's rows are the head's, and a scoring pass wants the full row. */
+    int32_t verify_head = 0;
+    if (plan.draft_pass == 0 && plan.tok_shift == 0) {
+        verify_head = 1;
+        for (const StepEntry& e : plan.e) {
+            if (!e.req || !e.produces_token || e.hidden_row >= 0) continue;
+            const SamplingParams& sp = e.req->sp;
+            if (e.req->score || !sp.grammar.empty() || sp.grammar_program || sp.grammar_lazy) {
+                verify_head = 0;
+                break;
+            }
+            if (sp.greedy()) continue;
+            if (sp.top_k < 1 || sp.top_k > k_verify_head_rerank / 4 || sp.min_p != 0.0f) {
+                verify_head = 0;
+                break;
+            }
+        }
+        if (verify_head && n_out > k_verify_head_max_rows) verify_head = 0;
+    }
+
     /* From here the manager's change marks are taken, so a build that stops before its upload
      * is issued on every rank leaves the card's tables unknown to the next one. */
     if (int st = build_groups(plan, kv, s, o); st < 0) {
@@ -1213,6 +1247,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.checkpoint_tok = n_ck ? on_rank(base, b0, s.d_cktok) : nullptr;
         B.checkpoint_slot = n_ck ? on_rank(base, b0, s.d_ckslot) : nullptr;
         B.n_ahead = n_ahead;
+        B.verify_head = verify_head;
     }
     /* THE FLIGHT, behind everything that reads this span: the upload, and the derivation copies
      * run_derivations issued above. */

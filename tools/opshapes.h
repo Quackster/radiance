@@ -245,8 +245,31 @@ inline int rad_operand_shapes(const std::string& op, const Geometry& g, int n_op
         add((uint32_t)RAD_F8E4M3, {M, n});
         add((uint32_t)RAD_F32, {M, (n + group - 1) / group});
     }
+    /* ---- the per-row (OCP-MX) producers. `rmsnorm_quant_fp8_row`, `gated_quant_fp8_row` and
+     * `gate_quant_fp8_row` are the group=128 producers above with the group dropped, so their
+     * operands have the same extents in the same order EXCEPT `scale`, which is one f32 per ROW
+     * -- `[M, 1]`, not `[M, ceil(n/128)]`. There is no `group` parameter. The grid is
+     * libr4d/r4d_shapes.cpp's `r4d_shape_*_quant_fp8_row` (the OCP-MX GEMMs read one activation
+     * scale per token, `As[m]`). `residual` and `out_bf16` are optional and passed, as those hooks
+     * pass them. */
+    else if (op == "rmsnorm_quant_fp8_row") {
+        if (n <= 0) return RAD_E_UNSUPPORTED;
+        add(D, {M, n}); add(D, {M, n}); add((uint32_t)RAD_F32, {n});
+        add((uint32_t)RAD_F8E4M3, {M, n}); add((uint32_t)RAD_F32, {M, 1}); add(D, {M, n});
+    }
+    else if (op == "gated_quant_fp8_row") {
+        if (n <= 0) return RAD_E_UNSUPPORTED;
+        add(D, {M, 2 * n}); add((uint32_t)RAD_F8E4M3, {M, n});
+        add((uint32_t)RAD_F32, {M, 1}); add(D, {M, n});
+    }
+    else if (op == "gate_quant_fp8_row") {
+        if (n <= 0) return RAD_E_UNSUPPORTED;
+        add(D, {M, n}); add(D, {M, n}); add((uint32_t)RAD_F8E4M3, {M, n});
+        add((uint32_t)RAD_F32, {M, 1}); add(D, {M, n});
+    }
     else if (op == "gemm_nt_q") {
-        /* BLOCK-SCALED FP8 ONLY, and the restriction is the honest one rather than laziness.
+        /* BLOCK-SCALED FP8 AND THE OCP-MX FAMILY. The restriction was the honest one rather than
+         * laziness, and it still holds for the other four formats.
          *
          * `gemm_nt_q` is one op over six weight formats and the SCALE GRID is what differs between
          * them -- per row, per row-group, per output-row-block, an e8m0 exponent byte, with or
@@ -254,32 +277,80 @@ inline int rad_operand_shapes(const std::string& op, const Geometry& g, int n_op
          * kernel that reads it, not of the schema, so a recipe that guessed would be testing the
          * bounds handling of five kernels and calling the result correctness (see the header).
          *
-         * The fp8 family is different: its grid is stated by the CHECKPOINT -- E4M3 [N][K] against
-         * a bf16 [ceil(N/128)][ceil(K/128)] plane, with `group` carrying the 128 -- so there is
-         * nothing left to guess, and it is the family the production model runs on. The rest are
-         * skipped and counted.
+         * Two families are different because their grids are STATED by the format rather than
+         * guessed:
+         *   - fp8: the CHECKPOINT -- E4M3 [N][K] against a bf16 [ceil(N/128)][ceil(K/128)] plane,
+         *     with `group` carrying the 128 -- and it is the family the production model runs on.
+         *   - the OCP-MX family (mxfp4a8, mxfp6a8, mxfp8a8): one CANONICAL grid -- `b` row-major
+         *     [N, K] in its code dtype (e2m1 two codes a byte, e2m3 four codes in three bytes,
+         *     e4m3 one byte a code) over an E8M0 [N, K/32] scale plane. The device's fragment order
+         *     and [K/32][N] transpose are that grid's STORED form and live in the row's layout hooks,
+         *     not in this description -- see the MX branch. The activation is E4M3 with one f32
+         *     scale per ROW [M, 1] (libr4d/r4d_shapes.cpp's `quant_act_fp8_row`), and `a_sum`
+         *     belongs to the asymmetric-integer formats and is absent. `b_ref` is mxfp4's fold only:
+         *     e2m3 and e4m3 codes are self-scaling and their rows decline the operand.
          *
-         * `a_sum` and `b_ref` belong to the asymmetric-integer and mxfp4 grids and are absent. */
+         * The remaining formats are skipped and counted. */
         const char* q = g.get_s("dtype");
-        /* OCP-MXFP4 is the other grid: e2m1 codes with one E8M0 exponent per 32 of K (`group`
-         * 32), read against the fp8 family's own activation pair -- E4M3 with an f32 scale per
-         * (row, 128 of K), which is what LinearFP8 feeds it. The weight operands arrive in libr4d's
-         * stored layout, and their BYTE COUNTS are what is sized here: the codes are K/2 bytes a
-         * row in fragment order, the exponents [K/32][N] and the per-row reference [N]. Drawn
-         * bytes are fine for timing -- the kernel's work does not depend on which exponents it
-         * folds. */
-        if (q && std::strcmp(q, "mxfp4a8") == 0) {
-            if (N <= 0 || K <= 0 || group != 32) return RAD_E_UNSUPPORTED;
-            add((uint32_t)RAD_F8E4M3, {M, K});
-            add((uint32_t)RAD_F32,    {M, (K + 127) / 128});
-            add((uint32_t)RAD_U8,     {N, K / 2});     /* b       -- e2m1 codes, fragment order */
-            add((uint32_t)RAD_U8,     {K / 32, N});    /* b_scale -- E8M0, [K/32][N] */
-            add((uint32_t)RAD_BF16,   {M, N});         /* y */
-            skip_opd();                                /* a_sum */
-            add((uint32_t)RAD_U8,     {N});            /* b_ref   -- the per-row reference */
+        const bool a8  = q && std::strcmp(q, "fp8a8")   == 0;
+        const bool a16 = q && std::strcmp(q, "fp8a16")  == 0;
+        const bool mx4 = q && std::strcmp(q, "mxfp4a8") == 0;
+        const bool mx6 = q && std::strcmp(q, "mxfp6a8") == 0;
+        const bool mx8 = q && std::strcmp(q, "mxfp8a8") == 0;
+        const bool w5  = q && std::strcmp(q, "w5a8")   == 0;
+        const bool mx  = mx4 || mx6 || mx8 || w5;
+        /* The native MXFP4 decode/tiled rows (`gemm_mxfp4a8_decode`, `gemm_mxfp4a8_tiled`) are the
+         * same op, dtype and grid as `gemm_mxfp4a8_nt_m64`, so they are described here by
+         * construction and need no branch of their own: the row's layout hooks own the stored form
+         * and kbench builds it from the canonical planes below. */
+        if (mx) {
+            /* THE OCP-MX GRID IS THE FORMAT'S, AND IT IS THE CANONICAL ONE -- the same logical
+             * weight the ORACLE reads, not the fragment-ordered bytes the kernel is handed.
+             *
+             * kbench compares an MX weight by building BOTH forms from the encoding's canonical
+             * planes: `kf_lay_weight` runs the row's own RadLayoutFn/RadRelayoutFn to produce the
+             * fragment-ordered planes the kernel reads, and `kf_planes_logical` decodes the same
+             * planes to the row-major tensor libref reads. The two are never the same bytes, so the
+             * comparison does NOT need the row's RadUnrelayoutFn -- that is the ENGINE oracle's
+             * instrument (core/runtime/oracle.cpp), which starts from already-stored bytes and must
+             * invert them. What kbench DOES need is for this recipe's declared form to be the
+             * canonical one `kf_planes_logical` is handed, exactly as the oracle's own hook
+             * (libref/ref_shapes.cpp gemm_q_shape) and libr4d's (r4d_shapes.cpp
+             * r4d_shape_gemm_nt_q) both state it: `b` row-major [N, K] in its code dtype and
+             * `b_scale` the E8M0 [N, K/32] plane. Declaring the PACKED byte extent here instead
+             * sized the reference's buffer at half (or three-quarters) and made the fixture refuse
+             * the case on an element-count mismatch -- which is all the old skip named. `b_ref`
+             * describes the canonical [N, K/32] plane the `wref` view derives from too (a row max;
+             * the unrelayout broadcasts it back).
+             *
+             * K % kMxGroup is the OCP-MX block width, fixed by the format (libr4d's
+             * R4D_MXFP4_GROUP, which is not on this header's include path) and independent of the
+             * schema's `group` parameter, which the MX kernels do not read. The kernel constraints
+             * also require K % kMxGroup and N % 16 (cGemmNtMxfp4A8 in r4d_rows). */
+            constexpr int64_t kMxGroup = 32;
+            if (N <= 0 || K <= 0 || K % kMxGroup) return RAD_E_UNSUPPORTED;
+            add((uint32_t)RAD_F8E4M3, {M, K});     /* a        -- E4M3 activation */
+            add((uint32_t)RAD_F32,    {M, 1});     /* a_scale  -- one per ROW, As[m] */
+            /* `b` is the row-major code plane over the LOGICAL [N, K]: e2m1 at two codes a byte,
+             * e2m3 at four codes in three bytes, e4m3 at one byte a code -- the packed byte count
+             * is rad_dtype_bytes, not this shape. */
+            if (mx4)      add((uint32_t)RAD_FP4E2M1, {N, K});
+            else if (mx6) add((uint32_t)RAD_FP6E2M3, {N, K});
+            else if (w5)  add((uint32_t)RAD_I5,      {N, K});
+            else          add((uint32_t)RAD_F8E4M3,  {N, K});
+            /* `b_scale` and `b_ref` are the OCP E8M0 exponent bytes, declared as U8: libref reads a
+             * U8 stream beside an MX weight AS e8m0 (libref/ref_gemm.h:160). Both are the canonical
+             * [N][K/32] plane, NOT libr4d's stored [K/32][N] transpose. The dense int5 row takes an
+             * f16 scale there instead (an integer code cannot ride libquant's e8m0 mx rule). */
+            if (w5) add((uint32_t)RAD_F16, {N, K / kMxGroup});  /* b_scale -- w5a8 f16 */
+            else    add((uint32_t)RAD_U8,  {N, K / kMxGroup});  /* b_scale -- e8m0 */
+            add((uint32_t)RAD_BF16,   {M, N});             /* y */
+            skip_opd();                                    /* a_sum -- asymmetric-integer only */
+            /* `b_ref` is mxfp4's fold. e2m3 and e4m3 codes are self-scaling, so their rows decline
+             * the operand and it is declared absent rather than sized on a grid that does not exist. */
+            if (mx4) add((uint32_t)RAD_U8, {N, K / kMxGroup});  /* b_ref -- the same plane */
+            else     skip_opd();                                /* b_ref -- mxfp6/mxfp8 have no fold */
         } else {
-            const bool a8  = q && std::strcmp(q, "fp8a8")  == 0;
-            const bool a16 = q && std::strcmp(q, "fp8a16") == 0;
             if ((!a8 && !a16) || N <= 0 || K <= 0 || group <= 0) return RAD_E_UNSUPPORTED;
             const int64_t kb = (K + group - 1) / group;
             const int64_t nb = (N + group - 1) / group;
@@ -287,11 +358,33 @@ inline int rad_operand_shapes(const std::string& op, const Geometry& g, int n_op
             if (a8) { add((uint32_t)RAD_F8E4M3, {M, K}); add((uint32_t)RAD_F32, {M, kb}); }
             else    { add((uint32_t)RAD_BF16,   {M, K}); skip_opd(); }
             add((uint32_t)RAD_F8E4M3, {N, K});    /* b       -- the checkpoint's own bytes */
-            add((uint32_t)RAD_BF16,   {nb, kb});  /* b_scale -- weight_scale_inv, one per 128x128 */
+            add((uint32_t)RAD_BF16,   {nb, kb});  /* b_scale -- weight_scale_inv, per 128x128 tile */
             add((uint32_t)RAD_BF16,   {M, N});    /* y */
             skip_opd();                           /* a_sum */
             skip_opd();                           /* b_ref */
         }
+    }
+    else if (op == "gemm_nt_q_gated_mx") {
+        /* THE GATED FOLD OF THE MX DECODE ROW, and it is a SECOND OP rather than `gemm_nt_q` with a
+         * flag because the MX weight carries an eighth `b_ref` operand and operands are positional
+         * with an exact arity check. The weight grid is `gemm_nt_q`'s MX branch verbatim -- `b`
+         * canonical row-major e2m1 [N, K] and `b_scale`/`b_ref` the E8M0 [N, K/32] plane -- and the
+         * SwiGLU and the whole-row fp8 quantiser are in the epilogue. `N` is the WEIGHT's rows (gate
+         * then up), so the quantiser's outputs are N/2 wide and `scale` is one f32 per ROW. mxfp4a8
+         * only, and decode-only: no row serves M > 64, so nothing above it is describable here. */
+        const char* gmq = g.get_s("dtype");
+        const bool  gmx4 = gmq && std::strcmp(gmq, "mxfp4a8") == 0;
+        constexpr int64_t kMxGroup = 32;
+        if (!gmx4 || N <= 0 || K <= 0 || (N % 2) || K % kMxGroup) return RAD_E_UNSUPPORTED;
+        const int64_t nout = N / 2;
+        add((uint32_t)RAD_F8E4M3,  {M, K});            /* a */
+        add((uint32_t)RAD_F32,     {M, 1});            /* a_scale, one per row */
+        add((uint32_t)RAD_FP4E2M1, {N, K});            /* b -- canonical e2m1 [N, K] */
+        add((uint32_t)RAD_U8,      {N, K / kMxGroup}); /* b_scale -- canonical [N][K/32] */
+        add((uint32_t)RAD_F8E4M3,  {M, nout});         /* q */
+        add((uint32_t)RAD_F32,     {M, 1});            /* scale, one per row */
+        add((uint32_t)RAD_BF16,    {M, nout});         /* out_bf16 */
+        add((uint32_t)RAD_U8,      {N, K / kMxGroup}); /* b_ref -- canonical wref plane */
     }
     else if (op == "dequant") {
         add((uint32_t)RAD_I8, {M, n}); add((uint32_t)RAD_F32, {M, group ? n / group : 1});

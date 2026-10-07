@@ -39,9 +39,9 @@ made knowingly.
 - `dtype` is always present and always a string. It names the **operand combination**, which is
   why a weight format and an activation format share one key: `bf16`, `f16`/`fp16`, `f32`/`fp32`,
   `fp8_e4m3`, `fp8a8`, `fp8a16`, `w4`, `w4a8`, `w4a8_asym`, `w4a8h`, `w8a8`, `w4a16`, `w8a16`,
-  `w2a8`, `mxfp4a8`. `w4a8h` is `w4a8` with a `group`-wide Walsh–Hadamard along K baked into the
-  stored weight (`docs/MOE-W4.md`), `w4a8_asym` the unsigned-nibble-minus-zero-point grid rather
-  than the symmetric one, and `fp8a8`/`fp8a16` say whether a block-scaled E4M3 weight is met by
+  `w2a8`, `mxfp4a8`, `mxfp8a8`, `mxfp6a8`. `w4a8h` is `w4a8` with a `group`-wide
+  Walsh–Hadamard along K baked into the stored weight (`docs/MOE-W4.md`), `w4a8_asym` the
+  unsigned-nibble-minus-zero-point grid rather than the symmetric one, and `fp8a8`/`fp8a16` say whether a block-scaled E4M3 weight is met by
   an fp8 activation or a bf16 one. `q_dtype` and `kv_dtype` are the same key split in two where
   attention reads two formats at once.
 - `M` is the ranged parameter wherever a token count appears. **At most one ranged parameter per
@@ -304,10 +304,53 @@ spelling of `act`, not the vocabulary's.
 | op | params | operands |
 |---|---|---|
 | `quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
+| `quant_act_fp8_row` | `M` `n` `dtype` | `x` → `q`, `scale` |
 | `had_quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
 | `rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
+| `rmsnorm_quant_fp8_row` | `M` `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
+| `gated_quant_fp8_row` | `M` `n` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gemm_nt_q_gated` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `out_bf16`? |
+| `gemm_nt_q_gated_mx` | `M` `N` `K` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `out_bf16`?; `b_ref`w? |
+| `paroquant_quant_fp8_row` | `M` `n` `stages` `dtype` `k_base`/opt | `x`, `pairs`w, `angle`w, `t_scale`w → `q`, `scale` |
+| `paroquant_quant_fp8_row_multi2` | `M` `n` `stages` `dtype` `P` `k_base`/opt | `x`, `pairs0`w, `angle0`w, `t_scale0`w, `pairs1`w, `angle1`w, `t_scale1`w → `q0`, `scale0`, `q1`, `scale1`|
+| `paroquant_rmsnorm_quant_fp8_row2` | `M` `n` `stages` `dtype` `P` `k_base`/opt `eps`:f64 `wadd`:f64/opt `act`:str/opt `no_rot`/opt | `x`, `res`:inout?, `w`w, `pairs0`w, `angle0`w, `t_scale0`w, `pairs1`w, `angle1`w, `t_scale1`w → `q0`, `scale0`, `q1`, `scale1`, `y`? |
+| `paroquant_rmsnorm_quant_fp8_row3` | `M` `n` `stages` `dtype` `P` `k_base`/opt `eps`:f64 `wadd`:f64/opt `act`:str/opt `no_rot`/opt | `x`, `res`:inout?, `w`w, `pairs0`w, `angle0`w, `t_scale0`w, `pairs1`w, `angle1`w, `t_scale1`w, `pairs2`w, `angle2`w, `t_scale2`w → `q0`, `scale0`, `q1`, `scale1`, `q2`, `scale2`, `y`? |
+| `paroquant_gated_quant_fp8_row1` | `M` `n` `stages` `dtype` `P` `k_base`/opt `act`:str/opt | `gu`, `pairs0`w, `angle0`w, `t_scale0`w → `q0`, `scale0`, `gu2`? |
+
+`quant_act_fp8_row` is `quant_act_fp8` with the group dropped: one symmetric E4M3 scale per **row**
+(`scale` is `[M, 1]`, `amax / 448`, a DEQUANT multiplier, scale 1 for a zero row, the same three
+choices as the per-group form) rather than per (row, `group` columns). It is a new op and not a
+parameter on `quant_act_fp8` because the constraint system has no param-eq-param predicate, so
+`group == n` cannot be a row constraint, and the OCP-MX (`mxfp4a8`/`mxfp8a8`/`mxfp6a8`) GEMMs
+read their activation with a single f32 scale per token and no per-128 group.
+
+`rmsnorm_quant_fp8_row` and `gated_quant_fp8_row` are the same producers as `rmsnorm_quant_fp8` and
+`gated_quant_fp8` with that per-row scale: the same operands in the same order, no `group`
+parameter, and `scale` at `[M, 1]` rather than `[M, ceil(n/group)]`. They exist because the MX trunk
+reads the same activations the fp8 trunk does and wants the same fused producers.
+
+`paroquant_quant_fp8_row` is the **Path-A** producer: it rotates a bf16 activation into the domain
+a still-rotated ParoQuant weight is stored in, then applies `quant_act_fp8_row`'s whole-row E4M3
+quantiser. The stored weight reconstructs to `w = R(v) · D`, so a GEMM reading the codes `v` needs
+the activation `a = (x / t_scale) · M_decᵀ` — divide by `t_scale` (the container's
+`1/channel_scales`), then apply the `stages` Givens rotations **ascending and transposed**
+(`(a,b) → (c·a + s·b, −s·a + c·b)`). `pairs` is `i32 [stages, n]` with column-global indices,
+`angle` is `f32 [stages, n/2]` in radians, `t_scale` is `f32 [1, n]`; all three are weight operands
+of the consuming GEMM's weight. Unlike the fp8 family's folded Walsh-Hadamard this rotation mixes
+arbitrary column pairs, so it cannot be done wave-local in registers. Device-only; no ref
+implementation (`enc_givens_forward` in the core is its oracle).
+
+`paroquant_rmsnorm_quant_fp8_row2`/`...3` and `paroquant_gated_quant_fp8_row1` are the **fused**
+Path-A producers: the whole-row norm (`rmsnorm_quant_fp8_row`) or gated product
+(`gated_quant_fp8_row`) **and** the Givens rotation plus whole-row E4M3 quantiser in the **same
+launch**, once per consumer partition (`P` is 2, 3 and 1 respectively). They exist because a
+separate producer launch per linear is what dominates Path A's decode: the norm/gate launch already
+runs, so folding the rotation into it removes the launch without changing the arithmetic, which is
+byte-identical to the standalone producer (a device selftest is the gate). `q0..P-1`/`scale0..P-1`
+are the per-consumer rotated activations an `mxfp6a8` GEMM reads; the norm form keeps the bf16
+normalised row in shared memory (`K·6` bytes, so the norm-fed widths), the gated form walks one
+128-group at a time so its width may exceed the LDS budget.
 
 ### The int8 and gated fp8 fusions — device-only
 
@@ -317,6 +360,11 @@ spelling of `act`, not the vocabulary's.
 | `had_quant_act_i8g` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
 | `gated_had_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gate_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
+| `gate_quant_fp8_row` | `M` `n` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
+
+`gate_quant_fp8_row` is the per-row (OCP-MX) form of `gate_quant_fp8`: the gate in its own operand
+(a gated attention's gate is a column slice of the `[q|gate]` projection), then the whole-row
+quantiser, with `scale` at `[M, 1]`.
 
 `gemm_nt_q_gated` is the row above pulled into the projection that feeds it: `gemm_nt_q` over a
 `[N, K]` gate_up plane — `N` is the WEIGHT's rows, twice the fused width, gate half first — with
@@ -326,6 +374,14 @@ op's `y`, and an architecture that resolved it into `gemm_nt_q`'s operand list w
 a buffer of half the width it expects. `act` is REQUIRED here, unlike the quantiser's: an
 implementation is free to compile one gate and an optional parameter would let it resolve for
 another.
+
+`gemm_nt_q_gated_mx` is the OCP-MX (`mxfp4a8`) form of `gemm_nt_q_gated`: the same projection and
+the same `gated_quant_fp8_row` pass (silu(gate)·up, rounded to bf16, then the whole-row E4M3
+quantiser), with no `group` — one f32 `scale` per row — and the MX weight's eighth operand `b_ref`,
+the per-output-row reference exponent the E8M0 block scale is folded against. It is a NEW op rather
+than a `dtype` on `gemm_nt_q_gated` because operand lists are positional and checked for exact
+arity at issue, so the `b_ref` slot cannot ride on the seven-operand op; `gemm_nt_q` carries the
+same slot because it was declared with it from the start.
 
 `out_bf16` is not an optimisation: the unfused pair leaves a bf16 tensor behind and the codes are
 taken over *that*, so a layer with a bf16 consumer of the post-norm value must ask for it or the
@@ -354,6 +410,7 @@ waiting on the mover's event — a read of weight bytes that may not have arrive
 | `gemm_nt` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
 | `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
+| `gemm_nt_q_paro` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt | `a`, `a_scale`, `a2`?, `a_scale2`?, `a3`?, `a_scale3`?, `b`w, `b_scale`w → `y` |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
 
 `nt` is A row-major `[M,K]` times B **transposed** `[N,K]`, giving `[M,N]` — the layout every
@@ -363,6 +420,83 @@ plugin that switches quant changes one string, not its op names.
 
 `gemm_nt_q` takes activation scales as an operand because the quantiser produced them; a kernel
 that folds dequantisation into its epilogue still receives them.
+
+`gemm_nt_q` with `dtype=mxfp4a8` is the OCP-MX family. The weight is three views of one encoding:
+`b` is E2M1 codes over the logical `[N, K]` (two packed a byte), `b_scale` is the E8M0 shared
+exponent per 32 K in `[K/32][N]` order, and `b_ref` is a per-output-row E8M0 reference exponent the
+block scale is folded against. `a` is E4M3 and `a_scale` is one f32 per **row** (`[M, 1]`), not the
+fp8 family's per-128 group; `a_sum` is absent (asymmetric-integer grids only). For this dtype
+`b_ref` is **required** — it is the only reference the fold has, and every element would be scaled
+against zero without it — so the `?` on the table row does not apply to `mxfp4a8`. The plugin's
+layout hook stores `b` in the kernel's WMMA fragment order (`r4d.mxfp4.frag.g32`) and `b_scale`
+transposed to `[K/32][N]` (`r4d.mxfp4.e8m0`), with `b_ref` derived as each row's largest exponent
+(`r4d.mxfp4.wref`); a reader of the container must relayout rather than assume row-major, which is
+why the per-op oracle needs the row's `RadUnrelayoutFn`.
+
+`gemm_nt_q` with `dtype=mxfp8a8` and `dtype=mxfp6a8` are the other two members of the OCP-MX
+family. They share `mxfp4a8`'s activation side exactly — E4M3 `a` with one f32 per row — and its
+E8M0 shared exponent per 32 K, and they differ only in `b` and in what the epilogue folds.
+`mxfp8a8`'s `b` is the E4M3 code itself, one byte each over the logical `[N, K]`; `mxfp6a8`'s `b`
+is E2M3 codes packed four to three bytes along the row, `[N, 3K/4]`. Neither takes `b_ref`: the
+wider codes are self-scaling, so the block E8M0 is applied directly in the epilogue and there is
+no fold to reference — the `?` on the table row means **absent** for these dtypes, not optional.
+Their layout hooks store `b` in the same WMMA fragment block structure as `mxfp4a8`
+(`r4d.mxfp8.frag.g32`, `r4d.mxfp6.frag.g32` — a lane holds eight consecutive k bytes of E4M3, and
+eight E2M3 codes in six bytes respectively) with the same transposed `[K/32][N]` scale plane, so
+the container rule is unchanged: relayout before reading. `gemm_nt_q_gated_mx` stays
+`mxfp4a8`-only — the gated fold it performs is exactly the mxfp4 fold these dtypes do without.
+
+`gemm_nt_q_paro` is the PARTITION-SELECT form of the same family: one merged weight (a fused
+`[gate|up]`, `[q|k|v]` or `[in_proj_qkv|z]`) run as **one** GEMM launch whose output columns take a
+different activation per partition, instead of P separate GEMMs. `a` covers output columns below
+`pb1`, `a2` the columns at or past `pb1`, and `a3` the columns at or past `pb2`; each partition
+carries its own per-row E4M3 scale (`a_scale`, `a_scale2`, `a_scale3`). `pb1`/`pb2` are 16-aligned
+column offsets, and an absent partition operand (or absent boundary) means the previous partition
+extends to the next boundary. The weight side and its stored fragment form are unchanged from the
+matching non-paro dtype. Today the plugin implements it at `dtype=mxfp6a8`, where the decode band
+(M <= 64) pins the kernel's per-wave N-tile count to one so a wave never straddles a boundary.
+
+### Selectable `mxfp4a8` kernels (`RADIANCE_MX_GEMM`, `RADIANCE_MX_TUNE`)
+
+The plugin carries two MXFP4 GEMM implementations for the same `gemm_nt_q`/`mxfp4a8` op -- the
+native split-K/tiled pair (formerly the ported PR #30 kernels, merged upstream) -- selected at load,
+so one binary can A/B them without a rebuild. They read the
+same stored form as `gemm_mxfp4a8_nt_m64` — the fragment-order `b`, the `[K/32][N]` E8M0 plane, the
+per-row `b_ref` and the per-`[M,1]` `a_scale` — so the choice moves the kernel, not the numerics:
+
+| env | rows made to win | bands |
+|---|---|---|
+| (unset) / `ours` | `gemm_mxfp4a8_nt_m64`, `gemm_mxfp4a8_tiled` | M <= 64, M >= 65 |
+| `pr_decode` | `gemm_mxfp4a8_decode` | M <= 128 |
+| `pr_tiled` | `gemm_mxfp4a8_tiled` | M >= 65 |
+| `ablk` | both native rows (shorthand for `pr_decode,pr_tiled`) | both |
+| `RADIANCE_MX_TUNE=1` | both native rows, the "tuned bands" | both |
+
+The value is a comma-list and is read once at plugin registration; the unselected row stays
+compiled and reachable by name (e.g. `r4d_selftest --case gemm_mxfp4a8_decode`). The native decode
+row is split-K across workgroups with its partial in the op's scratch; the native tiled row stages a
+256-row A tile through LDS. Their default priority is below ours, so an unset environment is
+byte-for-byte today's selection.
+
+`RADIANCE_MX_TUNE` is the single switch a tuning A/B flips: anything but `0`/empty raises BOTH
+native rows, i.e. selects the kernels whose axes the tuner can address per band (below).
+`RADIANCE_MX_GEMM` still works and the two are additive. Unset is today's behaviour byte for byte.
+
+**Bands.** `core/plugin/bands.cpp` takes a ranged op's bucket boundaries from the LE / GE-1 / EQ-1,EQ
+values of EVERY row of the op, and a row's constraints are AND-ed — so a boundary cannot ride on a
+real row without narrowing what that row serves. `gemm_nt_q_bands` is an inert row (priority 0,
+dtype `__bands__`, matches no tensor, launch refuses with `RAD_E_UNSUPPORTED`) that contributes only
+M edges 16, 32, 48, 128, 256, 512, 1024, 2048; the ordinary rows already contribute 8, 16 and 64.
+Together the `(8, 64]` decode band becomes `(8,16] (16,32] (32,48] (48,64]` and `(64, max]` becomes
+`(64,128] (128,256] (256,512] (512,1024] (1024,2048]` plus the open top. Because `ks`/`bk`/`tn`/`dec`
+resolve on the actual M, a band with no tune line launches exactly as before and the default is
+unchanged; a tuner or tune cache can now pin the keys per band. The ported PR decode row's axes are
+its `ks`/`bk`/`nt` (dtype `mxfp4a8`, M <= 64) and the ported PR tiled row's are `tn` plus `dec`,
+where `dec=1` serves the band with the decode kernel's wide form (M <= 256). `dec=1` is refused where
+the A plane can be fragment-tiled (`afrag` T <= the band's upper bound). The band list and the
+per-band row are held by `tests/r4d_bands_test`, which reads the real table out of `libr4d.so` on the
+host and can be run twice for an A/B (`./r4d_bands_test` vs `RADIANCE_MX_TUNE=1 ./r4d_bands_test`).
+
 
 ## Attention
 
@@ -492,6 +626,7 @@ and adding 0.0f is exact, so a block sum over 8 wave partials and over 32 are th
 | `row_topk` | `M`(range) `N` `R` `vocab_off`/opt `dtype` | `x` → `idx`, `val`, `pairs`? |
 | `row_topk_merge` | `M` `R` `world_size` `dtype` | `gathered` → `idx`, `val` |
 | `logit_rerank` | `M`(range) `R` `n_vocab` `n_embd` `vocab_off`/opt `dtype` | `x`, `head`w, `idx_in` → `idx`, `val`, `pairs`? |
+| `logits_scatter` | `M`(range) `R` `n_vocab` `vocab_off`/opt | `idx`, `val` → `logits` |
 
 `row_topk` and `row_topk_merge` are a pair, and the second only means anything with the first's
 optional half. A vocab-sharded head produces logits for its own slice and nothing else, so its
@@ -516,6 +651,15 @@ an answer that agrees with the exact argmax on almost every row. `idx_in` carrie
 drafting each rank rescores the candidates it owns and the existing `all_gather` + `row_topk_merge`
 still finds the global winner -- it needs no collective of its own. Ties break on the LOWER id, the
 rule the other two use, so a tie inside a shard and a tie between shards resolve alike.
+
+`logits_scatter` is the DFlash2 verify head's WRITE. `logit_rerank` has produced R exactly-scored
+(global id, value) pairs a row; this fills the target's full-vocabulary logits row with `-inf` and
+scatters those R into it, so the sampler reads a SPARSE row whose only finite entries are the
+reranked candidates. `vocab_off` is the shard's first global column and an id outside this rank's
+rows is dropped -- its value belongs to the other rank's plane, which the sampler's vocab-parallel
+candidate merge reads. The approximation is exact over the sampler's support only under the batch's
+sampling gate (greedy, or `top_k <= R/4` with `min_p` 0 and no grammar), which the builder computes
+and carries on `RadBatch`; that gate is the caller's contract, not this op's.
 
 **`router_topk_scatter` is those two in one launch**, and it exists because neither of them is
 work. At a decode shape each is a SINGLE 256-thread workgroup ranking about a kilobyte — the
@@ -795,6 +939,7 @@ by ~1 ULP, which breaks the replicated-state invariant. The build sets it global
 | op | params | operands |
 |---|---|---|
 | `ar_rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
+| `ar_rmsnorm_quant_fp8_row` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
 | `ar_ln_had_quant_i8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
@@ -804,6 +949,14 @@ by ~1 ULP, which breaks the replicated-state invariant. The build sets it global
 property of the LINK and not of the kernel, which is why it is a parameter — see `all_reduce`'s
 `min_bytes` for the same argument. `x` is INOUT on `ar_rmsnorm_quant_fp8`: it is both the message
 and the input, and the reduced sum lands in it.
+
+`ar_rmsnorm_quant_fp8_row` is the per-row (OCP-MX) twin: the same all-reduce, residual add and RMS
+norm, with `quant_act_fp8_row`'s whole-row quantiser, so `scale` is `[M, 1]` rather than
+`[M, ceil(n/128)]` and there is no `group`. Its tail arithmetic is exactly `rmsnorm_quant_fp8_row`'s,
+run after the reduction; the wire, the row partition and the reduced bytes in `x` are the
+group-scaled form's, so it is byte-identical to `all_reduce` followed by `rmsnorm_quant_fp8_row` on
+the same wire. Wire 6 additionally needs `n` to be a multiple of the 512-element chunk, so a chunk
+never straddles a row.
 
 `ar_hc_write` is `all_reduce` of `y` followed by `hc_write` of the reduced `y`, for a block whose
 output feeds a gated residual rather than a norm. `y` is INOUT for the same reason `x` is above.
@@ -1419,6 +1572,7 @@ candidates, and what enters the head from the trunk. Those two ends are what the
 | op | params | operands |
 |---|---|---|
 | `dflash_select` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `dtype` | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w → `tokens` |
+| `dflash_select_q` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `dtype` | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `pred_scale`w, `succ`w, `succ_scale`w → `tokens` |
 
 `dflash_conv` is the drafter's grouped convolution, and device-only:
 
@@ -1440,6 +1594,16 @@ argmax inside one workgroup. Written literally it is `steps` full-vocabulary [ra
 matrix products — 466 MiB a step to use seven rows — and through this operand it is 8 KiB of
 codebook gather. The only approximation is the top-K candidate set, which can cost acceptance and
 nothing else.
+
+**`dflash_select_q` is the same walk over codebooks held as E4M3 codes**: `pred` and `succ` are
+`[n_vocab, rank]` `fp8_e4m3` and `pred_scale`/`succ_scale` their f32 scales, one a row (`[n_vocab, 1]`,
+recipe `codes=fp8_e4m3 block=1x* scale=f32`) or one for the whole table (`[1, 1]`), so
+`codebook[v][r] = codes[v][r] · scale[v]`. The operand list differs from `dflash_select`'s and
+operands are positional, which is why it is an op of its own, as `embed_lookup_q` is. The two
+codebooks are 2 × 121 MiB at bf16; at E4M3 they are half that and the KV cache takes the
+difference (about 3.9k tokens at fp8 KV). The architecture chooses between the two ops from what the
+container says each codebook IS, so a container with bf16 codebooks is served as it always was.
+What the narrower codebooks can move is the drafter's acceptance, and only that: a draft is verified.
 
 ### `mtp_enter`: the MTP head's entry, when the residual stream is wide
 

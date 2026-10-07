@@ -1276,13 +1276,15 @@ extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) 
         if (!r4d_contig(oq)) return R4D_NO(RAD_E_STRIDE);
     }
 
-    /* THE WINDOW, as gdn_conv_update derives it: the cache depth fixes max_query_len as
-     * state_len_max - (width - 2), and a sequence brings at most that many tokens. The fold holds
-     * them in registers, so the deployment's window has to fit RU_CVT. */
+    /* THE WINDOW SPLIT, as gdn_conv_update derives it: the standalone kernel is handed
+     * max_query_len = cache depth - (width - 2), NOT the step's token count, and this fold writes
+     * the same W - 2 split, so the two agree at any cache depth. That depth is the DEPLOYMENT's
+     * window (conv_width - 1 + n_spec), so it can exceed RU_CVT while a capped step brings far
+     * fewer tokens: the token count is T from cu, bounded by the RU_CVT register loop, and the
+     * band stops at eight tokens on its own. Gating on the depth would refuse the whole range for
+     * a deployment whose ceiling is RU_CVT (n_spec == RU_CVT), which is what B2 was. */
     if (r4d_geti_or(a, "conv_width", 0) != R4D_GDN_CONV_W) return R4D_NO(RAD_E_UNSUPPORTED);
-    const long long mql = cst->shape[2] - (R4D_GDN_CONV_W - 2);
-    if (mql < 1) return R4D_NO(RAD_E_SHAPE);
-    if (mql > RU_CVT) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (cst->shape[2] < R4D_GDN_CONV_W - 1) return R4D_NO(RAD_E_SHAPE);
 
     /* The recurrent half's contract checks, as r4d_rad_gdn_recurrent_update makes them. */
     if (const char* sf = r4d_gets(a, "state_form")) {

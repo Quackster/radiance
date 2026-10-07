@@ -409,6 +409,14 @@ AVX_KERNEL(quant_act_fp8) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------- quant_act_fp8_row */
+/* The per-row form, for the OCP-MX (mxfp4a8) GEMMs, which read one f32 activation scale per
+ * token and no per-128 group. It reuses quant_act_fp8's body rather than restating it: that body
+ * reads an absent `group` as 0 and clamps it to n, which is exactly one scale per row. */
+AVX_KERNEL(quant_act_fp8_row) {
+    return AVX_FN(avx_quant_act_fp8)(a, stream);
+}
+
 /* ------------------------------------------------------------- rmsnorm_quant_fp8 */
 /* RMS norm, an optional residual add, and quant_act_fp8, in one pass.
  *
@@ -509,6 +517,17 @@ AVX_KERNEL(gated_quant_fp8) {
         fp8_emit(out, tmp, n, g, q, s, ob, r);
     }
     return RAD_OK;
+}
+
+/* ------------------------------------------------------------- the per-row (OCP-MX) forms */
+/* Both bodies above read an absent `group` as 0 and clamp it to n, which is exactly one scale per
+ * row -- so they ARE the per-row implementations and these wrappers only give the registry the
+ * names whose `_shape` twins declare `scale` at [M, 1]. Same argument as quant_act_fp8_row above. */
+AVX_KERNEL(rmsnorm_quant_fp8_row) {
+    return AVX_FN(avx_rmsnorm_quant_fp8)(a, stream);
+}
+AVX_KERNEL(gated_quant_fp8_row) {
+    return AVX_FN(avx_gated_quant_fp8)(a, stream);
 }
 
 /* ------------------------------------------------------------- had_quant_act_fp8 */
