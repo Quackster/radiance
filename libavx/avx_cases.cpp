@@ -217,6 +217,14 @@ std::vector<Case> build_cases() {
                             HS("dtype", dt), HF("yarn_factor", 2), HF("yarn_low", 14),
                             HF("yarn_high", 22), HF("yarn_magnitude", 1.069314718) });
     }
+    for (double magnitude : {2.0, (double)NAN}) {
+        add("rope", { HI("M", 12), HI("head_dim", 128), HI("n_head", 4), HI("n_head_kv", 2),
+                      HF("theta", 1e7), HF("scale", 1), HS("mode", "neox"),
+                      HI("rotary_dim", 64), HS("dtype", "bf16"), HF("yarn_factor", 0),
+                      HF("yarn_magnitude", magnitude) });
+        add("rope_table", { HI("M", 12), HI("rot", 64), HF("theta", 1e7), HF("scale", 1),
+                            HS("dtype", "f32"), HF("yarn_factor", 0), HF("yarn_magnitude", magnitude) });
+    }
     /* The multi-component forms: Qwen3-VL's interleaved M-RoPE over a partial rotary, and a vision
      * tower's 2-D axial rotary over a whole 72-wide head. */
     for (const char* dt : { "f32", "bf16" }) {

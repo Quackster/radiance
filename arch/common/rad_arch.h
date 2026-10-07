@@ -1068,7 +1068,9 @@ inline int yarn_from(Geom& g, const RadModelMeta* meta, const char* prefix, int6
     if (!std::strcmp(type, "linear")) {
         const double factor = get("factor", 0.0);
         if (!std::isfinite(factor) || factor <= 0.0) return RAD_E_INVAL;
-        g.rope_scale = (float)factor;
+        const float scale = (float)factor;
+        if (!std::isfinite(scale) || scale <= 0.0f) return RAD_E_INVAL;
+        g.rope_scale = scale;
         return RAD_OK;
     }
     if (std::strcmp(type, "yarn")) {

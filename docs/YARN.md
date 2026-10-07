@@ -15,13 +15,16 @@ inherit the target's scaling. The vision tower keeps its original axial rotation
 
 | Architecture | Rotary paths | Validation so far |
 | --- | --- | --- |
-| `qwen35_fp8` | Target direct/table; independent DFlash2 | Qwen3.8-27B FP8: text/tool/image checks, 499997-token retrieval and two concurrent 255981-token retrievals, TP4/BF16 KV |
+| `qwen35_fp8` | Target direct/table; independent DFlash2 | 27B FP8, uncensored FP8 and MXFP4: text/tool/image checks, 499997-token retrieval and two overlapping 255981-token requests, TP4/BF16 KV |
 | `qwen35_bf16` | Target direct rotary | Architecture declaration and shared numerical tests; no end-to-end BF16 model run yet |
-| `qwen35moe_fp8` | Shared Qwen35 target and MTP geometry | Shares implementation; model qualification pending |
-| `qwen4exp_fp8` | Attention, indexer, compressed block keys and shared MTP geometry | Architecture declarations and compressed-key GPU numerical checks; model qualification pending |
+| `qwen35moe_fp8` | Shared Qwen35 target and MTP geometry | 35B-A3B stock/YaRN smoke and retrieval, including 499997 tokens and paired 255981-token requests; TP2/BF16 KV |
+| `qwen4exp_fp8` | Attention, indexer, compressed block keys and shared MTP geometry | Both Flash variants: stock/YaRN smoke and retrieval, including 499997 tokens and paired 255981-token requests; TP4, tiered experts, BF16 KV |
 
 Radiance 1.2.0 also serves the published Qwen3.8-27B MXFP4 container through the
-Qwen35 FP8 architecture's encoding dispatch. Its model qualification is pending.
+Qwen35 FP8 architecture's encoding dispatch. It passed the model checks above.
+Request logs prove overlapping request lifetimes, not continuous simultaneous GPU
+residency or a common decode batch. See [qualification and audit](YARN-VALIDATION.md)
+for exact settings, timings, evidence boundaries and outstanding review findings.
 Synthetic retrieval is evidence for those requests, not a general accuracy benchmark
 or a capacity guarantee for other model sizes. Original-context quality should be
 checked alongside extended-context quality when deploying static YaRN.

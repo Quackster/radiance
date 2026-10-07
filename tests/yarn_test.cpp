@@ -46,6 +46,22 @@ TEST(yarn_metadata_rejects_bad_inputs_and_preserves_default) {
     CHECK_OK(yarn_from(g, &m, "", 64)); CHECK_EQ(g.rope_scale, 2.0f);
 }
 
+TEST(linear_metadata_rejects_fp32_overflow_and_underflow) {
+    const char* keys[] = {"rope_parameters.rope_type", "rope_parameters.factor"};
+    const char* vals[] = {"linear", "2"};
+    RadModelMeta m{}; m.n_kv = 2; m.kv_key = keys; m.kv_val = vals;
+    Geom g{};
+    for (const char* bad : {"1e300", "1e-300", "0", "-2", "nan", "inf"}) {
+        vals[1] = bad;
+        g.rope_scale = 3.0f;
+        CHECK_EQ(yarn_from(g, &m, "", 64), RAD_E_INVAL);
+        CHECK_EQ(g.rope_scale, 3.0f);
+    }
+    vals[1] = "0.5";
+    CHECK_OK(yarn_from(g, &m, "", 64));
+    CHECK_EQ(g.rope_scale, 0.5f);
+}
+
 TEST(yarn_legacy_explicit_magnitude_and_fractional_bounds) {
     const char* keys[] = {"rope_scaling.type", "rope_scaling.factor",
         "rope_scaling.original_max_position_embeddings", "rope_scaling.attention_factor",

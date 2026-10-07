@@ -30,7 +30,10 @@ struct RadYarn {
 };
 
 inline RadYarn rad_yarn_args(const RadArgs* a) {
-    return { (float)rad_args_getf_or(a, "yarn_factor", 0.0),
+    const float factor = (float)rad_args_getf_or(a, "yarn_factor", 0.0);
+    /* Disabled YaRN ignores every auxiliary coefficient on every backend. */
+    if (factor == 0.0f) return {};
+    return { factor,
              (float)rad_args_getf_or(a, "yarn_low", 0.0),
              (float)rad_args_getf_or(a, "yarn_high", 0.0),
              (float)rad_args_getf_or(a, "yarn_magnitude", 1.0) };

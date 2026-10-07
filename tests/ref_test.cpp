@@ -1824,6 +1824,26 @@ TEST(yarn_rotary_matches_independent_vllm_vectors) {
     }
 }
 
+TEST(disabled_yarn_ignores_auxiliary_coefficients) {
+    for (double magnitude : {2.0, (double)NAN}) {
+        T pos(RAD_I32, {1}); pos.n({0});
+        T qkv(RAD_F32, {1, 4}); qkv.f({1, 2, 3, 4});
+        A direct; direct.t(qkv).t(pos).i("M", 1).i("head_dim", 4)
+            .i("n_head", 1).i("n_head_kv", 0).d("theta", 10000).d("scale", 1)
+            .s("mode", "neox").d("yarn_factor", 0).d("yarn_low", NAN)
+            .d("yarn_high", NAN).d("yarn_magnitude", magnitude);
+        CHECK_OK(run("rope", direct));
+        for (int i = 0; i < 4; ++i) CHECK_EQ(qkv.at(i), (float)(i + 1));
+        T table(RAD_F32, {1, 4});
+        A ta; ta.t(pos).t(table).i("M", 1).i("rot", 4).d("theta", 10000)
+            .d("scale", 1).s("dtype", "f32").d("yarn_factor", 0)
+            .d("yarn_low", NAN).d("yarn_high", NAN).d("yarn_magnitude", magnitude);
+        CHECK_OK(run("rope_table", ta));
+        CHECK_EQ(table.at(0), 1.0f); CHECK_EQ(table.at(1), 1.0f);
+        CHECK_EQ(table.at(2), 0.0f); CHECK_EQ(table.at(3), 0.0f);
+    }
+}
+
 TEST(yarn_multimodal_positions_and_invalid_parameters) {
     const int rot = 64, hd = 80;
     T positions(RAD_I32, {3, 1}); positions.n({262144, 500000, 524287});
