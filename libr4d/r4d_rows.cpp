@@ -1932,6 +1932,19 @@ static const RadOperandSpec oArgmax[] = {
     { "params", RAD_OPD_IN,  0 },
     { "token",  RAD_OPD_OUT, 0 },
 };
+/* `stats` is [M, 2 + 2k] f32: max, sum of exp(l - max), then k (id, logit) pairs. `k` is the
+ * deployment's width, `vocab_off` sample_topk's. */
+static const RadParamSpec pLogprobs[] = {
+    { "M",         RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab",   RAD_P_INT, RAD_REQUIRED },
+    { "k",         RAD_P_INT, RAD_REQUIRED },
+    { "vocab_off", RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oLogprobs[] = {
+    { "logits", RAD_OPD_IN,  0 },
+    { "params", RAD_OPD_IN,  0 },
+    { "stats",  RAD_OPD_OUT, 0 },
+};
 static const RadOperandSpec oNarrow[] = {
     { "cand_idx", RAD_OPD_INOUT, 0 },
     { "cand_val", RAD_OPD_INOUT, 0 },
@@ -2104,6 +2117,9 @@ static const RadOpSchema kSchemas[] = {
            "the exact top-k candidate set, descending, ties to the lower token id. The width is "
            "the buffer's; a row's own top_k may be narrower and leaves holes."),
     SCHEMA("sample_argmax", pMVocab, oArgmax, "greedy, ties to the lower token id."),
+    SCHEMA("sample_logprobs", pLogprobs, oLogprobs,
+           "for a row with RAD_SP_LOGPROBS: the raw logits' max, sum of exp(l - max) and k largest "
+           "(id, logit) pairs, descending, ties to the lower id. Other rows are not written."),
     SCHEMA("sample_topp", pMCand, oNarrow,
            "nucleus: keep the shortest prefix whose cumulative probability reaches top_p, always "
            "at least one. The candidates are assumed descending, as sample_topk leaves them."),
@@ -2470,6 +2486,25 @@ static const RadConstraint cAttnDecodeH256G8Bf16[] = {
     C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 8), C_EQ("block_size", 16),
     C_GE("causal", 0), C_LE("q_len", 8), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
 };
+/* FOUR QUERIES PER KV HEAD, head_dim 256 (r4d_attn_paged_h256_gqa4.hip) -- Qwen3.5-0.8B, 8 query
+ * heads over 2. `q_len <= 16` is the same `q_len * gqa <= 64` bound, so every legal speculation
+ * depth is a decode launch at this ratio. */
+static const RadConstraint cAttnPrefillH256G4Fp8[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 4), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cAttnPrefillH256G4Bf16[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 4), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
+static const RadConstraint cAttnDecodeH256G4Fp8[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 4), C_EQ("block_size", 16),
+    C_GE("causal", 0), C_LE("q_len", 16), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cAttnDecodeH256G4Bf16[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 4), C_EQ("block_size", 16),
+    C_GE("causal", 0), C_LE("q_len", 16), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
 /* TWELVE QUERIES PER KV HEAD, head_dim 256 (r4d_attn_paged_h256_gqa12.hip) -- Qwen3.8-Flash-Next's
  * QSA layers, 24 query heads over 2. `q_len <= 5` is the same `q_len * gqa <= 64` bound the two
  * ratios above state, and it is TIGHTER than the legal speculation depths: a verify of depth 7 is
@@ -2707,6 +2742,13 @@ static const RadConstraint cArExact8[] = {
     C_EQ("world_size", 8), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
     C_P2P,
 };
+/* No DIV: the three-rank two-shot shards unevenly (r4d_rad_ar_twoshot_3rank_exact), so the only
+ * shape it needs is the 16-byte push ar_setup already checks. */
+static const RadConstraint cArTsExact3[] = {
+    C_EQ("world_size", 3), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_GE("numel", R4D_AR_WIDE_ONESHOT_MAX_ELEMS + 1), C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
+    C_P2P,
+};
 static const RadConstraint cArTsExact4[] = {
     C_EQ("world_size", 4), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
     C_DIV("numel", 64), C_GE("numel", R4D_AR_WIDE_ONESHOT_MAX_ELEMS + 1),
@@ -2721,6 +2763,11 @@ static const RadConstraint cArTsExact8[] = {
 };
 static const RadConstraint cArWht6[] = {
     C_EQ("world_size", 2), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 64),
+    C_P2P,
+};
+/* DIV 32, not 96: the three-rank split is uneven in whole groups (r4d_rad_ar_twoshot_3rank_ti8). */
+static const RadConstraint cArTi8Ts3[] = {
+    C_EQ("world_size", 3), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 32),
     C_P2P,
 };
 static const RadConstraint cArTi8Ts4[] = {
@@ -3412,6 +3459,7 @@ static const RadConstraint cGridEmbed[] = { C_GE("n", 1), C_GE("side", 1), C_IN(
 static const RadConstraint cGemmBias[]  = { C_GE("M", 1), C_DIV("K", 8), C_IN("dtype", "bf16") };
 static const RadConstraint cSampleVoc[] = { C_GE("n_vocab", 1) };
 static const RadConstraint cSampleCand[] = { C_GE("n_cand", 1), C_LE("n_cand", 4096) };
+static const RadConstraint cSampleLogprobs[] = { C_GE("n_vocab", 1), C_GE("k", 1), C_LE("k", 64) };
 /* The activation width the column loop vectorises over; M is unbounded -- the kernel chunks rows. */
 static const RadConstraint cLogitsGemm[] = { C_DIV("n_embd", 8), C_IN("dtype", "bf16") };
 /* The fp8 head. n_embd on the 128 block the scales are taken over, and NO CAP ON M -- the row
@@ -3910,6 +3958,17 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_sample_argmax, nullptr, nullptr, nullptr,
   r4d_shape_sample_argmax },
 
+{ "sample_logprobs_f32", "sample_logprobs", "sample",
+  "the raw distribution's summary for a logprobs row: max, sum of exp(l - max), the k largest",
+  "any vocabulary; k <= 64, the LDS the sort runs in. sample_topk's radix select at the op's k, so "
+  "the set and its tie rule are the top-k's; the maximum is its first entry and the sum one more "
+  "pass. A row without RAD_SP_LOGPROBS leaves before reading anything",
+  "f32 logits, f32 stats [M, 2 + 2k] with the ids as floats",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cSampleLogprobs), NOTUNE,
+  nullptr, nullptr, r4d_rad_sample_logprobs, nullptr, nullptr, nullptr,
+  r4d_shape_sample_logprobs },
+
 { "sample_topp_f32", "sample_topp", "sample",
   "nucleus narrowing in place",
   "n_cand <= 4096; the prefix sum is SEQUENTIAL in f32 in candidate order, because a parallel "
@@ -4079,6 +4138,44 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
   ROW(cAttnDecodeH256G8Bf16), ROW(tAttnSplit), nullptr,
   nullptr, nullptr, r4d_rad_attn_decode_h256_gqa8_bf16, r4d_rad_attn_decode_h256_gqa8_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_prefill_h256_gqa4_fp8kv", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 256, 4 queries per kv head, paged block 16, varlen",
+  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH256G4Fp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa4_fp8, nullptr, nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_prefill_h256_gqa4_bf16kv", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 256, 4 queries per kv head, paged block 16, varlen",
+  "bf16 query, bf16 kv cache, bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH256G4Bf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_gqa4_bf16, nullptr, nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_decode_h256_gqa4_fp8kv", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
+  "head_dim 256, 4 queries per kv head, paged block 16, q_len*gqa <= 64, no window",
+  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256G4Fp8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_gqa4_fp8, r4d_rad_attn_decode_h256_gqa4_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_decode_h256_gqa4_bf16kv", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
+  "head_dim 256, 4 queries per kv head, paged block 16, q_len*gqa <= 64, no window",
+  "bf16 query, bf16 kv cache, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256G4Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_gqa4_bf16, r4d_rad_attn_decode_h256_gqa4_scratch,
   nullptr, nullptr,
   r4d_shape_attn_paged },
 
@@ -4427,6 +4524,20 @@ static const RadKernelInfo kKernels[] = {
 
 /* ---------------------------------------------------------------------------- all-reduce ----
  * The two-shot rows outrank the one-shots, for the reason the constraint block above states. */
+{ "ar_twoshot_3rank_exact", "all_reduce", "ar",
+  "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, per-block pipelined "
+  "handshake",
+  "exactly 3 ranks, all peer-accessible; messages above "
+  R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements, two hops; shards as even as the word count "
+  "allows (the first words % 3 take one more); shares the wide family's flag/seq/scratch set; in "
+  "place; cudagraph-safe",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks "
+  "and to ar_oneshot_3rank_exact",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_TWOSHOT,
+  ROW(cArTsExact3), ROW(tAr), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_exact, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+
 { "ar_twoshot_4rank_exact", "all_reduce", "ar",
   "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, per-block pipelined "
   "handshake",
@@ -4517,8 +4628,9 @@ static const RadKernelInfo kKernels[] = {
   r4d_shape_all_gather },
 { "ar_oneshot_3rank_exact", "all_reduce", "ar",
   "all-reduce (sum), one-shot push over P2P IPC scratch, per-block handshake",
-  "exactly 3 ranks, all peer-accessible; one scratch slot per (parity, source rank); "
-  "the only wide form at three -- the two-shot shards the message `world` ways; cudagraph-safe",
+  "exactly 3 ranks, all peer-accessible; one scratch slot per (parity, source rank); in place; "
+  "above " R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements ar_twoshot_3rank_exact outranks it; "
+  "cudagraph-safe",
   "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
   ROW(cArExact3), ROW(tAr), nullptr,
@@ -4542,6 +4654,18 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
   ROW(cArExact8), ROW(tAr), nullptr,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_oneshot_8rank_exact, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+
+{ "ar_twoshot_3rank_ti8", "all_reduce", "ar",
+  "all-reduce (sum), reduce-scatter + all-gather; both hops ride the tiered-int8 wire (double "
+  "quant, the owner storing the decode of its own words) -- lossy",
+  "exactly 3 ranks, all peer-accessible; groups of 32, split over the shards as evenly as they "
+  "divide (the first groups % 3 take one more); under min_bytes the exact one-shot; cudagraph-safe",
+  "bf16 / fp16 payload, int8 + fp16 scale + u32 record per group on the wire, fp32 accumulate in "
+  "ascending rank order, bit-identical across ranks",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+  ROW(cArTi8Ts3), ROW(tAr), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_ti8, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
 { "ar_twoshot_4rank_ti8", "all_reduce", "ar",

@@ -1199,6 +1199,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget) {
     r.state = ReqState::Running;
     s.running = true;
     server::sink_admitted(r.sink);
+    server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(), r.n_cached);
     s.sched_tokens = (int32_t)want;
     s.pending_ckpt = ckpt;
     ++m_.admitted;
@@ -1841,6 +1842,10 @@ int Scheduler::commit(const StepResult& res) {
         bool eos = res.eos && res.eos[i] && !r.ignore_eos;
 
         bool overflowed = false;
+        /* A token whose logprobs the engine could not compute (TokenLogprobs::token -1) for a
+         * request that asked for them: the request fails with the reason rather than send that
+         * token without the numbers it was asked for, and nothing after it is sent. */
+        bool lp_failed = false;
 
         /* THE SNAPSHOT THE ENGINE JUST TOOK IS NOW READABLE. Marking it here rather than at
          * reservation is the difference between a checkpoint and a promise: reserve_checkpoint
@@ -1859,6 +1864,8 @@ int Scheduler::commit(const StepResult& res) {
             r.n_computed += e.n_tokens;
             publish_shared_prefix(s, e);
             step_prefill_tok_ += e.n_tokens;
+            server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(),
+                                         r.n_cached);
             /* Once, when the prompt is fully placed: the admission accounting the usage block
              * reports. `n_cached` is what the prefix cache supplied and is not recomputed here. */
             if (r.n_computed >= (int64_t)r.prompt.size())
@@ -1870,7 +1877,11 @@ int Scheduler::commit(const StepResult& res) {
             } else if (e.produces_token && res.token) {
                 if (!s.first_tok_us) s.first_tok_us = mono_us();
                 r.output.push_back(res.token[i]);
-                overflowed = !server::sink_push(r.sink, res.token[i]);
+                const TokenLogprobs* lp =
+                    res.lp && res.first_row[i] >= 0 && r.sp.n_probs >= 0
+                        ? &res.lp[res.first_row[i]] : nullptr;
+                if (lp && lp->token < 0) lp_failed = true;
+                else overflowed = !server::sink_push(r.sink, res.token[i], lp);
                 /* The conv window absorbed this chunk; the cursor advances by one committed
                  * position, exactly as it does in decode. */
                 s.conv_cursor = (int32_t)((s.conv_cursor + 1) % (W ? W : 1));
@@ -1918,15 +1929,21 @@ int Scheduler::commit(const StepResult& res) {
             /* AND THE CONTEXT BOUNDS IT WHATEVER max_tokens SAYS, including "no limit": a
              * sequence may not grow past the positions this deployment can address. */
             if (ctx_limit_ > 0 && ctx_limit_ - s.seq_len() < room) room = ctx_limit_ - s.seq_len();
-            auto emit = [&](int32_t t) {
+            /* `j` is the token's place in the step's emission: its logprobs row is the entry's
+             * j-th, when the request asked for them. */
+            auto emit = [&](int32_t t, int32_t j) {
                 if (room <= 0) return;
                 --room;
                 if (!s.first_tok_us) s.first_tok_us = mono_us();
                 r.output.push_back(t);
-                if (!server::sink_push(r.sink, t)) overflowed = true;
+                const TokenLogprobs* lp =
+                    res.lp && res.first_row[i] >= 0 && r.sp.n_probs >= 0
+                        ? &res.lp[res.first_row[i] + j] : nullptr;
+                if (lp_failed || (lp && lp->token < 0)) { lp_failed = true; return; }
+                if (!server::sink_push(r.sink, t, lp)) overflowed = true;
             };
-            for (int32_t j = 0; j < a; ++j) emit(s.draft[j]);
-            if (res.token) emit(res.token[i]);
+            for (int32_t j = 0; j < a; ++j) emit(s.draft[j], j);
+            if (res.token) emit(res.token[i], a);
             r.n_computed = valid;
             step_decode_tok_ += 1 + a;
 
@@ -1974,6 +1991,11 @@ int Scheduler::commit(const StepResult& res) {
             /* The sink has already failed the request -- a consumer that far behind is gone --
              * so all that is left is to stop generating for it and give its blocks back. */
             close_request(s, ReqState::Failed, "sink_overflow", carried);
+            ++m_.failed;
+            completed_.push_back(r.id);
+        } else if (lp_failed) {
+            close_request(s, ReqState::Failed, "logprobs", carried, true, RAD_E_STATE,
+                          "the logprobs of a token it generated could not be computed");
             ++m_.failed;
             completed_.push_back(r.id);
         } else if (server::sink_cancelled(r.sink)) {

@@ -577,13 +577,16 @@ int32_t host_sample_into(CandidateSet& s, const SamplingParams& sp, const HostRe
     }
 
     if (order == ChainOrder::Radiance) {
-        host_temp(s, sp.temp);
+        /* `temp_last` moves temperature behind the cuts, as the device chain moves it onto the
+         * candidate plane (Sampler::issue); the cuts keep this order either way. */
+        if (!sp.temp_last) host_temp(s, sp.temp);
         host_mask(s, in.bitmask, in.n_words);
         host_top_k(s, sp.top_k);
         host_top_p(s, sp.top_p, 1);
         host_min_p(s, sp.min_p, 1);
         host_typical(s, sp.typical_p, 1);
         host_xtc(s, sp.xtc_probability, sp.xtc_threshold, 1, sp.seed, in.pos);
+        if (sp.temp_last) host_temp(s, sp.temp);
     } else {
         /* llama.cpp's default order, for checking this port against llama.cpp itself. Note the
          * absence of top-n-sigma: it is not in SamplingParams and radiance does not ship it, so a

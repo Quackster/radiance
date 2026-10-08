@@ -179,13 +179,35 @@ int to_rgb(const AVFrame* f, SwsContext** sws, Frame* out, std::string* why) {
                          src == AV_PIX_FMT_YUVJ444P || src == AV_PIX_FMT_YUVJ440P;
     sws_setColorspaceDetails(*sws, coef, src_full, sws_getCoefficients(SWS_CS_DEFAULT), 1, 0,
                              1 << 16, 1 << 16);
+    /* THE SCALER WRITES INTO A FRAME FFMPEG ALLOCATED, and the rows are copied out. Its SIMD paths
+     * store whole vectors, so a row ends wherever the last vector does: a 4:2:0 or 4:2:2 picture
+     * 1788 wide converted with these flags writes 12 bytes past 1788 x 3, and into a buffer of
+     * exactly width x height x 3 those land on the next heap chunk's header -- the process aborts
+     * at a later allocation ("malloc(): corrupted top size"). av_frame_get_buffer pads every line
+     * and the end as the scaler expects. */
+    AVFrame* rgb = av_frame_alloc();
+    if (!rgb) { *why = "out of memory"; return RAD_E_NOMEM; }
+    rgb->format = AV_PIX_FMT_RGB24;
+    rgb->width = f->width;
+    rgb->height = f->height;
+    if (av_frame_get_buffer(rgb, 0) < 0) {
+        av_frame_free(&rgb);
+        *why = "out of memory";
+        return RAD_E_NOMEM;
+    }
+    const int e = sws_scale(*sws, f->data, f->linesize, 0, f->height, rgb->data, rgb->linesize);
+    if (e != f->height) {
+        av_frame_free(&rgb);
+        *why = "colour conversion failed";
+        return RAD_E_INVAL;
+    }
     out->w = f->width;
     out->h = f->height;
-    out->rgb.resize((size_t)f->width * (size_t)f->height * 3);
-    uint8_t* dst[4] = { out->rgb.data(), nullptr, nullptr, nullptr };
-    int dst_ls[4] = { f->width * 3, 0, 0, 0 };
-    const int e = sws_scale(*sws, f->data, f->linesize, 0, f->height, dst, dst_ls);
-    if (e != f->height) { *why = "colour conversion failed"; return RAD_E_INVAL; }
+    const size_t row = (size_t)f->width * 3;
+    out->rgb.resize(row * (size_t)f->height);
+    for (int y = 0; y < f->height; ++y)
+        std::memcpy(out->rgb.data() + (size_t)y * row, rgb->data[0] + (ptrdiff_t)y * rgb->linesize[0], row);
+    av_frame_free(&rgb);
     return RAD_OK;
 }
 

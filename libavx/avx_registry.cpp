@@ -459,6 +459,9 @@ static const RadParamSpec pTopk[]        = { P_INT("M"), P_INT("n_vocab"), P_INT
 static const RadOperandSpec oTopk[]      = { OPD("logits"), OPD("params"),
                                              OUT("cand_idx"), OUT("cand_val"), OUT_O("pairs") };
 static const RadOperandSpec oArgmax[]    = { OPD("logits"), OPD("params"), OUT("token") };
+static const RadParamSpec pLogprobs[]    = { P_INT("M"), P_INT("n_vocab"), P_INT("k"),
+                                             P_INTO("vocab_off") };
+static const RadOperandSpec oLogprobs[]  = { OPD("logits"), OPD("params"), OUT("stats") };
 static const RadOperandSpec oNarrow[]    = { INOUT("cand_idx"), INOUT("cand_val"), OPD("params") };
 static const RadOperandSpec oPick[]      = { OPD("cand_idx"), OPD("cand_val"), OPD("params"),
                                              OUT("token") };
@@ -654,6 +657,9 @@ static const RadOpSchema kSchemas[] = {
   "stream has to come out of a host reference, a device kernel and a rerun." },
 { "sample_merge_topk", ARR(pMCand), ARR(oMerge), "the vocab-parallel candidate merge." },
 { "sample_argmax", ARR(pMVocab), ARR(oArgmax), "greedy, ties to the lower token id." },
+{ "sample_logprobs", ARR(pLogprobs), ARR(oLogprobs),
+  "the raw logits' max, sum of exp(l - max) and k largest (id, logit) pairs, for a row with "
+  "RAD_SP_LOGPROBS." },
 { "dflash_select", ARR(pDflashSelect), ARR(oDflashSelect),
   "a greedy walk over a candidate lattice: score[l, c] = unary[l, c] + sum_r pred[pid(l)][r] * "
   "hp[l][r] * succ[cand[l, c]][r], pid(0) the anchor and pid(l) the walk's own previous pick. "
@@ -900,6 +906,8 @@ SIMPLE("avx_sample_mask", "sample_mask", "sample", "grammar bitmask application"
 SIMPLE("avx_sample_pick", "sample_pick", "sample", "seeded inverse-CDF draw", DT_FLOAT,
        L(sample_pick)),
 SIMPLE("avx_sample_argmax", "sample_argmax", "sample", "greedy pick", DT_FLOAT, L(sample_argmax)),
+SIMPLE("avx_sample_logprobs", "sample_logprobs", "sample", "the raw distribution's summary",
+       DT_FLOAT, L(sample_logprobs)),
 SIMPLE("avx_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates and tokens, float unary and codebooks", L(dflash_select)),

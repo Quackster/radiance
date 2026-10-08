@@ -1165,13 +1165,22 @@ int replay_one(const KfCase& c, const Geometry& g, int64_t M,
  */
 /* The library the others are checked against: the one --ref names, else the first kernel library
  * that declared itself a reference implementation (RadPluginReferenceFn) -- by that declaration,
- * never by name, so the library radiance ships is found exactly as one a third party wrote. */
+ * never by name, so the library radiance ships is found exactly as one a third party wrote. A
+ * named one has to be loaded, which --kernels decides: checked against a library that is not
+ * there, every case would come back unchecked. */
 std::string resolve_reference(const Registry& reg, const std::string& named) {
-    if (!named.empty()) return named;
+    if (!named.empty()) {
+        const Plugin* p = reg.plugin(named);
+        if (p && (p->kind & RAD_PLUGIN_KERNEL)) return p->name;
+        RAD_ERR("--ref names '%s', which is not a loaded kernel library: name it in --kernels "
+                "too when that lists the libraries to load", named.c_str());
+        return std::string();
+    }
     for (const Plugin& p : reg.plugins())
         if (p.kind == RAD_PLUGIN_KERNEL && p.reference) return p.name;
-    RAD_ERR("no kernel library on the search path declares itself a reference implementation, so "
-            "there is nothing to check against; name one with --ref");
+    RAD_ERR("no kernel library loaded declares itself a reference implementation, so there is "
+            "nothing to check against: name one with --ref, and in --kernels when that lists the "
+            "libraries to load (libref is the one radiance ships)");
     return std::string();
 }
 
@@ -1487,7 +1496,7 @@ void usage() {
         "                     Attention is swept over DEPTH as well as query length: the paged\n"
         "                     block table, the split over KV and the window all live there.\n"
         "      --home DIR     $RADIANCE_HOME\n"
-        "      --kernels A:B  kernel plugin hierarchy, first wins\n"
+        "      --kernels A:B  the kernel libraries to load, first wins; default every library found\n"
         "      --op NAME      check only this op (repeatable prefix match)\n"
         "      --ref NAME     the oracle plugin's name (default: the library that declares itself a\n"
         "                     reference implementation)\n"

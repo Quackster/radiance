@@ -20,7 +20,7 @@ GPU_MAX_ALLOC_PERCENT=100 GPU_MAX_HEAP_SIZE=100 RADIANCE_PROFILE_EVERY="$EVERY" 
 ./bin/radiance --model "${M:-$HOME/models/rad/q38-27b-fp8-df2.v2.rad}" \
     --radiance-home "$HOME/workspace/radiance/build/radiance_home" \
     --max-num-seqs 8 --max-model-len 24000 --checkpoint-slots 0 --no-prefix-cache \
-    --tp 2 --tp-wire wht6 --tp-wire-min-kb 128 --vram-weights-mib 20000 --vram-kv-mib 8000 \
+    --tp 2 --tp-wire wht6 --tp-wire-min-kb 128 \
     --max-num-batched-tokens 4096 --num-speculative-tokens ${DEPTH:-auto} \
     --profile-ops --port $P >> "$HOME/dprofd.log" 2>&1 &
 for i in $(seq 1 150); do

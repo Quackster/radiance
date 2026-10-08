@@ -161,14 +161,21 @@ TEST(the_model_is_required_and_nothing_else_is) {
 
 /* ================================================================== taken */
 
+TEST(the_pool_size_flags_are_gone_and_say_what_replaced_them) {
+    /* The card's split is the resolver's (core/mem/vram_budget.h); a launch line that sizes a
+     * pool is refused by name, not served with a split other than the one it asked for. */
+    Config c;
+    CHECK_EQ(parse({ "--vram-weights-mib", "20480" }, &c), RAD_E_INVAL);
+    Config k;
+    CHECK_EQ(parse({ "--vram-kv-mib", "6144" }, &k), RAD_E_INVAL);
+}
+
 TEST(the_sizes_and_counts_reach_the_fields_they_name) {
     Config c;
     CHECK_EQ(parse({ "--tp", "2",
                      "--max-num-batched-tokens", "512",
                      "--max-num-seqs", "8",
                      "--max-model-len", "200000",
-                     "--vram-weights-mib", "20480",
-                     "--vram-kv-mib", "6144",
                      "--host-pool-mib", "12288",
                      "--prefix-cache-host-mib", "4096",
                      "--prefix-cache-disk-mib", "65536",
@@ -180,8 +187,6 @@ TEST(the_sizes_and_counts_reach_the_fields_they_name) {
     CHECK_EQ(c.max_tok, 512ll);
     CHECK_EQ(c.max_seqs, 8ll);
     CHECK_EQ(c.max_ctx, 200000ll);
-    CHECK_EQ(c.vram_weights_mib, 20480ll);
-    CHECK_EQ(c.vram_kv_mib, 6144ll);
     CHECK_EQ(c.host_pool_mib, 12288ll);
     CHECK_EQ(c.prefix_cache_host_mib, 4096ll);
     CHECK_EQ(c.prefix_cache_disk_mib, 65536ll);
@@ -339,22 +344,32 @@ TEST(the_kv_cache_dtype_is_one_of_two_names) {
     CHECK_EQ(d.kv_cache_dtype, std::string("bf16"));
 }
 
-/* THE TWO TABLE PLACEMENTS take the same four names and nothing else, default to auto, and leave
- * the resolved values to Engine::plan: a parse never decides a tier. Where each table may go is
- * the engine's to refuse, with the model in hand -- not the parser's. */
-TEST(the_table_placements_are_auto_vram_ram_or_disk) {
+/* THE TWO TABLE PLACEMENTS: the embedding takes ram (the default) or vram, the n-gram table auto
+ * (the default), vram, ram or disk, and nothing else. A parse records whether the embedding's was
+ * named and leaves the resolved values to Engine::plan: where each table may go is the engine's to
+ * refuse, with the model in hand -- not the parser's. */
+TEST(the_embedding_is_ram_or_vram_and_the_ngram_table_takes_four) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
-    CHECK(d.embedding_placement == TablePlacement::Auto);
+    CHECK(d.embedding_placement == TablePlacement::Ram);
+    CHECK(!d.embedding_placement_given);
     CHECK(d.ngram_placement == TablePlacement::Auto);
+    CHECK_EQ(d.embedding_host_mib, 0ll);                     /* the resolver's */
     Config c;
     CHECK_EQ(parse({ "--embedding-placement", "ram", "--ngram-placement", "disk" }, &c), RAD_OK);
     CHECK(c.embedding_placement == TablePlacement::Ram);
+    CHECK(c.embedding_placement_given);
     CHECK(c.ngram_placement == TablePlacement::Disk);
-    CHECK_EQ(parse({ "--embedding-placement", "vram", "--ngram-placement", "auto" }, &c), RAD_OK);
-    CHECK(c.embedding_placement == TablePlacement::Vram);
-    CHECK(c.ngram_placement == TablePlacement::Auto);
-    CHECK(c.embedding_resolved == TablePlacement::Vram);     /* untouched until plan */
+    Config v;
+    CHECK_EQ(parse({ "--embedding-placement", "vram", "--ngram-placement", "auto" }, &v), RAD_OK);
+    CHECK(v.embedding_placement == TablePlacement::Vram);
+    CHECK(v.embedding_placement_given);
+    CHECK(v.ngram_placement == TablePlacement::Auto);
+    CHECK(v.embedding_resolved == TablePlacement::Vram);     /* untouched until plan */
+    CHECK_EQ(parse({ "--ngram-placement", "ram" }, &v), RAD_OK);
+    CHECK(v.ngram_placement == TablePlacement::Ram);
+    for (const char* bad : { "auto", "disk" })
+        CHECK_EQ(parse({ "--embedding-placement", bad }, &c), RAD_E_INVAL);
     for (const char* bad : { "RAM", "memory", "host", "" }) {
         CHECK_EQ(parse({ "--embedding-placement", bad }, &c), RAD_E_INVAL);
         CHECK_EQ(parse({ "--ngram-placement", bad }, &c), RAD_E_INVAL);
@@ -794,6 +809,17 @@ TEST(the_environment_supplies_what_the_line_left_unsaid) {
 
 /* LATER WINS, for every flag that takes a value. Scripts build these lines by appending, and a
  * parser that kept the first occurrence would make an override a no-op. */
+TEST(the_download_dir_is_taken_and_left_empty_until_given) {
+    /* Empty means "the XDG cache", which hf_model.cpp resolves only when --model is a repo id:
+     * a server started on a local file never reads HOME for it. */
+    Config c;
+    CHECK_EQ(parse({}, &c), 0);
+    CHECK(c.download_dir.empty());
+    Config d;
+    CHECK_EQ(parse({ "--download-dir", "/big/models" }, &d), 0);
+    CHECK_EQ(d.download_dir, std::string("/big/models"));
+}
+
 TEST(a_repeated_flag_takes_the_last_one) {
     Config c;
     CHECK_EQ(parse({ "--port", "1", "--port", "8100" }, &c), RAD_OK);
@@ -844,7 +870,8 @@ TEST(usage_names_every_flag_it_documents) {
                            "--dry-sequence-breakers", "--chat-template-kwargs",
                            "--reasoning-format", "--max-n", "--max-queued-requests",
                            "--max-stop-strings", "--http-threads", "--max-body-mib", "--no-cors",
-                           "--image-max-pixels", "--video-fps", "--max-source-pixels" })
+                           "--image-max-pixels", "--video-fps", "--max-source-pixels",
+                           "--download-dir" })
         CHECK(text.find(f) != std::string::npos);
     CHECK(text.size() > 1000);
 }

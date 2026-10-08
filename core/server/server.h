@@ -57,6 +57,10 @@ struct ServerOptions {
      * /v1/completions answer 501 naming /v1/embeddings, rather than queueing a request the engine
      * would finish after one step with no text. */
     bool        embedding_model = false;
+    /* What --model named, reported as the model entry's `root` the way vLLM reports the path it
+     * loaded: a served name chosen for clients says nothing about which file is behind it. Empty
+     * leaves the field out. */
+    std::string model_path;
     std::string host = "0.0.0.0";
     int         port = 8000;
     int         n_threads = 0;
@@ -196,11 +200,28 @@ private:
     HttpResponse handle_health(const HttpRequest& req);
     HttpResponse handle_ping(const HttpRequest& req);
     HttpResponse handle_version(const HttpRequest& req);
+    HttpResponse handle_props(const HttpRequest& req);
+    HttpResponse handle_apply_template(const HttpRequest& req);
+    HttpResponse handle_input_tokens(const HttpRequest& req);
+    HttpResponse handle_messages(const HttpRequest& req);
+    HttpResponse handle_count_tokens(const HttpRequest& req);
+    HttpResponse handle_responses(const HttpRequest& req);
+    HttpResponse handle_responses_tokens(const HttpRequest& req);
+    /* A request another API's shape was translated into: admitted and served like a chat one,
+     * answered in `r.shape`. */
+    HttpResponse serve_translated(const HttpRequest& req, OaiRequest& r);
+    HttpResponse handle_native_completion(const HttpRequest& req);
+    HttpResponse handle_infill(const HttpRequest& req);
+    json native_result(const OaiRequest& r, const Generation& g, const std::string& content);
     HttpResponse handle_load(const HttpRequest& req);
     HttpResponse handle_tokenize(const HttpRequest& req);
     HttpResponse handle_detokenize(const HttpRequest& req);
     HttpResponse handle_tokenizer_info(const HttpRequest& req);
     HttpResponse handle_server_info(const HttpRequest& req);
+    /* What this deployment can do -- chat, tools, reasoning, grammar, media, logprobs, the
+     * reasoning efforts it takes -- as /server_info's `capabilities` and the model entry both
+     * report it, built in one place so the two cannot disagree. */
+    json capabilities() const;
     HttpResponse handle_sessions(const HttpRequest& req);
     HttpResponse handle_reset_prefix_cache(const HttpRequest& req);
 
@@ -209,7 +230,8 @@ private:
     HttpResponse handle_stats(const HttpRequest& req);
     HttpResponse handle_graph(const HttpRequest& req);
 
-    HttpResponse error_response(const ApiError& e, const std::string& peer);
+    HttpResponse error_response(const ApiError& e, const std::string& peer,
+                                ApiShape shape = ApiShape::OpenAI);
     /* THE REQUEST LOG. One line when a request is admitted and one from record() when it ends,
      * at the info level, so `docker logs` answers "who asked what, how long, how did it end"
      * without the engine's own levels. The debug level adds the last user message's opening. */

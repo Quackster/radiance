@@ -156,8 +156,8 @@ public:
      * exhaust at the same total token count, and any other split strands memory in whichever
      * group outlasts the others.
      *
-     * The byte budget comes from the operator and is not derived here: it is whatever `kv_pool`
-     * still has (which is --vram-kv-mib). The linear-state snapshots take none of it -- they live
+     * The byte budget is the budget resolver's and is not re-derived here: it is whatever
+     * `kv_pool` still has (vram_kv). The linear-state snapshots take none of it -- they live
      * in pinned host memory (set_checkpoint_store) -- so the pool is the live cache and nothing
      * else (spec §6, §7.3). */
     int configure(const std::vector<KVGroupInfo>& groups, const Config& cfg, Pool& kv_pool);
@@ -165,7 +165,7 @@ public:
     /* configure(), split at the seam the budget resolver needs. plan_groups() sizes every group
      * from the declaration and the run configuration -- no pool, no bytes -- and ceiling() then
      * says what a FULL cache for `ctx` tokens on max_seqs sequences would cost. Pools are
-     * allocated before carve() runs, so a derived --vram-kv-mib has to be decided from these two
+     * allocated before carve() runs, so the KV pool has to be decided from these two
      * and nothing else (core/mem/vram_budget.cpp). carve() spends the pool it is given. */
     int     plan_groups(const std::vector<KVGroupInfo>& groups, const Config& cfg);
     int64_t ceiling(int64_t ctx) const;

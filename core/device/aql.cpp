@@ -57,6 +57,7 @@
 #include <cstring>
 #include <memory>
 #include <deque>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <new>
@@ -2085,10 +2086,17 @@ int a_vmem_decommit(void* addr, int64_t bytes) {
  * process takes is the runtime's HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED, the same capability the thunk
  * decides by, and the log says it once.
  *
- * What hipHostMalloc does besides the pin is kept, so the pages are the same pages: shared
- * anonymous memory, huge pages advised from 2 MiB up, a preferred NUMA node that is the one
- * nearest the current card (ROCr allocates from that node's pool), fine-grained coherence (the
- * pool locked to), and access from every card.
+ * What hipHostMalloc does besides the pin is kept: huge pages advised from 2 MiB up, a preferred
+ * NUMA node that is the one nearest the current card (ROCr allocates from that node's pool),
+ * fine-grained coherence (the pool locked to), and access from every card. The memory is PRIVATE
+ * anonymous memory and not hipHostMalloc's shared kind, because the advice is only as good as the
+ * policy behind it: shared anonymous memory is shmem, whose huge pages follow
+ * transparent_hugepage/shmem_enabled, `never` on stock Ubuntu, so the pool got 4 KiB pages there
+ * whatever it advised. Private memory follows transparent_hugepage/enabled, `madvise` on the same
+ * hosts. Where an IOMMU translates the cards' reads (Intel VT-d, which these pieces exist for) each
+ * page is a translation of its own, and a pool streamed from at 4 KiB measured 10-21% slower
+ * prefill on such a host. MADV_DONTFORK keeps the range out of any child: a private range
+ * a card has pinned is copied whole into a forked child, where it is of no use.
  *
  * kPinPiece is a power of two well under the failing size. The cost is one buffer object per piece
  * per card: a few dozen for the largest pools. */
@@ -2131,6 +2139,21 @@ void prefer_numa_node(void* p, int64_t len, int node) {
         RAD_WARN("device: pinned host memory could not prefer NUMA node %d, the one nearest the "
                  "card (mbind: %s); its pages land on whichever node touches them first", node,
                  std::strerror(errno));
+}
+
+/* TRANSPARENT HUGE PAGES TURNED OFF leave every pinned range at 4 KiB pages whatever it advises:
+ * said once, because on a host whose IOMMU translates the cards' reads that is a slower stream
+ * from the host pool and nothing else on the log points at it. */
+void warn_if_no_huge_pages() {
+    static std::atomic<bool> said{false};
+    if (said.exchange(true)) return;
+    std::ifstream f("/sys/kernel/mm/transparent_hugepage/enabled");
+    std::string mode;
+    if (!std::getline(f, mode) || mode.find("[never]") == std::string::npos) return;
+    RAD_WARN("device: transparent huge pages are off (/sys/kernel/mm/transparent_hugepage/enabled "
+             "is never), so pinned host memory gets 4 KiB pages; where an IOMMU translates the "
+             "cards' reads, streaming from the host pool is slower. 'madvise' gives the pinned "
+             "ranges huge pages and nothing else.");
 }
 
 const char* hsa_why(hsa_status_t st) {
@@ -2193,7 +2216,7 @@ void* pin_pieces(int64_t bytes) {
     /* One alignment over, trimmed at both ends, so the range starts on a 2 MiB boundary: a pool's
      * fixed-stride slots inherit its base alignment, and a huge page needs it. */
     void* m = ::mmap(nullptr, (size_t)(len + align), PROT_READ | PROT_WRITE,
-                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED) {
         device_set_error("rad_dev_alloc(%s): mmap: %s", humanb(bytes).c_str(), std::strerror(errno));
         return nullptr;
@@ -2205,7 +2228,11 @@ void* pin_pieces(int64_t bytes) {
     char* const p = (char*)at;
 
     prefer_numa_node(p, len, current_card_numa_node());
-    if (len >= ((int64_t)2 << 20)) ::madvise(p, (size_t)len, MADV_HUGEPAGE);
+    if (len >= ((int64_t)2 << 20)) {
+        ::madvise(p, (size_t)len, MADV_HUGEPAGE);
+        warn_if_no_huge_pages();
+    }
+    (void)::madvise(p, (size_t)len, MADV_DONTFORK);
 
     const int pieces = (int)((len + kPinPiece - 1) / kPinPiece);
     int done = 0;
@@ -2342,6 +2369,8 @@ int a_code_runs(size_t from, size_t to, int device, char* why, int cap) {
 DeviceBackend g_aql;
 
 }  // namespace
+
+size_t aql_code_registered(void) { return a_code_mark(); }
 
 const DeviceBackend* aql_backend_if_present(void) {
     static const DeviceBackend* b = []() -> const DeviceBackend* {

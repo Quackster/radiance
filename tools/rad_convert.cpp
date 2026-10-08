@@ -211,7 +211,8 @@ void usage() {
         "      --list-quantizers  every quantiser loaded and the options each takes, then exit\n"
         "      --arch ID        override the architecture id from the checkpoint\n"
         "      --home DIR       $RADIANCE_HOME (kernels/, architectures/, quantizers/)\n"
-        "      --kernels A:B    kernel plugin hierarchy, first wins. Default $RADIANCE_KERNELS.\n"
+        "      --kernels A:B    the kernel libraries to load, first wins. Default $RADIANCE_KERNELS,\n"
+        "                       else every library found\n"
         "                       Declare checks the recipe against the kernels it resolves\n"
         "      --tokenizer F    tokenizer.json; its declared chain is baked instead of being\n"
         "                       reconstructed from a pre-tokenizer name\n"
@@ -403,6 +404,16 @@ int main(int argc, char** argv) {
      * the last word. Declare reads RadModelMeta and so does the engine's, from the container's
      * header, so a choice that changes the graph is stated once and held at both. */
     for (const auto& kv : set_kv) meta.set(kv.first, kv.second);
+    /* ...AND THE DESCRIPTOR FOLLOWS. The plugin pair is derived from quantization_config, so a
+     * --set of it re-derives the pair rather than leaving the container stating one format and
+     * selecting the plugin of another: a bf16 checkpoint whose recipe writes Qwen's block fp8 is
+     * converted for qwen35_fp8 by stating what that release states. */
+    for (const auto& kv : set_kv)
+        if (kv.first.rfind("quantization_config.", 0) == 0) {
+            meta.quant = quant_descriptor(meta);
+            meta.finish();
+            break;
+        }
 
     /* THE CONTAINER --reuse NAMES, read with pread and never paged through its mapping. */
     RadFile reuse;

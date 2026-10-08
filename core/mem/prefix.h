@@ -206,7 +206,8 @@ public:
                const std::vector<int32_t>& tokens,
                const std::vector<MMContentKey>& mm,
                const std::vector<std::vector<int32_t>>& blocks,
-               int64_t n_tokens);
+               int64_t n_tokens,
+               const std::string& label = std::string());
 
     /* Drop the least recently used entries, releasing their KV references. Returns how many were
      * dropped. Blocks a live sequence still holds stay allocated -- releasing the cache's

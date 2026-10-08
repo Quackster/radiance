@@ -128,17 +128,22 @@ TEST(loading_reads_identity_and_calls_open) {
     if (open_calls) CHECK(open_calls() >= 1);
 }
 
-/* The hierarchy is CONFIGURED, not discovered: a named plugin takes its position and one present
- * on disk but absent from the list loads at the end, after everything named. */
+/* The hierarchy is CONFIGURED, not discovered: a named plugin takes its position, and a kernel
+ * library present on disk but absent from the list is not loaded at all -- naming the libraries
+ * is choosing them. With no list, everything on disk loads. */
 TEST(hierarchy_order_is_configured) {
     Registry r;
     CHECK_OK(r.load_dir(kernels_dir(), { "radtest_base" }));
     const Plugin* base = r.plugin("radtest_base");
-    const Plugin* over = r.plugin("radtest_over");
-    CHECK(base && over);
-    if (!base || !over) return;
+    CHECK(base != nullptr);
+    if (!base) return;
     CHECK_EQ(base->order, 0);
-    CHECK_EQ(over->order, 1);      /* unnamed, so it loads behind everything named */
+    CHECK(r.plugin("radtest_over") == nullptr);   /* unnamed, so not loaded */
+    for (const KernelRow& row : r.rows()) CHECK(row.plugin != "radtest_over");
+
+    Registry all;
+    CHECK_OK(all.load_dir(kernels_dir(), {}));
+    CHECK(all.plugin("radtest_base") && all.plugin("radtest_over"));
 
     Registry r2;
     CHECK_OK(r2.load_dir(kernels_dir(), { "radtest_over", "radtest_base" }));
@@ -175,9 +180,14 @@ TEST(the_reference_library_sorts_last_with_no_hierarchy) {
     /* Naming it is still an override: an operator comparing a library against the reference puts
      * the reference in front on purpose, and the pin must not defeat that. */
     Registry r2;
-    CHECK_OK(r2.load_dir(order_dir(), { "radtest_reference" }));
+    CHECK_OK(r2.load_dir(order_dir(), { "radtest_reference", "radtest_base" }));
     CHECK_EQ(r2.plugin("radtest_reference")->order, 0);
     CHECK(r2.plugin("radtest_base")->order > 0);
+
+    /* And a list that leaves it out leaves it out: the reference is a library like any other. */
+    Registry r3;
+    CHECK_OK(r3.load_dir(order_dir(), { "radtest_base" }));
+    CHECK(r3.plugin("radtest_reference") == nullptr);
 }
 
 TEST(abi_mismatch_is_refused_by_name_with_both_versions) {
@@ -818,14 +828,37 @@ TEST(a_device_fact_constraint_is_matched_against_the_machine) {
     CHECK(has(why, "measured at launch"));
 }
 
-/* THE SHIPPED libr4d PICKS THE ALL-REDUCE BY MESSAGE SIZE, and the selector is what says so. At 4
- * and 8 ranks the exact sum is a one-shot for a decode-sized message and a two-shot for a prefill
- * chunk; the two-shot rows start one element above the one-shot bound, so that bound is a band
- * edge of the blocks' ranged `numel`. The band at or under the edge has to stay resolvable for
- * every row that places a DIV on `numel` -- the two-rank wht6 wire (64) and the four-rank ti8 wire
- * (128) among them -- or a lossy two-rank serve would lose its decode band. Checked here against
- * the real plugin, because nothing else can run a four- or eight-rank resolution on a two-card
- * machine. Geometry is Qwen3.8-Flash-Next's: 2560 wide, a 2048-token chunk. */
+/* AN ENGINE SERVING WITH NO CARD LEAVES A GPU LIBRARY'S DEVICE ROWS OUT. On the host backend no
+ * GPU code object runs, and a device row that resolved anyway would be launched at the first step
+ * and fail -- CPU-only serving with the shipped libraries installed was exactly that. Only the
+ * engine says so (set_no_device_code); a registry that only selects keeps every row, which the
+ * libr4d tests below rely on wherever they run. First of the libr4d tests in this file, so its
+ * dlopen is the one that registers the library's fat binaries. */
+TEST(an_engine_with_no_card_leaves_a_gpu_librarys_device_rows_out) {
+    const std::string so = home() + "/kernels/libr4d.so";
+    if (access(so.c_str(), R_OK) != 0) {
+        fprintf(stderr, "  SKIP %s: no %s (a build without HIP)\n", ::radtest::current(),
+                so.c_str());
+        return;
+    }
+    Registry r;
+    r.set_no_device_code(true);
+    CHECK(r.load_plugin(so, 0) >= 0);
+    const Plugin* p = r.plugin("libr4d");
+    CHECK(p != nullptr);
+    if (!p) return;
+    CHECK(p->device_code_absent);
+    for (const KernelRow& row : r.rows()) CHECK(row.info->domain != RAD_DOMAIN_DEVICE);
+}
+
+/* THE SHIPPED libr4d PICKS THE ALL-REDUCE BY MESSAGE SIZE, and the selector is what says so. At 3,
+ * 4 and 8 ranks the exact sum is a one-shot for a decode-sized message and a two-shot for a
+ * prefill chunk; the two-shot rows start one element above the one-shot bound, so that bound is a
+ * band edge of the blocks' ranged `numel`. The band at or under the edge has to stay resolvable
+ * for every row that places a DIV on `numel` -- the two-rank wht6 wire (64) and the three- and
+ * four-rank ti8 wires (32, 128) among them -- or a lossy serve would lose its decode band. Checked
+ * here against the real plugin, because nothing else can run a resolution above two ranks on a
+ * two-card machine. Geometry is Qwen3.8-Flash-Next's: 2560 wide, a 2048-token chunk. */
 TEST(libr4d_resolves_the_all_reduce_by_message_size) {
     const std::string so = home() + "/kernels/libr4d.so";
     if (access(so.c_str(), R_OK) != 0) {
@@ -853,10 +886,14 @@ TEST(libr4d_resolves_the_all_reduce_by_message_size) {
         return s;
     };
 
+    CHECK_EQ(names(bands(3, 1, chunk)),
+             "524288:ar_oneshot_3rank_exact 5242880:ar_twoshot_3rank_exact ");
     CHECK_EQ(names(bands(4, 1, chunk)),
              "524288:ar_oneshot_4rank_exact 5242880:ar_twoshot_4rank_exact ");
     CHECK_EQ(names(bands(8, 1, chunk)),
              "524288:ar_oneshot_8rank_exact 5242880:ar_twoshot_8rank_exact ");
+    CHECK_EQ(names(bands(3, 0, chunk)),
+             "524288:ar_twoshot_3rank_ti8 5242880:ar_twoshot_3rank_ti8 ");
     CHECK_EQ(names(bands(4, 0, chunk)),
              "524288:ar_twoshot_4rank_ti8 5242880:ar_twoshot_4rank_ti8 ");
     CHECK_EQ(names(bands(2, 0, chunk)),
@@ -868,6 +905,9 @@ TEST(libr4d_resolves_the_all_reduce_by_message_size) {
     CHECK_EQ(names(bands(4, 1, 16384)),
              "524288:ar_oneshot_4rank_exact 20971520:ar_twoshot_4rank_exact "
              "41943040:ar_oneshot_4rank_exact ");
+    CHECK_EQ(names(bands(3, 1, 16384)),
+             "524288:ar_oneshot_3rank_exact 20971520:ar_twoshot_3rank_exact "
+             "41943040:ar_oneshot_3rank_exact ");
 
     /* A step that never exceeds the bound has one band, and it is the one-shot's. */
     CHECK_EQ(names(bands(4, 1, 128)), "327680:ar_oneshot_4rank_exact ");

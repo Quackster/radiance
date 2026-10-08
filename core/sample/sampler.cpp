@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 
 namespace rad {
@@ -177,6 +178,8 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
 
     buf_params_ = decl("sampler.params", RAD_U32, rows,
                        (int64_t)(sizeof(DeviceSampleParams) / 4), RAD_BUF_PERSIST);
+    buf_params_late_ = decl("sampler.params_late", RAD_U32, rows,
+                            (int64_t)(sizeof(DeviceSampleParams) / 4), RAD_BUF_PERSIST);
     buf_hist_   = decl("sampler.history", RAD_I32, rows, cfg_.max_hist, RAD_BUF_PERSIST);
     /* One byte beside every history token: nonzero where that token is a whole DRY sequence
      * breaker, which DRY never penalises. Resolving a token against the breaker strings needs the
@@ -194,7 +197,16 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
                            ncand * cfg_.world_size * 2, RAD_BUF_TRANSIENT);
     }
 
-    if (!buf_params_ || !buf_hist_ || !buf_brk_ || !buf_mask_ || !buf_cand_i_ || !buf_cand_v_) {
+    /* THE LOGPROBS SUMMARY, PERSIST for the reason the staging planes are: nothing in the
+     * declared op list reads it -- rank 0 copies it to the host behind the pick -- so liveness
+     * over the op list would hand its bytes to the candidate planes the stages after it write. */
+    buf_lp_ = decl("sampler.logprobs", RAD_F32, rows, lp_width(), RAD_BUF_PERSIST);
+    if (vocab_parallel())
+        buf_lp_g_ = decl("sampler.logprobs_gathered", RAD_F32, rows,
+                         lp_width() * cfg_.world_size, RAD_BUF_PERSIST);
+
+    if (!buf_params_ || !buf_params_late_ || !buf_hist_ || !buf_brk_ || !buf_mask_ ||
+        !buf_cand_i_ || !buf_cand_v_ || !buf_lp_) {
         RAD_ERR("sampler: a staging buffer failed to declare");
         return RAD_E_NOMEM;
     }
@@ -252,6 +264,15 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
     op_typical_   = op_cand("sample_typical");
     op_xtc_       = op_cand("sample_xtc");
     op_pick_      = op_cand("sample_pick");
+    /* THE SAME TEMPERATURE KERNEL OVER THE CANDIDATE PLANE: its `n_vocab` is the candidate width,
+     * which is all the kernel reads it as -- a row length. */
+    {
+        RadParam p[2] = {
+            RadParam{ "M", RAD_P_RANGE, 1, rows, nullptr },
+            RadParam{ "n_vocab", RAD_P_INT, (long long)ncand, 0, nullptr },
+        };
+        op_temp_late_ = rad_decl_op(b, "sample_temp", p, 2, nullptr, 0);
+    }
 
     if (vocab_parallel()) {
         /* lm_head is vocab-sharded, so each rank reduces ITS OWN shard and only the candidate
@@ -267,6 +288,31 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
         };
         op_allgather_ = rad_decl_op(b, "all_gather", ag, 4, nullptr, 0);
         op_merge_     = op_cand("sample_merge_topk");
+    }
+
+    /* THE RAW DISTRIBUTION'S SUMMARY, at the one width every request's top_logprobs fits in. A
+     * deployment whose kernels lack it serves every request that does not ask for logprobs;
+     * check_request refuses the ones that do, by name. */
+    {
+        RadParam p[4] = {
+            RadParam{ "M", RAD_P_RANGE, 1, rows, nullptr },
+            RadParam{ "n_vocab", RAD_P_INT, (long long)nv, 0, nullptr },
+            RadParam{ "k", RAD_P_INT, (long long)kLpK, 0, nullptr },
+            RadParam{ "vocab_off", RAD_P_INT, (long long)cfg_.vocab_off, 0, nullptr },
+        };
+        op_logprobs_ = rad_decl_op(b, "sample_logprobs", p, vocab_parallel() ? 4 : 3, nullptr, 0);
+    }
+    if (vocab_parallel()) {
+        /* Each rank summarised its own shard; rank 0 merges them on the host, so every rank's
+         * row lands beside the others' as the candidate pairs do. */
+        RadParam ag[4] = {
+            RadParam{ "world_size", RAD_P_INT, (long long)cfg_.world_size, 0, nullptr },
+            RadParam{ "numel", RAD_P_INT, (long long)(rows * lp_width()), 0, nullptr },
+            RadParam{ "dtype", RAD_P_STR, 0, 0, "f32" },
+            RadParam{ "row", RAD_P_INT, (long long)lp_width(), 0, nullptr },
+        };
+        op_lp_gather_ = rad_decl_op(b, "all_gather", ag, 4, nullptr, 0);
+        if (!op_lp_gather_) op_logprobs_ = RAD_NULL_HANDLE;
     }
 
     RAD_TRY(stage_alloc());
@@ -288,14 +334,32 @@ int Sampler::stage_alloc() {
         rows * (int64_t)sizeof(DeviceSampleParams), RAD_MEM_HOST_PINNED);
     greedy_stage_ = (DeviceSampleParams*)rad_dev_alloc(
         rows * (int64_t)sizeof(DeviceSampleParams), RAD_MEM_HOST_PINNED);
+    late_stage_   = (DeviceSampleParams*)rad_dev_alloc(
+        rows * (int64_t)sizeof(DeviceSampleParams), RAD_MEM_HOST_PINNED);
     greedy_ready_ = false;
     hist_stage_   = (int32_t*)rad_dev_alloc(rows * cfg_.max_hist * 4, RAD_MEM_HOST_PINNED);
     brk_stage_    = (uint8_t*)rad_dev_alloc(rows * cfg_.max_hist, RAD_MEM_HOST_PINNED);
     mask_stage_   = (uint32_t*)rad_dev_alloc(rows * mask_words_ * 4, RAD_MEM_HOST_PINNED);
 
-    if (!params_stage_ || !greedy_stage_ || !hist_stage_ || !brk_stage_ || !mask_stage_) {
+    /* Rank 0's landing place for the logprobs copies, and only rank 0's: it is the rank that
+     * reads them. */
+    if (cfg_.rank == 0) {
+        const int64_t w = lp_width() * (vocab_parallel() ? cfg_.world_size : 1);
+        lp_host_    = (float*)rad_dev_alloc(rows * w * 4, RAD_MEM_HOST_PINNED);
+        lp_ci_host_ = (int32_t*)rad_dev_alloc(rows * cfg_.max_candidates * 4, RAD_MEM_HOST_PINNED);
+        lp_cv_host_ = (float*)rad_dev_alloc(rows * cfg_.max_candidates * 4, RAD_MEM_HOST_PINNED);
+        if (!lp_host_ || !lp_ci_host_ || !lp_cv_host_) {
+            RAD_ERR("sampler: could not pin %s for the logprobs readback",
+                    humanb(rows * (w + 2 * cfg_.max_candidates) * 4).c_str());
+            stage_free();
+            return RAD_E_NOMEM;
+        }
+    }
+
+    if (!params_stage_ || !greedy_stage_ || !late_stage_ || !hist_stage_ || !brk_stage_ ||
+        !mask_stage_) {
         RAD_ERR("sampler: could not pin %s of staging",
-                humanb(rows * ((int64_t)sizeof(DeviceSampleParams) + cfg_.max_hist * 5 +
+                humanb(rows * (3 * (int64_t)sizeof(DeviceSampleParams) + cfg_.max_hist * 5 +
                                mask_words_ * 4)).c_str());
         stage_free();
         return RAD_E_NOMEM;
@@ -306,11 +370,19 @@ int Sampler::stage_alloc() {
 void Sampler::stage_free() {
     if (params_stage_) rad_dev_free(params_stage_, RAD_MEM_HOST_PINNED);
     if (greedy_stage_) rad_dev_free(greedy_stage_, RAD_MEM_HOST_PINNED);
+    if (late_stage_)   rad_dev_free(late_stage_,   RAD_MEM_HOST_PINNED);
     if (hist_stage_)   rad_dev_free(hist_stage_,   RAD_MEM_HOST_PINNED);
     if (brk_stage_)    rad_dev_free(brk_stage_,    RAD_MEM_HOST_PINNED);
     if (mask_stage_)   rad_dev_free(mask_stage_,   RAD_MEM_HOST_PINNED);
+    if (lp_host_)      rad_dev_free(lp_host_,      RAD_MEM_HOST_PINNED);
+    if (lp_ci_host_)   rad_dev_free(lp_ci_host_,   RAD_MEM_HOST_PINNED);
+    if (lp_cv_host_)   rad_dev_free(lp_cv_host_,   RAD_MEM_HOST_PINNED);
+    lp_host_      = nullptr;
+    lp_ci_host_   = nullptr;
+    lp_cv_host_   = nullptr;
     params_stage_ = nullptr;
     greedy_stage_ = nullptr;
+    late_stage_   = nullptr;
     cur_stage_    = nullptr;
     hist_stage_   = nullptr;
     brk_stage_    = nullptr;
@@ -349,6 +421,11 @@ int Sampler::check_request(const SamplingParams& sp, std::string* why) const {
     if (sp.top_k > cfg_.max_candidates)
         return refuse("top_k exceeds the sampler's candidate width (--max-candidates)",
                       RAD_E_INVAL);
+    if (sp.n_probs > RAD_MAX_LOGPROBS) {
+        if (why) *why = "at most " + std::to_string(RAD_MAX_LOGPROBS) +
+                        " logprobs alternatives may be asked for";
+        return RAD_E_INVAL;
+    }
     /* Every breaker is a pass over the whole vocabulary on the scheduler thread, and every other
      * sequence on the server waits for it; see kDryMaxBreakers. Refused here, before any of that
      * work is queued, rather than truncated -- a request whose breakers quietly went missing is a
@@ -366,12 +443,18 @@ int Sampler::check_request(const SamplingParams& sp, std::string* why) const {
         return (wanted && !h) ? n : nullptr;
     };
     /* A SPLIT VOCABULARY MOVES GREEDY ONTO THE CHAIN, so what a greedy request needs moves with
-     * it: not the argmax, but the top-k, the merge and the pick that build_step's top_k = 1 sends
-     * it through. Admission has to check what will actually be issued. */
-    const bool greedy_chain = sp.greedy() && vocab_parallel();
+     * it: not the argmax, but the temperature stage, the top-k, the merge and the pick that
+     * build_step's top_k = 1 sends it through -- run() issues the temperature stage for every
+     * batch with a chain row, even though its kernel leaves a greedy row (temperature 0) as it
+     * is. Admission has to check what will actually be issued. */
+    /* AND SO DOES ONE ASKING FOR LOGPROBS, which build_step stages as a top-1 chain row so its
+     * token comes off a candidate plane (sampler.h). */
+    const bool lp = sp.n_probs >= 0;
+    const bool greedy_chain = sp.greedy() && (vocab_parallel() || lp);
     const char* missing = nullptr;
+    if (!missing) missing = need(lp, op_logprobs_, "sample_logprobs");
     if (!missing) missing = need(sp.greedy() && !greedy_chain, op_argmax_, "sample_argmax");
-    if (!missing) missing = need(!sp.greedy(), op_temp_, "sample_temp");
+    if (!missing) missing = need(!sp.greedy() || greedy_chain, op_temp_, "sample_temp");
     if (!missing) missing = need(!sp.greedy() || greedy_chain, op_pick_, "sample_pick");
     /* EVERY CHAIN ROW NEEDS THE TOP-K, whatever its own top_k says: it is the stage that writes
      * the candidate set every later stage reads. top_k = 0 asks for the whole candidate width,
@@ -381,6 +464,8 @@ int Sampler::check_request(const SamplingParams& sp, std::string* why) const {
     if (!missing) missing = need(sp.min_p > 0.0f, op_minp_, "sample_minp");
     if (!missing) missing = need(sp.typical_p < 1.0f, op_typical_, "sample_typical");
     if (!missing) missing = need(sp.xtc_probability > 0.0f, op_xtc_, "sample_xtc");
+    if (!missing) missing = need(!sp.greedy() && sp.temp_last, op_temp_late_,
+                                 "sample_temp (over the candidates, for temperature last)");
     if (!missing) missing = need(dry_on(sp), op_dry_, "sample_dry");
     if (!missing) missing = need(!sp.grammar.empty() || sp.thinking_budget >= 0, op_mask_,
                                  "sample_mask");
@@ -514,7 +599,9 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
     const int64_t cap = rows_for(cfg_);
     n_seq_ = 0;
     any_brk_ = false;
+    any_late_ = false;
     cur_stage_ = params_stage_;
+    lp_rows_.clear();
 
     /* DRY'S HOST HALF, for one row whose history `h[0, take)` is already staged. The breakers are
      * strings resolved against the vocabulary, so what they mean for this window is worked out
@@ -651,11 +738,28 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
              * Such a row is a CHAIN row and does not carry RAD_SP_GREEDY: every candidate stage
              * skips a row that does, because in an unsplit batch that flag is what keeps the pick
              * from overwriting the argmax's answer with a draw. */
+            /* A GREEDY ROW ASKING FOR LOGPROBS IS A TOP-1 CHAIN ROW TOO, for a reason of its own:
+             * its token has to come off a candidate plane, which is where logprobs_for reads the
+             * value it was drawn at. The argmax's tie rule is the top-k's, so the token is the
+             * same. */
+            const bool want_lp = sp.n_probs >= 0;
             if (sp.greedy()) {
-                if (vocab_parallel()) p.top_k = 1;
-                else                  p.flags |= RAD_SP_GREEDY;
+                if (vocab_parallel() || want_lp) p.top_k = 1;
+                else                             p.flags |= RAD_SP_GREEDY;
             }
+            if (want_lp) p.flags |= RAD_SP_LOGPROBS;
             if (sp.xtc_probability > 0.0f) p.flags |= RAD_SP_XTC;
+            /* TEMPERATURE LAST: the row's own temperature in the late stage's row, and 1 -- which
+             * the temperature stage skips -- in whichever of the two it does not run in. Every row
+             * gets a late row, because the late stage is issued over the whole batch. */
+            const bool late = sp.temp_last && !sp.greedy() && sp.temp != 1.0f;
+            DeviceSampleParams& lp = late_stage_[row];
+            lp = p;
+            lp.temp = late ? sp.temp : 1.0f;
+            if (late) {
+                p.temp = 1.0f;
+                any_late_ = true;
+            }
 
             /* THE HISTORY THE PENALTIES AND DRY READ, staged only for a row that runs one of them
              * -- the copy is scheduler-thread work and the upload is step-path bytes, and neither
@@ -766,6 +870,23 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
 
             if (budget && think.inside() && think.body >= sp.thinking_budget)
                 force_close(p, row, sp.reasoning.close);
+
+            if (want_lp) {
+                /* The temperature the candidate value carries: the early stage's and the late
+                 * one's, each only where its kernel runs (temp > 0 and not 1). */
+                auto t_of = [](float t) { return t > 0.0f && t != 1.0f ? t : 1.0f; };
+                LpRow L;
+                L.row   = row;
+                L.n_top = sp.n_probs;
+                L.temp  = t_of(p.temp) * t_of(late_stage_[row].temp);
+                L.p     = p;
+                if (p.hist_len > 0) {
+                    const int32_t* h = hist_stage_ + row * cfg_.max_hist;
+                    L.hist.assign(h, h + p.hist_len);
+                }
+                L.dry = brk;
+                lp_rows_.push_back(std::move(L));
+            }
         }
 
         /* Back to where the sequence actually is. The tokens it really accepted are applied by
@@ -881,6 +1002,12 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
      * number that makes a host-side grammar affordable at all (spec §13). */
     RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_params_), cur_stage_,
                              n_seq_ * (int64_t)sizeof(DeviceSampleParams), s));
+    /* The late temperature's rows only when this build staged one: a greedy build's rows come
+     * from greedy_stage_, and late_stage_ then holds an older build's. */
+    const bool late = any_late_ && cur_stage_ == params_stage_;
+    if (late)
+        RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_params_late_), late_stage_,
+                                 n_seq_ * (int64_t)sizeof(DeviceSampleParams), s));
     if (any_penalty || any_dry)
         RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_hist_), hist_stage_,
                                  n_seq_ * cfg_.max_hist * 4, s));
@@ -905,6 +1032,17 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
         std::vector<RadOperand> v(ops);
         return rad_issue(c, op, v.data(), (int)v.size(), n_seq_);
     };
+
+    /* THE LOGPROBS SUMMARY, ON THE LOGITS AS THE MODEL WROTE THEM: every stage below writes them in
+     * place. Only for a trunk build that staged a logprobs row -- a draft pass's greedy build
+     * stages none, and must not overwrite the summary rank 0 is about to copy back. */
+    const bool lp = !lp_rows_.empty() && cur_stage_ == params_stage_ && op_logprobs_;
+    const RadOperand o_lp = opd_rows(buf_lp_, n_seq_);
+    if (lp) {
+        RAD_TRY(issue(op_logprobs_, { o_logits, o_params, o_lp }));
+        if (vocab_parallel())
+            RAD_TRY(issue(op_lp_gather_, { o_lp, opd_rows(buf_lp_g_, n_seq_) }));
+    }
 
     /* Penalties act on raw logits, before anything derives a probability from them. DRY takes the
      * breaker marks only when some row in the batch has breakers; its fourth operand is optional
@@ -962,8 +1100,163 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     if (any_minp) RAD_TRY(issue(op_minp_,    { o_ci, o_cv, o_params }));
     if (any_typ)  RAD_TRY(issue(op_typical_, { o_ci, o_cv, o_params }));
     if (any_xtc)  RAD_TRY(issue(op_xtc_,     { o_ci, o_cv, o_params }));
+    if (late)
+        RAD_TRY(issue(op_temp_late_, { o_cv, opd_rows(buf_params_late_, n_seq_) }));
 
     RAD_TRY(issue(op_pick_, { o_ci, o_cv, o_params, o_tok }));
+
+    /* AND THE LOGPROBS ROWS ON THEIR WAY TO THE HOST, behind the pick on the same stream: the
+     * summary, and the candidate planes the pick drew from (logprobs_for reads a token's value
+     * there when the summary does not hold it). Only the rows between the first and the last
+     * that asked, and only on rank 0, which is the rank collect_step asks. */
+    if (lp && cfg_.rank == 0) {
+        lp_lo_ = lp_rows_.front().row;
+        lp_hi_ = lp_rows_.back().row + 1;
+        const int64_t w = lp_width() * (vocab_parallel() ? cfg_.world_size : 1);
+        const int64_t nc = cfg_.max_candidates, n = lp_hi_ - lp_lo_;
+        const char* sp = (const char*)rad_buf_ptr(c, vocab_parallel() ? buf_lp_g_ : buf_lp_);
+        const char* ci = (const char*)rad_buf_ptr(c, buf_cand_i_);
+        const char* cv = (const char*)rad_buf_ptr(c, buf_cand_v_);
+        if (!sp || !ci || !cv) return RAD_E_STATE;
+        RAD_TRY(rad_memcpy_async(lp_host_ + lp_lo_ * w, sp + lp_lo_ * w * 4, n * w * 4, s));
+        RAD_TRY(rad_memcpy_async(lp_ci_host_ + lp_lo_ * nc, ci + lp_lo_ * nc * 4, n * nc * 4, s));
+        RAD_TRY(rad_memcpy_async(lp_cv_host_ + lp_lo_ * nc, cv + lp_lo_ * nc * 4, n * nc * 4, s));
+    }
+    return RAD_OK;
+}
+
+/* ================================================================== logprobs */
+
+float Sampler::raw_logit(const LpRow& L, int32_t token, float v) const {
+    const DeviceSampleParams& p = L.p;
+    double y = (double)v * (double)L.temp;
+    /* DRY subtracted a penalty that depends on the token and the window alone, so the host
+     * reference computes it for this one token: a single candidate at 0 comes back at minus the
+     * penalty. */
+    if (p.flags & RAD_SP_DRY) {
+        static const DryBreakers kNone;
+        CandidateSet s;
+        s.c.push_back(Candidate{ token, 0.0f, 0.0f });
+        DryParams dp;
+        dp.multiplier     = p.dry_multiplier;
+        dp.base           = p.dry_base;
+        dp.allowed_length = p.dry_allowed_length > 0 ? p.dry_allowed_length : 2;
+        dp.penalty_last_n = p.dry_penalty_last_n < 0 ? -1 : p.dry_penalty_last_n;
+        host_dry(s, L.hist.data(), (int64_t)L.hist.size(), (int64_t)L.hist.size(), dp,
+                 L.dry ? *L.dry : kNone);
+        y -= (double)s.c[0].logit;
+    }
+    /* The penalties, inverted: presence and frequency added back, then the repetition penalty
+     * undone on the side of zero the logit is on -- it never changes sign. The window is the
+     * stage's: the tail of the staged history, penalty_last_n long when that is positive. */
+    if (p.flags & RAD_SP_PENALTY) {
+        int64_t n = (int64_t)L.hist.size(), o = 0;
+        if (p.penalty_last_n > 0 && n > p.penalty_last_n) { o = n - p.penalty_last_n; n = p.penalty_last_n; }
+        int64_t count = 0;
+        for (int64_t i = 0; i < n; ++i) count += L.hist[(size_t)(o + i)] == token;
+        if (count > 0) {
+            y += (double)count * p.freq_penalty + p.pres_penalty;
+            y = y > 0.0 ? y * p.rep_penalty : y / p.rep_penalty;
+        }
+    }
+    return (float)y;
+}
+
+int merge_logprob_rows(const float* st, int W, int k, double* log_z, int32_t* ids, float* vals,
+                       int cap) {
+    const int64_t w = 2 + 2 * (int64_t)k;
+    auto live = [&](int r) {
+        const float m = st[r * w], z = st[r * w + 1];
+        return std::isfinite(m) && std::isfinite(z) && z > 0.0f;
+    };
+    double mx = -INFINITY;
+    for (int r = 0; r < W; ++r)
+        if (live(r)) mx = std::max(mx, (double)st[r * w]);
+    double sum = 0.0;
+    for (int r = 0; r < W; ++r)
+        if (live(r)) sum += (double)st[r * w + 1] * std::exp((double)st[r * w] - mx);
+    *log_z = sum > 0.0 ? mx + std::log(sum) : NAN;
+
+    /* On the stack for every split the engine runs (eight ranks of 21 pairs is 168); a call for
+     * more takes the heap rather than a bound. Once per emitted token, on collect_step's path. */
+    struct Pair { float v; int32_t id; };
+    Pair buf[256];
+    std::vector<Pair> heap;
+    Pair* top = buf;
+    if ((int64_t)W * k > (int64_t)(sizeof buf / sizeof buf[0])) {
+        heap.resize((size_t)W * (size_t)k);
+        top = heap.data();
+    }
+    int m = 0;
+    for (int r = 0; r < W; ++r) {
+        if (!live(r)) continue;
+        for (int j = 0; j < k; ++j) {
+            const int32_t id = (int32_t)st[r * w + 2 + 2 * j];
+            const float   v  = st[r * w + 3 + 2 * j];
+            if (id >= 0 && std::isfinite(v)) top[m++] = Pair{ v, id };
+        }
+    }
+    std::sort(top, top + m, [](const Pair& a, const Pair& b) {
+        return a.v > b.v || (a.v == b.v && a.id < b.id);
+    });
+    const int n = std::min(cap, m);
+    for (int j = 0; j < n; ++j) {
+        ids[j]  = top[j].id;
+        vals[j] = top[j].v;
+    }
+    return n;
+}
+
+int Sampler::logprobs_for(int64_t row, int32_t token, TokenLogprobs* out) const {
+    if (!out || !lp_host_ || row < lp_lo_ || row >= lp_hi_) return RAD_E_STATE;
+    const LpRow* L = nullptr;
+    for (const LpRow& x : lp_rows_)
+        if (x.row == row) { L = &x; break; }
+    if (!L) return RAD_E_STATE;
+
+    /* Every rank's summary of its shard, merged: the maxima and normalisers by the usual
+     * rescale, the largest by value with the lower id first. */
+    const int W = vocab_parallel() ? cfg_.world_size : 1;
+    double log_z = 0.0;
+    int32_t ids[kLpK * 8];
+    float   vals[kLpK * 8];
+    const int n = merge_logprob_rows(lp_host_ + row * W * lp_width(), W, kLpK, &log_z, ids, vals,
+                                     (int)(sizeof ids / sizeof ids[0]));
+    /* A ROW WITH NO FINITE LOGIT HAS NO DISTRIBUTION to report against -- NaN logits out of the
+     * model, or every one at -inf -- and any number sent for it would be invented. */
+    if (!std::isfinite(log_z)) {
+        RAD_WARN("sampler: row %lld has no finite logit; its logprobs cannot be computed",
+                 (long long)row);
+        out->token = -1;
+        return RAD_E_INVAL;
+    }
+
+    out->token = token;
+    out->n_top = std::min(L->n_top, n);
+    for (int j = 0; j < out->n_top; ++j) {
+        out->top_id[j] = ids[j];
+        out->top_lp[j] = (float)((double)vals[j] - log_z);
+    }
+
+    /* The token's own raw logit: exact when it is among the largest, and otherwise recovered
+     * from the value the pick drew it at. */
+    double own = NAN;
+    for (int j = 0; j < n && std::isnan(own); ++j)
+        if (ids[j] == token) own = (double)vals[j];
+    if (std::isnan(own)) {
+        const int64_t nc = cfg_.max_candidates;
+        const int32_t* ci = lp_ci_host_ + row * nc;
+        const float*   cv = lp_cv_host_ + row * nc;
+        for (int64_t c = 0; c < nc && std::isnan(own); ++c)
+            if (ci[c] == token) own = (double)raw_logit(*L, token, cv[c]);
+    }
+    if (!std::isfinite(own)) {
+        RAD_WARN("sampler: row %lld sampled token %d, which has no finite logit on the candidate "
+                 "plane it was drawn from; its logprobs cannot be computed", (long long)row, token);
+        out->token = -1;
+        return RAD_E_INVAL;
+    }
+    out->logprob = (float)(own - log_z);
     return RAD_OK;
 }
 

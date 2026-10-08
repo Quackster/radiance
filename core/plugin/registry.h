@@ -150,10 +150,12 @@ public:
     /* ---------------------------------------------------------- loading (§2, §18) */
     /* Scan a directory of .so files and load them in HIERARCHY ORDER. The hierarchy is configured,
      * not discovered: `hierarchy` is an ordered list of plugin names (RadPluginInfo::name, or the
-     * file's stem, whichever the operator wrote), so substituting a kernel is dropping an .so in a
-     * directory and naming it ahead of the default. A plugin present on disk but absent from the
-     * list loads at the END, after everything named, in filename order so the result is
-     * reproducible.
+     * file as the operator wrote it -- `libr4d`, `r4d`, `libr4d.so`), so substituting a kernel is
+     * dropping an .so in a directory and naming it ahead of the default. A non-empty list is
+     * EXCLUSIVE: a kernel library it does not name is closed before it registers anything, and an
+     * entry that matches nothing is warned about by name. An empty list loads every kernel library
+     * found, in filename order so the result is reproducible, with a reference library last.
+     * Architecture and quantiser plugins are not ranked and always load.
      *
      * Always completes: every plugin that can be loaded is, every refusal is recorded in
      * load_errors(), and the FIRST negative status is returned. Reporting the whole list beats
@@ -181,6 +183,13 @@ public:
      * loads anything, once it has chosen its cards. */
     void set_code_device(int device) { code_device_ = device; }
 
+    /* THE ENGINE ABOUT TO SERVE ON THE HOST BACKEND SAYS SO: no card is visible, and no GPU code
+     * object runs in this process at all. A kernel library that brought device code then has its
+     * device rows left out of selection at load, its host rows staying, so every op takes its host
+     * kernel. Only the engine says this. A tool that selects without serving -- rad-convert's
+     * recipe check, rad-kbench's tables, a test of a library's constraints -- sees every row, as
+     * it would on the machine the model is served on. */
+    void set_no_device_code(bool v) { no_device_code_ = v; }
     /* WHAT THE ENGINE MEASURED ABOUT THE RANKS' DEVICES, for the constraints on "device." keys
      * (rad_types.h). Set before the first selection, by whoever chose the devices; a registry
      * nobody told anything has no facts, and a kernel constrained on one is not selected. */
@@ -333,6 +342,7 @@ private:
     };
 
     int code_device_ = 0;
+    bool no_device_code_ = false;
     Geometry device_facts_;
     TuneCache tune_;
 

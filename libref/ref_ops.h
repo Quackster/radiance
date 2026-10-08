@@ -170,6 +170,7 @@ int ref_sample_merge_topk  (const RadArgs*, RadStream);
 int ref_sample_mask        (const RadArgs*, RadStream);
 int ref_sample_pick        (const RadArgs*, RadStream);
 int ref_sample_argmax      (const RadArgs*, RadStream);
+int ref_sample_logprobs    (const RadArgs*, RadStream);
 
 /* ============================== OPERAND DESCRIPTION ==============================
  *
@@ -290,6 +291,7 @@ REF_SHAPE_FN(ref_sample_merge_topk);
 REF_SHAPE_FN(ref_sample_mask);
 REF_SHAPE_FN(ref_sample_pick);
 REF_SHAPE_FN(ref_sample_argmax);
+REF_SHAPE_FN(ref_sample_logprobs);
 
 }  /* extern "C" */
 #endif /* RAD_REF_OPS_H */

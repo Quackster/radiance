@@ -12,8 +12,10 @@ and row groups, the fused router launch, the adaptive draft window, the MoE pref
 sorted operand's decode kernel), mechkbfan (the token embedding in the pinned host pool), Code000
 (the n-gram gather on the card and the MTP head's history-pass skip), baKon (three-rank tensor
 parallelism, serving any world size from the shipped container, the request log, an uneven world's
-per-rank KV and weights split, and --rope-scaling) and hazyumps (static YaRN for the Qwen rotary
-paths).
+per-rank KV and weights split, --rope-scaling, the model entry's context length, root and
+capabilities, /props, the three-rank two-shot all-reduce and tiered-int8 wire, the diagnosis of
+the three-rank lossy-wire crash, and cardclock.py), hazyumps (static YaRN for the Qwen rotary
+paths) and redxherring (--model taking a Hugging Face repo id).
 
 This product includes software from the following projects, each under the MIT License. The
 license text is in the file named beside each.

@@ -66,7 +66,9 @@ lifts. There is nothing to `apt install` beyond a toolchain.
 **A machine with no GPU is a supported configuration.** The host backend is a real implementation,
 not a stub: the core, scheduler, planner, tokeniser, server and `libref` all run through it and
 the full test suite passes. It is slow, and it will not serve a production model — but it is a
-complete development and inspection environment.
+complete development and inspection environment. A build with ROCm, or the container image, runs
+the same host backend on a machine where no card is visible: the GPU library's kernels are left out
+there and every op takes its host kernel.
 
 ### 1.2 Build
 
@@ -201,8 +203,9 @@ library can change without a reconvert.
 
 **2. Kernels are plugins, and the order matters.** The engine resolves every op in the model
 against an ordered list of kernel libraries: first one that matches an op wins. `--kernels
-mylib,libref` states that order. With no list, the loader orders what it finds and puts a
-library that declares itself a reference implementation last.
+mylib,libref` names the libraries to use and their order; a library it leaves out is not loaded.
+With no list, every library found loads, and the loader puts one that declares itself a reference
+implementation last.
 
 Three ship with the tree:
 
@@ -250,6 +253,24 @@ skipped and a short one is continued. It also skips duplicate weight formats —
 `.safetensors` it will not also pull the `.bin`, the ONNX export and the GGUF.
 
 Set `HF_TOKEN` for a gated or private repo. `HFGET_JOBS` sets concurrency (default 4).
+
+A complete fetch records each file's content key (its LFS sha256, or the size of a small file) in
+`.hfget-manifest`, so the next run also fetches a file that changed at the same size. The free-space
+check counts only what is still to fetch.
+
+**The server can do this itself.** `--model` takes a repo id where it would take a path:
+
+```sh
+radiance --model StillDeadcode/minicpm5-2b-fp8 --port 8000
+```
+
+It runs the same script (installed beside the binary, in `libexec/radiance/`) into
+`--download-dir/<owner>/<name>` before bring-up, then serves the one `.rad` at the repo's top level,
+or the directory as a checkpoint (§3.4) when it holds none. A repo with several containers is
+refused by name; pass the file. Every start checks the hub and fetches what changed. A start that
+cannot read the listing, or whose update does not fit, serves the copy a complete earlier fetch
+left and says so; a transfer that fails part-way stops startup. A path that exists is always a
+path, and a name ending in `.rad`, `.safetensors`, `.gguf` or `.json` is never looked up.
 
 ### 3.2 Convert it
 
@@ -306,7 +327,19 @@ rad-convert $SRC -o out.rad --draft-model ~/models/openbmb/MiniCPM5-2B-DSpark
 
 # Re-quantise some weights and copy the rest from an earlier container
 rad-convert $SRC -o new.rad --recipe new.recipe --reuse old.rad
+
+# A bf16 Qwen3.8-27B -- the base release or a finetune of it -- as Qwen's block fp8: the recipe
+# writes the linears, and --set states the format, which is what selects the fp8 plugin
+rad-convert ~/models/ukisai/Swift-1.5-Qwen3.8-27b -o swift-27b-fp8.rad \
+    --draft-model ~/models/z-lab/Qwen3.8-27B-DFlash2 --recipe data/recipes/q38-27b-fp8block-df2.recipe \
+    --set quantization_config.quant_method=fp8 --set quantization_config.fmt=e4m3 \
+    --set "quantization_config.weight_block_size=128 128" --set quantization_config.activation_scheme=dynamic
 ```
+
+A checkpoint directory's `model.safetensors.index.json` decides which shard each tensor is read
+from. A finetune that changed only some tensors can be assembled from them and the base model: its
+changed tensors in shards of their own, links to the base model's shards for the rest, and an index
+that points each name at its copy. A name two shards hold that no index entry settles is refused.
 
 The conversions of record live in `scripts/convfn.sh` and `scripts/convdspark.sh`, with their
 recipes in `data/recipes/`.
@@ -429,15 +462,15 @@ radiance --model m.rad --debug-placement    # just the placement plan
 
 ### 4.3 Memory: how the card gets split
 
-The card is split into **resident weights** and the **paged KV pool**. You can state the split
-outright:
+The card is split into **resident weights** and the **paged KV pool**, and the engine derives the
+split from the card and the model; no flag states either pool. What you move are its inputs:
+`--gpu-headroom-mib` leaves card space alone, `--max-model-len` and `--max-num-seqs` bound the
+cache, and `--host-pool-mib` decides which experts must stay on the card. The startup receipt
+prints every term. On a machine with no visible card (the host backend) half of RAM stands in for
+the card and is split the same way; the weights pool is then host memory, holding the weights a
+host kernel cannot read where the container stores them.
 
-```sh
-radiance --model m.rad --vram-weights-mib 24000 --vram-kv-mib 6000
-```
-
-or leave both unset and let the engine derive it from the card. The non-expert weights come off
-the top of what is claimed. The rest — the `elastic` line of the startup receipt — is shared by
+The non-expert weights come off the top of what is claimed. The rest — the `elastic` line of the startup receipt — is shared by
 the expert slab and the KV cache, and no flag divides it:
 
 - **The cache lends** under `--placement auto` or `expert_tiered`, without `--deterministic`, on a
@@ -457,12 +490,11 @@ off the card and gives the cache more.
 **An uneven world re-splits its cheaper ranks.** The split above is worked out once, for the rank
 whose cache costs most, and one block table serves every rank. Where a rank's cache costs less per
 token -- an attention-zero rank at `--tp 3` keeps no attention cache -- it gets, under
-`expert_tiered` with both pools derived, a KV pool that pages exactly the common token count and the
+`expert_tiered`, a KV pool that pages exactly the common token count and the
 difference in its weights pool, up to every one of its weights resident; the startup log names the
 rank and both sizes (`kv: rank N's cache costs ...`). It holds with or without a lending cache:
 under `--deterministic`, or on a device without virtual memory management, the bytes that rank
-would never page go to its experts all the same. A stated `--vram-kv-mib` or `--vram-weights-mib`
-is applied to every card unchanged, and a rank whose cache costs as much per token as the dearest
+would never page go to its experts all the same. A rank whose cache costs as much per token as the dearest
 rank's is never re-split -- which at `--tp 2` and `--tp 4` is every rank. A rank that costs less and
 keeps the common split says why on the same `kv: rank N's cache costs ...` line. Every rank still
 allocates its whole `--host-pool-mib`, a re-split rank whose weights all fit on the card included,
@@ -508,7 +540,7 @@ Related flags:
 --gpu-headroom-mib 96      # VRAM left unclaimed on every card
 --kv-cache-dtype fp8       # halve what a token of context costs (a real quantisation)
 --host-pool-mib 8192       # pinned host tier for weights
---embedding-placement ram   # the token embedding off the card (below)
+--embedding-placement vram  # keep the token embedding on the card (below)
 --ngram-placement ram       # an n-gram table in RAM instead of read from disk (below)
 --weights-disk-tier       # stream what fits neither from the container; needs O_DIRECT
 ```
@@ -518,25 +550,27 @@ never the whole table, so a tier below the card serves them at little or no cost
 
 | | `vram` | `ram` | `disk` |
 |---|---|---|---|
-| `--embedding-placement` | on the card, with the other weights | the pinned host pool, read over the link in place | refused |
+| `--embedding-placement` | on the card, with the other weights | pinned host memory of its own, read over the link in place (the default) | refused |
 | `--ngram-placement` | on the card, every card holding all of it | a copy in RAM made at load, read by the card over the link | read from the container through a row cache |
 
-Both default to `auto`, the fastest tier that has room once every other weight is placed. Startup
-prints what each resolved to and why. A tier the flag names that cannot be honoured stops the
-server with the reason; nothing falls back quietly.
+The embedding defaults to `ram`; the n-gram table defaults to `auto`, the fastest tier that has
+room once every other weight is placed. Startup prints what each resolved to and why. A tier the
+flag names that cannot be honoured stops the server with the reason.
 
 **The token embedding** is the largest model-level weight a dense model has -- 248320 x 5120 in bf16
-is 1.18 GiB a card at `--tp 2`. With `ram` it is placed in the pinned host pool before any strategy
-runs and the lookup reads it over the link in place, so it costs no VRAM and the KV pool gets its
-share. The pool must hold it (`--host-pool-mib`, every rank its own shard). `auto` keeps it on the
-card unless the card cannot hold the other weights with it, or a derived KV pool could then not
-hold one `--max-model-len` sequence; then it takes `ram` if the host pool can hold it. The table is
-found by what reads it: a model-level weight only `embed_lookup` reads. A head tied to it is read by
-a GEMM too and is never moved, since it would stream whole every step. `disk` is refused: the lookup
-writes activations the card reads, and a host kernel reading the container cannot write them.
+is 1.18 GiB a card at `--tp 2`. By default (`ram`) it is pinned in host memory of its own, every
+rank its own shard, on top of `--host-pool-mib` -- the experts' pool keeps all of that -- and the
+lookup reads a step's rows over the link in place, so the table costs no VRAM and the KV pool and
+the experts get its share. The table is found by what reads it: a model-level weight only
+`embed_lookup` reads. A head tied to it is read by a GEMM too and is never moved, since it would
+stream whole every step, so such a model keeps it on the card; so does a host that cannot pin it
+(available memory and memory cgroups, after the pools, with 4 GiB to spare). Startup says which
+and why. Naming `ram` turns either case into a refusal; `vram` keeps the table on the card.
+`disk` is refused: the lookup writes activations the card reads, and a host kernel reading the
+container cannot write them.
 
 ```sh
-radiance --model m.rad --tp 2 --host-pool-mib 1280 --embedding-placement ram
+radiance --model m.rad --tp 2 --embedding-placement vram   # the table on the cards
 ```
 
 **An n-gram table** (Qwen3.8-Flash-Next's is 47.7 GiB) is read a few rows a token, which is why it
@@ -791,12 +825,13 @@ which is why it is a named flag and not a heuristic.
 `--tp-wire-min-kb` is the floor below which messages are still served exactly — 128 KiB leaves
 single-sequence decode exact and compresses prefill, which is where the win is.
 
-At four ranks `wht6` selects a different lossy wire with the same floor: tiered int8 over a
-two-shot all-reduce, both hops quantised. Eight ranks have no lossy wire, and `--tp 8 --tp-wire
-wht6` stops at startup naming the all-reduce it found no kernel for. The exact wire at four and
-eight ranks is one-shot up to 1 MiB a message and two-shot above it, which sends
-2·(ranks−1)/ranks of the message per rank instead of (ranks−1) times it; the two produce the same
-bits.
+At three and four ranks `wht6` selects a different lossy wire with the same floor: tiered int8
+over a two-shot all-reduce, both hops quantised (at three the shards are whole 32-element groups,
+one group uneven where the message does not divide). Eight ranks have no lossy wire, and
+`--tp 8 --tp-wire wht6` stops at startup naming the all-reduce it found no kernel for, and
+`--tp-wire exact`. The exact wire at three, four and eight ranks is one-shot up to 1 MiB a message
+and two-shot above it, which sends 2·(ranks−1)/ranks of the message per rank instead of
+(ranks−1) times it; the two produce the same bits.
 
 On a model with a gated residual (Qwen3.8-Flash-Next) the all-reduce rides inside the residual's
 write, with the MoE gather in front of it. At two ranks that holds on either wire: the rotated
@@ -983,9 +1018,10 @@ one line naming each one the command line moved.
 
 | flag | |
 |---|---|
-| `--model PATH` | the `.rad` container, or a checkpoint served as it stands (§3.4) (**required**) |
+| `--model PATH` | the `.rad` container, a checkpoint served as it stands (§3.4), or a Hugging Face repo id fetched before startup (§3.1) (**required**) |
+| `--download-dir DIR` | where a repo id is fetched to. Default `$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf` |
 | `--radiance-home DIR` | where `kernels/` and `architectures/` live |
-| `--kernels LIST` | kernel plugin hierarchy, comma-separated, first wins |
+| `--kernels LIST` | the kernel libraries to use, comma-separated, first wins; a library not named is not loaded. Default: every library found |
 
 **Batch shape**
 
@@ -1001,11 +1037,9 @@ one line naming each one the command line moved.
 | flag | default | |
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
-| `--vram-weights-mib N` | derive | the resident weight slab |
-| `--vram-kv-mib N` | derive | the paged KV pool |
 | `--kv-cache-dtype T` | bf16 | `bf16` or `fp8` |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
-| `--embedding-placement WHERE` | auto | `auto`, `vram` or `ram`: the token embedding on the card or in the pinned host pool, read in place; `disk` is refused. See §4.3 |
+| `--embedding-placement WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `--host-pool-mib` and read in place, or on the card. See §4.3 |
 | `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container. See §4.3 |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
 
@@ -1051,7 +1085,7 @@ one line naming each one the command line moved.
 |---|---|---|
 | `--host ADDR` | 0.0.0.0 | listen address |
 | `--port N` | 8000 | listen port |
-| `--api-key KEY` | — | require `Authorization: Bearer KEY` on every request but `/health`, `/ping` and the dashboard page (§6.6) |
+| `--api-key KEY` | — | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6) |
 | `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the one loaded serves it |
 | `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card |
 | `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the one the container carries. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
@@ -1133,13 +1167,19 @@ for a model that takes no images or video.
 | `POST /v1/completions` | raw text completion |
 | `POST /v1/embeddings` | needs a model with an embedding head, else 501 |
 | `POST /v1/systemone` | typed d1 decisions from candidate logits; [setup and contract](SYSTEMONE.md) |
-| `GET /v1/models`, `/v1/models/:id` | what is loaded |
-| `GET /health`, `/ping`, `POST /ping` | liveness |
+| `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic's Messages API, for Claude Code and the Anthropic SDKs — §5.9 |
+| `POST /v1/responses`, `POST /v1/responses/input_tokens` | OpenAI's Responses API, for Codex and the OpenAI SDKs' `responses` client — §5.9 |
+| `POST /completion`, `/completions`, `POST /infill` | llama-server's native completion and fill-in-the-middle, for llama.vim, llama.vscode and the clients built on llama-server's own API — §5.9 |
+| `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves) and `root` (the `--model` path), as vLLM reports them, and `capabilities` (the same object `/server_info` reports); `:id` answers the entry itself, as OpenAI's retrieve does |
+| `GET /health`, `/v1/health`, `/ping`, `POST /ping` | liveness |
 | `GET /load` | current load |
 | `GET /version` | server version |
+| `GET /props` | llama-server's props for the clients built against it: `n_ctx`, `total_slots`, `modalities`, `model_path`, the chat template and its capabilities, `bos_token`/`eos_token`, and the request defaults under llama-server's names |
+| `POST /apply-template` | the prompt a chat request renders to, as llama-server answers it |
+| `POST /v1/chat/completions/input_tokens` | how many tokens that prompt is |
 | `GET /server_info` | the whole configuration of the running engine |
 | `GET /metrics` | Prometheus |
-| `POST /tokenize`, `POST /detokenize` | |
+| `POST /tokenize`, `POST /detokenize` | vLLM's shape (`prompt` or `messages` in, `prompt` out) and llama-server's (`content` in and out, `with_pieces`) |
 | `GET /get_tokenizer_info` | |
 | `POST /reset_prefix_cache` | drop every cached prefix |
 | `GET /` or `/dashboard` | the web dashboard |
@@ -1147,7 +1187,9 @@ for a model that takes no images or video.
 
 Method spellings follow vLLM's, including the ones that look odd: `/tokenize` is POST because its
 input is a body, and `/ping` answers both GET and POST because different load balancers send
-different ones.
+different ones. As llama-server does, `/chat/completions`, `/embeddings` and `/models` answer without the `/v1`
+too, for a client configured with the bare host as its base URL -- and `/completions` without it is
+llama-server's native completion, as it is there. A path nothing serves is a JSON 404.
 
 A text prompt to `/v1/completions`, `/v1/embeddings` or `/tokenize` reads the model's control
 tokens as tokens, as vLLM and llama.cpp do: a client that renders its own chat template can send
@@ -1281,7 +1323,8 @@ grammar: this model's chat template produced no grammar for it, so the constrain
 be enforced
 ```
 
-That is the refused-not-ignored rule (§5.8) doing its job: an unconstrained 200 would leave you
+That is §5.8's rule doing its job -- a field that would change the answer is honoured or
+refused, never dropped: an unconstrained 200 would leave you
 parsing free prose against a schema you were told was enforced. `/v1/completions` has no template
 in the way, so the same grammar works there — which is why the example above uses it.
 
@@ -1302,9 +1345,15 @@ curl -s http://localhost:8000/tokenize -H 'Content-Type: application/json' \
 
 curl -s http://localhost:8000/detokenize -H 'Content-Type: application/json' \
   -d '{"tokens":[15339,1917]}'
+
+curl -s http://localhost:8000/tokenize -H 'Content-Type: application/json' \
+  -d '{"content":"hello world","with_pieces":true}'          # llama-server's shape
 ```
 
-`/tokenize` takes `prompt` **or** `messages`, not both.
+`/tokenize` takes one of `prompt`, `messages` or llama-server's `content` (a string, or strings and
+token ids mixed, with its `add_special` and `parse_special` and their defaults); the `content`
+form answers `tokens` as llama-server does, as `{id, piece}` objects with `with_pieces`.
+`/detokenize` answers the text as both `prompt` (vLLM) and `content` (llama-server).
 
 **An embedding model** (EmbeddingGemma 2) serves `/v1/embeddings` and nothing else; completions and
 chat answer 501. One input is one vector, and an input is never split: it has to fit one step
@@ -1351,13 +1400,13 @@ inputs; a model that states a default prompt applies it when the request names n
 |---|---|
 | `model` | accepted and not enforced — one server serves one model |
 | `messages` / `prompt` / `input` | chat / completion / embedding |
-| `max_tokens`, `max_completion_tokens` | default: what the context leaves after the prompt (`--default-max-tokens`). Clamped to what the context leaves, and to `--max-tokens-cap`, rather than refused — see §5.8 |
+| `max_tokens`, `max_completion_tokens`, `n_predict` | default: what the context leaves after the prompt (`--default-max-tokens`); -1 is llama-server's "no limit", the same without the default. Clamped to what the context leaves, and to `--max-tokens-cap`, rather than refused — see §5.8 |
 | `temperature` | [0, 2] |
 | `top_p` | (0, 1] |
 | `top_k` | ≥ 0, 0 disables |
 | `min_p`, `typical_p` | |
 | `presence_penalty`, `frequency_penalty` | [-2, 2] |
-| `repetition_penalty`, `repeat_last_n` | |
+| `repetition_penalty` (or `repeat_penalty`), `repeat_last_n` | |
 | `xtc_probability`, `xtc_threshold` | |
 | `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_penalty_last_n`, `dry_sequence_breakers` | |
 | `seed` | absent means "pick one" — **not** seed 0 |
@@ -1366,13 +1415,19 @@ inputs; a model that states a default prompt applies it when the request names n
 | `stop` | a string or an array; at most 64 strings of 4096 bytes (`--max-stop-strings`, `--max-stop-bytes`) |
 | `ignore_eos` | generate to `max_tokens` whatever the model emits |
 | `stream`, `stream_options.include_usage` | |
-| `logprobs`, `top_logprobs` | **not implemented** — refused, not returned as nulls. `/server_info` reports `logprobs: false` |
+| `timings_per_token`, `return_progress` | llama-server's: `timings` on every chunk, and `prompt_progress` chunks while the prompt is read |
+| `samplers` | llama-server's sampler order, names or letters. A stage it leaves out is off. The chain here is penalties, DRY, top-k, top-p, min-p, typical, XTC with temperature first (the default) or last (llama-server's default), so a list in either of those orders is honoured and any other is refused by name |
+| `session_id` | OpenRouter's conversation id: labels the conversation on `/sessions` and the dashboard |
+| `logprobs`, `top_logprobs`, `n_probs` | each generated token's logprob and up to 20 alternatives — see §5.11. Chat: `logprobs: true` with `top_logprobs` alternatives (0 when absent); completions: `logprobs: N`; any endpoint: llama-server's `n_probs: N`, which wins. Not with `echo` (the prompt's logprobs are not computed) |
 | `tools`, `tool_choice`, `parallel_tool_calls` | chat only. `tool_choice` is `auto`, `none`, `required` or `{"type":"function","function":{"name":...}}`; the last two hold the whole reply to calls (after the reasoning block), the named form to that one function, and cannot be combined with `response_format` or `grammar` |
 | `add_generation_prompt`, `chat_template_kwargs` | chat only |
+| `continue_final_message` | chat only. A conversation ending in an assistant message is continued rather than answered, as llama-server and the Anthropic API do -- the reply carries that message's text and what follows it. `true`, `"content"` or `"reasoning_content"` names it explicitly; `add_generation_prompt: true` opens a new turn instead |
+| `reasoning_format` | chat only, llama-server's: `none` keeps the reasoning in `content`; `auto` and `deepseek` split it into `reasoning_content`, the default |
 | `reasoning_effort`, `enable_thinking` | chat only. The levels are the template's (`capabilities.reasoning_efforts` on `/server_info`); `none` and `minimal` turn thinking off |
-| `thinking_token_budget`, `thinking_budget` | chat only. ≥ 0: the reasoning tokens after which the block is closed — see §5.2. Default `--thinking-token-budget`, else none |
+| `thinking_token_budget`, `thinking_budget`, `thinking_budget_tokens`, `reasoning_budget_tokens` | chat only. ≥ 0: the reasoning tokens after which the block is closed — see §5.2; -1 is none. Default `--thinking-token-budget`, else none |
 | `preserve_thinking` | chat only. The chat template variable of that name, as llama.cpp maps it; Qwen3.6 and later keep earlier turns' reasoning in the prompt with it |
-| `response_format` | chat only. Mutually exclusive with `grammar` |
+| `response_format`, `json_schema` | chat only. `json_schema` is llama-server's shorthand: the schema itself. Mutually exclusive with `grammar` |
+| `functions`, `function_call` | chat only: OpenAI's deprecated spellings of `tools` and `tool_choice`. The reply answers in the old shape too: one call at most, as `message.function_call` with `finish_reason: "function_call"`; the next turn's assistant `function_call` and `function` message are read as the call and its result |
 | `grammar` | a GBNF grammar directly. On chat it passes through the chat template and a template that drops it makes the request a refusal — see §5.5 |
 | `echo` | `/v1/completions` only |
 | `encoding_format` | `/v1/embeddings` only: `float` or `base64` |
@@ -1380,41 +1435,44 @@ inputs; a model that states a default prompt applies it when the request names n
 
 Any field the request omits keeps the deployment default (§4.9). A field the request names wins.
 
-### 5.8 A parameter this server does not implement is **refused**, not ignored
+### 5.8 What a field this server does not implement does
 
-This is the one place radiance deliberately differs from what an OpenAI client may expect, and it
-will be the first thing you hit pointing an existing client at it:
+Four kinds of field, and the rule they serve is that **a request that returns 200 had every field
+that could change its answer honoured**:
+
+- **Accepted** — the table above, in OpenAI's, vLLM's and llama-server's spellings.
+- **Inert** — fields that change nothing about the answer, accepted and ignored: OpenAI's and
+  OpenRouter's bookkeeping (`user`, `metadata`, `store`, `service_tier`, `safety_identifier`,
+  `prompt_cache_key`, `prediction`), and llama-server's knobs for its own speed and slots
+  (`cache_prompt`, `id_slot`, `n_cache_reuse`, `backend_sampling`, `reasoning_control`, `n_keep`,
+  `n_discard`, `speculative.*`, ...). The prefix cache and speculation here are the server's own
+  and never change the output.
+- **Guarded** — known, not implemented, and able to change the answer. llama-server's clients send
+  every one of them on every request at its off value, so each is accepted there and refused,
+  naming it, at any other:
 
 ```json
-{"error": {"message": "mirostat: mirostat is not one of the device samplers (spec 13)", ...}}
+{"error": {"message": "mirostat: mirostat is not one of the device samplers (spec 13); it is accepted only at 0, where it does nothing", ...}}
 ```
 
-The rule is that **a request that returns 200 means every field of it was honoured**. Silently
-dropping a sampler setting and answering 200 is how a deployment ends up serving a model at
-settings nobody chose.
+| guarded | accepted at | because |
+|---|---|---|
+| `logit_bias` | empty | the device sampler has no per-token bias stage |
+| `mirostat` | 0 | not one of the device samplers |
+| `top_n_sigma` | ≤ 0 | not one of the device samplers |
+| `dynatemp_range` | 0 | not one of the device samplers |
+| `min_keep` | 0 | the cuts keep no minimum count |
+| `post_sampling_probs` | false | logprobs are the raw distribution's; the sampler's are not returned |
+| `best_of` | 1 | not implemented |
+| `suffix` | empty | infilling through `/v1/completions` is not implemented |
+| `lora` | empty | explicitly out of scope |
+| `modalities`, `audio` | `["text"]`, null | output other than text is not implemented |
+| `n_indent`, `t_max_predict_ms`, `return_tokens` | 0, 0, false | not implemented |
+| `grammar_lazy`, `grammar_triggers`, `preserved_tokens` | off, empty | the chat format decides them |
 
-Three lists decide it:
-
-- **Accepted** — the table above.
-- **Inert** — OpenAI metadata that genuinely does nothing anywhere, accepted and ignored so the
-  official SDKs work: `user`, `metadata`, `store`, `service_tier`, `safety_identifier`,
-  `prompt_cache_key`.
-- **Refused with a reason** — known, not implemented, each named:
-
-| refused | because |
-|---|---|
-| `logit_bias` | the device sampler has no per-token bias stage |
-| `functions`, `function_call` | deprecated — send `tools` / `tool_choice` |
-| `best_of` | sampling n candidates and returning the best is not implemented |
-| `suffix` | infilling is not implemented |
-| `mirostat`, `mirostat_tau`, `mirostat_eta` | not one of the device samplers |
-| `top_n_sigma`, `dynatemp_range`, `dynatemp_exponent` | not one of the device samplers |
-| `lora` | explicitly out of scope |
-| `modalities`, `audio`, `prediction` | not implemented |
-| `continue_final_message` | assistant prefill is not implemented |
-| `cache_prompt` | prefix caching is a server-wide setting, not per request |
-
-Anything else unrecognised is refused too, naming the key.
+- **Anything else is ignored**, as llama-server and vLLM ignore it: a field this server has never
+  heard of is a client's own extension far more often than a request it misunderstood. The names
+  are logged at debug.
 
 **The one exception is `max_tokens`.** If `prompt + max_tokens` would exceed the context, the
 server clamps `max_tokens` to what is left and serves the request:
@@ -1446,7 +1504,56 @@ precisely without running the model.
 
 ---
 
-### 5.9 What a response says about its own speed
+
+### 5.9 Anthropic's, OpenAI's Responses and llama-server's native APIs
+
+`POST /v1/messages` takes Anthropic's request and answers in Anthropic's shapes, streamed
+(`message_start`, content blocks, `message_delta`, `message_stop`) or not, so Claude Code and the
+Anthropic SDKs work against radiance as they do against llama-server:
+
+```sh
+ANTHROPIC_BASE_URL=http://localhost:8000 ANTHROPIC_API_KEY="$KEY" claude
+```
+
+It is translated into the chat request it means and served by the chat path, so the template
+defaults, refusals and limits are the chat endpoint's. `system` (a string or text blocks), text and
+image blocks, `tool_use` and `tool_result`, client tools and `tool_choice`, `stop_sequences`,
+`thinking` (`enabled` with a `budget_tokens`, `disabled`, `adaptive`) and `metadata.user_id` (the
+conversation's label on `/sessions`) are honoured. A conversation that ends in an assistant message
+is continued, and the answer carries what follows it. Thinking blocks come back with an empty
+`signature`. Claude Code's per-request billing stamp at the head of the system prompt is held
+constant, as llama-server holds it, or no turn could reuse the prefix of the one before.
+`document` blocks and Anthropic's server tools (`web_search_…`, `code_execution_…`) run on
+Anthropic's side and are refused by name. `POST /v1/messages/count_tokens` answers the prompt's
+length. The key may come as `X-Api-Key` (§6.6).
+
+`POST /v1/responses` is OpenAI's Responses API, translated the same way: `instructions` and `input`
+(a string, or message, `function_call`, `function_call_output` and `reasoning` items) become the
+conversation, `max_output_tokens` and `reasoning.effort` and `text.format` the chat request's
+fields, and every field the Responses API does not define passes through to the chat request as it
+does in llama-server (`chat_template_kwargs`, `top_k`, ...). The answer is a response object, or
+its event stream with every event's `output_index`, `content_index` and `sequence_number`; a reply
+cut at `max_output_tokens` is `incomplete`. Function tools are offered to the model; the built-in
+tools (web search, file search, computer use) and freeform custom tools have no counterpart here
+and are left out, as llama-server leaves them out. Responses are not stored, so
+`previous_response_id` is refused: send the conversation as `input`. What a response object
+cannot carry is refused rather than computed and dropped: `n` other than 1, and logprobs
+(`include` naming `message.output_text.logprobs`, `top_logprobs`, `logprobs`, `n_probs`) --
+`/v1/chat/completions` serves those. A failed generation ends the stream in
+`response.failed`, as one on `/v1/messages` ends in Anthropic's `error` event.
+
+`POST /completion` (and `/completions` without `/v1`, as llama-server names it) is llama-server's
+native completion: a prompt string, token ids, or strings and ids mixed as one prompt; the
+request fields of §5.7; and llama-server's answer -- `content`, `stop_type` (`eos`, `limit`,
+`word`), `stopping_word`, `tokens_predicted`, `tokens_evaluated`, `generation_settings`,
+`timings`, and the generated ids with `return_tokens`. A stream is its chunks with the ids that
+made each, then the final result, with no `[DONE]`. `POST /infill` completes between
+`input_prefix` and `input_suffix`, with `input_extra` (files, `{filename, text}`) and `prompt`, in
+the repository-level fill-in-the-middle layout llama-server builds, byte for byte. It needs a model
+with fill-in-the-middle tokens (the Qwen, StarCoder, DeepSeek and CodeLlama spellings are
+recognised) and answers 501 without them; the extra files give way first when the prompt does not
+fit.
+### 5.10 What a response says about its own speed
 
 Every chat and completion response carries a top-level `timings` object for the request. It uses
 llama.cpp's field names, so a proxy or dashboard built against llama-server (llama-swap's activity
@@ -1481,6 +1588,47 @@ When streaming, each choice's final chunk (the one with `finish_reason`) carries
 `timings`, whether or not the request asked for `stream_options.include_usage`. The usage chunk,
 when asked for, carries the request's. `/metrics` stays the aggregate surface (§6.3). It sums
 the same quantities over every request, so it cannot say which request they belong to.
+
+### 5.11 Logprobs
+
+The numbers are the **raw distribution's** — the logits as the model wrote them, before any
+penalty, temperature, grammar mask or cut — which is what OpenAI and llama-server report. Each
+generated token carries its own logprob and its `top_logprobs` most likely alternatives, at most 20.
+
+```bash
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": "Say hi"}], "temperature": 0,
+  "logprobs": true, "top_logprobs": 2, "max_tokens": 4 }' | jq -c '.choices[0].logprobs.content[0]'
+```
+
+Qwen3.5-0.8B, thinking off:
+
+```json
+{"id":9419,"token":"Hello","bytes":[72,101,108,108,111],"logprob":-0.7186,
+ "top_logprobs":[{"id":9419,"token":"Hello","bytes":[72,101,108,108,111],"logprob":-0.7186},
+                 {"id":12675,"token":"Hi","bytes":[72,105],"logprob":-1.3188}]}
+```
+
+- **Chat** answers in OpenAI's shape, with llama-server's `id` beside each token; a stream carries
+  each token's entry on the chunk that carries its text.
+- **`/v1/completions`** answers OpenAI's legacy arrays (`tokens`, `token_logprobs`, `top_logprobs`
+  as one `{text: logprob}` object a token, `text_offset`) and llama-server's `content` array beside
+  them.
+- **`/completion`** (`n_probs`) answers llama-server's `completion_probabilities`.
+- A token that ends inside a UTF-8 character has the readable part as `token` and every byte in
+  `bytes`, as llama-server does. A stop string's own tokens are not reported, since their text never
+  went out.
+
+Speculation is unaffected — every verified position is scored, and an accepted draft is the token
+the model drew there. The cost is a top-k's worth of work for each row that asks
+(`sample_logprobs`, docs/OPS.md): about 0.12 ms a step on an R9700 at a 248K vocabulary, on the
+card. The chosen token's logprob is exact when it is among the raw top 20; otherwise it is
+recovered from the value it was drawn at by undoing temperature, DRY and the penalties, which
+agrees to float rounding.
+
+**Where llama-server differs:** `logprobs: true` without `top_logprobs` returns 20 alternatives
+there and none here, which is OpenAI's default. The values themselves agree with llama-server's to
+bf16 rounding (within 0.1 on Qwen3.5-0.8B, sampled tokens far down the tail included).
 
 ## 6. Operate it
 
@@ -1608,12 +1756,13 @@ any origin can call the API from a browser; `--no-cors` turns it off.
 radiance --model m.rad --api-key "$KEY"
 ```
 
-With a key, every request must carry `Authorization: Bearer KEY` or it is answered 401 —
-`/tokenize` and `/server_info` included, since they hand out the vocabulary, the chat template and
-the configuration. Three paths are exempt: `/health` and `/ping`, because a load balancer cannot
-carry a bearer token and an authenticated probe is a server that reports itself down, and the
-dashboard page itself (`/`, `/dashboard`), which holds no data — on a 401 it shows a key field,
-keeps the key in the browser's storage and sends it on every fetch of data it makes.
+With a key, every request must carry `Authorization: Bearer KEY` (or Anthropic's `X-Api-Key: KEY`)
+or it is answered 401 — `/tokenize` and `/server_info` included, since they hand out the
+vocabulary, the chat template and the configuration. Three paths are exempt: `/health` (and
+`/v1/health`) and `/ping`, because a load balancer cannot carry a bearer token and an
+authenticated probe is a server that reports itself down, and the dashboard page itself (`/`,
+`/dashboard`), which holds no data — on a 401 it shows a key field, keeps the key in the browser's
+storage and sends it on every fetch of data it makes.
 
 The key is checked, not encrypted: on any network you do not control, bind to localhost and put a
 TLS-terminating reverse proxy in front:
@@ -1670,10 +1819,11 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct at al
 | | |
 |---|---|
 | `RADIANCE_HOME` | where `kernels/`, `architectures/` and `quantizers/` live; a `:`-separated search path, the first home winning. Same as `--radiance-home` |
-| `RADIANCE_KERNELS` | default kernel hierarchy, comma-separated. Same as `--kernels`, read by the engine *and* every tool, so a plugin validated with `rad-kbench` can be served without editing launchers |
+| `RADIANCE_KERNELS` | default kernel libraries, comma-separated. Same as `--kernels`, read by the engine *and* every tool, so a plugin validated with `rad-kbench` can be served without editing launchers |
 | `RADIANCE_LOG` | `error` \| `warn` \| `info` \| `debug` \| `trace` |
 | `ROCM_PATH` | where ROCm lives, if not `/opt/rocm` |
-| `HF_TOKEN` | for `scripts/hfget.sh` on a gated repo |
+| `HF_TOKEN` | for `scripts/hfget.sh`, and `--model <owner/name>`, on a gated or private repo |
+| `XDG_CACHE_HOME` | where `--model <owner/name>` fetches to without `--download-dir` (`$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf`) |
 
 **Tooling**
 

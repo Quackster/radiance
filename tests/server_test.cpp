@@ -64,8 +64,16 @@ struct FakeDetok : IDetokenizer {
 
 struct FakeTokenizer : ITokenizer {
     mutable bool last_parse_special = false;
+    /* A vocabulary with llama's three fill-in-the-middle markers as special tokens, for /infill. */
+    bool fim = false;
+    static const char* fim_name(int32_t id) {
+        return id == 1001 ? "<PRE>" : id == 1002 ? "<SUF>" : id == 1003 ? "<MID>" : nullptr;
+    }
     std::vector<int32_t> encode(const std::string& s, bool, bool parse_special) const override {
         last_parse_special = parse_special;
+        if (fim && parse_special)
+            for (int32_t id = 1001; id <= 1003; ++id)
+                if (s == fim_name(id)) return { id };
         std::vector<int32_t> v;
         v.reserve(s.size());
         for (unsigned char c : s) v.push_back((int32_t)c);
@@ -73,8 +81,12 @@ struct FakeTokenizer : ITokenizer {
     }
     std::string decode(const std::vector<int32_t>& t) const override {
         std::string s;
-        for (int32_t x : t) if (x > 0) s.push_back((char)x);
+        for (int32_t x : t) if (x > 0) s += token_bytes(x);
         return s;
+    }
+    std::string token_bytes(int32_t id) const override {
+        if (fim && fim_name(id)) return fim_name(id);
+        return std::string(1, (char)id);
     }
     int32_t eos() const override { return 0; }
     int32_t bos() const override { return 1; }
@@ -268,6 +280,8 @@ struct FakeScheduler : IScheduler {
     std::vector<uint64_t> submitted;
     SamplingParams last_sp;              /* what the last submitted request was to sample with */
     std::vector<std::string> last_stop;  /* ...and the stop strings it was handed */
+    std::string last_label;              /* ...its session label */
+    int32_t last_max_tokens = 0;         /* ...and its max_tokens */
     std::vector<uint64_t> cancelled;
     std::vector<std::thread> workers;
     std::atomic<uint64_t> next_id{1};
@@ -286,6 +300,8 @@ struct FakeScheduler : IScheduler {
             submitted.push_back(id);
             last_sp = r.sp;
             last_stop = r.stop;
+            last_label = r.session_label;
+            last_max_tokens = r.max_tokens;
         }
         void* sink = r.sink;
         int32_t cap = r.max_tokens;
@@ -294,9 +310,10 @@ struct FakeScheduler : IScheduler {
         const int fst = fail_status;
         const char* fwhy = fail_why;
         const int32_t nd = drafts;
+        const int np = r.sp.n_probs;
         /* Under the lock: over a real socket, submits arrive from several HTTP workers at once. */
         std::lock_guard<std::mutex> lk(mu);
-        workers.emplace_back([sink, cap, text, h, fst, fwhy, nd] {
+        workers.emplace_back([sink, cap, text, h, fst, fwhy, nd, np] {
             sink_admitted(sink);
             sink_prompt_stats(sink, 8, 4);
             int32_t n = 0;
@@ -304,7 +321,17 @@ struct FakeScheduler : IScheduler {
                 if (n >= cap) break;
                 if (sink_cancelled(sink)) { sink_finish(sink, Finish::Cancelled); return; }
                 if (n > 0 && nd > 0) sink_drafts(sink, nd, 1);
-                if (!sink_push(sink, (int32_t)(unsigned char)c)) return;
+                /* Logprobs when asked: the n-th token at -(n+1)/4, and alternatives 'x', 'y', ...
+                 * at -1, -2, ... */
+                TokenLogprobs lp;
+                lp.token = (int32_t)(unsigned char)c;
+                lp.logprob = -0.25f * (float)(n + 1);
+                lp.n_top = np > 0 ? np : 0;
+                for (int j = 0; j < lp.n_top; ++j) {
+                    lp.top_id[j] = 'x' + j;
+                    lp.top_lp[j] = -1.0f - (float)j;
+                }
+                if (!sink_push(sink, (int32_t)(unsigned char)c, np >= 0 ? &lp : nullptr)) return;
                 ++n;
                 if (h && n >= 3) break;
             }
@@ -343,7 +370,8 @@ struct Fixture {
     FakeGrammar      gram;
     std::unique_ptr<Server> srv;
 
-    explicit Fixture(bool with_tools = true) {
+    explicit Fixture(bool with_tools = true, int64_t max_ctx = 0, const char* model_path = "",
+                     bool logprobs = false) {
         Deps d;
         d.sched = &sched;
         d.tok = &tok;
@@ -356,6 +384,9 @@ struct Fixture {
         o.model_id = "test-model";
         o.default_max_tokens = 32;
         o.max_seqs = 4;
+        o.max_ctx = max_ctx;
+        o.model_path = model_path;
+        o.supports_logprobs = logprobs;
         srv.reset(new Server(d, o));
     }
 
@@ -840,12 +871,25 @@ TEST(unsupported_parameters_are_400_and_name_themselves) {
     CHECK_EQ(e["error"]["code"].get<std::string>(), std::string("unsupported_parameter"));
     CHECK(e["error"]["message"].get<std::string>().find("logit_bias") != std::string::npos);
 
-    /* A parameter nobody has heard of is refused too, rather than silently dropped. */
+    /* A parameter nobody has heard of is a client's own extension, and is ignored as llama.cpp
+     * and vLLM ignore it (#47: OpenRouter's session_id, refused, broke the client). */
     HttpResponse r2 = f.post("/v1/chat/completions",
-                             R"({"messages":[{"role":"user","content":"hi"},{}],
-                                 "wobble":1})");
-    CHECK_EQ(r2.status, 400);
-    CHECK(r2.body.find("wobble") != std::string::npos);
+                             R"({"messages":[{"role":"user","content":"hi"}],
+                                 "wobble":1,"session_id":"abc"})");
+    CHECK_EQ(r2.status, 200);
+
+    /* What llama.cpp-built clients send on every request: the samplers this server does not run,
+     * at their off values. Accepted there, and refused by name the moment one is switched on. */
+    HttpResponse off = f.post("/v1/chat/completions",
+                             R"({"messages":[{"role":"user","content":"hi"}],
+                                 "mirostat":0,"top_n_sigma":-1,"dynatemp_range":0,
+                                 "logit_bias":{},"cache_prompt":true,"id_slot":-1,
+                                 "backend_sampling":false,"speculative.n_max":16})");
+    CHECK_EQ(off.status, 200);
+    HttpResponse on = f.post("/v1/chat/completions",
+                             R"({"messages":[{"role":"user","content":"hi"}],"mirostat":2})");
+    CHECK_EQ(on.status, 400);
+    CHECK_EQ(json::parse(on.body)["error"]["param"].get<std::string>(), std::string("mirostat"));
 
     /* Out-of-range values name the field and the range. */
     HttpResponse r3 = f.post("/v1/chat/completions",
@@ -1434,9 +1478,10 @@ TEST(preserve_thinking_at_the_top_level_reaches_the_template) {
     CHECK_EQ(parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}],"preserve_thinking":"yes"})",
                                 f.odeps(), lim, &r, &e), RAD_E_INVAL);
     CHECK_EQ(e.param, std::string("preserve_thinking"));
-    /* A chat field, not a completion one: /v1/completions has no template to hand it to. */
+    /* A chat field, not a completion one: /v1/completions has no template to hand it to, and
+     * ignores it as it ignores any field it does not read. */
     CHECK_EQ(parse_completion_request(R"({"prompt":"ab","preserve_thinking":true})", f.odeps(), lim,
-                                      &r, &e), RAD_E_INVAL);
+                                      &r, &e), RAD_OK);
 }
 
 /* parallel_tool_calls reaches the template, because it is the one tool-choice knob the generated
@@ -1967,14 +2012,16 @@ TEST(stop_strings_wait_for_the_reasoning_closer) {
     CHECK(!f.sched.saw_cancel());             /* ended by the reply itself, not cut */
 }
 
-/* THE BUDGET REACHES THE ENGINE in either spelling, with the block it is held on; one the block
- * cannot hold, a negative one, and two spellings that disagree are 400s naming the field. */
+/* THE BUDGET REACHES THE ENGINE in every spelling -- vLLM's, Qwen's and llama.cpp's two -- with
+ * the block it is held on; one the block cannot hold and two spellings that disagree are 400s
+ * naming the field, and a negative one is llama.cpp's "no budget". */
 TEST(a_thinking_budget_reaches_the_engine_or_is_refused_by_name) {
     Fixture f;
     f.tmpl.think_open = "{";
     f.tmpl.think_close = "|";
     f.tmpl.think_starts_open = true;
-    for (const char* k : { "thinking_token_budget", "thinking_budget" }) {
+    for (const char* k : { "thinking_token_budget", "thinking_budget", "thinking_budget_tokens",
+                           "reasoning_budget_tokens" }) {
         HttpResponse r = f.post("/v1/chat/completions",
                                 std::string(R"({"messages":[{"role":"user","content":"hi"}],")") +
                                     k + R"(":7})");
@@ -1988,8 +2035,7 @@ TEST(a_thinking_budget_reaches_the_engine_or_is_refused_by_name) {
     }
 
     struct Case { const char* extra; const char* param; };
-    for (const Case& c : { Case{ R"("thinking_token_budget":-1)", "thinking_token_budget" },
-                           Case{ R"("thinking_token_budget":3,"thinking_budget":4)",
+    for (const Case& c : { Case{ R"("thinking_token_budget":3,"thinking_budget":4)",
                                  "thinking_budget" },
                            Case{ R"("thinking_budget":"3")", "thinking_budget" } }) {
         HttpResponse r = f.post("/v1/chat/completions",
@@ -1997,6 +2043,16 @@ TEST(a_thinking_budget_reaches_the_engine_or_is_refused_by_name) {
                                     c.extra + "}");
         CHECK_EQ(r.status, 400);
         CHECK_EQ(json::parse(r.body)["error"]["param"].get<std::string>(), std::string(c.param));
+    }
+
+    {
+        HttpResponse r = f.post("/v1/chat/completions",
+                                R"({"messages":[{"role":"user","content":"hi"}],
+                                    "reasoning_budget_tokens":-1})");
+        CHECK_EQ(r.status, 200);
+        f.sched.join_all();
+        std::lock_guard<std::mutex> lk(f.sched.mu);
+        CHECK_EQ(f.sched.last_sp.thinking_budget, -1);
     }
 
     Fixture multi;
@@ -2029,6 +2085,7 @@ TEST(the_deployment_s_thinking_budget_is_a_default_a_request_can_override) {
     lim.default_thinking_budget = 64;
     CHECK_EQ(chat_with(f, lim, "").sp.thinking_budget, 64);
     CHECK_EQ(chat_with(f, lim, R"("thinking_token_budget":3)").sp.thinking_budget, 3);
+    CHECK_EQ(chat_with(f, lim, R"("reasoning_budget_tokens":-1)").sp.thinking_budget, -1);
     CHECK_EQ(chat_with(f, f.limits(), "").sp.thinking_budget, -1);
 
     f.tmpl.think_close.clear();
@@ -2513,12 +2570,45 @@ TEST(models_and_health_answer) {
     CHECK_EQ(j["object"].get<std::string>(), std::string("list"));
     CHECK_EQ(j["data"][0]["id"].get<std::string>(), std::string("test-model"));
 
-    CHECK_EQ(f.get("/v1/models/test-model").status, 200);
+    HttpResponse one = f.get("/v1/models/test-model");
+    CHECK_EQ(one.status, 200);
+    /* The entry itself, the way OpenAI's retrieve answers it. */
+    CHECK_EQ(json::parse(one.body).value("id", std::string()), std::string("test-model"));
+    CHECK_EQ(json::parse(one.body).value("object", std::string()), std::string("model"));
     CHECK_EQ(f.get("/v1/models/other").status, 404);
 
     HttpResponse h = f.get("/health");
     CHECK_EQ(h.status, 200);
     CHECK(json::parse(h.body)["status"].get<std::string>() == "ok");
+}
+
+TEST(the_model_entry_carries_the_context_length_the_server_was_started_with) {
+    /* Both routes a client sizes its window from: the list, and the entry it fetches by id. */
+    Fixture f(true, 262144, "/models/m.rad");
+    CHECK_EQ(json::parse(f.get("/v1/models/test-model").body).value("root", std::string()),
+             std::string("/models/m.rad"));
+    HttpResponse list = f.get("/v1/models");
+    CHECK_EQ(list.status, 200);
+    CHECK_EQ(json::parse(list.body)["data"][0].value("max_model_len", (int64_t)0), (int64_t)262144);
+    HttpResponse one = f.get("/v1/models/test-model");
+    CHECK_EQ(one.status, 200);
+    CHECK_EQ(json::parse(one.body).value("max_model_len", (int64_t)0), (int64_t)262144);
+    Fixture unknown;
+    CHECK(!json::parse(unknown.get("/v1/models").body)["data"][0].contains("max_model_len"));
+}
+
+TEST(the_model_entry_and_server_info_report_the_same_capabilities) {
+    Fixture f;
+    const json info = json::parse(f.get("/server_info").body)["capabilities"];
+    const json list = json::parse(f.get("/v1/models").body)["data"][0]["capabilities"];
+    const json one  = json::parse(f.get("/v1/models/test-model").body)["capabilities"];
+    CHECK(info.is_object());
+    CHECK(list == info);
+    CHECK(one == info);
+    /* Read per request, not frozen at startup: a template that takes no tools says so. */
+    CHECK(info.value("tools", false));
+    f.tmpl.tools_ok = false;
+    CHECK(!json::parse(f.get("/v1/models").body)["data"][0]["capabilities"].value("tools", true));
 }
 
 TEST(embeddings_without_an_embedder_is_501_not_an_empty_200) {
@@ -2734,6 +2824,45 @@ TEST(server_info_lists_the_router_rather_than_a_copy_of_it) {
     CHECK(has(r.body, "\"chat\":true"));
     /* Every registered route appears, so a route added without a test still shows up here. */
     for (const std::string& sig : f.srv->router().routes()) CHECK(has(r.body, sig));
+}
+
+TEST(props_answers_what_a_llama_server_client_reads) {
+    Fixture f;
+    HttpResponse r = f.get("/props");
+    CHECK_EQ(r.status, 200);
+    const json p = json::parse(r.body);
+    CHECK_EQ(p.value("total_slots", (int64_t)0), (int64_t)4);
+    /* No media pipeline attached: no image button. */
+    CHECK(!p["modalities"].value("vision", true));
+    /* The fixture knows no context length, so none is invented. */
+    CHECK(!p["default_generation_settings"].contains("n_ctx"));
+    /* The same defaults /server_info reports, under llama-server's names. */
+    const json defs = json::parse(f.get("/server_info").body)["request_defaults"];
+    const json params = p["default_generation_settings"]["params"];
+    CHECK_NEAR(params.value("temperature", -1.0), defs.value("temperature", -2.0), 1e-9);
+    CHECK_NEAR(params.value("repeat_penalty", -1.0), defs.value("repetition_penalty", -2.0), 1e-9);
+    CHECK_EQ(params.value("n_predict", (int64_t)0), (int64_t)32);   /* the fixture's default */
+    CHECK(has(p.value("build_info", std::string()), "radiance"));
+}
+
+TEST(props_reports_the_context_one_request_may_use) {
+    /* The fixture with a known length: build one rather than widen the shared Fixture. */
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    FakeChatTemplate tmpl;
+    FakeGrammar gram;
+    Deps d;
+    d.sched = &sched;
+    d.tok = &tok;
+    d.chat = &tmpl;
+    d.grammar = &gram;
+    ServerOptions o;
+    o.model_id = "test-model";
+    o.max_ctx = 262144;
+    Server srv(d, o);
+    const json p = json::parse(srv.router().call("GET", "/props").body);
+    CHECK_EQ(p["default_generation_settings"].value("n_ctx", (int64_t)0), (int64_t)262144);
+    sched.join_all();
 }
 
 TEST(server_info_drops_an_engine_blob_that_is_not_an_object) {
@@ -3109,6 +3238,741 @@ TEST(a_429_carries_the_deployments_retry_after) {
     for (auto& r : live) if (r.on_close) r.on_close(false);
     sched.join_all();
     srv.reset();
+}
+
+/* ================================================================== llama-server parity */
+
+/* llama-server's spellings reach the engine as the fields they name, and two spellings of one
+ * field that disagree are refused. -1 is llama-server's "no limit": not the deployment's default
+ * (the fixture's is 32) and not a refusal. */
+TEST(llama_server_spellings_reach_the_engine) {
+    Fixture f;
+    auto post = [&](const std::string& extra) {
+        HttpResponse r = f.post("/v1/chat/completions",
+                                R"({"messages":[{"role":"user","content":"hi"}])" + extra + "}");
+        f.sched.join_all();
+        return r;
+    };
+    CHECK_EQ(post(R"(,"repeat_penalty":1.25,"n_predict":5)").status, 200);
+    {
+        std::lock_guard<std::mutex> lk(f.sched.mu);
+        CHECK_NEAR(f.sched.last_sp.rep_penalty, 1.25, 1e-6);
+        CHECK_EQ(f.sched.last_max_tokens, 5);
+    }
+    CHECK_EQ(post(R"(,"repeat_penalty":1.2,"repetition_penalty":1.3)").status, 400);
+    CHECK_EQ(post(R"(,"max_tokens":4,"n_predict":5)").status, 400);
+    CHECK_EQ(post("").status, 200);
+    { std::lock_guard<std::mutex> lk(f.sched.mu); CHECK_EQ(f.sched.last_max_tokens, 32); }
+    CHECK_EQ(post(R"(,"max_tokens":-1)").status, 200);
+    { std::lock_guard<std::mutex> lk(f.sched.mu); CHECK(f.sched.last_max_tokens != 32); }
+    CHECK_EQ(post(R"(,"max_tokens":0)").status, 400);
+}
+
+/* `samplers`: a stage left out is off, temperature after the cuts sets temp_last, and an order
+ * the chain cannot run is refused by name -- as is a sampler it does not have. */
+TEST(the_sampler_order_is_honoured_or_refused) {
+    Fixture f;
+    auto post = [&](const std::string& extra) {
+        HttpResponse r = f.post("/v1/chat/completions",
+                                R"({"messages":[{"role":"user","content":"hi"}],"temperature":1.5,)"
+                                R"("top_p":0.5,"top_k":40)" + extra + "}");
+        f.sched.join_all();
+        return r;
+    };
+    CHECK_EQ(post(R"(,"samplers":"kpt")").status, 200);
+    { std::lock_guard<std::mutex> lk(f.sched.mu); CHECK(f.sched.last_sp.temp_last); }
+    CHECK_EQ(post(R"(,"samplers":["top_k","temperature","top_p"])").status, 200);
+    { std::lock_guard<std::mutex> lk(f.sched.mu); CHECK(!f.sched.last_sp.temp_last); }
+    /* llama.cpp's default list, typ_p before top_p: typical is off, so its place is free. */
+    CHECK_EQ(post(R"(,"samplers":["penalties","dry","top_n_sigma","top_k","typ_p","top_p","min_p","xtc","temperature"])").status, 200);
+    { std::lock_guard<std::mutex> lk(f.sched.mu); CHECK(f.sched.last_sp.temp_last); }
+    CHECK_EQ(post(R"(,"samplers":["top_p"])").status, 200);
+    {
+        std::lock_guard<std::mutex> lk(f.sched.mu);
+        CHECK_EQ(f.sched.last_sp.top_k, 0);                       /* left out: off */
+        CHECK_NEAR(f.sched.last_sp.temp, 1.0, 1e-6);
+    }
+    HttpResponse bad = post(R"(,"min_p":0.1,"samplers":["top_p","temperature","min_p"])");
+    CHECK_EQ(bad.status, 400);
+    CHECK_EQ(json::parse(bad.body)["error"]["param"].get<std::string>(), std::string("samplers"));
+    CHECK_EQ(post(R"(,"samplers":["infill"])").status, 400);
+}
+
+/* OpenRouter's session_id travels to the engine as the conversation's label, and nothing else. */
+TEST(the_session_id_labels_the_request) {
+    Fixture f;
+    CHECK_EQ(f.post("/v1/chat/completions",
+                    R"({"messages":[{"role":"user","content":"hi"}],"session_id":"conv-7"})").status,
+             200);
+    f.sched.join_all();
+    std::lock_guard<std::mutex> lk(f.sched.mu);
+    CHECK_EQ(f.sched.last_label, std::string("conv-7"));
+}
+
+/* ASSISTANT PREFILL: a conversation ending in an assistant message is continued unless the
+ * request asks for a generation prompt; asking for both explicitly is refused. */
+TEST(a_trailing_assistant_message_is_continued) {
+    Fixture f;
+    const std::string msgs =
+        R"("messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"The"}])";
+    CHECK_EQ(f.post("/v1/chat/completions", "{" + msgs + "}").status, 200);
+    CHECK_EQ(f.tmpl.last_opt.continue_final, std::string("auto"));
+    CHECK(!f.tmpl.last_opt.add_generation_prompt);
+    CHECK_EQ(f.post("/v1/chat/completions",
+                    "{" + msgs + R"(,"continue_final_message":"content"})").status, 200);
+    CHECK_EQ(f.tmpl.last_opt.continue_final, std::string("content"));
+    CHECK_EQ(f.post("/v1/chat/completions",
+                    "{" + msgs + R"(,"add_generation_prompt":true})").status, 200);
+    CHECK(f.tmpl.last_opt.continue_final.empty());
+    CHECK(f.tmpl.last_opt.add_generation_prompt);
+    CHECK_EQ(f.post("/v1/chat/completions",
+                    "{" + msgs + R"(,"continue_final_message":true,"add_generation_prompt":true})")
+                 .status, 400);
+    CHECK_EQ(f.post("/v1/chat/completions",
+                    R"({"messages":[{"role":"user","content":"hi"}],"continue_final_message":true})")
+                 .status, 400);
+    f.sched.join_all();
+}
+
+/* The deprecated functions API, llama-server's json_schema and reasoning_format reach the
+ * template as the fields they spell. */
+TEST(older_and_llama_server_chat_spellings_reach_the_template) {
+    Fixture f;
+    CHECK_EQ(f.post("/v1/chat/completions",
+                    R"({"messages":[{"role":"user","content":"hi"}],
+                        "functions":[{"name":"f","parameters":{"type":"object"}}]})").status, 200);
+    CHECK_EQ(f.tmpl.last_n_tools, 1);
+    CHECK_EQ(f.post("/v1/chat/completions",
+                    R"({"messages":[{"role":"user","content":"hi"}],"functions":[],"tools":[]})")
+                 .status, 400);
+    CHECK_EQ(f.post("/v1/chat/completions",
+                    R"({"messages":[{"role":"user","content":"hi"}],"reasoning_format":"none"})")
+                 .status, 200);
+    CHECK_EQ(f.tmpl.last_opt.reasoning_format, std::string("none"));
+    CHECK_EQ(f.post("/v1/chat/completions",
+                    R"({"messages":[{"role":"user","content":"hi"}],
+                        "reasoning_format":"deepseek-legacy"})").status, 400);
+    /* The fake template makes no grammar of a schema, so this one is refused after the render;
+     * what is checked is that the schema reached it. */
+    (void)f.post("/v1/chat/completions",
+                 R"({"messages":[{"role":"user","content":"hi"}],"json_schema":{"type":"object"}})");
+    CHECK_EQ(f.tmpl.last_opt.json_schema, std::string(R"({"type":"object"})"));
+    f.sched.join_all();
+}
+
+/* The routes llama-server answers and this server now does too: without /v1, the token count,
+ * the rendered prompt, and llama-server's /tokenize and /detokenize shapes. */
+TEST(llama_server_routes_answer) {
+    Fixture f;
+    CHECK_EQ(f.post("/chat/completions", R"({"messages":[{"role":"user","content":"hi"}]})").status,
+             200);
+    CHECK_EQ(f.post("/completions", R"({"prompt":"ab"})").status, 200);
+    CHECK_EQ(f.get("/models").status, 200);
+    CHECK_EQ(f.get("/v1/health").status, 200);
+    f.sched.join_all();
+
+    HttpResponse at = f.post("/apply-template", R"({"messages":[{"role":"user","content":"hi"}]})");
+    CHECK_EQ(at.status, 200);
+    const std::string prompt = json::parse(at.body).value("prompt", std::string());
+    CHECK(has(prompt, "<user>hi"));
+    HttpResponse it = f.post("/v1/chat/completions/input_tokens",
+                             R"({"messages":[{"role":"user","content":"hi"}]})");
+    CHECK_EQ(it.status, 200);
+    CHECK_EQ(json::parse(it.body).value("input_tokens", (int64_t)-1), (int64_t)prompt.size());
+
+    HttpResponse t = f.post("/tokenize", R"({"content":["ab",7]})");
+    CHECK_EQ(t.status, 200);
+    CHECK(json::parse(t.body)["tokens"] == json::array({ 97, 98, 7 }));
+    HttpResponse tp = f.post("/tokenize", R"({"content":"a","with_pieces":true})");
+    CHECK_EQ(json::parse(tp.body)["tokens"][0].value("piece", std::string()), std::string("a"));
+    HttpResponse d = f.post("/detokenize", R"({"tokens":[104,105]})");
+    CHECK_EQ(json::parse(d.body).value("content", std::string()), std::string("hi"));
+    CHECK_EQ(json::parse(d.body).value("prompt", std::string()), std::string("hi"));
+
+    const json p = json::parse(f.get("/props").body);
+    CHECK_EQ(p.value("role", std::string()), std::string("model"));
+    CHECK(p["default_generation_settings"]["params"]["samplers"].is_array());
+    CHECK_EQ(p["default_generation_settings"]["params"].value("mirostat", -1), 0);
+}
+
+/* A prompt the context cannot hold names itself in both of the phrasings the agents that compact
+ * on overflow look for, with llama-server's two numbers beside OpenAI's code. */
+TEST(an_overflow_reads_as_one_to_the_clients_that_compact) {
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    FakeChatTemplate tmpl;
+    FakeGrammar gram;
+    Deps d;
+    d.sched = &sched;
+    d.tok = &tok;
+    d.chat = &tmpl;
+    d.grammar = &gram;
+    ServerOptions o;
+    o.model_id = "test-model";
+    o.max_ctx = 8;
+    Server srv(d, o);
+    HttpResponse r = srv.router().call("POST", "/v1/chat/completions",
+                                       R"({"messages":[{"role":"user","content":"a long prompt"}]})");
+    CHECK_EQ(r.status, 400);
+    const json e = json::parse(r.body)["error"];
+    CHECK_EQ(e.value("code", std::string()), std::string("context_length_exceeded"));
+    CHECK(has(e.value("message", std::string()), "maximum context length is 8 tokens"));
+    CHECK(has(e.value("message", std::string()), "exceeds the available context size"));
+    CHECK_EQ(e.value("n_ctx", (int64_t)0), (int64_t)8);
+    CHECK(e.value("n_prompt_tokens", (int64_t)0) > 8);
+    sched.join_all();
+}
+
+/* ================================================================== Anthropic's Messages API */
+
+/* The translation is the chat request the Anthropic one means: the system blocks as one system
+ * message with Claude Code's billing stamp held still, a tool result as a tool message ahead of
+ * the user's own words, the tools and the choice, thinking, stop sequences and the label. */
+TEST(an_anthropic_request_becomes_the_chat_request_it_means) {
+    OaiLimits lim;
+    std::string chat, label;
+    ApiError e;
+    CHECK_OK(anthropic_to_chat(R"({
+        "model":"x","max_tokens":9,"stop_sequences":["END"],
+        "system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=1; cch=a5145;"},
+                  {"type":"text","text":"Be terse.","cache_control":{"type":"ephemeral"}}],
+        "metadata":{"user_id":"user_1_session_9"},
+        "thinking":{"type":"disabled"},
+        "tools":[{"name":"get","description":"d","input_schema":{"type":"object"}}],
+        "tool_choice":{"type":"any","disable_parallel_tool_use":true},
+        "messages":[
+          {"role":"user","content":"weather?"},
+          {"role":"assistant","content":[{"type":"text","text":"Looking."},
+                                         {"type":"tool_use","id":"t1","name":"get","input":{"c":"P"}}]},
+          {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"sun"},
+                                    {"type":"text","text":"thanks"}]}]})",
+        lim, &chat, &label, &e));
+    const json c = json::parse(chat);
+    CHECK_EQ(c["messages"][0].value("role", ""), std::string("system"));
+    CHECK(has(c["messages"][0].value("content", ""), "cch=fffff;"));
+    CHECK(has(c["messages"][0].value("content", ""), "Be terse."));
+    CHECK_EQ(c["messages"][2]["tool_calls"][0]["function"].value("arguments", ""),
+             std::string(R"({"c":"P"})"));
+    CHECK_EQ(c["messages"][3].value("role", ""), std::string("tool"));        /* result first */
+    CHECK_EQ(c["messages"][3].value("tool_call_id", ""), std::string("t1"));
+    CHECK_EQ(c["messages"][4].value("role", ""), std::string("user"));        /* then the words */
+    CHECK_EQ(c.value("tool_choice", ""), std::string("required"));
+    CHECK(!c.value("parallel_tool_calls", true));
+    CHECK(!c.value("enable_thinking", true));
+    CHECK_EQ(c["stop"][0].get<std::string>(), std::string("END"));
+    CHECK_EQ(label, std::string("user_1_session_9"));
+
+    /* What would change the answer and cannot be served is refused, by name. */
+    CHECK(anthropic_to_chat(R"({"messages":[{"role":"user","content":[{"type":"document"}]}]})",
+                            lim, &chat, &label, &e) < 0);
+    CHECK(anthropic_to_chat(R"({"messages":[{"role":"user","content":"x"}],
+                                "tools":[{"type":"web_search_20250305","name":"web_search"}]})",
+                            lim, &chat, &label, &e) < 0);
+}
+
+/* The answer and the errors in Anthropic's shapes, through the server. */
+TEST(the_messages_api_answers_in_anthropics_shapes) {
+    Fixture f;
+    HttpResponse r = f.post("/v1/messages",
+                            R"({"model":"x","max_tokens":16,"messages":[{"role":"user","content":"hi"}]})");
+    CHECK_EQ(r.status, 200);
+    const json m = json::parse(r.body);
+    CHECK_EQ(m.value("type", ""), std::string("message"));
+    CHECK(has(m.value("id", ""), "msg_"));
+    CHECK_EQ(m["content"][0].value("type", ""), std::string("text"));
+    CHECK_EQ(m["content"][0].value("text", ""), std::string("hello"));
+    CHECK_EQ(m.value("stop_reason", ""), std::string("end_turn"));
+    CHECK(m["usage"].contains("input_tokens") && m["usage"].contains("output_tokens"));
+    f.sched.join_all();
+
+    HttpResponse bad = f.post("/v1/messages", R"({"model":"x","max_tokens":16})");
+    CHECK_EQ(bad.status, 400);
+    const json e = json::parse(bad.body);
+    CHECK_EQ(e.value("type", ""), std::string("error"));
+    CHECK_EQ(e["error"].value("type", ""), std::string("invalid_request_error"));
+
+    HttpResponse n = f.post("/v1/messages/count_tokens",
+                            R"({"model":"x","messages":[{"role":"user","content":"hi"}]})");
+    CHECK_EQ(n.status, 200);
+    CHECK(json::parse(n.body).value("input_tokens", (int64_t)0) > 0);
+
+    /* The stream: message_start, a text block opened, filled and stopped, then message_delta
+     * and message_stop -- and no [DONE]. */
+    HttpResponse s = f.post("/v1/messages", R"({"model":"x","max_tokens":16,"stream":true,
+                                               "messages":[{"role":"user","content":"hi"}]})");
+    CHECK_EQ(s.status, 200);
+    const std::string body = drain(s);
+    std::vector<std::string> types;
+    for (size_t at = 0; (at = body.find("event: ", at)) != std::string::npos;) {
+        const size_t nl = body.find('\n', at);
+        types.push_back(body.substr(at + 7, nl - at - 7));
+        at = nl;
+    }
+    CHECK(!types.empty() && types.front() == "message_start");
+    CHECK(types.size() >= 2 && types.back() == "message_stop");
+    CHECK(std::find(types.begin(), types.end(), "content_block_start") != types.end());
+    CHECK(std::find(types.begin(), types.end(), "message_delta") != types.end());
+    CHECK(!has(body, "[DONE]"));
+    f.sched.join_all();
+}
+
+/* ================================================================== OpenAI's Responses API */
+
+/* The translation: instructions as the system message, input items as the turns they are --
+ * a reasoning item and a call joined into one assistant turn, the call's output as a tool message
+ * -- function tools only, max_output_tokens, reasoning.effort, text.format, and every field the
+ * Responses API does not define passed through. */
+TEST(a_responses_request_becomes_the_chat_request_it_means) {
+    OaiLimits lim;
+    std::string chat, echo;
+    ApiError e;
+    CHECK_OK(responses_to_chat(R"({
+        "model":"m","instructions":"Be terse.","max_output_tokens":7,
+        "reasoning":{"effort":"low"},"top_k":5,
+        "text":{"format":{"type":"json_schema","name":"a","schema":{"type":"object"}}},
+        "tools":[{"type":"function","name":"get","parameters":{"type":"object"}},
+                 {"type":"web_search"}],
+        "input":[
+          {"role":"user","content":"weather?"},
+          {"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"think"}]},
+          {"type":"function_call","call_id":"c1","name":"get","arguments":"{}"},
+          {"type":"function_call_output","call_id":"c1","output":"sun"}]})",
+        lim, &chat, &echo, &e));
+    const json c = json::parse(chat);
+    CHECK_EQ(c["messages"][0].value("role", ""), std::string("system"));
+    CHECK_EQ(c["messages"][1].value("role", ""), std::string("user"));
+    CHECK_EQ(c["messages"][2].value("reasoning_content", ""), std::string("think"));
+    CHECK_EQ(c["messages"][2]["tool_calls"][0].value("id", ""), std::string("c1"));
+    CHECK_EQ(c["messages"][3].value("role", ""), std::string("tool"));
+    CHECK_EQ(c["tools"].size(), (size_t)1);                       /* web_search left out */
+    CHECK_EQ(c.value("max_tokens", 0), 7);
+    CHECK_EQ(c.value("reasoning_effort", ""), std::string("low"));
+    CHECK_EQ(c.value("top_k", 0), 5);                             /* passed through */
+    CHECK_EQ(c["response_format"].value("type", ""), std::string("json_schema"));
+    CHECK(!c.contains("input") && !c.contains("text") && !c.contains("instructions"));
+    CHECK_EQ(json::parse(echo).value("instructions", ""), std::string("Be terse."));
+
+    CHECK(responses_to_chat(R"({"input":"x","previous_response_id":"resp_1"})", lim, &chat,
+                            &echo, &e) < 0);
+}
+
+TEST(the_responses_api_answers_with_a_response_object_and_its_events) {
+    Fixture f;
+    HttpResponse r = f.post("/v1/responses", R"({"model":"m","input":"hi"})");
+    CHECK_EQ(r.status, 200);
+    const json o = json::parse(r.body);
+    CHECK_EQ(o.value("object", ""), std::string("response"));
+    CHECK(has(o.value("id", ""), "resp_"));
+    CHECK_EQ(o.value("status", ""), std::string("completed"));
+    CHECK_EQ(o["output"][0].value("type", ""), std::string("message"));
+    CHECK_EQ(o["output"][0]["content"][0].value("text", ""), std::string("hello"));
+    CHECK(o["usage"].contains("total_tokens"));
+    f.sched.join_all();
+
+    HttpResponse n = f.post("/v1/responses/input_tokens", R"({"model":"m","input":"hi"})");
+    CHECK_EQ(json::parse(n.body).value("object", ""), std::string("response.input_tokens"));
+
+    HttpResponse s = f.post("/v1/responses", R"({"model":"m","input":"hi","stream":true})");
+    const std::string body = drain(s);
+    std::vector<std::string> types;
+    int64_t last_seq = -1;
+    bool ordered = true;
+    for (size_t at = 0; (at = body.find("data: ", at)) != std::string::npos;) {
+        const size_t nl = body.find('\n', at);
+        const json ev = json::parse(body.substr(at + 6, nl - at - 6), nullptr, false);
+        at = nl;
+        if (!ev.is_object()) continue;
+        types.push_back(ev.value("type", ""));
+        const int64_t q = ev.value("sequence_number", (int64_t)-1);
+        ordered = ordered && q == last_seq + 1;
+        last_seq = q;
+    }
+    CHECK(ordered);
+    CHECK(!types.empty() && types.front() == "response.created");
+    CHECK(!types.empty() && types.back() == "response.completed");
+    CHECK(std::find(types.begin(), types.end(), "response.output_text.delta") != types.end());
+    CHECK(!has(body, "[DONE]"));
+    f.sched.join_all();
+}
+
+/* ================================================================== llama-server's native shape */
+
+/* /completion and /completions answer llama-server's native result: the text, how it ended, the
+ * counts, the settings it ran with -- with the generated ids when asked -- and a prompt of strings
+ * and ids mixed is one prompt. */
+TEST(the_native_completion_answers_in_llama_servers_shape) {
+    Fixture f;
+    HttpResponse r = f.post("/completion", R"({"prompt":["a",98],"n_predict":10,"return_tokens":true})");
+    CHECK_EQ(r.status, 200);
+    const json o = json::parse(r.body);
+    CHECK_EQ(o.value("content", ""), std::string("hello"));
+    CHECK(o.value("stop", false));
+    CHECK_EQ(o.value("stop_type", ""), std::string("eos"));
+    CHECK_EQ(o.value("tokens_evaluated", (int64_t)0), (int64_t)2);      /* 'a' and 98: one prompt */
+    CHECK_EQ(o["tokens"].size(), (size_t)5);
+    CHECK(o.contains("generation_settings") && o["generation_settings"].contains("samplers"));
+    f.sched.join_all();
+
+    /* The stream: chunks with the ids that made them, a final result, no [DONE]. */
+    HttpResponse s = f.post("/completions", R"({"prompt":"ab","stream":true})");
+    const std::string body = drain(s);
+    CHECK(has(body, "\"tokens\":["));
+    CHECK(has(body, "\"stop\":true"));
+    CHECK(!has(body, "[DONE]"));
+    f.sched.join_all();
+
+    /* return_tokens is the native endpoint's own; elsewhere it is guarded at its off value. */
+    CHECK_EQ(f.post("/v1/completions", R"({"prompt":"ab","return_tokens":true})").status, 400);
+}
+
+/* ================================================================== logprobs */
+
+/* A sink carries each token's alternatives beside it, for a request that enabled them. */
+TEST(the_sink_carries_a_tokens_alternatives) {
+    Sink s(16);
+    s.enable_logprobs(3);
+    TokenLogprobs lp;
+    lp.logprob = -0.5f;
+    lp.n_top = 2;
+    lp.top_id[0] = 7; lp.top_lp[0] = -0.1f;
+    lp.top_id[1] = 9; lp.top_lp[1] = -2.0f;
+    CHECK(s.push(5, &lp));
+    CHECK(s.push(6));
+    SinkToken buf[4];
+    SinkAlt alts[4 * 3];
+    CHECK_EQ((long long)s.read(buf, 4, alts), 2LL);
+    CHECK_EQ(buf[0].token, 5);
+    CHECK_EQ(buf[0].logprob, -0.5f);
+    CHECK_EQ(buf[0].n_alt, 2);
+    CHECK_EQ(alts[0].id, 7);
+    CHECK_EQ(alts[1].id, 9);
+    CHECK_EQ(alts[1].logprob, -2.0f);
+    CHECK_EQ(buf[1].n_alt, 0);
+}
+
+/* Chat: `logprobs` and `top_logprobs` reach the sampler as n_probs, and every token comes back in
+ * OpenAI's shape with llama-server's id beside it. */
+TEST(chat_logprobs_come_back_per_token_with_their_alternatives) {
+    Fixture f(true, 0, "", true);
+    f.sched.reply = "abc";
+    HttpResponse r = f.post("/v1/chat/completions",
+                            R"({"messages":[{"role":"user","content":"hi"}],
+                                "logprobs":true,"top_logprobs":2})");
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(f.sched.last_sp.n_probs, 2);
+    const json c = json::parse(r.body)["choices"][0]["logprobs"]["content"];
+    CHECK_EQ(c.size(), (size_t)3);
+    CHECK_EQ(c[1]["token"].get<std::string>(), std::string("b"));
+    CHECK_EQ(c[1]["id"].get<int>(), (int)'b');
+    CHECK_EQ(c[1]["logprob"].get<float>(), -0.5f);
+    CHECK_EQ(c[1]["bytes"][0].get<int>(), (int)'b');
+    CHECK_EQ(c[1]["top_logprobs"].size(), (size_t)2);
+    CHECK_EQ(c[1]["top_logprobs"][1]["token"].get<std::string>(), std::string("y"));
+    CHECK_EQ(c[1]["top_logprobs"][1]["logprob"].get<float>(), -2.0f);
+    f.sched.join_all();
+
+    /* `logprobs` alone is the token's own and no alternatives -- OpenAI's default of 0. */
+    HttpResponse z = f.post("/v1/chat/completions",
+                            R"({"messages":[{"role":"user","content":"hi"}],"logprobs":true})");
+    CHECK_EQ(f.sched.last_sp.n_probs, 0);
+    const json zc = json::parse(z.body)["choices"][0]["logprobs"]["content"];
+    CHECK_EQ(zc.size(), (size_t)3);
+    CHECK(zc[0]["top_logprobs"].empty());
+    f.sched.join_all();
+
+    /* Streamed: each token's entry rides a chunk, and together they are the reply's. */
+    HttpResponse s = f.post("/v1/chat/completions",
+                            R"({"messages":[{"role":"user","content":"hi"}],"stream":true,
+                                "logprobs":true,"top_logprobs":1})");
+    const std::string body = drain(s);
+    size_t n = 0;
+    for (size_t at = body.find("data: {"); at != std::string::npos;
+         at = body.find("data: {", at + 1)) {
+        const json ev = json::parse(body.substr(at + 6, body.find("\n\n", at) - at - 6));
+        const json& ch = ev["choices"][0];
+        if (ch.contains("logprobs") && ch["logprobs"].is_object())
+            n += ch["logprobs"]["content"].size();
+    }
+    CHECK_EQ(n, (size_t)3);
+    f.sched.join_all();
+}
+
+TEST(logprobs_are_refused_out_of_range_and_with_echo) {
+    Fixture f(true, 0, "", true);
+    CHECK_EQ(f.post("/v1/chat/completions",
+                    R"({"messages":[{"role":"user","content":"hi"}],"logprobs":true,
+                        "top_logprobs":21})").status, 400);
+    CHECK_EQ(f.post("/v1/chat/completions",
+                    R"({"messages":[{"role":"user","content":"hi"}],"top_logprobs":2})").status,
+             400);
+    CHECK_EQ(f.post("/v1/completions", R"({"prompt":"hi","logprobs":2,"echo":true})").status,
+             400);
+    CHECK_EQ(f.post("/completion", R"({"prompt":"hi","n_probs":2,"post_sampling_probs":true})")
+                 .status, 400);
+}
+
+/* Legacy completions: OpenAI's parallel arrays, with llama-server's content array beside them. */
+TEST(completion_logprobs_have_the_legacy_shape) {
+    Fixture f(true, 0, "", true);
+    f.sched.reply = "abc";
+    HttpResponse r = f.post("/v1/completions", R"({"prompt":"hi","logprobs":2})");
+    CHECK_EQ(r.status, 200);
+    const json lp = json::parse(r.body)["choices"][0]["logprobs"];
+    CHECK_EQ(lp["tokens"].size(), (size_t)3);
+    CHECK_EQ(lp["tokens"][2].get<std::string>(), std::string("c"));
+    CHECK_EQ(lp["token_logprobs"][2].get<float>(), -0.75f);
+    CHECK_EQ(lp["top_logprobs"][0]["x"].get<float>(), -1.0f);
+    CHECK_EQ(lp["text_offset"][2].get<int>(), 2);
+    CHECK_EQ(lp["content"].size(), (size_t)3);
+    f.sched.join_all();
+}
+
+/* A stop string's own tokens never went out, so their logprobs do not either. */
+TEST(logprobs_end_where_the_stop_string_cut_the_reply) {
+    Fixture f(true, 0, "", true);
+    f.sched.reply = "abXYc";
+    HttpResponse r = f.post("/v1/completions", R"({"prompt":"hi","logprobs":1,"stop":["XY"]})");
+    const json o = json::parse(r.body)["choices"][0];
+    CHECK_EQ(o["text"].get<std::string>(), std::string("ab"));
+    CHECK_EQ(o["logprobs"]["tokens"].size(), (size_t)2);
+    f.sched.join_all();
+}
+
+/* llama-server's native n_probs: completion_probabilities on the answer, and on each streamed
+ * chunk instead when streaming. */
+TEST(native_n_probs_return_completion_probabilities) {
+    Fixture f(true, 0, "", true);
+    f.sched.reply = "ab";
+    HttpResponse r = f.post("/completion", R"({"prompt":"hi","n_probs":3})");
+    CHECK_EQ(r.status, 200);
+    const json o = json::parse(r.body);
+    CHECK_EQ(o["completion_probabilities"].size(), (size_t)2);
+    CHECK_EQ(o["completion_probabilities"][0]["top_logprobs"].size(), (size_t)3);
+    CHECK_EQ(o["completion_probabilities"][0]["id"].get<int>(), (int)'a');
+    CHECK_EQ(o["generation_settings"]["n_probs"].get<int>(), 3);
+    f.sched.join_all();
+
+    HttpResponse s = f.post("/completion", R"({"prompt":"hi","n_probs":1,"stream":true})");
+    const std::string body = drain(s);
+    CHECK(has(body, "\"completion_probabilities\":[{"));
+    f.sched.join_all();
+}
+
+/* A model with no fill-in-the-middle tokens -- the fixture's -- cannot infill, and says so. */
+TEST(infill_without_fim_tokens_is_refused_by_name) {
+    Fixture f;
+    HttpResponse r = f.post("/infill", R"({"input_prefix":"def f():\n    ","input_suffix":"\n"})");
+    CHECK_EQ(r.status, 501);
+    CHECK(has(r.body, "fill-in-the-middle"));
+}
+
+/* With the markers, a fill is served; a field of the wrong type, or a body nested past the
+ * bound every generation endpoint holds, is a 400. */
+TEST(infill_serves_a_fill_and_refuses_a_malformed_body) {
+    Fixture f;
+    f.tok.fim = true;
+    CHECK_EQ(f.post("/infill", R"({"input_prefix":"a","input_suffix":"b",
+                                   "input_extra":[{"filename":"x.py","text":"y"}]})").status, 200);
+    f.sched.join_all();
+    for (const char* body : { R"({"input_prefix":"a","n_predict":"many"})",
+                              R"({"input_prefix":"a","max_tokens":1.5})",
+                              R"({"input_prefix":"a","input_extra":[{"filename":5}]})",
+                              R"({"input_prefix":"a","input_extra":[{"text":["y"]}]})" })
+        CHECK_EQ(f.post("/infill", body).status, 400);
+    const std::string deep = R"({"input_prefix":"a","input_extra":)" + std::string(2000, '[') +
+                             std::string(2000, ']') + "}";
+    CHECK_EQ(f.post("/infill", deep).status, 400);
+}
+
+/* ================================================================== malformed and failed */
+
+/* A FIELD OF THE WRONG TYPE is a 400 naming it on every API, never a 500: the translators read
+ * the client's fields before the chat parser checks them, and the chat parser reads a few before
+ * its own validation. */
+TEST(a_field_of_the_wrong_type_is_a_400_on_every_api) {
+    Fixture f;
+    struct Case { const char* path; const char* body; const char* param; };
+    for (const Case& c : {
+             Case{ "/v1/messages", R"({"model":"x","max_tokens":9,"messages":[{"role":1,"content":"hi"}]})",
+                   "messages[].role" },
+             Case{ "/v1/messages", R"({"model":"x","max_tokens":9,"messages":[{"role":"user",
+                   "content":[{"type":"text","text":5}]}]})", "messages[].content[].text" },
+             Case{ "/v1/messages", R"({"model":"x","max_tokens":9,"messages":[{"role":"user",
+                   "content":[{"type":"image","source":"x"}]}]})", "messages[].content[].source" },
+             Case{ "/v1/messages", R"({"model":"x","max_tokens":9,"system":[{"type":"text","text":[]}],
+                   "messages":[{"role":"user","content":"hi"}]})", "system[].text" },
+             Case{ "/v1/messages", R"({"model":"x","max_tokens":9,"tool_choice":{"type":"auto",
+                   "disable_parallel_tool_use":"yes"},"messages":[{"role":"user","content":"hi"}]})",
+                   "disable_parallel_tool_use" },
+             Case{ "/v1/chat/completions", R"({"messages":["x",{"role":"assistant","content":"hi"}]})",
+                   "messages[]" },
+             Case{ "/v1/chat/completions", R"({"messages":[{"role":"user",
+                   "content":[{"type":"text","text":5}]}]})", "messages[].content[].text" },
+             Case{ "/v1/responses", R"({"input":[{"type":5}]})", "input[].type" },
+             Case{ "/v1/responses", R"({"input":[{"role":"user","content":[{"type":"input_text",
+                   "text":5}]}]})", "input[].content[].text" },
+             Case{ "/v1/responses", R"({"input":[{"type":"function_call","name":"f","arguments":{}}]})",
+                   "input[].arguments" },
+             Case{ "/v1/responses", R"({"input":"hi","tool_choice":{"type":"function","name":7}})",
+                   "tool_choice.name" } }) {
+        HttpResponse r = f.post(c.path, c.body);
+        CHECK_EQ(r.status, 400);
+        const json e = json::parse(r.body, nullptr, false);
+        CHECK(e.is_object() && e.contains("error"));
+        if (e.is_object() && e["error"].contains("param"))
+            CHECK_EQ(e["error"]["param"].get<std::string>(), std::string(c.param));
+        else
+            CHECK(has(r.body, c.param));
+    }
+}
+
+/* A STREAM THE ENGINE FAILED ends in its API's own failure, never in its success event: a
+ * client that stops reading at the terminal event must not take the partial reply as whole. */
+TEST(a_failed_stream_ends_in_its_apis_own_failure) {
+    Fixture f;
+    f.sched.reply = "he";
+    f.sched.fail_status = RAD_E_UNSUPPORTED;
+    f.sched.fail_why = "boom";
+
+    HttpResponse a = f.post("/v1/messages", R"({"model":"x","max_tokens":16,"stream":true,
+                                               "messages":[{"role":"user","content":"hi"}]})");
+    const std::string ab = drain(a);
+    CHECK(has(ab, "event: error\ndata: {\"type\":\"error\""));
+    CHECK(has(ab, "boom"));
+    CHECK(!has(ab, "message_delta"));
+    CHECK(!has(ab, "message_stop"));
+    f.sched.join_all();
+
+    HttpResponse r = f.post("/v1/responses", R"({"model":"m","input":"hi","stream":true})");
+    const std::string rb = drain(r);
+    CHECK(has(rb, "event: response.failed"));
+    CHECK(has(rb, "\"status\":\"failed\""));
+    CHECK(has(rb, "boom"));
+    CHECK(!has(rb, "response.completed"));
+    f.sched.join_all();
+
+    HttpResponse c = f.post("/v1/chat/completions", R"({"stream":true,
+                                                       "messages":[{"role":"user","content":"hi"}]})");
+    const std::string cb = drain(c);
+    CHECK(has(cb, "\"finish_reason\":\"error\""));
+    CHECK(has(cb, "boom"));
+    f.sched.join_all();
+}
+
+/* ================================================================== the functions API */
+
+/* OpenAI's DEPRECATED functions API end to end: the reply's call is `function_call` with
+ * finish_reason "function_call", streamed and not, one call at most; and the next turn -- the
+ * assistant's function_call and the `function` message with its result -- is served. */
+TEST(the_functions_api_answers_and_continues_in_its_own_shape) {
+    Fixture f;
+    f.sched.reply = R"(TOOL:get:{"c":"P"})";
+    const std::string fns = R"("functions":[{"name":"get","parameters":{"type":"object"}}],)";
+    HttpResponse r = f.post("/v1/chat/completions",
+                            "{" + fns + R"("messages":[{"role":"user","content":"weather?"}]})");
+    CHECK_EQ(r.status, 200);
+    CHECK(!f.tmpl.last_opt.parallel_tool_calls);
+    const json c = json::parse(r.body)["choices"][0];
+    CHECK_EQ(c["finish_reason"].get<std::string>(), std::string("function_call"));
+    CHECK_EQ(c["message"]["function_call"]["name"].get<std::string>(), std::string("get"));
+    CHECK_EQ(c["message"]["function_call"]["arguments"].get<std::string>(),
+             std::string(R"({"c":"P"})"));
+    CHECK(!c["message"].contains("tool_calls"));
+    f.sched.join_all();
+
+    HttpResponse s = f.post("/v1/chat/completions",
+                            "{" + fns + R"("stream":true,"messages":[{"role":"user","content":"w"}]})");
+    const std::string body = drain(s);
+    CHECK(has(body, R"("delta":{"function_call":{"name":"get","arguments":""}})"));
+    CHECK(has(body, R"("finish_reason":"function_call")"));
+    CHECK(!has(body, "tool_calls"));
+    f.sched.join_all();
+
+    f.sched.reply = "sunny";
+    HttpResponse t = f.post("/v1/chat/completions", "{" + fns + R"("messages":[
+        {"role":"user","content":"weather?"},
+        {"role":"assistant","content":null,"function_call":{"name":"get","arguments":"{\"c\":\"P\"}"}},
+        {"role":"function","name":"get","content":"sun"}]})");
+    CHECK_EQ(t.status, 200);
+    CHECK_EQ(json::parse(t.body)["choices"][0]["message"]["content"].get<std::string>(),
+             std::string("sunny"));
+    f.sched.join_all();
+}
+
+/* ================================================================== odds and ends */
+
+/* What the Responses API cannot carry is refused rather than computed and dropped: several
+ * choices, and logprobs in any spelling. The chat stream's own extras are dropped. */
+TEST(the_responses_api_refuses_what_a_response_cannot_carry) {
+    Fixture f(true, 0, "", true);
+    for (const char* extra : { R"("n":2)", R"("logprobs":true)", R"("top_logprobs":3)",
+                               R"("n_probs":2)", R"("include":["message.output_text.logprobs"])" })
+        CHECK_EQ(f.post("/v1/responses", std::string(R"({"input":"hi",)") + extra + "}").status, 400);
+    HttpResponse ok = f.post("/v1/responses", R"({"input":"hi","stream":true,"return_progress":true,
+                                                  "stream_options":{"include_usage":true},
+                                                  "include":["reasoning.encrypted_content"]})");
+    CHECK_EQ(ok.status, 200);
+    const std::string body = drain(ok);
+    CHECK(!has(body, "chat.completion.chunk"));
+    CHECK(has(body, "response.completed"));
+    f.sched.join_all();
+}
+
+/* text_offset is where each token's text starts in the reply, streamed or not, even where a token
+ * carries half a character and its own text is empty. */
+TEST(text_offset_is_the_same_streamed_and_not_past_a_split_character) {
+    Fixture f(true, 0, "", true);
+    f.sched.reply = "a\xC3\xA9" "b";
+    HttpResponse r = f.post("/v1/completions", R"({"prompt":"hi","logprobs":1})");
+    CHECK_EQ(r.status, 200);
+    const json want = json::array({ 0, 1, 2, 3 });
+    CHECK(json::parse(r.body)["choices"][0]["logprobs"]["text_offset"] == want);
+    f.sched.join_all();
+
+    HttpResponse s = f.post("/v1/completions", R"({"prompt":"hi","logprobs":1,"stream":true})");
+    json got = json::array();
+    int bad = 0;
+    for (const std::string& p : sse_payloads(drain(s), &bad)) {
+        if (p == "[DONE]") continue;
+        const json j = json::parse(p);
+        const json& lp = j["choices"][0]["logprobs"];
+        if (lp.is_object()) for (const json& o : lp["text_offset"]) got.push_back(o);
+    }
+    CHECK_EQ(bad, 0);
+    CHECK(got == want);
+    f.sched.join_all();
+}
+
+/* A piece that is not whole UTF-8 goes as its bytes, 0 to 255, as llama-server sends it. */
+TEST(tokenize_pieces_carry_bytes_unsigned) {
+    Fixture f;
+    HttpResponse r = f.post("/tokenize", R"({"content":"\u00e9","with_pieces":true})");
+    CHECK_EQ(r.status, 200);
+    const json t = json::parse(r.body)["tokens"];
+    CHECK_EQ(t.size(), (size_t)2);
+    CHECK(t[0]["piece"] == json::array({ 0xC3 }));
+    CHECK(t[1]["piece"] == json::array({ 0xA9 }));
+}
+
+/* A conversation label is cut to 128 bytes where a character starts, so it stays text. */
+TEST(a_long_session_label_is_cut_on_a_character) {
+    Fixture f;
+    const std::string id = std::string(127, 'a') + "\xC3\xA9";
+    CHECK_EQ(f.post("/v1/chat/completions", R"({"messages":[{"role":"user","content":"hi"}],
+                                               "session_id":")" + id + "\"}").status, 200);
+    f.sched.join_all();
+    std::lock_guard<std::mutex> lk(f.sched.mu);
+    CHECK_EQ(f.sched.last_label, std::string(127, 'a'));
+}
+
+/* Anthropic's reply names the model the request asked for, as Anthropic's does. */
+TEST(the_messages_api_names_the_requested_model) {
+    Fixture f;
+    HttpResponse r = f.post("/v1/messages", R"({"model":"claude-x","max_tokens":4,
+                                               "messages":[{"role":"user","content":"hi"}]})");
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(json::parse(r.body).value("model", ""), std::string("claude-x"));
+    f.sched.join_all();
 }
 
 RAD_TEST_MAIN()

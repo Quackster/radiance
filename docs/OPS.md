@@ -1240,9 +1240,21 @@ resolutions of one op — which is not something a batch can contain.
 | `sample_pick` | `M`(range) `n_cand` | `cand_idx`, `cand_val`, `params` → `token` |
 | `sample_argmax` | `M`(range) `n_vocab` | `logits`, `params` → `token` |
 | `sample_merge_topk` | `M`(range) `n_cand` | `gathered`, `params` → `cand_idx`, `cand_val` |
+| `sample_logprobs` | `M`(range) `n_vocab` `k` `vocab_off`/opt | `logits`, `params` → `stats` |
 
 `sample_mask` is where a GBNF grammar lands: the state machine stays on host and what crosses is a
 token bitmask per sequence, 19 KiB at a 151K vocab, cheap enough to upload every step.
+
+`sample_logprobs` is what an OpenAI `logprobs` field or llama-server's `n_probs` reads. It runs on
+the RAW logits, before any stage has touched them, and only for a row whose flags carry
+`RAD_SP_LOGPROBS`; other rows are not written. `stats` is `[M, 2 + 2k]` f32: the row's maximum, the
+sum of `exp(l - max)` over it, and its `k` largest as (id, logit) pairs, descending, ties to the
+lower id, the id written as a float (exact below 2^24) and GLOBAL under a split vocabulary
+(`vocab_off` added). A slot past the vocabulary is id -1, logit -infinity. `k` is geometry: the one
+width every request's `top_logprobs` fits in. The engine declares 21 -- OpenAI's bound of 20, plus
+one so that a row is 44 floats, whole 16-byte words, which the vocab-parallel `all_gather` moves. A
+token's logprob is `l - max - log(sum)`; under a split vocabulary the host merges the ranks' rows
+(the maxima and sums by the usual rescale, the pairs by value).
 
 ### Stages the decomposed chain does not carry
 

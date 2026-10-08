@@ -360,12 +360,16 @@ int Registry::commit_(Staged& s, int order) {
          * libraries for several cards would serve none of them but the first in the hierarchy.
          * What the library carries is read out of the fat binaries its dlopen registered, which is
          * what the launch itself will consult (core/device/aql_code.cpp), not out of
-         * build_target, which is prose. Its host rows run anywhere and stay. */
+         * build_target, which is prose. Its host rows run anywhere and stay. On the host backend
+         * an engine that serves says no GPU code runs at all (set_no_device_code). */
         int n_device = 0;
         for (const auto& r : staged_rows) n_device += r.first->domain == RAD_DOMAIN_DEVICE;
         std::string why;
+        if (no_device_code_)
+            why = "no card is visible, so this process runs on the host backend and no GPU code "
+                  "object runs here";
         if (n_device > 0 && s.code_to > s.code_from &&
-            rad::dev_code_runs(s.code_from, s.code_to, code_device_, &why) == 0) {
+            (no_device_code_ || rad::dev_code_runs(s.code_from, s.code_to, code_device_, &why) == 0)) {
             std::vector<std::pair<const RadKernelInfo*, int>> keep;
             for (const auto& r : staged_rows)
                 if (r.first->domain != RAD_DOMAIN_DEVICE) keep.push_back(r);
@@ -480,8 +484,8 @@ int Registry::commit_(Staged& s, int order) {
         if (rad_dev_count() > code_device_ && rad_dev_props(code_device_, &dp) == RAD_OK &&
             dp.arch[0] && !target_covers(p.build_target, dp.arch))
             RAD_WARN("kernel plugin '%s' declares it was built for %s and this machine reports %s. "
-                     "Its kernels will fail to launch; build it for %s, or put a library that "
-                     "serves this device ahead of it with --kernels.",
+                     "Its kernels will fail to launch; build it for %s, or leave it out with "
+                     "--kernels.",
                      p.name.c_str(), p.build_target.c_str(), dp.arch, dp.arch);
     }
 
@@ -576,33 +580,74 @@ int Registry::load_dirs(const std::vector<std::string>& dirs,
         staged.push_back(s);
     }
 
-    /* The hierarchy is configured, not discovered. A plugin the operator named takes that
-     * position; a plugin present on disk but absent from the list loads after everything named,
-     * so dropping an .so into the directory adds it with no configuration and naming it ahead of
-     * another is what substitutes it.
+    /* An entry names a library by its declared name or by its file, written as the operator sees
+     * it on disk: `libr4d`, `r4d`, `libr4d.so` and a path to it are one library. */
+    auto names = [](const std::string& h, const Staged& s) {
+        return h == s.name || h == s.file || stem_of(h) == s.file;
+    };
+    std::string found;   /* every kernel library on the search path, for a list that names none */
+    for (const Staged& s : staged)
+        if (s.info && s.info->kind == RAD_PLUGIN_KERNEL)
+            found += (found.empty() ? "" : ", ") + s.name;
+
+    /* A HIERARCHY NAMES THE KERNEL LIBRARIES THAT SERVE, AND ONLY THOSE LOAD. Ordering alone
+     * cannot keep a library out: selection runs per domain, so a library named first that has no
+     * device row for an op leaves that op to whichever unnamed library does -- a GPU library on a
+     * machine whose card it was not built for, say -- and an operator who listed what to use gets
+     * something else. A kernel library on the search path that the list leaves out is closed again
+     * before it registers anything, and said once. Architecture and quantiser plugins are not
+     * kernel libraries and no list ranks them. */
+    if (!hierarchy.empty()) {
+        std::vector<Staged> kept;
+        std::string left_out;
+        for (Staged& s : staged) {
+            const bool kernel = s.info && s.info->kind == RAD_PLUGIN_KERNEL;
+            const bool named = std::find_if(hierarchy.begin(), hierarchy.end(),
+                                            [&](const std::string& h) {
+                                                return names(h, s);
+                                            }) != hierarchy.end();
+            if (!kernel || named) {
+                kept.push_back(s);
+                continue;
+            }
+            left_out += (left_out.empty() ? "" : ", ") + s.name;
+            unstage_(s);
+        }
+        staged.swap(kept);
+        if (!left_out.empty())
+            RAD_INFO("kernel libraries on the search path that --kernels (or RADIANCE_KERNELS) "
+                     "does not name, and so not loaded: %s", left_out.c_str());
+    }
+
+    /* The hierarchy is configured, not discovered: a library the operator named takes that
+     * position. With no list every kernel library on the search path loads, so dropping an .so
+     * into the directory adds it with no configuration.
      *
      * A REFERENCE LIBRARY IS PINNED BELOW EVERY OTHER UNNAMED PLUGIN. It declares a kernel for
      * every op it knows, so a plugin ranked behind it is unreachable -- an unnamed kernel library
      * for this machine's card would load, never be selected for anything, and leave the whole
      * model resolving to the naive implementation. Pinning it is what makes an unconfigured
-     * drop-in work. Naming it in the hierarchy overrides this, which is how it is put in front of
-     * a library to compare against. Which library is one is its own declaration
+     * drop-in work. Naming it in the hierarchy places it where it is named, which is how it is put
+     * in front of a library to compare against. Which library is one is its own declaration
      * (RadPluginReferenceFn), not its name. */
     const size_t kUnnamed = (size_t)INT_MAX - 1;
     std::vector<size_t> rank(staged.size());
     for (size_t i = 0; i < staged.size(); ++i)
         rank[i] = staged[i].reference ? (size_t)INT_MAX : kUnnamed;
     for (size_t h = 0; h < hierarchy.size(); ++h) {
-        bool found = false;
+        bool hit = false;
         for (size_t i = 0; i < staged.size(); ++i) {
-            if (staged[i].name == hierarchy[h] || staged[i].file == hierarchy[h]) {
+            if (names(hierarchy[h], staged[i])) {
                 rank[i] = h;
-                found = true;
+                hit = true;
             }
         }
-        if (!found)
-            RAD_WARN("kernel hierarchy names '%s', which is not in %s -- ignored",
-                     hierarchy[h].c_str(), dir.c_str());
+        /* The list is what loads, so an entry that matches nothing is a library that is not
+         * there to select -- and a list none of whose entries match loads no kernel library. */
+        if (!hit)
+            RAD_WARN("--kernels (or RADIANCE_KERNELS) names '%s', which is no kernel library in "
+                     "%s, so nothing loads in its place; the kernel libraries there are: %s",
+                     hierarchy[h].c_str(), dir.c_str(), found.empty() ? "none" : found.c_str());
     }
     std::vector<size_t> idx(staged.size());
     for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;

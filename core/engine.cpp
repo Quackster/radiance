@@ -913,6 +913,10 @@ int Engine::step_loop() {
         res.n_accepted = so.accepted.data();
         res.token      = so.token.data();
         res.eos        = so.eos.data();
+        if (!so.lp.empty()) {
+            res.lp        = so.lp.data();
+            res.first_row = so.first_row.data();
+        }
         st = sched_.commit(res);
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
@@ -1046,6 +1050,20 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     return RAD_OK;
 }
 
+/* One sampled row's logprobs into the step's table, which is sized on the first row that asks.
+ * A ROW WHOSE LOGPROBS CANNOT BE COMPUTED FAILS ITS REQUEST, NOT THE STEP: its numbers are not
+ * finite (RAD_E_INVAL), so its entry is left at token -1 (TokenLogprobs), which the scheduler
+ * answers by failing that request with the reason, and every other sequence in the batch goes on.
+ * A row outside the step, or one that was never staged for logprobs, is the engine's own fault. */
+int Engine::row_logprobs(StepOut& so, int32_t row, int32_t token) {
+    if (so.lp.empty()) so.lp.resize((size_t)so.n_rows);
+    if (row < 0 || row >= so.n_rows) return RAD_E_STATE;
+    TokenLogprobs& lp = so.lp[(size_t)row];
+    const int s = ranks_[0]->sampler.logprobs_for(row, token, &lp);
+    if (s == RAD_E_INVAL) { lp = TokenLogprobs{}; return RAD_OK; }
+    return s;
+}
+
 /* Wait for the sampled ids and turn them into the three per-sequence arrays the scheduler wants.
  * This is the ONE host synchronisation on the step path: the host needs the tokens to commit them
  * and to stream them. Everything else in a step is enqueued and never waited on (spec §5.4). */
@@ -1068,6 +1086,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     so.token.assign(plan.e.size(), 0);
     so.accepted.assign(plan.e.size(), 0);
     so.eos.assign(plan.e.size(), 0);
+    so.lp.clear();
     if (so.n_rows <= 0) {
         /* A final scoring step still owns the forward and any checkpoint save behind it. Wait
          * for their end before commit releases the sequence, even though there are no sampled
@@ -1171,6 +1190,11 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             so.accepted[i] = acc;
             so.token[i]    = out[acc];
             so.eos[i]      = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
+            /* Each emitted token's logprobs from its own row: an accepted draft is the token the
+             * target drew at its position, so its row is the distribution it came from. */
+            if (e.req && e.req->sp.n_probs >= 0)
+                for (int32_t j = 0; j <= acc; ++j)
+                    RAD_TRY(row_logprobs(so, so.first_row[i] + j, out[j]));
             /* EVERY token that leaves, in order: the grammar's state has to advance over the
              * accepted drafts too, or the next step's mask is built n_accepted tokens behind.
              * Bounded by the truncated `acc`, so it sees exactly the tokens the client does. */
@@ -1196,6 +1220,8 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
         }
         so.token[i] = so.rows[(size_t)so.first_row[i]];
         so.eos[i]   = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
+        if (e.req && e.req->sp.n_probs >= 0)
+            RAD_TRY(row_logprobs(so, so.first_row[i], so.token[i]));
         /* The grammar must see the token it just emitted, or the next step's mask is built from a
          * state one token behind the sequence. EVERY rank, not just rank 0: each rank builds the
          * mask for its own vocabulary shard from its own automaton, so a rank whose grammar did
@@ -2341,11 +2367,14 @@ int Engine::run_server() {
      * more choices a request; the floor keeps a small batch from refusing what it would queue. */
     o.max_n    = cfg_.max_n > 0 ? (int)cfg_.max_n : (int)std::max<int64_t>(o.max_n, cfg_.max_seqs);
     o.max_ctx  = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
+    o.model_path = cfg_.model;
     o.default_reasoning_effort = cfg_.reasoning_effort;
     o.reasoning_effort_map = cfg_.reasoning_effort_map;
     o.default_thinking_budget = cfg_.thinking_token_budget;
     o.default_sampling = resolve_sampling_defaults(meta_, file_ != nullptr, cfg_);
     o.default_dry_breakers_set = cfg_.sample_dry_seq_breakers.has_value();
+    /* An embedding model samples nothing, so it has no logprobs to give. */
+    o.supports_logprobs = !embedding_ && ranks_[0]->sampler.has_logprobs();
     /* -1 leaves ServerOptions' own default, which is `auto` (0). That is resolved per request
      * against the context, so it needs one to resolve against. */
     if (cfg_.default_max_tokens >= 0) o.default_max_tokens = cfg_.default_max_tokens;

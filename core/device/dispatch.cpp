@@ -87,6 +87,15 @@ static void warn_cwsr_off() {
                  "amdgpu.cwsr_enable=1 (module option, then rebuild the initramfs and reboot)");
 }
 
+#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
+/* THE HOST BACKEND IN A BUILD THAT HAS HIP STILL COUNTS THE GPU CODE PLUGINS BRING. The
+ * registration hooks are this build's own exported symbols and see every dlopen'ed kernel
+ * library's fat binaries, card or no card, so the plugin loader can bracket each dlopen and know
+ * which library brought device code. An engine serving here leaves that library's device rows out
+ * of selection (Registry::set_no_device_code); a tool that only selects keeps them. */
+static DeviceBackend g_host_beside_hip;
+#endif
+
 static const DeviceBackend* select_backend() {
 #if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
     if (const DeviceBackend* b = aql_backend_if_present()) {
@@ -96,8 +105,12 @@ static const DeviceBackend* select_backend() {
         return b;
     }
     RAD_INFO("device: built with HIP but no device is visible -- using the host backend");
-#endif
+    g_host_beside_hip = *host_backend();
+    g_host_beside_hip.code_mark = aql_code_registered;
+    const DeviceBackend* b = &g_host_beside_hip;
+#else
     const DeviceBackend* b = host_backend();
+#endif
     RAD_INFO("device: host backend, %d device(s) [%s]", b->count(), device_inventory(b).c_str());
     return b;
 }

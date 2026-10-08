@@ -383,6 +383,7 @@ public:
     struct SessionInfo {
         uint64_t    id = 0;
         std::string model;
+        std::string label;     /* the client's own name for the conversation, or "" */
         int64_t     n_tokens = 0;
         int64_t     bytes = 0;
         uint64_t    first_seen_ns = 0;
@@ -426,7 +427,7 @@ public:
      * is a row per turn -- a table nobody can read, holding a copy of every prefix of the
      * transcript for as long as the newest. */
     void note_session(uint64_t id, const std::vector<BlockHash>& chain, int64_t n_tokens,
-                      uint64_t now_ns);
+                      uint64_t now_ns, const std::string& label = std::string());
     void set_model(const std::string& m) { model_ = m; }
     /* Newest activity first. Recomputes each session's tier histogram from the records, so it is
      * a view and never a second copy of the truth. The walk takes the lock in slices and lets
@@ -545,6 +546,7 @@ private:
         uint64_t first_seen_ns = 0;
         uint64_t last_used_ns = 0;
         std::vector<BlockHash> chain;
+        std::string label;
     };
 
     /* Erase one row and its root index entry together. */

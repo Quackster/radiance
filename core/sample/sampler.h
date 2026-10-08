@@ -18,6 +18,21 @@
  *     XTC
  *     the pick
  *
+ * TEMPERATURE MAY RUN AFTER THE CUTS INSTEAD, per sequence: llama.cpp's order, which a request
+ * names with `samplers` (SamplingParams::temp_last). Such a row's temperature is staged at 1 for
+ * the stage above, which skips it, and at its own value for a second `sample_temp` over the
+ * candidate plane after XTC -- the same kernel at the candidate width, so no plugin needs a
+ * second implementation of it. Every other row is 1 there.
+ *
+ * LOGPROBS ARE READ OFF THE RAW LOGITS, before the first stage: `sample_logprobs` summarises each
+ * row that asks (RAD_SP_LOGPROBS) as its maximum, its normaliser and its kLpK largest (one more
+ * than RAD_MAX_LOGPROBS, for the row's width below), and rank 0 copies that back behind the pick.
+ * The emitted token's own logprob is its raw logit less the log normaliser. When it is not among the largest its raw logit is no longer on the card
+ * -- every stage wrote the logits in place -- so it is recovered from the value the pick drew it
+ * at, the candidate plane's, by undoing temperature, DRY and the penalties on the host
+ * (logprobs_for). Such a row is never a greedy-flagged one: a greedy row asking for logprobs is
+ * staged as a top-1 chain row, so that its token is drawn from a candidate plane too.
+ *
  * A GREEDY SEQUENCE SKIPS ALL OF IT and takes `sample_argmax` -- after penalties and the mask,
  * because temperature 0 collapses every other logit to -inf and a mask applied afterwards would
  * leave nothing at all. host_ref.cpp makes the same choice for the same reason and the two must
@@ -50,6 +65,7 @@
  *   sample_xtc         M(range) n_cand    cand_idx, cand_val, params      -> cand_idx, cand_val
  *   sample_pick        M(range) n_cand    cand_idx, cand_val, params      -> token
  *   sample_merge_topk  M(range) n_cand    gathered, params                -> cand_idx, cand_val
+ *   sample_logprobs    M(range) n_vocab k vocab_off?   logits, params     -> stats
  *
  * `M` is the number of SAMPLED POSITIONS, not tokens: one per sequence at decode, n_spec+1 per
  * sequence at a verify. `params` is [M] rows of DeviceSampleParams below; `history` is
@@ -196,6 +212,16 @@ public:
      * top-k) happens between the top-k and the cuts; full logits are never gathered. */
     int run(RadCtx* c, rad_buf logits, rad_buf out_tokens);
 
+    /* THE EMITTED TOKEN'S LOGPROBS, after the step the last build_step staged has completed on the
+     * card: row `row` must have been staged for a request with SamplingParams::n_probs >= 0, and
+     * `token` is what the step sampled there. Rank 0's sampler only -- it is the one that copies
+     * the summary back. RAD_E_STATE for a row that was not staged for logprobs; RAD_E_INVAL, with
+     * `out->token` -1, for one whose numbers are not finite -- a row with no finite logit, or a
+     * token drawn where none was -- which is a number no client should be sent. */
+    int logprobs_for(int64_t row, int32_t token, TokenLogprobs* out) const;
+    /* Did `sample_logprobs` resolve? What the server advertises as logprobs support. */
+    bool has_logprobs() const { return op_logprobs_ != RAD_NULL_HANDLE; }
+
     /* The parameter rows the last build_step or build_greedy staged, and how many. What `run`
      * uploads, readable so the staging can be checked without a device behind it. */
     const DeviceSampleParams* staged_params(int64_t* n) const {
@@ -240,6 +266,7 @@ private:
     rad_op op_penalties_ = RAD_NULL_HANDLE;
     rad_op op_dry_       = RAD_NULL_HANDLE;
     rad_op op_temp_      = RAD_NULL_HANDLE;
+    rad_op op_temp_late_ = RAD_NULL_HANDLE;   /* sample_temp over the candidates (temp_last) */
     rad_op op_mask_      = RAD_NULL_HANDLE;
     rad_op op_topk_      = RAD_NULL_HANDLE;
     rad_op op_topp_      = RAD_NULL_HANDLE;
@@ -250,9 +277,12 @@ private:
     rad_op op_argmax_    = RAD_NULL_HANDLE;
     rad_op op_allgather_ = RAD_NULL_HANDLE;
     rad_op op_merge_     = RAD_NULL_HANDLE;   /* the candidate merge, under tensor parallel */
+    rad_op op_logprobs_  = RAD_NULL_HANDLE;   /* the raw distribution's summary */
+    rad_op op_lp_gather_ = RAD_NULL_HANDLE;   /* every rank's summary, under a split vocabulary */
 
     /* Device-side buffers, from the ordinary buffer plan. */
     rad_buf buf_params_  = RAD_NULL_HANDLE;
+    rad_buf buf_params_late_ = RAD_NULL_HANDLE;   /* the late temperature's rows */
     rad_buf buf_hist_    = RAD_NULL_HANDLE;
     rad_buf buf_brk_     = RAD_NULL_HANDLE;   /* DRY's single-token breaker marks, beside history */
     rad_buf buf_mask_    = RAD_NULL_HANDLE;
@@ -260,9 +290,15 @@ private:
     rad_buf buf_cand_v_  = RAD_NULL_HANDLE;
     rad_buf buf_gather_  = RAD_NULL_HANDLE;
     rad_buf buf_pairs_   = RAD_NULL_HANDLE;   /* this rank's candidates as (global id, logit) */
+    rad_buf buf_lp_      = RAD_NULL_HANDLE;   /* sample_logprobs' stats, [rows, lp_width()] */
+    rad_buf buf_lp_g_    = RAD_NULL_HANDLE;   /* and every rank's side by side */
 
     /* Pinned staging. One allocation each, at declare, never on the step path. */
     DeviceSampleParams* params_stage_ = nullptr;
+    /* The late temperature's rows: params_stage_'s, with each row's temperature at 1 unless it
+     * runs last. Uploaded only by a step where some row does (any_late_). */
+    DeviceSampleParams* late_stage_   = nullptr;
+    bool                any_late_     = false;
     /* THE GREEDY ROWS HAVE STAGING OF THEIR OWN, written once. A draft pass is staged while the
      * step before it -- whose sampler uploads `params_stage_` when the card reaches it -- may not
      * have run yet; rows written into the same staging would reach that step's sampler instead.
@@ -305,6 +341,35 @@ private:
      * request must not stop the step loop for everyone else. */
     std::vector<uint64_t> failed_;
 
+    /* ---------------------------------------------------------- logprobs */
+    /* THE SUMMARY'S WIDTH: RAD_MAX_LOGPROBS + 1 pairs, not RAD_MAX_LOGPROBS, so that a row is 44
+     * floats -- whole 16-byte words, which is what the all-gather of a split vocabulary moves (and
+     * libr4d's refuses anything else). The extra pair is never reported. */
+    static constexpr int kLpK = RAD_MAX_LOGPROBS + 1;
+    static int64_t lp_width() { return 2 + 2 * (int64_t)kLpK; }
+    /* WHAT UNDOING A ROW'S CHAIN NEEDS, kept from build_step for each row staged with
+     * RAD_SP_LOGPROBS: the staged row itself, the temperature the candidate value carries, the
+     * history window both history stages read, and the request's DRY breakers. Copied rather
+     * than pointed at, because the staging is rebuilt by the next step. */
+    struct LpRow {
+        int64_t            row = -1;
+        int32_t            n_top = 0;
+        float              temp = 1.0f;          /* the candidate value is l / temp */
+        DeviceSampleParams p{};
+        std::vector<int32_t> hist;               /* the staged history row, [0, hist_len) */
+        const DryBreakers* dry = nullptr;        /* lives in seqs_ for the request's lifetime */
+    };
+    std::vector<LpRow> lp_rows_;
+    /* Rank 0's copies, written behind the pick: the summaries ([rows, W * lp_width()], W ranks
+     * side by side) and the candidate planes the pick drew from. */
+    float*   lp_host_    = nullptr;
+    int32_t* lp_ci_host_ = nullptr;
+    float*   lp_cv_host_ = nullptr;
+    int64_t  lp_lo_ = 0, lp_hi_ = 0;             /* the rows copied, [lo, hi) */
+    /* A token's raw logit from the value the pick drew it at: temperature, DRY and the penalties
+     * undone, in the reverse of the order the chain applied them. */
+    float raw_logit(const LpRow& L, int32_t token, float v) const;
+
     /* Per-request grammar and DRY state, keyed by request id. Held here rather than in Request
      * because Request is a frozen struct shared across components and a unique_ptr in it would
      * make the scheduler's copies a compile error. */
@@ -313,5 +378,14 @@ private:
     int stage_alloc();
     void stage_free();
 };
+
+/* SPLIT-VOCABULARY SUMMARIES, MERGED: `W` ranks' `sample_logprobs` rows of `k` pairs each, side by
+ * side in `st` (W * (2 + 2k) floats). Sets the shared log normaliser and fills up to `cap` of the
+ * largest (id, logit) pairs over every rank, descending, ties to the lower id; returns how many. A
+ * rank whose maximum or normaliser is not finite contributes nothing, nor does a pair whose logit
+ * is not finite, and `*log_z` comes back NaN when no rank contributes. One rank is the same
+ * arithmetic. What Sampler::logprobs_for reads a step's summaries with. */
+int merge_logprob_rows(const float* st, int W, int k, double* log_z, int32_t* ids, float* vals,
+                       int cap);
 
 }  /* namespace rad */

@@ -8,12 +8,12 @@
  * exception crossing the transport is a connection closed with no body, which is the least
  * diagnosable thing a client can be handed.
  *
- * A parameter we do not support is a 400 that names it. Not a silent ignore. A client that sends
- * `logit_bias` and gets a 200 has been told its bias was applied, and the resulting bug report
- * ("the model ignores my bias") is unanswerable from the server side. The cost of strictness is
- * that a client sending a field we have not heard of gets a 400 rather than a shrug; the
- * allowlist below is where the genuinely inert OpenAI metadata fields (`user`, `store`, ...)
- * are named, so that cost falls only on fields that actually mean something.
+ * A parameter that would change the answer and is not served is a 400 that names it, not a
+ * silent ignore: a client that sends a `logit_bias` and gets a 200 has been told its bias was
+ * applied, and the bug report that follows ("the model ignores my bias") is unanswerable from the
+ * server side. Such a field is accepted at its "off" value, which is what llama.cpp-built clients
+ * send on every request. A field this server has never heard of is ignored, as llama.cpp and vLLM
+ * ignore it (oai.cpp, key vetting).
  */
 #pragma once
 #include "iface.h"
@@ -40,6 +40,11 @@ struct ApiError {
     /* The values `param` takes, when the error is a value outside a known set: `supported` in the
      * envelope, so a client can retry with one rather than parse the sentence. */
     std::vector<std::string> supported;
+    /* A prompt the context cannot hold: its length and the context's, under llama-server's names,
+     * so a client that compacts its history on overflow reads the numbers rather than the
+     * sentence. -1 leaves them out. */
+    int64_t     n_prompt_tokens = -1;
+    int64_t     n_ctx = -1;
 
     std::string dump() const;    /* the OpenAI error envelope, as a JSON string */
 };
@@ -60,6 +65,11 @@ ApiError err_overloaded(const std::string& why);
 
 enum class Endpoint { Chat, Completion, Embedding };
 
+/* WHICH API A CHAT REQUEST CAME IN THROUGH, and so which shape its answer goes out in. Every shape
+ * is parsed into the same chat request (Anthropic's is translated first, anthropic_to_chat) and
+ * served by the same path; only the bytes on the wire differ. */
+enum class ApiShape { OpenAI, Anthropic, Responses, LlamaNative };
+
 struct PromptInput {
     std::vector<int32_t> tokens;
     std::string          text;    /* the rendered prompt; needed for `echo` and for the logs */
@@ -73,13 +83,36 @@ struct OaiRequest {
     std::string id;               /* "chatcmpl-..." / "cmpl-..." */
     int64_t     created = 0;      /* unix seconds */
 
+    ApiShape shape = ApiShape::OpenAI;
     bool stream = false;
     bool include_usage = false;   /* stream_options.include_usage */
+    /* llama.cpp's streaming extras: `timings` on every chunk, not only the last; and
+     * `prompt_progress` chunks while the prompt is read. */
+    bool timings_per_token = false;
+    bool return_progress = false;
+    /* The conversation as the client names it (OpenRouter's `session_id`), "" when it names none:
+     * a label on /sessions, nothing else. */
+    std::string session_label;
+    /* The build, as OpenAI's `system_fingerprint` and llama.cpp's own: what produced the reply. */
+    std::string system_fingerprint;
 
     int             n = 1;
     SamplingParams  sp;
     int32_t         max_tokens = 0;
     std::vector<std::string> stop;
+    /* Of `stop`, how many the client sent; the rest are the chat format's own end-of-turn
+     * markers. A reply cut on one of the first is Anthropic's `stop_sequence`, on the rest its
+     * `end_turn`. */
+    size_t          n_client_stops = 0;
+    /* The assistant text a continued conversation ends in (assistant prefill), "" otherwise. The
+     * OpenAI shape answers the whole message, as llama-server does; Anthropic's answers what
+     * follows it, as Anthropic's API does. */
+    std::string     continued;
+    /* The Responses API's request fields its response object echoes (instructions, tools,
+     * tool_choice, text, reasoning, ...), as a JSON object; "" for the other shapes. */
+    std::string     echo_json;
+    /* llama-server's native /completion: the generated token ids beside the text. */
+    bool            return_tokens = false;
     /* The reasoning block's closer when the reply starts inside the block, else "": the stop
      * strings above then apply only after it (IDetokenizer::defer_stops_until). */
     std::string stops_after;
@@ -94,6 +127,9 @@ struct OaiRequest {
     bool want_logprobs = false;
 
     bool tools_present = false;
+    /* OpenAI's deprecated functions API: the request sent `functions`, so the reply carries its
+     * call as `function_call` (one at most) and ends in finish_reason "function_call". */
+    bool legacy_functions = false;
     /* FOR THE REQUEST LOG, counted while the parse walks the body anyway: the messages and tools
      * a chat request carried, and the last user message's opening (one line, bounded) that the
      * debug level prints so a log line can be matched to what was typed. Completion requests
@@ -126,6 +162,7 @@ struct OaiRequest {
 /* What the server needs to know about itself to validate a request. */
 struct OaiLimits {
     std::string model_id = "radiance";
+    std::string version;                  /* the build, for `system_fingerprint` */
     int64_t     max_ctx = 0;              /* 0 = unknown, no length check */
     /* What a request that names no max_tokens may generate. 0 is "whatever the context leaves",
      * resolved against the prompt in clamp_max_tokens, which needs max_ctx to resolve against.
@@ -250,23 +287,45 @@ struct OaiDeps {
 /* Parse. `body` is the raw request body; a malformed body is a 400 that says where. */
 int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                        OaiRequest* out, ApiError* err);
+/* `native` is llama-server's /completion: its `return_tokens`, and a prompt array of strings and
+ * token ids mixed as ONE prompt, as llama-server reads it. */
 int parse_completion_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
-                             OaiRequest* out, ApiError* err);
+                             OaiRequest* out, ApiError* err, bool native = false);
 /* Embeddings: fills `out->prompts` with one entry per input. */
 int parse_embeddings_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                              OaiRequest* out, ApiError* err);
 
 /* ================================================================== responses */
 
-struct LogprobEntry {
+/* One emitted token's logprobs as the wire carries them. `bytes` is the token's own bytes and
+ * `text` is their longest well-formed UTF-8 prefix -- a byte-level token can hold half a
+ * character, and a JSON string cannot -- llama-server's spelling. `end` is where the token's
+ * decoded text ends in the choice's text, which is what decides whether it went out before a stop
+ * string cut the reply. */
+struct LogprobAlt {
     int32_t     token = 0;
-    std::string text;
+    std::string text, bytes;
     float       logprob = 0.0f;
 };
+struct LogprobEntry {
+    int32_t     token = 0;
+    std::string text, bytes;
+    float       logprob = 0.0f;
+    std::vector<LogprobAlt> top;
+    size_t      end = 0;
+};
+
+/* The entries as a JSON array's elements, comma-joined, in OpenAI's chat shape with llama-server's
+ * `id` beside each token -- which is also llama-server's native `completion_probabilities`. */
+std::string logprobs_content(const LogprobEntry* e, size_t n);
+/* OpenAI's legacy /v1/completions `logprobs` object for the entries, `offset` the text offset of
+ * the first, with llama-server's `content` array beside the legacy arrays. */
+std::string logprobs_legacy(const LogprobEntry* e, size_t n, size_t offset);
 
 struct ChoiceOut {
     int           index = 0;
     std::string   text;          /* raw generated text */
+    std::string   stop_word;     /* the stop string that cut it, "" when none or unknown */
     ParsedMessage msg;           /* chat: content / reasoning / tool_calls after parsing */
     Finish        finish = Finish::None;
     std::vector<LogprobEntry> logprobs;
@@ -318,7 +377,30 @@ std::string text_completion_body(const OaiRequest& r, const std::vector<ChoiceOu
                                  const UsageOut& u, const TimingsOut& t = TimingsOut());
 std::string embeddings_body(const OaiRequest& r, const std::vector<std::vector<float>>& vecs,
                             const UsageOut& u);
-std::string models_body(const std::string& model_id, int64_t created);
+/* ONE MODEL ENTRY: what /v1/models lists and /v1/models/:id returns on its own. */
+struct ModelCard {
+    std::string id;
+    int64_t     created = 0;
+    /* The context the server was started with (--max-model-len, else the container's trained
+     * length), the field vLLM's model card carries. Clients size their own context from it -- an
+     * agent that compresses its history at the window's edge, a UI that shows how much is left --
+     * and without it they guess from the model's name, which is wrong whenever the deployment sets
+     * its own length. 0 leaves the field out rather than reporting a length the server does not
+     * know. */
+    int64_t     max_model_len = 0;
+    /* What the server loaded (ServerOptions::model_path), vLLM's `root`. Empty leaves it out. */
+    std::string root;
+    /* What the model can be asked for -- tools, reasoning, images -- as /server_info reports it.
+     * There is no field for it in OpenAI's model object, so without this a client learns it by
+     * sending a request and reading the refusal; the entry it already fetches can say so up
+     * front. A JSON object as text, spliced in as it is; empty leaves it out. */
+    std::string capabilities;
+};
+/* The list, for GET /v1/models. */
+std::string models_body(const ModelCard& m);
+/* The entry itself, for GET /v1/models/:id: OpenAI's retrieve answers the model object, not a
+ * list of one, and its SDK reads `id` off the top level. */
+std::string model_body(const ModelCard& m);
 
 /* The usage chunk of each endpoint's stream: an SSE event whose choices array is empty and whose
  * only payload is `usage`. Emitted when the request asked for stream_options.include_usage, ONCE
@@ -343,48 +425,170 @@ bool calls_complete(const ParsedMessage& m);
  * what it has delivered, so nothing here diffs, holds back or reconciles: a delta is the next
  * piece of the answer, and the chunks a client concatenates are the answer the buffered path
  * returns.
+ *
+ * THE WIRE SHAPE IS THE SUBCLASS'S. Reading the reply -- the reader, the message it adds up to,
+ * the finish it implies -- is the same for every API this server speaks, so it lives here once;
+ * what one increment looks like on the wire is OpenAI's chunk (ChatDeltaStream) or Anthropic's
+ * event (AnthropicStream).
  */
-class ChatDeltaStream {
+class ReplyStream {
 public:
-    ChatDeltaStream(const OaiRequest& r, int index, const IReplyParser* parser);
+    ReplyStream(const OaiRequest& r, int index, const IReplyParser* parser);
+    virtual ~ReplyStream() = default;
 
-    /* The `role: assistant` opener OpenAI clients expect before any content. */
-    std::string first_chunk();
+    /* What opens the stream: OpenAI's `role: assistant` chunk, Anthropic's message_start. */
+    virtual std::string first_chunk() = 0;
 
-    /* Feed the text generated since the last push; returns zero or more SSE `data:` lines.
+    /* Feed the text generated since the last push; returns the bytes for what it completed.
      * `is_final` says the generation is over, which resolves whatever the reader was holding. */
     std::string push(std::string_view appended, bool is_final);
 
-    /* The terminating chunk carrying finish_reason, and this choice's `timings` when they are
-     * valid -- on the final chunk whether or not the request asked for a usage chunk, as
-     * llama.cpp sends them. The usage chunk is the stream's, not the choice's: chat_usage_chunk. */
-    std::string final_chunk(Finish f, const TimingsOut& t = TimingsOut());
+    /* What closes the choice: the finish reason, and this choice's `timings` when they are valid
+     * (llama.cpp sends them on the final chunk). `u` is the request's usage, for the shapes that
+     * close a message with it. */
+    virtual std::string final_chunk(Finish f, const TimingsOut& t, const UsageOut& u) = 0;
+    /* What closes a choice the engine failed, in place of final_chunk: the shape's own failure,
+     * so a client reading to the terminal event never takes a truncated reply as complete.
+     * OpenAI's chunks have none, so theirs is the final chunk with finish_reason "error" and the
+     * error object after it. */
+    virtual std::string error_chunk(const ApiError& e, const TimingsOut& t, const UsageOut& u);
 
     /* What the whole generation parsed to -- the non-streaming shape. Complete once push has
      * been called with is_final. */
     const ParsedMessage& parsed() const { return last_; }
     Finish adjusted_finish(Finish f) const;
 
-private:
-    std::string chunk(json delta, const char* finish_reason, const TimingsOut* t = nullptr);
-    std::string emit(const std::vector<ReplyDelta>& ev);
+    /* llama.cpp's `timings_per_token`, for the shapes that carry timings. */
+    virtual void set_timings(const TimingsOut&) {}
+    /* Logprobs entries (logprobs_content's elements) for the next chunk this stream writes, for
+     * the shapes that carry them; the others drop them. */
+    virtual void add_logprobs(const std::string&) {}
 
-    /* A delta's chunk is written, not built: the frame around the delta object is the same in
-     * every one, so it is serialised once, and the delta between is written with
-     * json_quote_append. The bytes are the ones chunk() writes for the same delta. */
-    void delta_open(std::string& out);
-    void delta_close(std::string& out) const;
+protected:
+    /* The bytes for the increments one push completed. Each emitter folds every increment into
+     * `last_` through absorb() first. */
+    virtual std::string emit(const std::vector<ReplyDelta>& ev) = 0;
+    bool absorb(const ReplyDelta& d);
     static void quote(std::string& out, std::string_view s);
-    std::string head_;     /* `data: {...,"choices":[{"index":N,"delta":`, built on first use */
 
     std::unique_ptr<IReplyReader> reader_;
-    std::string id_, model_;
+    std::string id_, model_, fingerprint_;
     int64_t     created_;
     int         index_;
     bool        finished_ = false;
 
     ParsedMessage            last_;
     std::vector<ReplyDelta>  ev_;
+};
+
+/* ANTHROPIC'S MESSAGES API, translated into the chat request it means (`*chat`, a /v1/chat/completions
+ * body) so that every refusal and default is the chat endpoint's. `*label` is the conversation's
+ * label if the request carries one (metadata.user_id). Claude Code's per-request billing stamp in
+ * the system prompt is held constant, as llama-server holds it, or no turn of a conversation could
+ * reuse the one before it. */
+int anthropic_to_chat(const std::string& body, const OaiLimits& lim, std::string* chat,
+                      std::string* label, ApiError* err);
+/* The non-streaming answer, and an error, in Anthropic's shapes. */
+std::string anthropic_message_body(const OaiRequest& r, const ChoiceOut& c, const UsageOut& u);
+std::string anthropic_error_body(const ApiError& e);
+/* OPENAI'S RESPONSES API, translated into the chat request it means, as Anthropic's is. `*echo` is
+ * the request's fields the response object repeats back. previous_response_id needs responses
+ * stored server-side and is refused; tool types other than function have no chat equivalent and
+ * are left out, as llama-server leaves them out. */
+int responses_to_chat(const std::string& body, const OaiLimits& lim, std::string* chat,
+                      std::string* echo, ApiError* err);
+std::string responses_body(const OaiRequest& r, const ChoiceOut& c, const UsageOut& u);
+
+/* Anthropic's stop_reason for a finish and the stop string that caused it. */
+const char* anthropic_stop_reason(const OaiRequest& r, Finish f, const std::string& stop_word);
+
+/* OpenAI's chat.completion.chunk. */
+class ChatDeltaStream final : public ReplyStream {
+public:
+    ChatDeltaStream(const OaiRequest& r, int index, const IReplyParser* parser)
+        : ReplyStream(r, index, parser), legacy_(r.legacy_functions) {}
+    std::string first_chunk() override;
+    std::string final_chunk(Finish f, const TimingsOut& t, const UsageOut& u) override;
+
+    /* llama.cpp's `timings_per_token`: the timings the next pushes' chunks carry, beside
+     * `choices` as the final chunk carries them. Invalid timings carry nothing. */
+    void set_timings(const TimingsOut& t) override;
+    /* OpenAI's `logprobs.content` on the next chunk out: entries wait for one, because a push may
+     * complete no delta (a tool call's opening, a held-back byte) and the tokens still count. */
+    void add_logprobs(const std::string& elems) override;
+
+private:
+    std::string emit(const std::vector<ReplyDelta>& ev) override;
+    std::string chunk(json delta, const char* finish_reason, const TimingsOut* t = nullptr);
+    std::string lp_;       /* pending logprobs entries, comma-joined */
+
+    /* A delta's chunk is written, not built: the frame around the delta object is the same in
+     * every one, so it is serialised once, and the delta between is written with
+     * json_quote_append. The bytes are the ones chunk() writes for the same delta. */
+    void delta_open(std::string& out);
+    void delta_close(std::string& out);
+    std::string head_;     /* `data: {...,"choices":[{"index":N,"delta":`, built on first use */
+    std::string timings_;  /* `"timings":{...}` for every delta chunk, or "" */
+    bool        legacy_;   /* OaiRequest::legacy_functions */
+};
+
+/* ANTHROPIC'S EVENTS: message_start, then a content block a kind -- thinking, text, each tool_use
+ * -- opened, filled by deltas and stopped, then message_delta with the stop reason and the usage,
+ * and message_stop. The prefill a continued conversation ends in is not repeated (`continued`). */
+class AnthropicStream final : public ReplyStream {
+public:
+    AnthropicStream(const OaiRequest& r, int index, const IReplyParser* parser);
+    std::string first_chunk() override;
+    std::string final_chunk(Finish f, const TimingsOut& t, const UsageOut& u) override;
+    /* Anthropic's `error` event, which ends the stream with no message_stop. */
+    std::string error_chunk(const ApiError& e, const TimingsOut& t, const UsageOut& u) override;
+    /* The stop string that cut the reply, for stop_reason and stop_sequence. */
+    void set_stop_word(const std::string& w) { stop_word_ = w; }
+
+private:
+    enum class Block { None, Thinking, Text, Tool };
+    std::string emit(const std::vector<ReplyDelta>& ev) override;
+    void open(std::string& out, Block b, const ToolCall* tc);
+    void close(std::string& out);
+    static void event(std::string& out, const char* type, const json& data);
+
+    const OaiRequest* r_;
+    int64_t     n_input_ = 0;
+    std::string skip_;           /* the prefill still to be passed over */
+    std::string stop_word_;
+    Block       block_ = Block::None;
+    int         n_blocks_ = 0;   /* blocks opened so far: the next one's index */
+};
+
+/* THE RESPONSES API'S EVENTS: response.created and .in_progress; an output item a kind --
+ * reasoning, the message, each function call -- added, its content part added, filled by deltas,
+ * and done; then response.completed (or .incomplete at the token limit) with the whole response.
+ * Every event carries its output_index, content_index and sequence_number, which the OpenAI SDK's
+ * stream accumulator places deltas by. */
+class ResponsesStream final : public ReplyStream {
+public:
+    ResponsesStream(const OaiRequest& r, int index, const IReplyParser* parser);
+    std::string first_chunk() override;
+    std::string final_chunk(Finish f, const TimingsOut& t, const UsageOut& u) override;
+    /* response.failed, with the items finished so far and the error. */
+    std::string error_chunk(const ApiError& e, const TimingsOut& t, const UsageOut& u) override;
+
+private:
+    enum class Item { None, Reasoning, Message, Call };
+    std::string emit(const std::vector<ReplyDelta>& ev) override;
+    void open(std::string& out, Item k, size_t call);
+    void close(std::string& out);
+    void event(std::string& out, const char* type, json data);
+    json response(const char* status) const;
+
+    const OaiRequest* r_;
+    Item        item_ = Item::None;
+    std::string item_id_, text_;  /* the open item's id and its text so far */
+    size_t      call_ = 0;            /* the open call's index into last_.tool_calls */
+    std::vector<std::string> items_;  /* every closed item, serialised, in output order */
+    int64_t     seq_ = 0;
+    UsageOut    usage_;
+    const char* incomplete_ = nullptr;
 };
 
 /* The SSE terminator. Written once at the end of every stream, including a failed one, because a
@@ -411,6 +615,10 @@ bool        token_id(const json& v, int32_t* out);
  * and either comes back holding only what fitted, which the caller refuses. See the definition
  * for why the tree is bounded rather than the body alone. */
 json        parse_json_bounded(const std::string& body, int64_t max_ctx, bool* over, bool* deep);
+/* The body of a generation endpoint: parse_json_bounded, and a 400 saying which bound it broke or
+ * that it is not one JSON object. */
+int         parse_request_object(const std::string& body, const OaiLimits& lim, json* b,
+                                 ApiError* err);
 int64_t     json_value_budget(int64_t max_ctx);
 constexpr int kJsonMaxDepth = 1024;
 

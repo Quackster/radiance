@@ -336,7 +336,7 @@ private:
 /* ------------------------------------------------------------------ configuration */
 struct MoverConfig {
     /* Shadow slots and the staging ring are NOT here. They are budgeted by the planner out of
-     * --vram-weights-mib and reported in the plan (SlabClass::n_shadow, n_stage), and a second
+     * the weights pool and reported in the plan (SlabClass::n_shadow, n_stage), and a second
      * knob for the same quantity is a second number for the mover and the operator to disagree
      * about -- with an overrun as the direction that disagreement goes wrong in.
      *
@@ -419,7 +419,7 @@ public:
      * diagnosis.
      *
      * `budget` IS THE PRODUCTION PATH AND SHOULD ALWAYS BE PASSED. Pools already allocated
-     * --vram-weights-mib as one block; a mover that called rad_dev_alloc beside it would spend
+     * the weights pool as one block; a mover that called rad_dev_alloc beside it would spend
      * that budget TWICE and the overrun would surface as an out-of-memory from an unrelated
      * launch much later. Reserving from Pools::weights() is also what makes it structurally
      * impossible for a promotion to reach a KV block -- there is no path from the weights pool to
@@ -598,7 +598,7 @@ public:
      * grouped GEMM is handed every expert's pointer at issue -- so before a routed layer's first
      * expert op, every one of its file-tier units is read into a VRAM buffer and published there,
      * and after the layer it is published as null again (unstage_units does that half). The
-     * buffers are the two the plan charged out of --vram-weights-mib (Plan::file_stage_vram).
+     * buffers are the two the plan charged out of the weights pool (Plan::file_stage_vram).
      *
      * stage_file_units  read every unit of `units` that is on the file tier into `dst`, packed at
      *                   RAD_ALIGN_UNIT in the order given, through the pinned read windows: the
@@ -655,7 +655,7 @@ private:
     };
 
     /* One weight class's memory. The slab is two kinds of slot rather than one: the BUDGETED slots
-     * come out of --vram-weights-mib like every other weight allocation and sit at a fixed stride
+     * come out of the weights pool like every other weight allocation and sit at a fixed stride
      * from one base, and the FLEX slots past them are addresses inside another pool's memory --
      * the KV cache's carve, the activation arena's top -- lent while that pool is not using them.
      * They cannot be one range because the flex slots are scattered over every layer's stripe of

@@ -689,7 +689,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * the 16 attention layers pay it, because the 48 delta-net layers carry fixed-size state
      * instead. At eight sequences of 16k that is 4.3 GB of read traffic a step, which is most of
      * what depth costs at that concurrency, and halving the width halves it. It also halves what a
-     * sequence costs in --vram-kv-mib, which is context and batch size as well as time.
+     * sequence costs in the KV pool, which is context and batch size as well as time.
      *
      * IT IS OFF BY DEFAULT ON A QUALITY ARGUMENT, not as a precaution. Greedy continuations from a
      * long prompt agree between bf16 and fp8 for the first few hundred tokens and then diverge,

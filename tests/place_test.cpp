@@ -392,13 +392,13 @@ TEST(planner_spills_experts_before_dense_weights) {
     CHECK_OK(Planner(in).plan(&p));
 
     /* THREE resident, not four, and the fourth slot is the shadow. Spare slots come out of
-     * --vram-weights-mib like everything else in the slab -- there is nowhere else for them to
+     * the weights pool like everything else in the slab -- there is nowhere else for them to
      * come from, because --gpu-headroom-mib is memory the engine promises not to touch -- so
      * dynamic placement costs a resident unit and the report says how many. */
     CHECK_EQ(p.totals.bytes[(int)Tier::VRAM], 3 * MiB);
     CHECK_EQ(p.totals.bytes[(int)Tier::HostPinned], 6 * MiB);
     CHECK_EQ(p.slab_overhead, 1 * MiB + RAD_ALIGN_UNIT);
-    /* And the whole of it fits the budget the operator stated, which is the property that stops
+    /* And the whole of it fits the budget the plan was given, which is the property that stops
      * the mover overrunning the pool that was sized for it. */
     CHECK(p.totals.bytes[(int)Tier::VRAM] + p.slab_overhead <= p.vram_budget);
 
@@ -475,7 +475,7 @@ TEST(the_expert_floor_places_every_expert) {
         f.op("moe_gemm", d, false);
     }
     WeightFootprint wf;
-    weight_footprint(f.prog, &wf, TablePlacement::Vram, TablePlacement::Disk);
+    weight_footprint(f.prog, &wf, TablePlacement::Vram, TablePlacement::Disk, false, true);
     CHECK(wf.expert_spare > 0);
 
     const int64_t host = 100 * MiB;
@@ -633,7 +633,7 @@ TEST(planner_reads_routed_experts_it_cannot_hold_from_the_container) {
     /* The buffers are the largest layer's file-tier units, twice, at the stager's packing. */
     CHECK_EQ(p.file_layer_max, std::max(per_layer[0], per_layer[1]));
     CHECK(p.file_stage_vram >= 2 * p.file_layer_max + (int64_t)RAD_ALIGN_UNIT);
-    /* And everything the VRAM side holds fits the budget the operator stated -- the residents,
+    /* And everything the VRAM side holds fits the budget the plan was given -- the residents,
      * the shadow slots and the two buffers -- so the mover cannot overrun the pool. */
     CHECK(p.totals.bytes[(int)Tier::VRAM] + p.slab_overhead + p.file_stage_vram <= p.vram_budget);
     /* The exact prefetch's ring is not for these: the file stager reads into its own buffers. */
@@ -2169,7 +2169,7 @@ TEST(the_stager_stages_each_layer_one_layer_ahead_and_releases_it_when_the_next_
 }
 
 TEST(mover_reserves_from_the_weight_pool_rather_than_beside_it) {
-    /* THE PRODUCTION PATH. Pools has already allocated --vram-weights-mib as one block; a mover
+    /* THE PRODUCTION PATH. Pools has already allocated the weights pool as one block; a mover
      * that called the allocator beside it would spend that budget twice and the overrun would
      * surface as an out-of-memory from some unrelated launch much later. Reserving from
      * Pools::weights() is also what makes it structurally impossible for a promotion to reach a
@@ -2189,7 +2189,7 @@ TEST(mover_reserves_from_the_weight_pool_rather_than_beside_it) {
     MoverConfig mc;
     CHECK_OK(m.init(hf.f.prog, hf.plan, mc, &pools));
 
-    /* Every byte the mover took came out of the stated budgets, and none of it out of KV. */
+    /* Every byte the mover took came out of the pools' budgets, and none of it out of KV. */
     CHECK(pools.weights().used() > weights_before);
     CHECK(pools.host_pinned().used() > host_before);
     CHECK_EQ(pools.kv().used(), (int64_t)0);
@@ -2331,7 +2331,7 @@ TEST(the_weight_footprint_splits_statics_from_the_elastic_expert_plane) {
     build_moe(f, /*n=*/4, /*each=*/2 * MiB, &experts);
 
     WeightFootprint fp;
-    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk, false, true);
 
     /* One model-level weight and four experts: five units. */
     CHECK_EQ(fp.n_units, 5ll);
@@ -2361,12 +2361,12 @@ TEST(weights_in_one_layer_are_one_unit_and_are_aligned_once_each) {
     }
 
     WeightFootprint fp;
-    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk, false, true);
     CHECK_EQ(fp.n_units, 2ll);              /* the declared group is the unit, not the weight */
 
     /* ONE align_up A UNIT AND ONE INSIDE IT, which is how Mover::init spends the slab. A budget
        that summed raw bytes would be short by an alignment per unit -- on a 512-expert MoE that
-       is real memory, and the failure is an overrun of the pool the operator sized. */
+       is real memory, and the failure is an overrun of the weights pool. */
     const int64_t per_unit = align_up(align_up(odd, RAD_ALIGN_UNIT) + odd, RAD_ALIGN_UNIT);
     CHECK_EQ(fp.statics, 2 * per_unit);
     CHECK(fp.statics > 4 * odd);
@@ -2394,10 +2394,65 @@ TEST(a_weight_with_no_device_band_takes_its_whole_unit_to_the_mapped_tier) {
     f.prog.ops.push_back(host_only);
 
     WeightFootprint fp;
-    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk, false, true);
     CHECK_EQ(fp.n_units, 1ll);
     CHECK_EQ(fp.statics, 0ll);
     CHECK_EQ(fp.mapped, 6 * MiB);          /* both weights: the unit is what moves */
+}
+
+/* ON THE HOST BACKEND THE WEIGHTS POOL IS HOST MEMORY, so a weight only a host kernel reads stays in
+ * the container's mapping only when it lies there as its kernel reads it. One its host kernel
+ * widened at load has no such place, and CPU-only serving would refuse at load; it takes a copy in
+ * the pool instead, and the footprint the budget sizes that pool from counts it the same way. */
+TEST(on_the_host_backend_a_converted_host_only_weight_takes_a_pool_copy) {
+    Fixture f;
+    const rad_weight direct = f.weight("blk.0.a.weight", 4 * MiB, RAD_ACCESS_PER_TOKEN, 0, -1);
+    const rad_weight widened = f.weight("output_norm.weight", 2 * MiB, RAD_ACCESS_PER_TOKEN, -1, -1);
+    f.prog.weights[widened].widen = true;
+    for (rad_weight w : { direct, widened }) {
+        OpInfo o;
+        o.op = "host_op";
+        o.index = (int32_t)f.prog.ops.size();
+        o.weights = { w };
+        Band hb;
+        hb.hi = 1 << 20;
+        hb.dom[RAD_DOMAIN_HOST].row = &g_host_row;      /* no device band */
+        hb.miss[RAD_DOMAIN_DEVICE] = "no device kernel";
+        o.bands.push_back(hb);
+        f.prog.ops.push_back(o);
+    }
+
+    WeightFootprint card, host;
+    weight_footprint(f.prog, &card, TablePlacement::Vram, TablePlacement::Disk, false, true);
+    weight_footprint(f.prog, &host, TablePlacement::Vram, TablePlacement::Disk, true, true);
+    CHECK_EQ(card.mapped, 6 * MiB);          /* on a card both stay where a host kernel reads them */
+    CHECK_EQ(card.statics, 0ll);
+    CHECK_EQ(host.mapped, 4 * MiB);
+    CHECK_EQ(host.statics, 2 * MiB);         /* the widened one is the pool's */
+
+    Config cfg = base_config();
+    cfg.vram_weights_mib = 8;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    in.host_backend = true;
+    CHECK_OK(Planner(in).plan(&plan));
+    CHECK(plan.weight[direct].tier == Tier::Mapped);
+    CHECK(plan.weight[widened].tier == Tier::VRAM);   /* the weights pool, host memory here */
+
+    /* A CHECKPOINT SERVED DIRECTLY has no container mapping for either weight to stay in, so on
+     * the host backend both take a pool copy, and the footprint counts both: a budget sized from
+     * a footprint that left one in the mapping is a pool the planner then overfills. */
+    WeightFootprint ckpt;
+    weight_footprint(f.prog, &ckpt, TablePlacement::Vram, TablePlacement::Disk, true, false);
+    CHECK_EQ(ckpt.mapped, 0ll);
+    CHECK_EQ(ckpt.statics, 6 * MiB);
+    Plan cplan;
+    PlannerInput cin{&f.prog, &cfg, 0, 1, nullptr, 0};
+    cin.host_backend = true;
+    cin.container = false;
+    CHECK_OK(Planner(cin).plan(&cplan));
+    CHECK(cplan.weight[direct].tier == Tier::VRAM);
+    CHECK(cplan.weight[widened].tier == Tier::VRAM);
 }
 
 /* --embedding-placement. The fixture's embedding is read by an `embed_lookup`, as every arch
@@ -2441,7 +2496,7 @@ TEST(the_placement_flags_find_their_tables_by_what_reads_them) {
     add_ngram_table(f, 8 * MiB);
 
     WeightFootprint fp;
-    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk, false, true);
     CHECK_EQ(fp.embedding, 1 * MiB);
     CHECK_EQ(fp.ngram, 8 * MiB);
     CHECK(!fp.ngram_device);
@@ -2449,7 +2504,7 @@ TEST(the_placement_flags_find_their_tables_by_what_reads_them) {
     CHECK_EQ(fp.statics, 2 * 4 * MiB + 2 * MiB);
     CHECK_EQ(fp.mapped, 8 * MiB);
 
-    weight_footprint(f.prog, &fp, TablePlacement::Ram, TablePlacement::Disk);
+    weight_footprint(f.prog, &fp, TablePlacement::Ram, TablePlacement::Disk, false, true);
     CHECK_EQ(fp.embedding, 1 * MiB);
     CHECK_EQ(fp.hosted, 1 * MiB);
     CHECK_EQ(fp.statics, 2 * 4 * MiB + 1 * MiB);
@@ -2466,7 +2521,7 @@ TEST(the_placement_flags_find_their_tables_by_what_reads_them) {
     t.op("embed_lookup", {m}, false);
     t.op("logits_gemm", {m}, false);
     CHECK(!is_embedding_table(t.prog, m));
-    weight_footprint(t.prog, &fp, TablePlacement::Ram, TablePlacement::Disk);
+    weight_footprint(t.prog, &fp, TablePlacement::Ram, TablePlacement::Disk, false, true);
     CHECK_EQ(fp.embedding, 0ll);
     CHECK_EQ(fp.hosted, 0ll);
 }
@@ -2492,13 +2547,38 @@ TEST(embedding_ram_goes_to_the_pinned_pool_read_in_place_and_costs_no_vram) {
     for (rad_weight w = 2; (size_t)w < f.prog.weights.size(); ++w)
         CHECK(plan.weight[w].tier == Tier::VRAM);
 
-    /* Vram, the default, leaves it with the other weights. */
+    /* Vram leaves it with the other weights. */
     cfg.embedding_resolved = TablePlacement::Vram;
     cfg.vram_weights_mib = 10;
     Plan plan2;
     CHECK_OK(Planner(in).plan(&plan2));
     CHECK(plan2.weight[emb].tier == Tier::VRAM);
     CHECK_EQ(plan2.embedding_host_bytes, 0ll);
+}
+
+/* THE EMBEDDING'S OWN ROOM: the resolver sizes Config::embedding_host_mib on top of
+ * --host-pool-mib, so a dense model with no pool still places the table, and a pool the experts
+ * share keeps all of --host-pool-mib for them after the table is pinned. */
+TEST(embedding_ram_brings_its_own_room_beside_the_host_pool) {
+    Fixture f;
+    build_dense_lookup(f, /*layers=*/2, /*per_layer=*/4 * MiB);
+    Config cfg = base_config();
+    cfg.placement = "all_vram";
+    cfg.vram_weights_mib = 9;
+    cfg.host_pool_mib = 0;              /* no pool of weights at all */
+    cfg.embedding_host_mib = 1;
+    cfg.embedding_resolved = TablePlacement::Ram;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    CHECK(plan.weight[1].tier == Tier::HostPinned);
+    CHECK_EQ(plan.host_budget, 0ll);
+
+    cfg.host_pool_mib = 3;
+    Plan plan2;
+    CHECK_OK(Planner(in).plan(&plan2));
+    CHECK(plan2.weight[1].tier == Tier::HostPinned);
+    CHECK_EQ(plan2.host_budget, 3 * MiB);  /* --host-pool-mib, whole */
 }
 
 /* A TABLE THAT IS NOT A WHOLE NUMBER OF PAGES still leaves the report's pinned total at what the
@@ -2595,14 +2675,14 @@ TEST(an_ngram_table_a_device_kernel_reads_goes_where_the_placement_says) {
     f.op("embed_lookup_q", {t}, /*host_kernel=*/true);
 
     WeightFootprint fp;
-    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Vram);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Vram, false, true);
     CHECK(fp.ngram_device);
     CHECK(fp.ngram_host);
     CHECK_EQ(fp.ngram, 8 * MiB);
     CHECK_EQ(fp.mapped, 0ll);
     CHECK_EQ(fp.statics, 4 * MiB + 2 * MiB + 8 * MiB);
     for (TablePlacement off : { TablePlacement::Ram, TablePlacement::Disk }) {
-        weight_footprint(f.prog, &fp, TablePlacement::Vram, off);
+        weight_footprint(f.prog, &fp, TablePlacement::Vram, off, false, true);
         CHECK_EQ(fp.ngram, 8 * MiB);
         CHECK_EQ(fp.mapped, 8 * MiB);
         CHECK_EQ(fp.statics, 4 * MiB + 2 * MiB);
@@ -2646,7 +2726,7 @@ TEST(an_ngram_table_with_no_host_kernel_cannot_stay_on_disk) {
     const rad_weight t = f.weight("ngram.weight", 8 * MiB, RAD_ACCESS_VOCAB, -1, -1);
     f.op("embed_lookup_q", {t}, /*host_kernel=*/false);
     WeightFootprint fp;
-    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk, false, true);
     CHECK(fp.ngram_device);
     CHECK(!fp.ngram_host);
 }
@@ -2655,13 +2735,13 @@ TEST(an_empty_program_has_an_empty_footprint) {
     Fixture f;
     WeightFootprint fp;
     fp.statics = 1;                         /* and the out parameter is reset, not accumulated */
-    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk, false, true);
     CHECK_EQ(fp.statics, 0ll);
     CHECK_EQ(fp.experts, 0ll);
     CHECK_EQ(fp.mapped, 0ll);
     CHECK_EQ(fp.n_units, 0ll);
     /* and a null one is not a crash */
-    weight_footprint(f.prog, nullptr, TablePlacement::Vram, TablePlacement::Disk);
+    weight_footprint(f.prog, nullptr, TablePlacement::Vram, TablePlacement::Disk, false, true);
 }
 
 RAD_TEST_MAIN()

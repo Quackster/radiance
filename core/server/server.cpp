@@ -4,6 +4,7 @@
 #include "json_partial.h"
 #include "systemone.h"
 #include "rad_internal.h"
+#include "text/tokenizer.h"
 
 #include <nlohmann/json.hpp>
 
@@ -20,12 +21,13 @@ namespace server {
 struct Server::Generation {
     std::shared_ptr<Sink>         sink;
     std::unique_ptr<IDetokenizer> detok;
-    std::unique_ptr<ChatDeltaStream> delta;   /* chat streaming only */
+    std::unique_ptr<ReplyStream> delta;   /* chat streaming only, in the request's API shape */
     uint64_t    id = 0;
     int         index = 0;
     int         prompt_index = 0;
     std::string text;
     std::vector<LogprobEntry> logprobs;
+    size_t      lp_sent = 0;         /* streaming: how many of `logprobs` a chunk already carried */
     /* The reply against its reasoning block, every token the sink delivers: what
      * completion_tokens_details.reasoning_tokens reports. */
     ReasoningCount think;
@@ -37,7 +39,11 @@ struct Server::Generation {
     size_t      stops_floor = std::string::npos;
     size_t      closer_scanned = 0;
     size_t      stop_cut = std::string::npos;
+    std::string stop_word;           /* the stop string at stop_cut, "" when the decoder cut it */
     size_t      emitted = 0;         /* streaming: text already handed to the delta stream */
+    std::vector<int32_t> tokens;     /* llama-server's native shape: the ids generated */
+    size_t      tokens_sent = 0;     /* ...and how many of them a stream chunk carried */
+    int32_t     progress_sent = -1;  /* streaming: the prompt_progress last sent, -1 for none */
     bool        retired = false;     /* reap() has been said for this id, at most once */
 };
 
@@ -56,6 +62,7 @@ Server::Server(const Deps& d, const ServerOptions& o)
     : deps_(d), opt_(o),
       metrics_(o.model_id, o.max_ctx > 0 ? o.max_ctx : 32768) {
     lim_.model_id = opt_.model_id;
+    lim_.version = opt_.version;
     lim_.max_ctx = opt_.max_ctx;
     lim_.default_max_tokens = opt_.default_max_tokens;
     lim_.max_tokens_cap = opt_.max_tokens_cap;
@@ -133,14 +140,43 @@ void Server::register_routes() {
     router_.post("/v1/systemone",        [this](const HttpRequest& q) { return handle_systemone(q); });
     router_.get ("/v1/models",           [this](const HttpRequest& q) { return handle_models(q); });
     router_.get ("/v1/models/:id",       [this](const HttpRequest& q) { return handle_models(q); });
+    /* THE SAME ROUTES WITHOUT /v1, as llama-server answers them: a client configured with the
+     * bare host as its base URL appends the path alone. */
+    router_.post("/chat/completions",    [this](const HttpRequest& q) { return handle_chat(q); });
+    /* llama-server's native completion, under both of its names: /completions without /v1 is
+     * the native endpoint there, not OpenAI's. */
+    router_.post("/completion",          [this](const HttpRequest& q) { return handle_native_completion(q); });
+    router_.post("/completions",         [this](const HttpRequest& q) { return handle_native_completion(q); });
+    router_.post("/infill",              [this](const HttpRequest& q) { return handle_infill(q); });
+    router_.post("/embeddings",          [this](const HttpRequest& q) { return handle_embeddings(q); });
+    router_.get ("/models",              [this](const HttpRequest& q) { return handle_models(q); });
+    /* llama-server's: the prompt a chat request renders to, and how many tokens it is. */
+    router_.post("/apply-template",      [this](const HttpRequest& q) { return handle_apply_template(q); });
+    router_.post("/v1/chat/completions/input_tokens",
+                 [this](const HttpRequest& q) { return handle_input_tokens(q); });
+    router_.post("/chat/completions/input_tokens",
+                 [this](const HttpRequest& q) { return handle_input_tokens(q); });
+    /* Anthropic's Messages API, translated onto the chat path (anthropic_to_chat). */
+    router_.post("/v1/messages",         [this](const HttpRequest& q) { return handle_messages(q); });
+    router_.post("/v1/messages/count_tokens",
+                 [this](const HttpRequest& q) { return handle_count_tokens(q); });
+    /* OpenAI's Responses API, translated the same way (responses_to_chat). */
+    router_.post("/v1/responses",        [this](const HttpRequest& q) { return handle_responses(q); });
+    router_.post("/responses",           [this](const HttpRequest& q) { return handle_responses(q); });
+    router_.post("/v1/responses/input_tokens",
+                 [this](const HttpRequest& q) { return handle_responses_tokens(q); });
+    router_.post("/responses/input_tokens",
+                 [this](const HttpRequest& q) { return handle_responses_tokens(q); });
 
     router_.get ("/metrics",             [this](const HttpRequest& q) { return handle_metrics(q); });
     router_.get ("/health",              [this](const HttpRequest& q) { return handle_health(q); });
+    router_.get ("/v1/health",           [this](const HttpRequest& q) { return handle_health(q); });
     router_.get ("/ping",                [this](const HttpRequest& q) { return handle_ping(q); });
     router_.post("/ping",                [this](const HttpRequest& q) { return handle_ping(q); });
     router_.get ("/load",                [this](const HttpRequest& q) { return handle_load(q); });
     router_.get ("/version",             [this](const HttpRequest& q) { return handle_version(q); });
     router_.get ("/server_info",         [this](const HttpRequest& q) { return handle_server_info(q); });
+    router_.get ("/props",               [this](const HttpRequest& q) { return handle_props(q); });
 
     router_.post("/tokenize",            [this](const HttpRequest& q) { return handle_tokenize(q); });
     router_.post("/detokenize",          [this](const HttpRequest& q) { return handle_detokenize(q); });
@@ -310,7 +346,7 @@ static std::string from_peer(const std::string& peer) {
     return peer.empty() ? std::string() : " from " + peer;
 }
 
-HttpResponse Server::error_response(const ApiError& e, const std::string& peer) {
+HttpResponse Server::error_response(const ApiError& e, const std::string& peer, ApiShape shape) {
     metrics_.observe_http(e.status);
     /* A refusal is the line the operator is looking for when a client says "rejected": the
      * status, the type, the message, and who asked. 4xx is the client's doing and said at info;
@@ -321,7 +357,8 @@ HttpResponse Server::error_response(const ApiError& e, const std::string& peer) 
     else
         RAD_INFO("req refused%s -> %d %s: %s", from_peer(peer).c_str(), e.status, e.type.c_str(),
                  e.message.c_str());
-    HttpResponse r = HttpResponse::json_body(e.status, e.dump());
+    HttpResponse r = HttpResponse::json_body(
+        e.status, shape == ApiShape::Anthropic ? anthropic_error_body(e) : e.dump());
     if (e.status == 429) r.set_header("Retry-After", std::to_string(opt_.retry_after_s));
     return r;
 }
@@ -377,7 +414,7 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
             g.index = idx;
             g.prompt_index = (int)p;
             g.sink = std::make_shared<Sink>();
-            g.sink->set_has_logprobs(opt_.supports_logprobs);
+            if (r.want_logprobs) g.sink->enable_logprobs(r.n_logprobs);
             g.think.start(r.sp.reasoning);
             g.detok = deps_.tok->detokenizer(r.stop, r.preserved_tokens);
             if (!g.detok) {
@@ -400,6 +437,7 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
             rq.priority = r.priority;
             rq.stream = r.stream;
             rq.media = r.prompts[p].media;
+            rq.session_label = r.session_label;
             rq.sink = g.sink.get();
             rqs.push_back(std::move(rq));
             gens->push_back(std::move(g));
@@ -448,9 +486,32 @@ bool Server::all_done(const std::vector<Generation>& gens) const {
     return true;
 }
 
+/* A token's logprobs entry text: the bytes it adds to the reply, and the readable prefix of them. */
+static void lp_text(const ITokenizer& tok, int32_t id, std::string* text, std::string* bytes) {
+    *bytes = tok.reply_bytes(id);
+    *text = bytes->substr(0, utf8_valid_prefix(*bytes));
+}
+
+/* How many of the entries from `from` went out with the reply: under a stop string, every one
+ * whose text BEGAN before the cut -- one that straddles it contributed text the client got, and
+ * the stop string's own tokens did not -- and otherwise all of them. */
+static size_t lp_before_cut(const std::vector<LogprobEntry>& lp, size_t from, size_t cut) {
+    if (cut == std::string::npos) return lp.size() - from;
+    size_t start = from ? lp[from - 1].end : 0, n = 0;
+    for (size_t k = from; k < lp.size() && start < cut; ++k, ++n) start = lp[k].end;
+    return n;
+}
+
+static std::vector<LogprobEntry> kept_logprobs(const std::vector<LogprobEntry>& lp, size_t cut) {
+    return std::vector<LogprobEntry>(lp.begin(), lp.begin() + (long)lp_before_cut(lp, 0, cut));
+}
+
 bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
     bool progress = false;
     SinkToken buf[128];
+    /* Each read's alternatives; only a request that asked for them sizes this. */
+    thread_local std::vector<SinkAlt> alts;
+    if (r.want_logprobs) alts.resize(128 * (size_t)std::max(1, r.n_logprobs));
 
     size_t maxstop = 0;
     for (const auto& s : r.stop) maxstop = std::max(maxstop, s.size());
@@ -459,14 +520,28 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
         if (g.closed) continue;
 
         size_t n;
-        while ((n = g.sink->read(buf, 128)) > 0) {
+        while ((n = g.sink->read(buf, 128, r.want_logprobs ? alts.data() : nullptr)) > 0) {
             progress = true;
             for (size_t i = 0; i < n; ++i) {
                 g.think.push(r.sp.reasoning, buf[i].token);
+                if (r.shape == ApiShape::LlamaNative) g.tokens.push_back(buf[i].token);
                 std::string piece = g.detok->push(buf[i].token);
                 if (!piece.empty()) g.text += piece;
-                if (r.want_logprobs)
-                    g.logprobs.push_back(LogprobEntry{buf[i].token, piece, buf[i].logprob});
+                if (!r.want_logprobs) continue;
+                LogprobEntry e;
+                e.token = buf[i].token;
+                e.logprob = buf[i].logprob;
+                e.end = g.text.size();
+                lp_text(*deps_.tok, e.token, &e.text, &e.bytes);
+                const SinkAlt* a = alts.data() + i * (size_t)g.sink->alt_width();
+                for (int32_t j = 0; j < buf[i].n_alt; ++j) {
+                    LogprobAlt t;
+                    t.token = a[j].id;
+                    t.logprob = a[j].logprob;
+                    lp_text(*deps_.tok, t.token, &t.text, &t.bytes);
+                    e.top.push_back(std::move(t));
+                }
+                g.logprobs.push_back(std::move(e));
             }
         }
 
@@ -474,6 +549,7 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
          * can never find it -- it is searching text the stop string was already removed from. */
         if (maxstop && !g.closed && g.stop_cut == std::string::npos && g.detok->stopped()) {
             g.stop_cut = g.text.size();
+            g.stop_word = g.detok->stop_hit();
             g.finish = Finish::StopString;
             g.closed = true;
             progress = true;
@@ -507,8 +583,10 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
             for (const auto& s : r.stop) {
                 if (s.empty()) continue;
                 size_t at = g.text.find(s, start);
-                if (at != std::string::npos && (g.stop_cut == std::string::npos || at < g.stop_cut))
+                if (at != std::string::npos && (g.stop_cut == std::string::npos || at < g.stop_cut)) {
                     g.stop_cut = at;
+                    g.stop_word = s;
+                }
             }
             g.scanned = g.text.size();
             if (g.stop_cut != std::string::npos) {
@@ -666,7 +744,7 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
     if (submit_all(r, &gens, &err) < 0) {
         retire(gens);
         release(r.n_choices());
-        return error_response(err, req.peer);
+        return error_response(err, req.peer, r.shape);
     }
 
     for (;;) {
@@ -687,7 +765,7 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
             cancel_all(gens, false);
             retire(gens);
             release(r.n_choices());
-            return error_response(err_overloaded("the server is shutting down"), req.peer);
+            return error_response(err_overloaded("the server is shutting down"), req.peer, r.shape);
         }
         /* Wait on whichever choice is still running. Bounded, so the peer check above runs. */
         for (auto& g : gens) if (!g.closed) { g.sink->wait(); break; }
@@ -703,7 +781,8 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
         ChoiceOut c;
         c.index = g.index;
         c.finish = g.finish;
-        c.logprobs = std::move(g.logprobs);
+        c.stop_word = g.stop_word;
+        if (r.want_logprobs) c.logprobs = kept_logprobs(g.logprobs, g.stop_cut);
 
         if (r.endpoint == Endpoint::Chat) {
             /* Parse whenever there is a parser, not only when tools were sent: the same parser
@@ -758,7 +837,7 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
             e.status = 500;
             e.type = "internal_server_error";
             e.message = why;
-            return error_response(e, req.peer);
+            return error_response(e, req.peer, r.shape);
         }
     }
 
@@ -767,29 +846,169 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
     release(r.n_choices());
 
     const TimingsOut timings = timings_of(gens);
-    std::string body = r.endpoint == Endpoint::Chat
+    if (r.shape == ApiShape::LlamaNative) {
+        /* llama-server answers one result, and an array of them for several prompts. */
+        json res = json::array();
+        for (const auto& g : gens) res.push_back(native_result(r, g, g.text));
+        metrics_.observe_http(200);
+        return HttpResponse::json_body(200, json_dump(res.size() == 1 ? res[0] : res));
+    }
+    std::string body = r.shape == ApiShape::Anthropic
+                           ? anthropic_message_body(r, choices.front(), usage)
+                       : r.shape == ApiShape::Responses
+                           ? responses_body(r, choices.front(), usage)
+                       : r.endpoint == Endpoint::Chat
                            ? chat_completion_body(r, choices, usage, timings)
                            : text_completion_body(r, choices, usage, timings);
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, std::move(body));
 }
 
+/* ------------------------------------------------------------------ llama-server's native shape */
+
+/* What a request was served with, under llama-server's names: its `generation_settings`. */
+static nlohmann::ordered_json native_settings(const OaiRequest& r) {
+    const SamplingParams& sp = r.sp;
+    nlohmann::ordered_json p;
+    p["seed"]               = sp.seed;
+    p["temperature"]        = sp.temp;
+    p["top_k"]              = sp.top_k;
+    p["top_p"]              = sp.top_p;
+    p["min_p"]              = sp.min_p;
+    p["typical_p"]          = sp.typical_p;
+    p["xtc_probability"]    = sp.xtc_probability;
+    p["xtc_threshold"]      = sp.xtc_threshold;
+    p["repeat_last_n"]      = sp.penalty_last_n;
+    p["repeat_penalty"]     = sp.rep_penalty;
+    p["presence_penalty"]   = sp.pres_penalty;
+    p["frequency_penalty"]  = sp.freq_penalty;
+    p["dry_multiplier"]     = sp.dry_multiplier;
+    p["dry_base"]           = sp.dry_base;
+    p["dry_allowed_length"] = sp.dry_allowed_length;
+    p["dry_penalty_last_n"] = sp.dry_penalty_last_n;
+    p["dry_sequence_breakers"] = sp.dry_seq_breakers;
+    p["mirostat"]           = 0;
+    p["stop"]               = std::vector<std::string>(r.stop.begin(),
+                                                       r.stop.begin() + (long)std::min(r.n_client_stops, r.stop.size()));
+    p["max_tokens"]         = r.max_tokens;
+    p["n_predict"]          = r.max_tokens;
+    p["ignore_eos"]         = r.ignore_eos;
+    p["stream"]             = r.stream;
+    p["grammar"]            = sp.grammar;
+    p["n_probs"]            = r.want_logprobs ? r.n_logprobs : 0;
+    p["post_sampling_probs"] = false;
+    p["samplers"]           = sp.temp_last
+        ? std::vector<std::string>{ "penalties", "dry", "top_k", "top_p", "min_p", "typ_p", "xtc", "temperature" }
+        : std::vector<std::string>{ "penalties", "dry", "temperature", "top_k", "top_p", "min_p", "typ_p", "xtc" };
+    return p;
+}
+
+static const char* native_stop_type(Finish f) {
+    switch (f) {
+        case Finish::Stop:       return "eos";
+        case Finish::Length:     return "limit";
+        case Finish::StopString: return "word";
+        default:                 return "none";
+    }
+}
+
+/* llama-server's final result for one choice: the text, how it ended, the prompt it ran on and
+ * where the time went. A stream's last chunk is this with `content` empty -- the text went out
+ * in the chunks before it. */
+json Server::native_result(const OaiRequest& r, const Generation& g, const std::string& content) {
+    const Sink* one = g.sink.get();
+    const TimingsOut t = timings_of(&one, 1);
+    const int64_t n_prompt = (int64_t)r.prompts[(size_t)g.prompt_index].tokens.size();
+    nlohmann::ordered_json o;
+    o["index"]   = g.index;
+    o["content"] = content;
+    o["tokens"]  = r.return_tokens ? g.tokens : std::vector<int32_t>{};
+    o["id_slot"] = 0;
+    o["stop"]    = true;
+    o["model"]   = r.model;
+    o["tokens_predicted"] = g.sink->n_produced();
+    o["tokens_evaluated"] = n_prompt;
+    o["generation_settings"] = native_settings(r);
+    o["prompt"]  = r.prompts[(size_t)g.prompt_index].text;
+    o["has_new_line"] = g.text.find('\n') != std::string::npos;
+    o["truncated"] = false;
+    o["stop_type"] = native_stop_type(g.finish);
+    o["stopping_word"] = g.stop_word;
+    o["tokens_cached"] = n_prompt + g.sink->n_produced();
+    if (t.valid) o["timings"] = timings_json(t);
+    /* The whole reply's probabilities on the answer, as llama-server sends them: a stream
+     * carried them chunk by chunk instead. */
+    if (r.want_logprobs && !r.stream) {
+        const std::vector<LogprobEntry> kept = kept_logprobs(g.logprobs, g.stop_cut);
+        o["completion_probabilities"] =
+            nlohmann::ordered_json::parse("[" + logprobs_content(kept.data(), kept.size()) + "]");
+    }
+    return o;
+}
+
 /* ------------------------------------------------------------------ streaming */
 
 static std::string text_chunk(const OaiRequest& r, int index, const std::string& delta,
-                              const char* finish_reason, const TimingsOut* t = nullptr) {
+                              const char* finish_reason, const TimingsOut* t = nullptr,
+                              const std::string& logprobs = std::string()) {
     nlohmann::ordered_json ch;
     ch["text"] = delta;
     ch["index"] = index;
-    ch["logprobs"] = nullptr;
+    if (!logprobs.empty()) ch["logprobs"] = nlohmann::ordered_json::parse(logprobs);
+    else ch["logprobs"] = nullptr;
     if (finish_reason) ch["finish_reason"] = finish_reason; else ch["finish_reason"] = nullptr;
     nlohmann::ordered_json o;
     o["id"] = r.id;
     o["object"] = "text_completion";
     o["created"] = r.created;
     o["model"] = r.model;
+    if (!r.system_fingerprint.empty()) o["system_fingerprint"] = r.system_fingerprint;
     o["choices"] = nlohmann::ordered_json::array({ch});
     if (t && t->valid) o["timings"] = timings_json(*t);
+    return sse_event(o.dump());
+}
+
+/* llama-server's `prompt_progress` chunk: the endpoint's opening chunk -- an assistant role with
+ * no content, or an empty text -- carrying how much of the prompt is in the cache, of how much,
+ * how much of that the prefix cache supplied, and the time since the prompt phase began. */
+static std::string progress_chunk(const OaiRequest& r, int index, const Sink& s) {
+    nlohmann::ordered_json ch;
+    if (r.shape == ApiShape::LlamaNative) {
+        /* llama-server's native chunk carries the progress at its top level. */
+        const int64_t ta = s.t_admitted_ns();
+        nlohmann::ordered_json o;
+        o["index"] = index;
+        o["content"] = "";
+        o["tokens"] = nlohmann::ordered_json::array();
+        o["stop"] = false;
+        o["prompt_progress"] = { { "total", s.progress_total() }, { "cache", s.progress_cached() },
+                                 { "processed", s.progress_processed() },
+                                 { "time_ms", ta >= 0 ? (s.age_ns() - ta) / 1000000 : 0 } };
+        return sse_event(o.dump());
+    }
+    if (r.endpoint == Endpoint::Chat) {
+        ch["index"] = index;
+        ch["delta"] = { { "role", "assistant" }, { "content", nullptr } };
+    } else {
+        ch["text"] = "";
+        ch["index"] = index;
+        ch["logprobs"] = nullptr;
+    }
+    ch["finish_reason"] = nullptr;
+    const int64_t ta = s.t_admitted_ns();
+    nlohmann::ordered_json pp;
+    pp["total"]     = s.progress_total();
+    pp["cache"]     = s.progress_cached();
+    pp["processed"] = s.progress_processed();
+    pp["time_ms"]   = ta >= 0 ? (s.age_ns() - ta) / 1000000 : 0;
+    nlohmann::ordered_json o;
+    o["id"] = r.id;
+    o["object"] = r.endpoint == Endpoint::Chat ? "chat.completion.chunk" : "text_completion";
+    o["created"] = r.created;
+    o["model"] = r.model;
+    if (!r.system_fingerprint.empty()) o["system_fingerprint"] = r.system_fingerprint;
+    o["choices"] = nlohmann::ordered_json::array({ch});
+    o["prompt_progress"] = std::move(pp);
     return sse_event(o.dump());
 }
 
@@ -802,11 +1021,16 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
     if (submit_all(st->r, &st->gens, &err) < 0) {
         retire(st->gens);
         release(r.n_choices());
-        return error_response(err, req.peer);
+        return error_response(err, req.peer, r.shape);
     }
     if (st->r.endpoint == Endpoint::Chat)
         for (auto& g : st->gens)
-            g.delta.reset(new ChatDeltaStream(st->r, g.index, st->r.reply_parser.get()));
+            g.delta.reset(
+                st->r.shape == ApiShape::Anthropic
+                    ? (ReplyStream*)new AnthropicStream(st->r, g.index, st->r.reply_parser.get())
+                : st->r.shape == ApiShape::Responses
+                    ? (ReplyStream*)new ResponsesStream(st->r, g.index, st->r.reply_parser.get())
+                    : (ReplyStream*)new ChatDeltaStream(st->r, g.index, st->r.reply_parser.get()));
 
     HttpResponse res;
     res.status = 200;
@@ -853,6 +1077,15 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
         for (const auto& s : st->r.stop) maxstop = std::max(maxstop, s.size());
 
         for (auto& g : st->gens) {
+            /* The prompt's progress first, so a client sees it before the first token: every
+             * advance the scheduler reported, as llama-server sends one a prefill batch. */
+            if (st->r.return_progress) {
+                const int32_t done = g.sink->progress_processed();
+                if (done > g.progress_sent) {
+                    out += progress_chunk(st->r, g.index, *g.sink);
+                    g.progress_sent = done;
+                }
+            }
             /* Hold back the longest stop string minus one byte while the choice is still running:
              * otherwise the first half of a stop sequence is already on the wire by the time we
              * recognise it, and it cannot be taken back.
@@ -868,16 +1101,67 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                 if (safe <= g.emitted) continue;
             }
 
+            /* THE LOGPROBS OF THE TOKENS WHOSE TEXT THIS CHUNK CARRIES: every entry ending inside
+             * it while the choice runs, and once it is closed the rest of what went out with the
+             * reply (lp_before_cut). */
+            size_t lp_n = 0, lp_off = 0;
+            if (st->r.want_logprobs) {
+                lp_off = g.lp_sent ? g.logprobs[g.lp_sent - 1].end : 0;
+                if (g.closed)
+                    lp_n = lp_before_cut(g.logprobs, g.lp_sent, g.stop_cut);
+                else
+                    while (g.lp_sent + lp_n < g.logprobs.size() &&
+                           g.logprobs[g.lp_sent + lp_n].end <= safe) ++lp_n;
+            }
+            const LogprobEntry* lp_at = lp_n ? &g.logprobs[g.lp_sent] : nullptr;
+            g.lp_sent += lp_n;
+
+            /* llama.cpp's `timings_per_token`: this choice's timings so far on every chunk. */
+            TimingsOut now;
+            if (st->r.timings_per_token) {
+                const Sink* one = g.sink.get();
+                now = timings_of(&one, 1);
+                if (g.delta) g.delta->set_timings(now);
+            }
             if (st->r.endpoint == Endpoint::Chat) {
                 /* Only what is new: the reader keeps its own place in the reply, which is what
                  * makes a long reply cost its length rather than its length squared. */
+                if (lp_n) g.delta->add_logprobs(logprobs_content(lp_at, lp_n));
                 out += g.delta->push(std::string_view(g.text).substr(g.emitted, safe - g.emitted),
                                      g.closed);
-            } else if (safe > g.emitted) {
+            } else if (st->r.shape == ApiShape::LlamaNative) {
+                /* llama-server's native chunk: the new text, the ids that made it, the counts. */
+                if (safe > g.emitted || g.tokens.size() > g.tokens_sent || lp_n) {
+                    nlohmann::ordered_json o;
+                    o["index"] = g.index;
+                    o["content"] = g.text.substr(g.emitted, safe - g.emitted);
+                    o["tokens"] = std::vector<int32_t>(g.tokens.begin() + (long)g.tokens_sent,
+                                                       g.tokens.end());
+                    o["stop"] = false;
+                    o["id_slot"] = -1;
+                    o["tokens_predicted"] = g.sink->n_produced();
+                    o["tokens_evaluated"] =
+                        (int64_t)st->r.prompts[(size_t)g.prompt_index].tokens.size();
+                    if (st->r.timings_per_token && now.valid) o["timings"] = timings_json(now);
+                    if (lp_n)
+                        o["completion_probabilities"] = nlohmann::ordered_json::parse(
+                            "[" + logprobs_content(lp_at, lp_n) + "]");
+                    out += sse_event(o.dump());
+                    g.tokens_sent = g.tokens.size();
+                }
+            } else if (safe > g.emitted || lp_n) {
                 out += text_chunk(st->r, g.index, g.text.substr(g.emitted, safe - g.emitted),
-                                  nullptr);
+                                  nullptr, st->r.timings_per_token ? &now : nullptr,
+                                  lp_n ? logprobs_legacy(lp_at, lp_n, lp_off) : std::string());
             }
             g.emitted = safe;
+            /* A sent entry is read again only as the one before the next, for where that one
+             * starts; keeping the rest would hold ~1.7 KB a token at 20 alternatives for the
+             * whole of a long stream. */
+            if (g.lp_sent > 1) {
+                g.logprobs.erase(g.logprobs.begin(), g.logprobs.begin() + (long)(g.lp_sent - 1));
+                g.lp_sent = 1;
+            }
         }
 
         if (self->all_done(st->gens)) {
@@ -888,24 +1172,34 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                  * usage chunk still has them, as llama.cpp sends them. */
                 const Sink* one = g.sink.get();
                 const TimingsOut gt = timings_of(&one, 1);
-                if (st->r.endpoint == Endpoint::Chat) {
-                    out += g.delta->final_chunk(g.finish, gt);
-                    Finish adj = g.delta->adjusted_finish(g.finish);
-                    if (adj == Finish::Error || adj == Finish::Cancelled) overall = adj;
-                    else if (adj == Finish::ToolCalls) overall = adj;
-                } else {
-                    out += text_chunk(st->r, g.index, "", finish_reason_oai(g.finish), &gt);
-                    if (g.finish == Finish::Error) overall = Finish::Error;
-                }
                 /* A failed generation cannot become a non-200 -- the headers left long ago -- so
-                 * it travels as an error event before [DONE]. Silence would look like a normal
+                 * it travels as an error event in the stream. Silence would look like a normal
                  * end of stream and the client would use a truncated answer. */
+                ApiError e;
                 if (g.finish == Finish::Error) {
-                    ApiError e;
                     e.status = 500;
                     e.type = "internal_server_error";
                     e.message = engine_failure(*g.sink);
-                    out += sse_error(e);
+                    overall = Finish::Error;
+                }
+                if (st->r.endpoint == Endpoint::Chat) {
+                    if (auto* a = dynamic_cast<AnthropicStream*>(g.delta.get()))
+                        a->set_stop_word(g.stop_word);
+                    if (g.finish == Finish::Error) {
+                        out += g.delta->error_chunk(e, gt, u);
+                    } else {
+                        out += g.delta->final_chunk(g.finish, gt, u);
+                        const Finish adj = g.delta->adjusted_finish(g.finish);
+                        if (overall != Finish::Error &&
+                            (adj == Finish::Cancelled || adj == Finish::ToolCalls))
+                            overall = adj;
+                    }
+                } else if (st->r.shape == ApiShape::LlamaNative) {
+                    out += sse_event(json_dump(self->native_result(st->r, g, "")));
+                    if (g.finish == Finish::Error) out += sse_error(e);
+                } else {
+                    out += text_chunk(st->r, g.index, "", finish_reason_oai(g.finish), &gt);
+                    if (g.finish == Finish::Error) out += sse_error(e);
                 }
             }
             /* THE USAGE CHUNK. `stream_options.include_usage` is parsed and validated on both
@@ -922,7 +1216,9 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                                                         : text_usage_chunk(st->r, u, t);
             }
 
-            out += SSE_DONE;
+            /* Anthropic's stream ends with message_stop and the Responses API's with
+             * response.completed, which final_chunk wrote; chat completions' with [DONE]. */
+            if (st->r.shape == ApiShape::OpenAI) out += SSE_DONE;
             st->done_sent = true;
             self->record(st->r, st->gens, overall);
             self->retire(st->gens);
@@ -980,6 +1276,291 @@ HttpResponse Server::handle_chat(const HttpRequest& req) {
     }
     log_admitted(r);
     return r.stream ? streaming_completion(req, r) : blocking_completion(req, r);
+}
+
+/* llama-server's /apply-template and its token count. Both parse the request exactly as
+ * /v1/chat/completions does -- the same template defaults, the same refusals -- and stop before
+ * anything is queued, so the prompt they report is the prompt a chat request would run. */
+HttpResponse Server::handle_apply_template(const HttpRequest& req) {
+    if (!deps_.tok || !deps_.chat)
+        return error_response(err_not_implemented("rendering a chat requires a chat template; "
+                                                  "this model was loaded without one"), req.peer);
+    OaiRequest r;
+    ApiError err;
+    if (parse_chat_request(req.body, odeps_, lim_, &r, &err) < 0)
+        return error_response(err, req.peer);
+    json o;
+    o["prompt"] = r.prompts.empty() ? std::string() : r.prompts[0].text;
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(o));
+}
+
+HttpResponse Server::handle_input_tokens(const HttpRequest& req) {
+    if (!deps_.tok || !deps_.chat)
+        return error_response(err_not_implemented("rendering a chat requires a chat template; "
+                                                  "this model was loaded without one"), req.peer);
+    OaiRequest r;
+    ApiError err;
+    if (parse_chat_request(req.body, odeps_, lim_, &r, &err) < 0)
+        return error_response(err, req.peer);
+    json o;
+    o["object"] = "response.input_tokens";
+    o["input_tokens"] = r.prompts.empty() ? 0 : (int64_t)r.prompts[0].tokens.size();
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(o));
+}
+
+/* ANTHROPIC'S MESSAGES API. The request is translated into the chat request it means and parsed by
+ * the chat endpoint's own parser, so every default, refusal and template rule is that endpoint's;
+ * the answer and the errors go out in Anthropic's shapes. */
+HttpResponse Server::handle_messages(const HttpRequest& req) {
+    if (!deps_.sched || !deps_.tok)
+        return error_response(err_not_implemented("the server has no engine attached"), req.peer,
+                              ApiShape::Anthropic);
+    if (opt_.embedding_model)
+        return error_response(err_not_implemented("this is an embedding model: it serves "
+                                                  "/v1/embeddings and generates no text"),
+                              req.peer, ApiShape::Anthropic);
+    std::string chat, label;
+    ApiError err;
+    OaiRequest r;
+    if (anthropic_to_chat(req.body, lim_, &chat, &label, &err) < 0 ||
+        parse_chat_request(chat, odeps_, lim_, &r, &err) < 0)
+        return error_response(err, req.peer, ApiShape::Anthropic);
+    r.shape = ApiShape::Anthropic;
+    r.id = random_id("msg_");
+    if (r.session_label.empty()) r.session_label = label;
+    return serve_translated(req, r);
+}
+
+HttpResponse Server::serve_translated(const HttpRequest& req, OaiRequest& r) {
+    r.peer = req.peer;
+    sweep_abandoned();
+    if (!admit(r.n_choices())) {
+        metrics_.observe_rejected();
+        return error_response(err_overloaded(
+            "the admission queue is full; retry after " + std::to_string(opt_.retry_after_s) +
+            "s. The server refuses rather than queueing without bound"), req.peer, r.shape);
+    }
+    log_admitted(r);
+    return r.stream ? streaming_completion(req, r) : blocking_completion(req, r);
+}
+
+/* llama-server's NATIVE /completion: the completions parser with llama-server's prompt forms,
+ * answered in its shape (native_result). */
+HttpResponse Server::handle_native_completion(const HttpRequest& req) {
+    if (!deps_.sched || !deps_.tok)
+        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+    if (opt_.embedding_model)
+        return error_response(err_not_implemented("this is an embedding model: it serves "
+                                                  "/v1/embeddings and generates no text"),
+                              req.peer);
+    OaiRequest r;
+    ApiError err;
+    if (parse_completion_request(req.body, odeps_, lim_, &r, &err, /*native=*/true) < 0)
+        return error_response(err, req.peer);
+    r.shape = ApiShape::LlamaNative;
+    return serve_translated(req, r);
+}
+
+/* A control token by the spellings model families give it, or -1: what llama.cpp's vocabulary
+ * loader recognises the fill-in-the-middle tokens by. A spelling counts only when it is ONE token
+ * that renders as itself. */
+static int32_t special_token(const ITokenizer& tok, std::initializer_list<const char*> names) {
+    for (const char* n : names) {
+        const std::vector<int32_t> t = tok.encode(n, false, /*parse_special=*/true);
+        if (t.size() == 1 && tok.token_bytes(t[0]) == n) return t[0];
+    }
+    return -1;
+}
+
+/* llama-server's /infill: code completion between a prefix and a suffix, as llama.vim and
+ * llama.vscode ask for it, in the repository-level FIM layout (arXiv 2409.12186) llama-server
+ * builds -- the extra files each under its name, then prefix, suffix and middle:
+ *
+ *   [REPO]myproject\n [SEP]name\n text ... [SEP]filename\n [PRE]prefix+prompt [SUF]suffix [MID]
+ *
+ * A model with no fill-in-the-middle tokens cannot do it and is refused. The completion itself is
+ * a native one, with every native field. */
+HttpResponse Server::handle_infill(const HttpRequest& req) {
+    if (!deps_.sched || !deps_.tok)
+        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+    const ITokenizer& tok = *deps_.tok;
+    const int32_t pre = special_token(tok, { "<|fim_prefix|>", "<fim_prefix>", "<fim-prefix>",
+                                             "<｜fim▁begin｜>", "<PRE>", "▁<PRE>", "<|code_prefix|>" });
+    const int32_t suf = special_token(tok, { "<|fim_suffix|>", "<fim_suffix>", "<fim-suffix>",
+                                             "<｜fim▁hole｜>", "<SUF>", "▁<SUF>", "<|code_suffix|>" });
+    const int32_t mid = special_token(tok, { "<|fim_middle|>", "<fim_middle>", "<fim-middle>",
+                                             "<｜fim▁end｜>", "<MID>", "▁<MID>", "<|code_middle|>" });
+    if (pre < 0 || suf < 0 || mid < 0)
+        return error_response(err_not_implemented("this model has no fill-in-the-middle tokens, "
+                                                  "so /infill cannot be served"), req.peer);
+    const int32_t rep = special_token(tok, { "<|repo_name|>", "<|fim_repo|>", "<fim-repo>",
+                                             "<reponame>", "<REPO>" });
+    const int32_t sep = special_token(tok, { "<|file_sep|>", "<|fim_sep|>", "<fim-sep>",
+                                             "<file_sep>", "<filename>" });
+
+    json b;
+    {
+        ApiError e;
+        if (parse_request_object(req.body, lim_, &b, &e) < 0) return error_response(e, req.peer);
+    }
+    auto text_of = [&](const char* k, std::vector<int32_t>* out, ApiError* e) {
+        auto it = b.find(k);
+        if (it == b.end() || it->is_null()) return true;
+        if (it->is_string()) {
+            *out = tok.encode(it->get<std::string>(), false, false);
+            return true;
+        }
+        if (it->is_array()) {
+            for (const json& v : *it) {
+                int32_t id = 0;
+                if (v.is_string()) {
+                    const std::vector<int32_t> t = tok.encode(v.get<std::string>(), false, false);
+                    out->insert(out->end(), t.begin(), t.end());
+                } else if (v.is_number_integer() && token_id(v, &id)) {
+                    out->push_back(id);
+                } else {
+                    *e = err_bad(k, "expected a string, or strings and token ids");
+                    return false;
+                }
+            }
+            return true;
+        }
+        *e = err_bad(k, "expected a string");
+        return false;
+    };
+    ApiError err;
+    std::vector<int32_t> prefix, suffix, prompt;
+    if (!text_of("input_prefix", &prefix, &err) || !text_of("input_suffix", &suffix, &err) ||
+        !text_of("prompt", &prompt, &err))
+        return error_response(err, req.peer);
+
+    std::vector<int32_t> extra;
+    if (rep >= 0) {
+        extra.push_back(rep);
+        const std::vector<int32_t> t = tok.encode("myproject\n", false, false);
+        extra.insert(extra.end(), t.begin(), t.end());
+    }
+    auto ex = b.find("input_extra");
+    if (ex != b.end() && ex->is_array()) {
+        for (const json& c : *ex) {
+            if (!c.is_object()) continue;
+            auto fn = c.find("filename"), tx = c.find("text");
+            if ((fn != c.end() && !fn->is_null() && !fn->is_string()) ||
+                (tx != c.end() && !tx->is_null() && !tx->is_string()))
+                return error_response(err_bad("input_extra[]", "filename and text must be strings"),
+                                      req.peer);
+            const std::string name = fn != c.end() && fn->is_string() ? fn->get<std::string>() : "tmp";
+            std::vector<int32_t> t;
+            if (sep >= 0) {
+                extra.push_back(sep);
+                t = tok.encode(name + "\n", false, false);
+            } else {
+                t = tok.encode("\n\n--- snippet ---\n\n", false, false);
+            }
+            extra.insert(extra.end(), t.begin(), t.end());
+            t = tok.encode(tx != c.end() && tx->is_string() ? tx->get<std::string>() : std::string(),
+                           false, false);
+            extra.insert(extra.end(), t.begin(), t.end());
+        }
+    }
+    if (sep >= 0) {
+        extra.push_back(sep);
+        const std::vector<int32_t> t = tok.encode("filename\n", false, false);
+        extra.insert(extra.end(), t.begin(), t.end());
+    }
+
+    /* THE EXTRA FILES GIVE WAY FIRST, newest kept, when the whole does not fit beside what the
+     * reply may generate: they are context, and the prefix and suffix are the edit. */
+    int64_t reserve = 256;
+    for (const char* k : { "max_tokens", "n_predict" }) {
+        auto it = b.find(k);
+        if (it == b.end() || it->is_null()) continue;
+        if (!it->is_number_integer())
+            return error_response(err_bad(k, "expected an integer"), req.peer);
+        reserve = it->get<int64_t>();
+    }
+    if (reserve <= 0) reserve = 256;
+    const ITokenizer::VocabInfo vi = tok.vocab_info();
+    const int64_t fixed = (int64_t)(prefix.size() + prompt.size() + suffix.size()) + 3 +
+                          (vi.add_bos && vi.bos >= 0 ? 1 : 0);
+    if (opt_.max_ctx > 0) {
+        const int64_t room = std::max<int64_t>(opt_.max_ctx - fixed - reserve, 0);
+        if ((int64_t)extra.size() > room) extra.erase(extra.begin(), extra.end() - room);
+    }
+    std::vector<int32_t> ids;
+    if (vi.add_bos && vi.bos >= 0) ids.push_back(vi.bos);
+    ids.insert(ids.end(), extra.begin(), extra.end());
+    ids.push_back(pre);
+    ids.insert(ids.end(), prefix.begin(), prefix.end());
+    ids.insert(ids.end(), prompt.begin(), prompt.end());
+    ids.push_back(suf);
+    ids.insert(ids.end(), suffix.begin(), suffix.end());
+    ids.push_back(mid);
+
+    for (const char* k : { "input_prefix", "input_suffix", "input_extra", "prompt" }) b.erase(k);
+    b["prompt"] = ids;
+    OaiRequest r;
+    if (parse_completion_request(b.dump(), odeps_, lim_, &r, &err, /*native=*/true) < 0)
+        return error_response(err, req.peer);
+    r.shape = ApiShape::LlamaNative;
+    return serve_translated(req, r);
+}
+
+/* OPENAI'S RESPONSES API, as the Messages API: translated into the chat request it means, served
+ * by the chat path, answered as a response object or its event stream. */
+HttpResponse Server::handle_responses(const HttpRequest& req) {
+    if (!deps_.sched || !deps_.tok)
+        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+    if (opt_.embedding_model)
+        return error_response(err_not_implemented("this is an embedding model: it serves "
+                                                  "/v1/embeddings and generates no text"),
+                              req.peer);
+    std::string chat, echo;
+    ApiError err;
+    OaiRequest r;
+    if (responses_to_chat(req.body, lim_, &chat, &echo, &err) < 0 ||
+        parse_chat_request(chat, odeps_, lim_, &r, &err) < 0)
+        return error_response(err, req.peer);
+    r.shape = ApiShape::Responses;
+    r.id = random_id("resp_");
+    r.echo_json = std::move(echo);
+    return serve_translated(req, r);
+}
+
+HttpResponse Server::handle_responses_tokens(const HttpRequest& req) {
+    if (!deps_.tok || !deps_.chat)
+        return error_response(err_not_implemented("rendering a chat requires a chat template; "
+                                                  "this model was loaded without one"), req.peer);
+    std::string chat;
+    ApiError err;
+    OaiRequest r;
+    if (responses_to_chat(req.body, lim_, &chat, nullptr, &err) < 0 ||
+        parse_chat_request(chat, odeps_, lim_, &r, &err) < 0)
+        return error_response(err, req.peer);
+    json o;
+    o["object"] = "response.input_tokens";
+    o["input_tokens"] = r.prompts.empty() ? 0 : (int64_t)r.prompts[0].tokens.size();
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(o));
+}
+
+HttpResponse Server::handle_count_tokens(const HttpRequest& req) {
+    if (!deps_.tok || !deps_.chat)
+        return error_response(err_not_implemented("rendering a chat requires a chat template; "
+                                                  "this model was loaded without one"), req.peer,
+                              ApiShape::Anthropic);
+    std::string chat;
+    ApiError err;
+    OaiRequest r;
+    if (anthropic_to_chat(req.body, lim_, &chat, nullptr, &err) < 0 ||
+        parse_chat_request(chat, odeps_, lim_, &r, &err) < 0)
+        return error_response(err, req.peer, ApiShape::Anthropic);
+    json o;
+    o["input_tokens"] = r.prompts.empty() ? 0 : (int64_t)r.prompts[0].tokens.size();
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(o));
 }
 
 HttpResponse Server::handle_completion(const HttpRequest& req) {
@@ -1279,8 +1860,14 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
         e.message = "no such model: " + id;
         return error_response(e, req.peer);
     }
+    ModelCard c;
+    c.id = opt_.model_id;
+    c.created = started_at_;
+    c.max_model_len = opt_.max_ctx;
+    c.root = opt_.model_path;
+    c.capabilities = capabilities().dump();
     metrics_.observe_http(200);
-    return HttpResponse::json_body(200, models_body(opt_.model_id, started_at_));
+    return HttpResponse::json_body(200, id.empty() ? models_body(c) : model_body(c));
 }
 
 HttpResponse Server::handle_metrics(const HttpRequest&) {

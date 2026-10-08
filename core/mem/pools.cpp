@@ -199,22 +199,20 @@ int Pools::configure(const Config& cfg, int64_t vram_capacity,
     const int64_t MiB = 1024 * 1024;
     const int64_t w  = cfg.vram_weights_mib  * MiB;
     const int64_t kv = cfg.vram_kv_mib       * MiB;
-    const int64_t hp = cfg.host_pool_mib     * MiB;
+    const int64_t hp = (cfg.host_pool_mib + cfg.embedding_host_mib) * MiB;
 
-    /* THE BUDGETS ARE RESOLVED BEFORE THIS RUNS AND THIS DOES NOT RE-DECIDE THEM. Either the
-     * operator stated them or core/mem/vram_budget.cpp derived them from the card, the measured
-     * driver residency and the computed arena -- and either way they arrive here as two numbers
-     * with a report behind them. Either way this component refuses rather than shrinking
-     * anything: an engine that quietly re-optimises a split is an engine whose
-     * benchmarks do not reproduce (spec §6). A zero here means the resolver was never called,
-     * which is a wiring bug and gets named as one. */
+    /* THE BUDGETS ARE RESOLVED BEFORE THIS RUNS AND THIS DOES NOT RE-DECIDE THEM.
+     * core/mem/vram_budget.cpp derived them from the card, the measured driver residency and the
+     * computed arena, and they arrive here as two numbers with a report behind them. This
+     * component refuses rather than shrinking anything: an engine that quietly re-optimises a
+     * split is an engine whose benchmarks do not reproduce (spec §6). A zero here means the
+     * resolver was never called, which is a wiring bug and gets named as one. */
     std::string missing;
     if (cfg.vram_weights_mib <= 0) missing += "  vram_weights resolved to 0 MiB\n";
     if (cfg.vram_kv_mib      <= 0) missing += "  vram_kv resolved to 0 MiB\n";
     if (!missing.empty()) {
-        fit_report_ = "VRAM pool budgets are empty -- state --vram-weights-mib / --vram-kv-mib, or "
-                      "let the card be split from --gpu-headroom-mib and --host-pool-mib:\n"
-                      + missing;
+        fit_report_ = "VRAM pool budgets are empty: the budget resolver (core/mem/vram_budget.cpp) "
+                      "did not run before the pools were configured:\n" + missing;
         RAD_ERR("%s", fit_report_.c_str());
         return RAD_E_INVAL;
     }
@@ -230,37 +228,13 @@ int Pools::configure(const Config& cfg, int64_t vram_capacity,
             "  total          %10s\n"
             "  card total     %10s\n"
             "  OVER BY        %10s\n"
-            "Lower --vram-weights-mib / --vram-kv-mib, or state neither and let the card be split "
-            "from --gpu-headroom-mib and --host-pool-mib (spec §6).\n",
+            "The resolved split is larger than the card, which the resolver does not produce: a "
+            "wiring bug (spec §6).\n",
             humanb(w).c_str(), humanb(kv).c_str(),
             humanb(want).c_str(), humanb(vram_capacity).c_str(),
             humanb(want - vram_capacity).c_str());
         RAD_ERR("%s", fit_report_.c_str());
         return RAD_E_NOMEM;
-    }
-
-    /* THE SLACK IS NAMED, because nothing else will name it -- and after the resolver ran there
-     * should be almost none. `vram_capacity` is totalGlobalMem: it is not the free VRAM and it is
-     * not the sum of the budgets. What is left over here is the driver's residency, the activation
-     * arena, --gpu-headroom-mib, and whatever MiB rounding could not place; vram_budget.cpp's
-     * report breaks that down term by term. A budget a couple of GiB under the card is that much
-     * of the expert plane streaming from host memory instead, which costs real prefill throughput
-     * on a model whose experts do not fit.
-     *
-     * THIS IS FOR A STATED BUDGET AND ONLY FOR ONE. A size threshold cannot tell the two apart: a
-     * small dense model whose cache is already at the largest context it can address leaves many
-     * GiB that NOTHING can spend, and warning there would tell the operator to leave unset the
-     * very flags they already left unset. Where the resolver made the split it has already printed
-     * every term including the unusable one, and there is nothing to add. */
-    if (vram_capacity > 0 && !cfg.vram_budget_derived) {
-        const int64_t slack = vram_capacity - want;
-        if (slack >= 1024 * MiB)
-            RAD_WARN("VRAM budgets total %s of the card's %s, so %s is neither budgeted nor "
-                     "accounted. The driver's context, the activation arena and "
-                     "--gpu-headroom-mib come out of it; anything past those is throughput on the "
-                     "floor. Leave --vram-weights-mib / --vram-kv-mib unset to have the card split "
-                     "automatically.",
-                     humanb(want).c_str(), humanb(vram_capacity).c_str(), humanb(slack).c_str());
     }
 
     int st = RAD_OK;

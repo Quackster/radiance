@@ -648,6 +648,40 @@ TEST(an_op_with_no_host_kernel_is_a_miss_per_band_not_a_failure) {
     CHECK(host_miss);
 }
 
+/* A DEVICE HOLE IS DECIDED PER INSTANCE. Two declarations of one op, one with a weight and one
+ * without, are two instances with bands of their own: the weighted one's device miss is covered
+ * by its host kernel, because the planner moves it to the host by placing its weight there, and
+ * on a card only the weightless instance's miss is a hole. */
+TEST(a_device_hole_is_decided_per_instance) {
+    Program p;
+    p.ops.resize(3);
+    p.ops[1].op = "rmsnorm";                          /* no weight */
+    p.ops[1].index = 1;
+    p.ops[2].op = "rmsnorm";
+    p.ops[2].index = 2;
+    p.ops[2].weights = { 1 };
+    auto miss = [](int32_t index, int domain) {
+        Program::Miss m;
+        m.op = "rmsnorm";
+        m.span = "M <= 64";
+        m.why = "no kernel matched";
+        m.domain = domain;
+        m.index = index;
+        return m;
+    };
+    p.misses.push_back(miss(2, RAD_DOMAIN_DEVICE));   /* the weighted one; its host kernel exists */
+    CHECK_EQ((int)p.device_holes(false).size(), 0);
+
+    p.misses.push_back(miss(1, RAD_DOMAIN_DEVICE));   /* the weightless one */
+    CHECK_EQ((int)p.device_holes(false).size(), 1);
+    CHECK_EQ(p.device_holes(false)[0]->index, 1);
+    CHECK_EQ((int)p.device_holes(true).size(), 0);    /* the host backend runs both on the host */
+
+    p.misses.push_back(miss(2, RAD_DOMAIN_HOST));     /* no host kernel for the weighted one */
+    CHECK_EQ((int)p.device_holes(true).size(), 1);
+    CHECK_EQ(p.device_holes(true)[0]->index, 2);
+}
+
 /* ================================================================== init, after the whole graph */
 TEST(a_refusing_init_becomes_a_miss_and_not_an_abort) {
     NEED_PLUGIN(reg)

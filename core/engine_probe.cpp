@@ -114,9 +114,10 @@ static void dump_row(int step, const char* phase, const char* name, uint32_t dty
      * WHY THAT IS ENOUGH FOR A KL DIVERGENCE, with no log-sum-exp anywhere. Renormalised over a
      * fixed candidate set S, p~_i = exp(l_i) / sum_{j in S} exp(l_j) -- the partition function
      * over the WHOLE vocabulary cancels, in both engines independently. So a top-K KLD against
-     * another engine's top-K logprobs needs only these logits. An OpenAI `logprobs` FIELD would
-     * need the normaliser, and `supports_logprobs` is false; this is a probe, and it says so by
-     * being an environment variable at -vv rather than a response field. */
+     * another engine's top-K logprobs needs only these logits. The OpenAI `logprobs` field carries
+     * the normaliser (sample_logprobs) and only the RAW distribution's top 20; this reads the
+     * plane the pick drew from, which is a probe, and it says so by being an environment variable
+     * at -vv rather than a response field. */
     static const int head = [] {
         const char* s = std::getenv("RADIANCE_DUMP_HEAD");
         const long v = (s && *s) ? std::strtol(s, nullptr, 10) : 0;
@@ -156,8 +157,8 @@ static void dump_row(int step, const char* phase, const char* name, uint32_t dty
      * writing different code -- so the question a LOSSY LEVER asks ("how much worse, if at all")
      * needs an instrument of its own.
      *
-     * WHY THIS SHAPE AND NOT A PERPLEXITY. The server returns no logprobs (`supports_logprobs` is
-     * never set, so it refuses them) and a served prefill produces logits only at the rows
+     * WHY THIS SHAPE AND NOT A PERPLEXITY. The server's logprobs are the generated positions'
+     * only -- never the prompt's -- and a served prefill produces logits only at the rows
      * `out_ids` names; the teacher-forced scoring pass is the KL mode's (core/kld.h), which runs in
      * place of the server. What a serving engine offers: send N distinct prompts at max_tokens = 1,
      * and every build under comparison sees IDENTICAL inputs at one row each. The top of that row,

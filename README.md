@@ -1,7 +1,8 @@
 # radiance
 
-An LLM inference server for AMD GPUs, in C++ and HIP, with an OpenAI-compatible HTTP API. Model
-architectures, kernel libraries and quantisers are `.so` plugins; the ones in this tree are built
+An LLM inference server for AMD GPUs, in C++ and HIP. Its HTTP API speaks OpenAI's chat, completions
+and Responses APIs, Anthropic's Messages API and llama-server's native one, so their clients and
+SDKs work unchanged. Model architectures, kernel libraries and quantisers are `.so` plugins; the ones in this tree are built
 and loaded the same way a third party's are ([`docs/PLUGIN.md`](docs/PLUGIN.md)).
 
 The bundled device kernels (`libr4d`) target **AMD RDNA4** (`gfx1200`, `gfx1201`). The serve flags
@@ -76,7 +77,13 @@ cmake --install build --prefix /opt/radiance # optional; bin/, include/, share/r
 ```sh
 export RADIANCE_HOME=$PWD/build/radiance_home   # the plugins; an installed prefix finds its own
 build/bin/radiance --model /srv/models/rad/minicpm5-2b-fp8.rad --port 8000 <flags>
+build/bin/radiance --model StillDeadcode/minicpm5-2b-fp8 --port 8000 <flags>
 ```
+
+`--model` also takes a Hugging Face repo id, as vLLM does. The server fetches the repo with `curl`
+and `jq` into `~/.cache/radiance/hf` (`--download-dir` puts it elsewhere), serves the container it
+holds, and checks it for changes at every start; a start that cannot reach the hub serves the copy
+it has. The Docker image has neither tool, so with Docker download the file as shown above.
 
 These are the flags each model is served with. They match its compose file, minus Flash-Next's
 prefix-cache tiers:
@@ -100,10 +107,10 @@ At `--tp 4` the gated residual's write carries the exact all-reduce, with the Mo
 of it, on decode and verify steps; a prefill chunk runs the unfused chain. That chain's exact
 all-reduce is one-shot up to 1 MiB a message and two-shot above that, which sends half the bytes
 on a prefill chunk; both produce the same bits. The row above runs exact.
-`--tp-wire wht6` at four ranks selects a different lossy wire, tiered int8 over the two-shot,
-above `--tp-wire-min-kb`. Eight ranks have no lossy wire, so `--tp 8 --tp-wire wht6` stops at
-startup naming the all-reduce. Four ranks is a capacity configuration; its per-step rate against
-`--tp 2` on the same cards has not been measured. The
+`--tp-wire wht6` at three and four ranks selects a different lossy wire, tiered int8 over the
+two-shot, above `--tp-wire-min-kb`. Eight ranks have no lossy wire, so `--tp 8 --tp-wire wht6`
+stops at startup naming the all-reduce. Four ranks is a capacity configuration; its per-step rate
+against `--tp 2` on the same cards has not been measured. The
 tiering flags are the tp2 recipe carried over. Above two ranks each rank still owns a **slice of
 every expert's width** — each parity's 128-column blocks are cut contiguously over the ranks and the
 odd block alternates with the parity, so every rank's share is whole blocks and every block has
@@ -114,7 +121,7 @@ above pins 4 × 12 GiB = 48 GiB, and the amdgpu driver caps pinned memory at `tt
 of RAM by default: that row needs 96 GiB of RAM or a raised limit
 ([`docs/GUIDE.md`](docs/GUIDE.md) §7).
 
-Add `--api-key KEY` to require `Authorization: Bearer KEY`. Add `--debug-graph` to print every op
+Add `--api-key KEY` to require `Authorization: Bearer KEY` (or `X-Api-Key: KEY`). Add `--debug-graph` to print every op
 and the kernel it resolved to, then exit without serving. Then:
 
 ```sh

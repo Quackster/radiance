@@ -424,8 +424,7 @@ int64_t KVManager::zero_blocks(const KVGroupPlan& p, int64_t tokens) const {
 }
 
 int KVManager::carve_into(Pool& kv_pool) {
-    /* The pool is whatever the operator stated or the resolver derived; nothing here re-decides
-     * it. What this does decide is how the groups share it, which is arithmetic, not policy. */
+    /* The pool is what the resolver derived; nothing here re-decides it. What this does decide is how the groups share it, which is arithmetic, not policy. */
     const int64_t budget_bytes = kv_pool.avail();
     const int64_t fixed        = fixed_;
     pool_base_ = kv_pool.base();
@@ -434,10 +433,11 @@ int KVManager::carve_into(Pool& kv_pool) {
     if (fixed >= budget_bytes) {
         RAD_ERR("vram_kv does not fit its fixed costs:\n"
                 "  linear/conv state  %10s  (%lld sequences)\n"
-                "  --vram-kv-mib      %10s\n"
+                "  vram_kv            %10s\n"
                 "  SHORT BY           %10s\n"
-                "Lower --max-seqs or raise --vram-kv-mib. The engine will not shrink one of them "
-                "for you (spec §6).",
+                "Lower --max-num-seqs, or give the cache more of the card: a smaller "
+                "--gpu-headroom-mib or a larger --host-pool-mib. The engine will not shrink one of "
+                "them for you (spec §6).",
                 humanb(fixed).c_str(), (long long)max_seqs_, humanb(budget_bytes).c_str(),
                 humanb(fixed - budget_bytes + 1).c_str());
         return RAD_E_NOMEM;
@@ -459,8 +459,8 @@ int KVManager::carve_into(Pool& kv_pool) {
         }
         if (p.n_blocks <= 0) {
             RAD_ERR("KV group '%s': a %s KV pool leaves 0 blocks (%s a page) after the fixed "
-                    "linear/conv costs of %s. Raise --vram-kv-mib or --host-pool-mib, or lower "
-                    "--max-seqs.",
+                    "linear/conv costs of %s. Raise --host-pool-mib or lower --gpu-headroom-mib, or "
+                    "lower --max-num-seqs.",
                     p.name.c_str(), humanb(budget_bytes).c_str(),
                     humanb(p.bytes_per_block).c_str(), humanb(fixed).c_str());
             return RAD_E_NOMEM;

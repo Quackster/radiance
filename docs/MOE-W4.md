@@ -243,8 +243,7 @@ its Hessians in the model's own domain; a rotated recipe's GPTQ reads them rotat
 Whole experts per rank, which a calibration run wants anyway. A step reads about 100 GiB a rank from
 the drive and grows only slowly with what it carries -- 50 s at ~32K tokens, 59 s at ~55K -- so
 drive it with large prefill steps: `--max-num-batched-tokens 65536 --max-num-seqs 64`, about 96
-requests in flight, with a KV pool that holds 64 sequences' recurrent state (`--vram-kv-mib`
-states it outright). That records ~930 tokens a second, ten million tokens in three hours.
+requests in flight, with a KV pool that holds 64 sequences' recurrent state. That records ~930 tokens a second, ten million tokens in three hours.
 
 **The corpus is what the Hessian is of, so it has to look like the traffic.** A few thousand
 tokens of one repeated sentence gives a Gram whose energy sits in a handful of directions, and GPTQ

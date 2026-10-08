@@ -788,6 +788,20 @@ extern "C" int r4d_shape_sample_argmax(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+extern "C" int r4d_shape_sample_logprobs(const RadParam* p, int n_p, int operand,
+                                         RadOpdDesc* out) {
+
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t nv = pi(p, n_p, "n_vocab");
+    const int64_t k  = pi(p, n_p, "k");
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_F32, M, nv),
+        opd_sample_params(M),
+        opd((uint32_t)RAD_F32, M, 2 + 2 * k),
+    };
+    R4D_PICK(l);
+}
+
 /* top_p, min_p, typical and xtc: the same three operands, narrowed in place. */
 extern "C" int r4d_shape_sample_narrow(const RadParam* p, int n_p, int operand,
                                        RadOpdDesc* out) {

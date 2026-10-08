@@ -1,0 +1,88 @@
+# swift15-w4nl64-i8-hc8m.recipe -- ukisai's Swift 1.5 finetune of Qwen3.8-Flash-Next by the
+# production recipe (qwen4exp-w4nl64-i8-hc8m.recipe), with the protected experts chosen from the
+# finetune's own recording. Every rule below the protected ones is that recipe's: the routed experts
+# as rotated u4 codes into the w4nl codebook with one E4M3 scale a (row, 64 of K) under a fixed f32
+# of 2^-13 (libr4d's w4nl64a8h), the codes chosen by GPTQ and three sweeps of coordinate descent;
+# sixteen protected experts plain bf16; the trunk's block linears and the lm_head int8, served W8A8;
+# the connections' mixing matrices and the MTP head's fc matrices E4M3; the n-gram table at one
+# fixed E4M3 scale.
+#
+# The base model's KL figures are not this model's; it has not been measured against its bf16 self.
+#
+#   CALIB=DIR rad-convert <Swift1.5-Qwen3.8-Flash-Next checkpoint> \
+#       --recipe data/recipes/swift15-w4nl64-i8-hc8m.recipe -o swift15-w4nl64-i8lm.rad
+#
+# DIR holds the Grams recorded from the finetune's bf16 model at one million tokens of the
+# calibration corpus with the per-expert tap: each layer's pooled Grams and each expert's own down
+# Gram, side by side (docs/MOE-W4.md, "Calibration"). The finetune changed only the attention,
+# delta-net and shared-expert projections; its routed experts are the base model's bytes, so a
+# --reuse of the base container with --changed copies everything else that reads unchanged tensors
+# under unchanged rules, and quantises the experts again against these Grams.
+#
+# Everything not named here is served as the checkpoint holds it; the first rule that matches a
+# weight decides it.
+
+# The protected experts, by the base recipe's rule applied to the finetune's own recording: an
+# expert whose share of its layer's down-input energy is at least 3% and at least three times its
+# share of the routing, and on each half of the layer's experts an even count, by adding that
+# half's next most energetic expert. The finetune's attention drives the early layers' super
+# experts the base model never fired on this corpus -- layer 4's expert 108 carries 15.8% of its
+# layer's down-input energy from 0.18% of the routing, layer 2's 322 6.2% -- and layers 34 and 44
+# drop below the bar; layer 47's 445 carries 67%.
+blk.2.ffn_*_exps.322.weight          cast dtype=bf16
+blk.2.ffn_*_exps.413.weight          cast dtype=bf16
+blk.4.ffn_*_exps.108.weight          cast dtype=bf16
+blk.4.ffn_*_exps.168.weight          cast dtype=bf16
+blk.4.ffn_*_exps.373.weight          cast dtype=bf16
+blk.4.ffn_*_exps.426.weight          cast dtype=bf16
+blk.14.ffn_*_exps.169.weight         cast dtype=bf16
+blk.14.ffn_*_exps.212.weight         cast dtype=bf16
+blk.42.ffn_*_exps.43.weight          cast dtype=bf16
+blk.42.ffn_*_exps.124.weight         cast dtype=bf16
+blk.46.ffn_*_exps.290.weight         cast dtype=bf16
+blk.46.ffn_*_exps.392.weight         cast dtype=bf16
+blk.47.ffn_*_exps.122.weight         cast dtype=bf16
+blk.47.ffn_*_exps.143.weight         cast dtype=bf16
+blk.47.ffn_*_exps.399.weight         cast dtype=bf16
+blk.47.ffn_*_exps.445.weight         cast dtype=bf16
+
+# Every other routed expert, trunk and MTP layer alike: u4 codes into the w4nl table, rotated by
+# the 128-wide Hadamard, an E4M3 scale a group of 64 under the fixed 2^-13 searched for least error
+# as stored, the codes chosen by GPTQ against $CALIB and then swept three times by coordinate
+# descent. The experts' scales sit between 2^-15 and 2^-10.6, inside E4M3's normal range under
+# 2^-13 with four binades either side; one past its top would be held there and said on stderr.
+# The MTP layer has no recording and is rounded to nearest, which libquant says on stderr.
+blk.*.ffn_*_exps.*.weight            gptq table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$CALIB
+
+# Every connection's two mixing matrices -- the 96 trunk connections, the final mixer and the MTP
+# head's three -- as E4M3 rows with an f32 scale a group of each row. A 128x128 block cannot cover
+# them: lowrank is 320, 2.5 blocks. Down is [320, 10240] and takes a scale every 128 columns; up is
+# [10240, 320] and takes four scales a row, 80 columns each.
+*_hc_down.weight                     rtn  codes=fp8_e4m3 group=128 scale=f32
+*_hc_up.weight                       rtn  codes=fp8_e4m3 group=80 scale=f32
+
+# The MTP head's fc_hidden and fc_embedding, the same rows. They only ever change the drafts.
+mtp.fc_hidden.weight                 rtn  codes=fp8_e4m3 group=128 scale=f32
+mtp.fc_embedding.weight              rtn  codes=fp8_e4m3 group=128 scale=f32
+
+# The trunk's block linears as int8, a scale per 128 columns of a row searched for least error.
+# The QSA indexer's projection is not one of them: its top-k is a hard choice between blocks, and
+# keeping it as the checkpoint holds it costs 20 MB.
+blk.*.attn_qg.weight                 rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.attn_k.weight                  rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.attn_v.weight                  rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.attn_output.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.ssm_inz.weight                 rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.ssm_out.weight                 rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.ffn_gate_up_shexp.weight       rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.ffn_down_shexp.weight          rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+
+# The lm_head, int8 with a bf16 scale a row per 128 columns (logits_gemm_i8): at E4M3 it costs
+# ~0.6 points of top-1 on its own.
+output.weight                        rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+
+# The n-gram table at one fixed E4M3 scale; qwen4exp-w4.recipe says where the value comes from.
+blk.*.ple_ngram.weight               rtn  codes=fp8_e4m3 block=*x* scale=bf16 rule=fixed scale_value=1.99317932128906e-4
+
+# The MTP head's 2-bit draft head.
+mtp.draft_head.weight                rtn  codes=u2 zero=u8 group=128 scale=f16

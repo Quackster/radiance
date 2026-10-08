@@ -111,7 +111,7 @@ struct MoveUnit {
 
     /* WHAT THE UNIT ACTUALLY COSTS A POOL, which is its class's slot stride and not `bytes`. The
      * planner budgets against this and the mover allocates this, so the two cannot drift -- and
-     * the direction they would drift in is an overrun of the pool the operator sized. `bytes` is
+     * the direction they would drift in is an overrun of the weights pool. `bytes` is
      * still what the report attributes to the weights, because padding is not a weight. */
     int64_t slot_bytes = 0;
 
@@ -179,7 +179,7 @@ struct SlabClass {
 /* SHADOW SLOTS: slab slots that are allocated but hold no unit, so a promotion writes into one
  * and only then publishes and never DMAs over a slot a kernel might still be reading (mover.h).
  *
- * THEY COME OUT OF --vram-weights-mib, like everything else in the slab. Taking them from
+ * THEY COME OUT OF THE WEIGHTS POOL, like everything else in the slab. Taking them from
  * whatever VRAM is left over after the slabs is not an option: spec §6 budgets every pool
  * explicitly and --gpu-headroom-mib is memory the engine promises NOT to touch. So dynamic
  * placement costs a few resident units, and the plan report prints exactly how many.
@@ -260,7 +260,7 @@ public:
      * routed layer starts (place/stager.h, FileStager). `file_layer_max` is the most one layer's
      * file-tier units take in a buffer, each at its own size rounded to RAD_ALIGN_UNIT, which is
      * how the stager packs them; `file_stage_vram` is the two buffers, taken out of
-     * --vram-weights-mib before any expert is made resident. Both 0 when nothing routed is on the
+     * the weights pool before any expert is made resident. Both 0 when nothing routed is on the
      * file tier. */
     int64_t file_layer_max = 0;
     int64_t file_stage_vram = 0;
@@ -310,7 +310,22 @@ struct PlannerInput {
      * served directly is neither grouped by movement unit nor aligned for O_DIRECT, so with this
      * false no unit is file-direct and both tiers are closed (spec §4.3). */
     bool                  container = true;
+    /* No card is visible and the device backend is the host's own memory (device_is_host()), so a
+     * host kernel can read the weights pool as well as the container's mapping. See
+     * mapped_unit(). */
+    bool                  host_backend = false;
 };
+
+/* DOES A UNIT STAY IN THE CONTAINER'S MAPPING because only a host kernel can read it? On a card,
+ * always: a host kernel cannot read VRAM, and the mapping is the one host address its bytes
+ * already have. On the host backend the weights pool is host memory too, and a unit whose stored
+ * form is not the container's (a widening or a relayout its host kernel asked for at load, or a
+ * checkpoint served directly) has no place in the mapping that looks the way its kernel reads it,
+ * so there it takes a converted copy in the weights pool like any other weight. One rule, for the
+ * planner and the budget alike. */
+inline bool mapped_unit(bool host_only, bool direct, bool host_backend) {
+    return host_only && (direct || !host_backend);
+}
 
 class Planner {
 public:
@@ -399,10 +414,12 @@ struct WeightFootprint {
 };
 /* `embedding` is what the token embedding's placement resolved to; only Ram moves it out of the
  * statics. `ngram` is the n-gram table's; only Vram puts it among them, and only where a device
- * kernel reads it. Stated by every caller, so the budget and the planner cannot count it
- * differently. */
+ * kernel reads it. `host_backend` and `container` are PlannerInput's: whether a host kernel can
+ * read the weights pool, and whether the weights lie in a container at all (a checkpoint served
+ * directly has no mapping a unit could stay in). Stated by every caller, so the budget and the
+ * planner cannot count it differently. */
 void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement embedding,
-                      TablePlacement ngram);
+                      TablePlacement ngram, bool host_backend, bool container);
 
 /* THE PINNED STAGING THE FILE TIER TAKES OUT OF --host-pool-mib before any unit is placed in it:
  * RAD_PLACE_FILE_STAGE_SLOTS of the widest per-layer unit, and the read windows when a routed

@@ -179,6 +179,10 @@ public:
         const int32_t*  n_accepted = nullptr;  /* [n_seq] drafted tokens accepted, 0..n_spec */
         const int32_t*  token = nullptr;       /* [n_seq] token sampled at the accepted position */
         const uint8_t*  eos = nullptr;         /* [n_seq] 1 when the sequence ended */
+        /* LOGPROBS, null on a step where no request asked: entry i's j-th emitted token (its
+         * accepted drafts first, then the sampled token) is lp[first_row[i] + j]. */
+        const TokenLogprobs* lp = nullptr;
+        const int32_t*       first_row = nullptr;  /* [n_seq] */
     };
 
     /* `geo` is the already-resolved chunk geometry. The engine resolves it once and passes it,

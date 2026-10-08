@@ -342,7 +342,7 @@ int PrefixCache::insert(uint64_t session,
                         const std::vector<int32_t>& tokens,
                         const std::vector<MMContentKey>& mm,
                         const std::vector<std::vector<int32_t>>& blocks,
-                        int64_t n_tokens) {
+                        int64_t n_tokens, const std::string& label) {
     if (!enabled_) return RAD_OK;
     if (blocks.size() != groups_.size()) return RAD_E_INVAL;
     if (n_tokens > (int64_t)tokens.size()) return RAD_E_INVAL;
@@ -427,7 +427,7 @@ int PrefixCache::insert(uint64_t session,
             if (it == map_.end()) continue;
             tiers_->note_used(hs[(size_t)b], it->second.blocks, now);
         }
-        tiers_->note_session(session, hs, n_tokens, now);
+        tiers_->note_session(session, hs, n_tokens, now, label);
     }
 
     /* A CONVERSATION'S SNAPSHOTS BELONG TO ITS LATEST TURN. The index keys a session by REQUEST

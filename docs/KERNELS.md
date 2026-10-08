@@ -252,6 +252,7 @@ not.
 | `sample_argmax` | yes | device | host |
 | `sample_chain` |   | device | - |
 | `sample_dry` | yes | device | host |
+| `sample_logprobs` |   | device | host |
 | `sample_mask` | yes | device | host |
 | `sample_merge_topk` |   | device | host |
 | `sample_minp` | yes | device | host |

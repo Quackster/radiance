@@ -988,7 +988,7 @@ static bool chain_extends(const std::vector<BlockHash>& shorter,
 }
 
 void IdleTiers::note_session(uint64_t id, const std::vector<BlockHash>& chain, int64_t n_tokens,
-                             uint64_t now_ns) {
+                             uint64_t now_ns, const std::string& label) {
     if (chain.empty()) return;
     std::lock_guard lk(mu_);
 
@@ -1008,6 +1008,9 @@ void IdleTiers::note_session(uint64_t id, const std::vector<BlockHash>& chain, i
      * to say which of them republished. So the most recent of them is touched and no row is
      * added, which is the one answer that is wrong about nothing. */
     uint64_t first_seen = 0;
+    /* A conversation's label outlives the turn that sent it: a later turn without one keeps the
+     * name an earlier one gave. */
+    std::string kept_label = label;
     bool absorbed = false;
     std::vector<uint64_t>& at_root = roots_[chain[0]];
     for (size_t i = 0; i < at_root.size();) {
@@ -1016,6 +1019,7 @@ void IdleTiers::note_session(uint64_t id, const std::vector<BlockHash>& chain, i
         if (!chain_extends(it->second.chain, chain)) { ++i; continue; }
         if (first_seen == 0 || it->second.first_seen_ns < first_seen)
             first_seen = it->second.first_seen_ns;
+        if (kept_label.empty()) kept_label = it->second.label;
         sessions_.erase(it);
         at_root.erase(at_root.begin() + (long)i);
         absorbed = true;
@@ -1028,7 +1032,11 @@ void IdleTiers::note_session(uint64_t id, const std::vector<BlockHash>& chain, i
             if (it == sessions_.end() || !chain_extends(chain, it->second.chain)) continue;
             if (!newest || it->second.last_used_ns > newest->last_used_ns) newest = &it->second;
         }
-        if (newest) { newest->last_used_ns = now_ns; return; }
+        if (newest) {
+            newest->last_used_ns = now_ns;
+            if (!label.empty()) newest->label = label;
+            return;
+        }
     }
 
     Session& s = sessions_[id];
@@ -1036,6 +1044,7 @@ void IdleTiers::note_session(uint64_t id, const std::vector<BlockHash>& chain, i
     s.n_tokens = n_tokens;
     s.first_seen_ns = first_seen ? first_seen : now_ns;
     s.chain = chain;
+    s.label = std::move(kept_label);
     at_root.push_back(id);
 }
 
@@ -1079,6 +1088,7 @@ std::vector<IdleTiers::SessionInfo> IdleTiers::sessions(Occupancy* occ) const {
             si.model = model_;
             si.n_tokens = kv.second.n_tokens;
             si.first_seen_ns = kv.second.first_seen_ns;
+            si.label = kv.second.label;
             si.last_used_ns = kv.second.last_used_ns;
             si.bytes = (int64_t)kv.second.chain.size() * cfg_.entry_bytes;
             out.push_back(std::move(si));

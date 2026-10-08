@@ -39,15 +39,18 @@ static const std::string g_draft_window_help =
     draft_window_name(kDraftWindowDefault);
 
 static const Flag g_flags[] = {
-    { "--model",              "PATH",   "the .rad container, or a checkpoint served as it stands" },
+    { "--model",              "PATH",   "the .rad container, a checkpoint served as it stands, or a\n"
+                                        "Hugging Face repo id (owner/name), fetched before startup" },
+    { "--download-dir",       "DIR",    "where a repo id is fetched to; default\n"
+                                        "$XDG_CACHE_HOME/radiance/hf, else ~/.cache/radiance/hf" },
     { "--radiance-home",      "DIRS",   "where kernels/, architectures/ and quantizers/ live; several\n"
                                         "homes separated by ':' are searched in order, the first winning" },
-    { "--kernels",            "LIST",   "kernel plugin hierarchy, comma-separated, first wins" },
+    { "--kernels",            "LIST",   "the kernel libraries to use, comma-separated, first wins; unnamed ones are not loaded. Default: every library found" },
 
     { "--tp",                 "N",      "tensor-parallel ranks" },
     { "--tp-wire",            "MODE",   "cross-rank all-reduce payload: exact (default) or wht6, a\n"
-                                        "lossy wire: rotated 6-bit at 2 ranks, tiered int8 at 4,\n"
-                                        "none at 8" },
+                                        "lossy wire: rotated 6-bit at 2 ranks, tiered int8 at 3\n"
+                                        "and 4, none at 8" },
     { "--tp-wire-min-kb",     "N",      "smallest all-reduce, in KiB, the lossy wire is used for" },
     { "--p2p",                "MODE",   "how the collectives reach the other cards: auto (default)\n"
                                         "asks the driver, on requires peer access and stops without\n"
@@ -59,15 +62,12 @@ static const Flag g_flags[] = {
                                         "keys, no reconvert (docs/YARN.md); none: off" },
 
     { "--gpu-headroom-mib",   "N",      "VRAM left unclaimed on every card (default 96)" },
-    { "--vram-weights-mib",   "N",      "the resident weight slab; 0 derives it from the card" },
-    { "--vram-kv-mib",        "N",      "the paged KV pool; 0 derives it from the card" },
     { "--kv-cache-dtype",     "T",      "bf16 | fp8 -- fp8 halves what a token of context costs" },
     { "--host-pool-mib",      "N",      "pinned host tier" },
-    { "--embedding-placement", "WHERE", "auto (default) | vram | ram: where the token embedding lives. ram\n"
-    "                                    keeps it in the pinned host pool, read over the link in place;\n"
-    "                                    auto keeps it on the card unless the KV cache could then not\n"
-    "                                    hold one --max-model-len sequence. disk is refused: the lookup\n"
-    "                                    writes the card's activations, which no host read can reach" },
+    { "--embedding-placement", "WHERE", "ram (default) | vram: where the token embedding lives. ram\n"
+    "                                    pins it in host memory beside --host-pool-mib, read over the\n"
+    "                                    link in place; by default a model whose output head reads the\n"
+    "                                    table, or a host without the memory, keeps it on the card" },
     { "--ngram-placement",    "WHERE",  "auto (default) | vram | ram | disk: where an n-gram\n"
     "                                    embedding table lives (Qwen3.8-Flash-Next: 47.7 GiB).\n"
     "                                    vram puts all of it on every card; ram copies it into\n"
@@ -226,10 +226,19 @@ static const Flag g_flags[] = {
 
 void config_usage(const char* argv0) {
     fprintf(stderr, "usage: %s --model FILE [options]\n\n", argv0);
+    /* A help text's continuation lines start under its first line, whatever indentation the
+     * string itself carries. */
     for (const Flag& f : g_flags) {
         char left[64];
         snprintf(left, sizeof left, "%s%s%s", f.name, f.arg ? " " : "", f.arg ? f.arg : "");
-        fprintf(stderr, "  %-32s %s\n", left, f.help);
+        std::string help;
+        for (const char* p = f.help; *p; ++p) {
+            help += *p;
+            if (*p != '\n') continue;
+            help.append(35, ' ');
+            while (p[1] == ' ') ++p;
+        }
+        fprintf(stderr, "  %-32s %s\n", left, help.c_str());
     }
     fprintf(stderr,
         "\nEvery pool is budgeted explicitly. The trade between KV blocks and resident weights\n"
@@ -376,6 +385,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("-v"))                      log_set_level(Log::Debug);
         else if (S("-vv"))                     log_set_level(Log::Trace);
         else if (S("--model"))                 { if (!(v = need(i))) return RAD_E_INVAL; c->model = v; }
+        else if (S("--download-dir"))          { if (!(v = need(i))) return RAD_E_INVAL; c->download_dir = v; }
         else if (S("--radiance-home"))         { if (!(v = need(i))) return RAD_E_INVAL; c->radiance_home = v; }
         else if (S("--kernels"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kernel_hierarchy = split_commas(v); }
         else if (S("--tp"))                    { if (!(v = need(i))) return RAD_E_INVAL; c->tp = atoi(v); }
@@ -408,8 +418,16 @@ int config_parse(int argc, char** argv, Config* c) {
             }
             c->rope_scaling = v;
         }
-        else if (S("--vram-weights-mib"))      { if (!(v = need(i))) return RAD_E_INVAL; c->vram_weights_mib = atoll(v); }
-        else if (S("--vram-kv-mib"))           { if (!(v = need(i))) return RAD_E_INVAL; c->vram_kv_mib = atoll(v); }
+        /* THE TWO POOLS ARE THE BUDGET RESOLVER'S, always (core/mem/vram_budget.h). A launch
+         * line that tries to size them is told which flags move the split, rather than "unknown
+         * option". */
+        else if (S("--vram-weights-mib") || S("--vram-kv-mib")) {
+            RAD_ERR("%s was removed: the card is split between the weights and the cache from what "
+                    "the model needs. --gpu-headroom-mib takes card space away, --max-model-len and "
+                    "--max-num-seqs bound the cache, and --host-pool-mib decides which experts stay "
+                    "on the card", a.c_str());
+            return RAD_E_INVAL;
+        }
         /* --gpu-headroom takes the short name too: it is the flag an operator reaches for and
          * "-mib" is the unit, which every other size flag in this list also spells out. Both
          * parse to the same field. */
@@ -428,11 +446,20 @@ int config_parse(int argc, char** argv, Config* c) {
             const bool emb = S("--embedding-placement");
             if (!(v = need(i))) return RAD_E_INVAL;
             TablePlacement p;
-            if (!parse_table_placement(v, &p)) {
+            /* The embedding has two tiers: its lookup writes activations the card reads, which a
+             * host kernel reading the container cannot reach, so there is no disk -- and with
+             * ram the default wherever it can be honoured, nothing left for auto to choose. */
+            if (emb && (!parse_table_placement(v, &p) ||
+                        (p != TablePlacement::Ram && p != TablePlacement::Vram))) {
+                RAD_ERR("--embedding-placement takes ram or vram, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            if (!emb && !parse_table_placement(v, &p)) {
                 RAD_ERR("%s takes auto, vram, ram or disk, not '%s'", a.c_str(), v);
                 return RAD_E_INVAL;
             }
             (emb ? c->embedding_placement : c->ngram_placement) = p;
+            if (emb) c->embedding_placement_given = true;
         }
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
         else if (S("--prefix-cache-host-mib"))     { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_host_mib = atoll(v); }
@@ -735,12 +762,12 @@ int config_parse(int argc, char** argv, Config* c) {
      * rank the one that IS installed behind the reference implementation, which matches every op
      * and would answer for all of them.
      *
-     * An empty hierarchy is not "no order". The loader orders what it finds: everything named by
-     * --kernels or RADIANCE_KERNELS first, then every other plugin, then the reference library
-     * last by construction because it matches anything (core/plugin/loader.cpp). So dropping a
-     * kernel library into $RADIANCE_HOME/kernels is enough to be used, on any card, with no
-     * configuration -- and naming one ahead of another is what settles a tie between two that
-     * both serve an op. */
+     * An empty hierarchy is not "no order". The loader loads everything it finds and orders it,
+     * the reference library last by construction because it matches anything
+     * (core/plugin/loader.cpp). So dropping a kernel library into $RADIANCE_HOME/kernels is
+     * enough to be used, on any card, with no configuration. A list names the libraries to use:
+     * only those load, in its order, so naming one ahead of another settles a tie between two that
+     * both serve an op and leaving one out keeps it out. */
     if (c->model.empty()) {
         RAD_ERR("--model is required");
         return RAD_E_INVAL;

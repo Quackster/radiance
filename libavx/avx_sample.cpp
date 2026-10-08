@@ -650,6 +650,100 @@ AVX_KERNEL(sample_argmax) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ sample_logprobs */
+/* The raw distribution's summary for a row with RAD_SP_LOGPROBS -- max, sum of exp(l - max), and
+ * the k largest as (id, logit) pairs, descending, ties to the lower id -- libref's contract
+ * (ref_sample.cpp). A row without the flag is not written.
+ *
+ * ONE PASS FOR THE k LARGEST, not k passes of topk_next_f32: `k` is the deployment's width (the
+ * largest top_logprobs any request may ask for), and k full sweeps of a 248K row would cost k times
+ * the argmax. The set is seeded with the row's first k columns, kept sorted, and the rest of the
+ * row is compared a vector at a time against its smallest value; a lane strictly above it is
+ * inserted. Strictly, because the scan runs in increasing id, and an equal value further along has
+ * the higher id and loses the tie. After the first few thousand columns almost no vector has such
+ * a lane, so the pass costs what the maximum does.
+ *
+ * The sum is f32 in four vector accumulators. Its terms are all in (0, 1] and the relative error
+ * of the sum is what a logprob carries (log of it), so f32 is ample next to libref's double. */
+AVX_KERNEL(sample_logprobs) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *lg = &a->t[0], *pr = &a->t[1], *st = &a->t[2];
+    const int64_t n_vocab = p_int(a, "n_vocab", lg->rank >= 2 ? lg->shape[lg->rank - 1] : 0);
+    const int64_t k = p_int(a, "k", 0);
+    const int64_t voff = p_int(a, "vocab_off", 0);
+    if (n_vocab <= 0 || k <= 0) return RAD_E_SHAPE;
+    const int64_t M = numel(lg) / n_vocab;
+    const int64_t w = 2 + 2 * k;
+    if (M <= 0 || numel(st) < M * w) return RAD_E_SHAPE;
+    Rows R;
+    AVX_TRY(rows_of_params(pr, M, &R));
+
+    AVX_PARALLEL_FOR_IF(M * n_vocab >= AVX_PAR_MIN)
+    for (int64_t m = 0; m < M; ++m) {
+        if (!(R.p[m].flags & RAD_SP_LOGPROBS)) continue;
+        float* buf = scratch_f32((size_t)n_vocab + 2 * (size_t)k);
+        const float* v = in_row(lg, rowoff(lg, m, n_vocab), n_vocab, buf);
+        float* tv = buf + n_vocab;                 /* the set's values, descending */
+        int32_t* ti = (int32_t*)(tv + k);          /* and their ids */
+
+        const float mx = row_max(v, n_vocab);
+        float sum = 0.0f;
+        {
+            const vf vmx = vf_set1(mx);
+            vf s0 = vf_zero(), s1 = vf_zero(), s2 = vf_zero(), s3 = vf_zero();
+            int64_t i = 0;
+            for (; i + 4 * VF_N <= n_vocab; i += 4 * VF_N) {
+                s0 = vf_add(s0, vf_exp(vf_sub(vf_loadu(v + i), vmx)));
+                s1 = vf_add(s1, vf_exp(vf_sub(vf_loadu(v + i + VF_N), vmx)));
+                s2 = vf_add(s2, vf_exp(vf_sub(vf_loadu(v + i + 2 * VF_N), vmx)));
+                s3 = vf_add(s3, vf_exp(vf_sub(vf_loadu(v + i + 3 * VF_N), vmx)));
+            }
+            for (; i + VF_N <= n_vocab; i += VF_N) s0 = vf_add(s0, vf_exp(vf_sub(vf_loadu(v + i), vmx)));
+            sum = vf_hsum(vf_add(vf_add(s0, s1), vf_add(s2, s3)));
+            for (; i < n_vocab; ++i) sum += std::exp(v[i] - mx);
+        }
+
+        /* Insert (x, id) into the sorted set of n entries, the set at most k long. */
+        int64_t n = 0;
+        auto insert = [&](float x, int32_t id) {
+            int64_t j = n < k ? n++ : k - 1;
+            while (j > 0 && x > tv[j - 1]) { tv[j] = tv[j - 1]; ti[j] = ti[j - 1]; --j; }
+            tv[j] = x;
+            ti[j] = id;
+        };
+        const int64_t seed = std::min(k, n_vocab);
+        for (int64_t i = 0; i < seed; ++i) insert(v[i], (int32_t)i);
+        int64_t i = seed;
+#if AVX_LEVEL > 0
+        for (; i + VF_N <= n_vocab; i += VF_N) {
+            const vf x = vf_loadu(v + i);
+#if AVX_LEVEL == 3
+            unsigned msk = (unsigned)_mm512_cmp_ps_mask(x, vf_set1(tv[k - 1]), _CMP_GT_OQ);
+#else
+            unsigned msk = (unsigned)_mm256_movemask_ps(_mm256_cmp_ps(x, vf_set1(tv[k - 1]), _CMP_GT_OQ));
+#endif
+            /* Lanes in increasing id; the bar can rise after each insertion. */
+            while (msk) {
+                const int lane = __builtin_ctz(msk);
+                msk &= msk - 1;
+                if (v[i + lane] > tv[k - 1]) insert(v[i + lane], (int32_t)(i + lane));
+            }
+        }
+#endif
+        for (; i < n_vocab; ++i)
+            if (v[i] > tv[k - 1]) insert(v[i], (int32_t)i);
+
+        const int64_t sb = rowoff(st, m, w), ss = laststride(st);
+        stt(st, sb, mx);
+        stt(st, sb + ss, sum);
+        for (int64_t j = 0; j < k; ++j) {
+            stt(st, sb + (2 + 2 * j) * ss, j < n ? (float)(ti[j] + voff) : -1.0f);
+            stt(st, sb + (3 + 2 * j) * ss, j < n ? tv[j] : -INFINITY);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ sample_merge_topk */
 /* THE VOCAB-PARALLEL MERGE. lm_head is vocab-sharded, so each rank runs top-k over ITS OWN shard
  * and the candidate sets are all-gathered -- k * world_size pairs, 2 KiB at k=64 and world_size=4,

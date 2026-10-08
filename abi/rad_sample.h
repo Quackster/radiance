@@ -44,7 +44,8 @@ enum {
     RAD_SP_PENALTY = 1 << 1,   /* any of rep / freq / pres is non-identity */
     RAD_SP_MASK    = 1 << 2,   /* a grammar is constraining this sequence this step */
     RAD_SP_XTC     = 1 << 3,
-    RAD_SP_DRY     = 1 << 4
+    RAD_SP_DRY     = 1 << 4,
+    RAD_SP_LOGPROBS = 1 << 5   /* `sample_logprobs` summarises this row's raw logits */
 };
 
 /* One row per sampled position. Laid out so the 8-byte fields are aligned and the struct has no

@@ -37,7 +37,8 @@ source. An engine you have to fork to change is not extensible; it just has a pa
 
 **In, v1:** continuous batching, paged KV, prefix caching, tensor parallel, speculative decoding,
 hybrid KV (full + sliding-window + linear-attention state in one model), weight placement across
-VRAM / RAM / SSD with runtime re-placement, an OpenAI-compatible server, a quantiser.
+VRAM / RAM / SSD with runtime re-placement, a server for OpenAI, Anthropic and llama-server
+clients, a quantiser.
 
 **Multimodal: pictures and video, on the Qwen plugins (§11).** The vision tower is declared by the
 language model's own architecture plugin, its embeddings travel in the step batch, and an image is
@@ -946,15 +947,13 @@ last-moment rescue. That is the trade, and it buys a run phase with no device ro
 
 ## 6. Memory and budgets
 
-Every pool is budgeted explicitly, and where the operator does not state a budget the engine
-derives one **from the card and prints every term of it**. There is still no profiling pass, no
-utilisation fraction and no inference about what the workload will be:
+Every pool is budgeted explicitly: the engine derives each budget **from the card and prints every
+term of it**, and the operator moves its inputs rather than stating a pool. There is no profiling
+pass, no utilisation fraction and no inference about what the workload will be:
 
 | | |
 |---|---|
 | `--gpu-headroom-mib` | VRAM left unclaimed on every card (default 96) |
-| `--vram-weights-mib` | the resident weight slab; 0 derives it from the card |
-| `--vram-kv-mib` | the paged KV pool; 0 derives it from the card |
 | `--host-pool-mib` | pinned host tier |
 | `--weights-disk-tier` | file tier for weights, read from the container; needs `O_DIRECT` |
 
@@ -1020,9 +1019,9 @@ What *is* a hard limit, and is still checked: the pool must hold **one** max-len
 context no single request can ever complete is a configuration error however much slack the pool
 has, because the API accepts that request and admission then refuses it.
 
-`--vram-weights-mib` and `--vram-kv-mib` win outright wherever they are given, and nothing
-re-optimises a split that was stated. An engine that quietly
-re-optimises is an engine whose benchmarks do not reproduce.
+There is no flag that states either pool: the split is the resolver's, computed once from numbers
+that are all printed, and nothing re-optimises it afterwards. An engine that quietly re-optimises is
+an engine whose benchmarks do not reproduce.
 A fixed weight-slab budget also means dynamic re-placement (§5.4) never competes with the KV pool.
 The mover works inside its own slab and cannot evict a KV block to promote an expert.
 
@@ -1556,8 +1555,14 @@ its state was seen before or not, and compiling happens where the request is adm
 ## 14. Server
 
 `/v1/chat/completions` (streaming and not), `/v1/completions`, `/v1/models` and `/v1/models/:id`,
-a real `/v1/embeddings`, tool calls in and out, and a Prometheus `/metrics` endpoint with
+a real `/v1/embeddings`, tool calls in and out, logprobs, and a Prometheus `/metrics` endpoint with
 vLLM-compatible metric names so existing dashboards work unchanged.
+
+The other clients' own APIs are translated onto the same chat request rather than served by a
+second path: Anthropic's `/v1/messages`, OpenAI's `/v1/responses`, and llama-server's native
+`/completion` and `/infill`, with `/props` and `/apply-template` for the front-ends built against
+llama-server. A request field this server does not implement is ignored when it cannot change the
+output and refused by name when it would, unless it carries its off value (GUIDE §5.8).
 
 Beside those, the operational set: `/health`, `/ping`, `/load`, `/version`, `/server_info`,
 `/tokenize`, `/detokenize`, `/get_tokenizer_info`, `/reset_prefix_cache`. Method spellings follow
@@ -1782,11 +1787,13 @@ out of that card's selection at load rather than failing at its first launch.
 `$RADIANCE_HOME` defaults to `share/radiance` under the install prefix, and is a search path of homes
 separated by `:`, the first winning; `architectures/`, `kernels/` and `quantizers/` under each are
 scanned at startup as one set. Kernel hierarchy is configured, not discovered — an ordered list
-(`--kernels`, or `RADIANCE_KERNELS`). A library named there takes that position, one present but
-unnamed loads after every named one, and a library that declares itself a reference implementation
-(`rad_plugin_reference`) sits below every unnamed one, because it matches every op and would
-otherwise shadow whatever ranked behind it. So adding a kernel library is dropping an `.so` in a
-home, and substituting one for another is naming it ahead of the other.
+(`--kernels`, or `RADIANCE_KERNELS`). A library named there takes that position, and one present but
+unnamed is not loaded: the list chooses the libraries as well as ordering them, because selection
+runs per domain and an order alone could not keep a library out of a domain the named ones leave
+empty. With no list every library found loads, and a library that declares itself a reference
+implementation (`rad_plugin_reference`) sits below every other, because it matches every op and
+would otherwise shadow whatever ranked behind it. So adding a kernel library is dropping an `.so`
+in a home, and substituting one for another is naming it ahead of the other.
 
 The plugins that ship are plugins like any other. Each directory builds inside the tree or on its
 own against an installed radiance through `find_package(radiance)` and the same `rad_add_plugin`, and

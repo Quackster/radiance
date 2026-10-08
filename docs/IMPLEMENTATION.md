@@ -28,7 +28,7 @@ core/sample/      device sampler dispatch + the host reference chain + grammar b
 core/text/        tokeniser, chat template, tool parsing, detokenisation
 core/mm/          image and video decoding, and the processor that turns frames into patches
 core/format/      the .rad reader and writer, safetensors, recipes, the imatrix, the tune cache
-core/server/      HTTP, OpenAI-compatible endpoints, /metrics, the dashboard
+core/server/      HTTP: the OpenAI, Anthropic and llama-server endpoints, /metrics, the dashboard
 core/kld.*        the KL mode: --kld-record / --kld-ref
 core/engine*      the thing that ties them together, and `radiance` the binary
 libref/           every op, naively, correct, host domain: the fallback and the oracle

@@ -193,6 +193,11 @@ int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOpt
     in.add_bos               = opt.add_bos || impl_->add_bos;
     in.add_eos               = opt.add_eos || impl_->add_eos;
     in.reasoning_format      = common_reasoning_format_from_name(opt.reasoning_format);
+    in.continue_final_message =
+        opt.continue_final.empty()          ? COMMON_CHAT_CONTINUATION_NONE
+        : opt.continue_final == "content"   ? COMMON_CHAT_CONTINUATION_CONTENT
+        : opt.continue_final == "reasoning_content" ? COMMON_CHAT_CONTINUATION_REASONING
+                                            : COMMON_CHAT_CONTINUATION_AUTO;
 
     common_chat_params p;
     try {

@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <memory>
 #include <fstream>
+#include <malloc.h>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -281,6 +282,31 @@ TEST(every_admitted_picture_format_decodes) {
         CHECK_EQ(f.h, want);
         CHECK(is_red(f));
     }
+}
+
+/* A PICTURE WIDER THAN A WHOLE NUMBER OF THE SCALER'S VECTORS: 4:2:0 at 1788 wide is converted to
+ * RGB 12 bytes past 1788 x 3. Into a buffer of exactly that size those bytes were the next heap
+ * chunk's header, and the server aborted at a later allocation (Codeberg #57). The mmap threshold
+ * is raised so the RGB comes from the heap proper, as it does in a server that has freed large
+ * buffers before; glibc then checks the neighbouring headers on every free below. */
+TEST(a_picture_of_an_awkward_width_converts_inside_its_buffer) {
+    if (!decoder_available()) { std::printf("  SKIP no media decoder in this build\n"); return; }
+    const std::vector<uint8_t> b = media_file("red-1788x282.jpg");
+    REQUIRE(!b.empty());
+    mallopt(M_MMAP_THRESHOLD, 64 << 20);
+    for (int i = 0; i < 8; ++i) {
+        Frame f;
+        std::string why;
+        const int rc = decode_image(b.data(), b.size(), int64_t(1) << 24, &f, &why);
+        if (rc != RAD_OK) std::printf("  %s\n", why.c_str());
+        CHECK_EQ(rc, RAD_OK);
+        CHECK_EQ(f.w, 1788);
+        CHECK_EQ(f.h, 282);
+        CHECK(is_red(f));
+        std::vector<uint8_t> behind(4096, 1);
+        CHECK_EQ(behind[0], 1);
+    }
+    mallopt(M_MMAP_THRESHOLD, 128 << 10);
 }
 
 TEST(every_admitted_video_format_decodes) {

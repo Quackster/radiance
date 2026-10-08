@@ -332,7 +332,8 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
 // [block][source rank]; seq_ctrs is 2 * max_blocks words, a handshake and a slot-parity counter
 // per block of capacity (r4d_ar_seq.h).
 // Three ranks: the same kernel instantiated at WS=3 (two peers). Nothing in the wide family is
-// power-of-two; the two-shot cannot serve 3 because it shards the message `world` ways.
+// power-of-two; the two-shot serves 3 too, with shards one word uneven where the message does not
+// divide (r4d_ar_twoshot_3rank_exact, below).
 void r4d_ar_oneshot_3rank_exact(long peer_scratch0, long peer_scratch1,
                                 long peer_flags0, long peer_flags1,
                                 long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
@@ -391,14 +392,21 @@ void r4d_ar_gather_hc_write_4rank(long peer_scratch0, long peer_scratch1, long p
 int  r4d_ar_gather_inv(long inv, long sorted, long T, long stream);
 void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers);
 
-// ---- all-reduce: two-shot, 4 or 8 ranks over P2P -------------------------------------------
+// ---- all-reduce: two-shot, 3, 4 or 8 ranks over P2P ----------------------------------------
 // Reduce-scatter + all-gather on the same buffer trio and peer-argument order as the wide
-// one-shot (r4d_ar_twoshot_Nrank_exact.hip): shard s, a contiguous 1/ws of the message, is
-// reduced by rank s (fp32, ascending rank order), then gathered. Sends 2*(ws-1)/ws*N bytes
-// per rank in two hops. Covers the sizes where the one-shot's (ws-1)*N send is too heavy.
-// Regions A and B sit at 0 and shard16, so the slot stride must hold 2*shard16. Above this bound
-// the caller falls back:
+// one-shot (r4d_ar_twoshot_Nrank_exact.hip): shard s, a contiguous run of the message's 16-byte
+// words, is reduced by rank s (fp32, ascending rank order), then gathered. Sends 2*(ws-1)/ws*N
+// bytes per rank in two hops. Covers the sizes where the one-shot's (ws-1)*N send is too heavy.
+// Shards are as even as the word count allows (the first n16 % ws take one more word), so a
+// message need not divide by the rank count -- at three it almost never does. Regions A and B sit
+// at 0 and the longest shard, so the slot stride must hold twice that. Above this bound the caller
+// falls back:
 enum { R4D_AR_TWOSHOT_WIDE_MAX_ELEMS = 20971520 };  // a 4096-token hidden-5120 prefill chunk
+void r4d_ar_twoshot_3rank_exact(long peer_scratch0, long peer_scratch1, long peer_flags0,
+                                long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
+                                long slot_stride16, long inp, long out, long n_elem, long dtype,
+                                long rank, long stream, long nblocks, long nthreads, long drain,
+                                long acq, long pub);
 void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                 long peer_flags0, long peer_flags1, long peer_flags2,
                                 long my_scratch, long my_flags, long seq_ctrs,
@@ -414,12 +422,19 @@ void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long out, long n_elem, long dtype, long rank, long stream,
                                 long nblocks, long nthreads, long drain, long acq, long pub);
 // The tiered int8 wire on both of the two-shot's hops (r4d_ar_twoshot_Nrank_ti8.hip; codec
-// in r4d_ar_ti8.h), 4 ranks only. The wire: int8 groups of 32 with an fp16 scale and a
+// in r4d_ar_ti8.h), 3 or 4 ranks. The wire: int8 groups of 32 with an fp16 scale and a
 // per-group record (T1 plain, T2 top-1-exact, T3 wht32) 38 bytes/group, deterministic
 // tiering, bit-identical across ranks. Same peer-argument order and flag layout as the exact
 // pair; slot stride in bytes (the wire is not 16B-aligned), holding two wire images; the 
-// encoder writes its own slot too (no loc_pack). numel must tile 32-elem groups over the ws
-// shards (numel % 128).
+// encoder writes its own slot too (no loc_pack). numel must be whole 32-elem groups; the
+// groups split over the ranks as evenly as they divide (the first ng % ws shards one group
+// longer) and every slot is laid out for the longest shard. The 4-rank entry still asks for
+// numel % 128, the even split.
+void r4d_ar_twoshot_3rank_ti8(long peer_scratch0, long peer_scratch1, long peer_flags0,
+                              long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
+                              long slot_stride_bytes, long inp, long out, long n_elem,
+                              long dtype, long rank, long stream, long nblocks,
+                              long nthreads, long drain, long acq, long pub);
 void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                               long peer_flags0, long peer_flags1, long peer_flags2,
                               long my_scratch, long my_flags, long seq_ctrs,

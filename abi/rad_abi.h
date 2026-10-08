@@ -602,7 +602,8 @@ typedef int  (*RadKernelConcurrentFn)(int i);
  * other, whatever it is called:
  *   - the loader ranks it below every unnamed kernel library, because a reference matches every
  *     op it declares and would otherwise answer for them ahead of the library serving the card
- *     (naming it in --kernels still puts it where it is named);
+ *     (naming it in --kernels still puts it where it is named, and a --kernels list that does
+ *     not name it leaves it out);
  *   - the engine refuses to serve a model with an op only a reference library implements, unless
  *     told to with --debug-accept-reference-kernels;
  *   - rad-kbench checks every other library against it.

@@ -376,6 +376,10 @@ const DeviceBackend* hip_backend_if_present(void);
 const DeviceBackend* aql_backend_if_present(void);
 /* Bytes copied to or from pageable host memory so far: every such copy is a host wait. */
 int64_t aql_pageable_bytes(void);
+/* The fat binaries registered so far, counted whichever backend runs: the registration hooks are
+ * this build's own exported symbols and see every dlopen'ed kernel plugin's device code, card or
+ * no card. The host backend's code_mark in a HIP build. */
+size_t  aql_code_registered(void);
 #endif
 
 /* ------------------------------------------------------------------ the error slot */

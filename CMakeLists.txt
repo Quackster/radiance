@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 # VERSION is what /version reports and what a client checks compatibility against. It is NOT the
 # ABI version -- that lives in abi/rad_abi.h and is read out of the header below, because
 # a plugin contract and a server release do not move together.
-project(radiance VERSION 1.2.4 LANGUAGES C CXX)
+project(radiance VERSION 1.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -219,6 +219,14 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/data/kernels_moe.rkb)
   install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/kernels_moe.rkb
           DESTINATION ${CMAKE_INSTALL_DATADIR}/radiance)
 endif()
+# THE DOWNLOADER `radiance --model <owner/name>` RUNS (core/hf_model.cpp). The engine finds it at
+# <bin>/../libexec/radiance/, so the build puts a copy at the same place under the build tree and
+# a binary run from either tree finds it without a path to configure.
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/scripts/hfget.sh
+               ${CMAKE_BINARY_DIR}/libexec/radiance/hfget.sh COPYONLY)
+install(PROGRAMS ${CMAKE_CURRENT_SOURCE_DIR}/scripts/hfget.sh
+        DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/radiance)
+
 # rad_add_plugin() and rad_hipify() live in cmake/RadAddPlugin.cmake because the installed package
 # config includes that same file: a third party building a plugin from their own repository needs
 # the function, and a second copy of it in the package config would drift from this one. The file

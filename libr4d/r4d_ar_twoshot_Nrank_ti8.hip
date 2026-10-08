@@ -1,5 +1,5 @@
-// r4d_ar_twoshot_Nrank_ti8.hip: r4d_ar_twoshot_4rank_ti8 -- reduce-scatter + all-gather with
-// the tiered-int8 wire on both hops, at 4 ranks. Codec (tiers 1/2/3) from r4d_ar_ti8.h,
+// r4d_ar_twoshot_Nrank_ti8.hip: r4d_ar_twoshot_{3,4}rank_ti8 -- reduce-scatter + all-gather with
+// the tiered-int8 wire on both hops, at 3 or 4 ranks. Codec (tiers 1/2/3) from r4d_ar_ti8.h,
 // transport from r4d_ar_twoshot_Nrank_exact.hip. The second hop costs 38/64 of its exact 
 // bytes. Own contribution reads exact from the input at fold time.
 //
@@ -10,6 +10,13 @@
 //
 // Slot: region A = ti8 wire (38*sg bytes, codes | rec | scales), region B at align16(A end)
 // a second wire image of the same layout; the stride must hold both.
+//
+// UNEVEN SHARDS, in whole groups (the exact two-shot's rule one level up): ng = numel/32 groups
+// split ng/ws a shard and the first ng % ws take one more, so shard s starts at group
+// s*base + min(s, rem). Every slot is laid out for the LONGEST shard (sg_max), whichever shard it
+// carries, so a writer and a reader never have to agree on anything but sg_max. At 4 ranks the
+// entry still requires numel to tile 32 x 4 and this is the even split it always was; at 3 a
+// 2048-wide row is 64 groups and 64 * rows divides by 3 one step in three.
 #include "r4d.h"
 #include "r4d_ar_ti8.h"
 #include "r4d_ar_wide.h"
@@ -20,7 +27,7 @@ template <typename T, int WS>
 __global__ void r4d_ar_twoshot_wide_ti8_kernel(
     const T* __restrict__ in, R4DArWidePeers<char, WS - 1> peers, char* __restrict__ my_base,
     unsigned int* __restrict__ my_flags, T* __restrict__ out,
-    unsigned int* __restrict__ seq_ctrs, int shard_elems, long slot_stride_bytes,
+    unsigned int* __restrict__ seq_ctrs, int n_groups, long slot_stride_bytes,
     long b_off_bytes, int rank, int drain, int acq, int pub) {
   constexpr int NPEERS = WS - 1;
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
@@ -29,7 +36,11 @@ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
   const unsigned int s = s_seq;
   const int parity = (int)s_slot;
 
-  const int sg = shard_elems / TI8_GROUP;  // groups per shard
+  // shard s = groups [s*gbase + min(s, grem), +gbase + (s < grem)); sg is the longest
+  const int gbase = n_groups / WS, grem = n_groups % WS;
+  const int sg = gbase + (grem ? 1 : 0);
+#define R4D_TI8_OFF(s) ((size_t)((s) * gbase + ((s) < grem ? (s) : grem)) * TI8_GROUP)
+#define R4D_TI8_LEN(s) (gbase + ((s) < grem ? 1 : 0))
   const int rec_off = TI8_REC_OFF * sg, sc_off = TI8_SC_OFF * sg;  // wire layout: codes | rec | scales
   const int gpb = (sg + nb - 1) / nb;      // block b owns shard groups [gA, gB)
   const int gA = b * gpb;
@@ -43,8 +54,9 @@ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
   // ---- phase 1: encode my contribution to each peer-owned shard into its owner's
   // region A. My own shard's contribution stays exact, read from the input at fold time.
   for (int p = 0; p < NPEERS; ++p) {
-    const T* src = in + (size_t)peers.rank[p] * shard_elems;
-    for (int k = 4 * gA + tid; k < 4 * gB; k += nt) {
+    const T* src = in + R4D_TI8_OFF(peers.rank[p]);
+    const int gE = gB < R4D_TI8_LEN(peers.rank[p]) ? gB : R4D_TI8_LEN(peers.rank[p]);
+    for (int k = 4 * gA + tid; k < 4 * gE; k += nt) {
       const int lig = k & 3;
       const int g = k >> 2;
       uint2 codes;
@@ -63,9 +75,10 @@ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
   // ---- reduce my shard: own contribution exact from the input, peers decoded from
   // region A, fp32 fold in ascending rank order; the reduced group is re-encoded and its
   // wire words go to every peer's region B, the owner keeping their decode.
-  const T* my_in = in + (size_t)rank * shard_elems;
-  T* my_out = out + (size_t)rank * shard_elems;
-  for (int k = 4 * gA + tid; k < 4 * gB; k += nt) {
+  const T* my_in = in + R4D_TI8_OFF(rank);
+  T* my_out = out + R4D_TI8_OFF(rank);
+  const int gM = gB < R4D_TI8_LEN(rank) ? gB : R4D_TI8_LEN(rank);
+  for (int k = 4 * gA + tid; k < 4 * gM; k += nt) {
     const int lig = k & 3;
     const int g = k >> 2;
     float acc[TI8_EPL];
@@ -111,8 +124,9 @@ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
     const int owner = peers.rank[p];
     const char* baseB = my_base +
         ((size_t)parity * WS + owner) * (size_t)slot_stride_bytes + b_off_bytes;
-    T* dst = out + (size_t)owner * shard_elems;
-    for (int k = 4 * gA + tid; k < 4 * gB; k += nt) {
+    T* dst = out + R4D_TI8_OFF(owner);
+    const int gE = gB < R4D_TI8_LEN(owner) ? gB : R4D_TI8_LEN(owner);
+    for (int k = 4 * gA + tid; k < 4 * gE; k += nt) {
       const int lig = k & 3;
       const int g = k >> 2;
       const uint2 c = ((const uint2*)baseB)[k];
@@ -123,6 +137,8 @@ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
       ti8_store8(dst + k * TI8_EPL, v);
     }
   }
+#undef R4D_TI8_OFF
+#undef R4D_TI8_LEN
 }
 
 // ---------------------------------------------------------------------------------- host side
@@ -138,11 +154,13 @@ static void ar_twoshot_ti8_launch(const long* peer_scratch, const long* peer_fla
                              " out of range for the " + std::to_string(WS) +
                              " ranks this entry point is compiled for");
   if (dtype != 0 && dtype != 1) throw std::runtime_error("ti8 ar: only bf16/fp16 payloads");
-  if (n_elem % ((long)TI8_GROUP * WS) != 0)
-    throw std::runtime_error("ti8 ar: n_elem must tile " + std::to_string(TI8_GROUP) +
-                             "-elem groups over " + std::to_string(WS) + " shards");
-  const int shard_elems = (int)(n_elem / WS);
-  const int sg = shard_elems / TI8_GROUP;
+  if (n_elem % TI8_GROUP != 0)
+    throw std::runtime_error("ti8 ar: n_elem must be whole " + std::to_string(TI8_GROUP) +
+                             "-elem groups");
+  const long n_groups = n_elem / TI8_GROUP;
+  if (n_groups < WS)
+    throw std::runtime_error("ti8 ar: fewer groups than ranks");
+  const int sg = (int)((n_groups + WS - 1) / WS);  // the longest shard, the slot layout's size
   const long b_off = ((long)TI8_GROUP_BYTES * sg + 15) / 16 * 16;  // one wire image, 16B-aligned
   if (2 * b_off > slot_stride_bytes)
     throw std::runtime_error("ti8 ar: slot stride " + std::to_string(slot_stride_bytes) +
@@ -194,11 +212,23 @@ static void ar_twoshot_ti8_launch(const long* peer_scratch, const long* peer_fla
 #define R4D_AR_TS8_LAUNCH(T)                                                            \
   r4d_ar_twoshot_wide_ti8_kernel<T, WS><<<nb, nt, 0, st>>>(                             \
       (const T*)inp, peers, (char*)my_scratch, (unsigned int*)my_flags, (T*)out,        \
-      (unsigned int*)seq_ctrs, shard_elems, (long)slot_stride_bytes, b_off, (int)rank,  \
+      (unsigned int*)seq_ctrs, (int)n_groups, (long)slot_stride_bytes, b_off, (int)rank, \
       (int)drain, (int)acq, (int)pub)
   if (dtype == 0) R4D_AR_TS8_LAUNCH(__hip_bfloat16);
   else R4D_AR_TS8_LAUNCH(__half);
 #undef R4D_AR_TS8_LAUNCH
+}
+
+void r4d_ar_twoshot_3rank_ti8(long peer_scratch0, long peer_scratch1, long peer_flags0,
+                              long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
+                              long slot_stride_bytes, long inp, long out, long n_elem,
+                              long dtype, long rank, long stream, long nblocks,
+                              long nthreads, long drain, long acq, long pub) {
+  const long ps[2] = {peer_scratch0, peer_scratch1};
+  const long pf[2] = {peer_flags0, peer_flags1};
+  ar_twoshot_ti8_launch<3>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride_bytes, inp,
+                           out, n_elem, dtype, rank, stream, nblocks, nthreads, drain,
+                           acq, pub);
 }
 
 void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_scratch2,

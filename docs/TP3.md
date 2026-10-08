@@ -49,9 +49,8 @@ difference into its weights pool, no further than every one of its weights resid
 of the resolved sizes take the rank's own split -- `Pools::configure` and the planner -- so the
 grown pool is planned into, and startup refuses a rank whose plan and weights pool disagree, or
 whose re-sized KV pool pages fewer tokens than it was sized for. The token count, the carve, the
-loan and the attention ranks' pools are unchanged; a stated `--vram-kv-mib` / `--vram-weights-mib`
-keeps meaning "this many on every card", and `auto` keeps the common split (a fully resident rank
-would choose all_vram while its peers spill). `--deterministic` and a device without virtual memory
+loan and the attention ranks' pools are unchanged, and `auto` keeps the common split (a fully
+resident rank would choose all_vram while its peers spill). `--deterministic` and a device without virtual memory
 management re-split like any other: the cache does not lend there, and the bytes the rank never
 pages are as much its experts' as they are under a lending cache. The condition is the cost, not
 the world: a rank is re-split only where its cache costs less per token than the dearest rank's,
@@ -126,6 +125,14 @@ radiance --model qwen3.8-next-flash-fp8-iq4r-moe.rad --tp 3 --tp-wire exact --ma
     --gpu-headroom-mib 96 --kv-cache-dtype fp8 \
     --num-speculative-tokens 3 --max-num-batched-tokens 2048
 ```
+
+The exact all-reduce at three ranks is the wide family's one-shot up to 1 MiB a message (every
+decode step) and its two-shot above it (every prefill chunk): reduce-scatter + all-gather, which
+sends 4/3 of the message per rank instead of twice it. A message rarely divides into thirds -- a
+2048-wide bf16 row is 256 16-byte words -- so the first `words % 3` shards take one word more.
+Both rows fold in fp32 in ascending rank order, so the band edge between them changes no bits.
+`--tp-wire wht6` at three ranks is the four-rank tiered-int8 wire over the same uneven two-shot,
+above `--tp-wire-min-kb`; under it, the exact one-shot.
 
 The log says what the geometry did:
 

@@ -44,7 +44,7 @@ void usage() {
         "\n"
         "  -m, --model FILE   the .rad whose declared graph supplies the shapes\n"
         "      --home DIR     $RADIANCE_HOME; the cache is written to <home>/tune/<machine>.tune\n"
-        "      --kernels A:B  kernel plugin hierarchy, first wins\n"
+        "      --kernels A:B  the kernel libraries to load, first wins; default every library found\n"
         "      --op NAME      tune only ops whose name starts with NAME\n"
         "      --machine KEY  override the machine key (for writing a cache for another box)\n"
         "      --reps N       timing reps, median reported (default 5)\n"

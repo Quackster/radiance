@@ -98,7 +98,8 @@ enum {
     SP_PENALTY = 1 << 1,
     SP_MASK    = 1 << 2,
     SP_XTC     = 1 << 3,
-    SP_DRY     = 1 << 4
+    SP_DRY     = 1 << 4,
+    SP_LOGPROBS = 1 << 5
 };
 
 __device__ __forceinline__ uint64_t splitmix64(uint64_t z) {
@@ -674,6 +675,115 @@ __global__ __launch_bounds__(kTopkThreads) void topk_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------- sample_logprobs
+// ref_sample_logprobs.  For a row with RAD_SP_LOGPROBS: [max, sum of exp(l - max), k (id, logit)
+// pairs], descending, ties to the lower id, ids global (+ vocab_off) and written as floats.  A row
+// without the flag is not written, and its block leaves before reading anything.
+//
+// THE k LARGEST ARE topk_kernel's SELECT, at the op's fixed k rather than a row's top_k: the same
+// radix_select passes, the tie-break pass only when the threshold's tie group is bigger than the
+// set is owed, and the same packed (key, ~id) bitonic sort, so this set and a top-k candidate set
+// over the same row agree to the bit and the tie rule is ref's by construction.  The maximum is
+// the first of them, so it costs nothing; the sum is one more pass, accurate expf, folded wave by
+// wave in a fixed order -- the same row gives the same bits every step.
+//
+// k IS BOUNDED BY kMaxLogprobs, the LDS the sort runs in.  The engine declares 21 (OpenAI's bound on
+// top_logprobs, and one more so a row is whole 16-byte words); the shim refuses a wider op rather
+// than truncating it.
+constexpr uint32_t kMaxLogprobs = 64;
+
+__global__ __launch_bounds__(kTopkThreads) void logprobs_kernel(
+    const float* __restrict__ lg, const SP* __restrict__ sp, float* __restrict__ st,
+    uint32_t n_vocab, uint32_t k, uint32_t lg_ld, uint32_t st_ld, int32_t vocab_off) {
+    __shared__ unsigned long long cand[kMaxLogprobs];
+    __shared__ uint32_t hist[258];
+    __shared__ uint32_t scan[256], wt[256 / kWave];
+    __shared__ uint32_t fill;
+    __shared__ float red[kTopkWaves];
+
+    const uint32_t m = blockIdx.x;
+    if (!(sp[m].flags & SP_LOGPROBS)) return;
+    const float* __restrict__ row = lg + (size_t)m * lg_ld;
+    float* __restrict__ out = st + (size_t)m * st_ld;
+    const uint32_t kk = k < n_vocab ? k : n_vocab;
+
+    uint32_t n_eq = 0, dummy = 0, n_tie = 0;
+    const uint32_t T = radix_select<true>(row, n_vocab, 0, kk, hist, scan, wt, &n_eq, &n_tie);
+    const uint32_t idx_cut = (n_tie == n_eq)
+                                 ? 0xffffffffu
+                                 : radix_select<false>(row, n_vocab, T, n_eq, hist, scan, wt,
+                                                       &dummy, &n_tie);
+    if (threadIdx.x == 0) fill = 0;
+    __syncthreads();
+    auto collect = [&](float f, uint32_t i) {
+        const uint32_t key = fkey(f);
+        if (!(key > T || (key == T && i <= idx_cut))) return;
+        const uint32_t slot = atomicAdd(&fill, 1u);
+        if (slot < kMaxLogprobs) cand[slot] = ((unsigned long long)key << 32) | (unsigned long long)(~i);
+    };
+    const bool v4 = ((uintptr_t)row & 15u) == 0 && (n_vocab & 3u) == 0;
+    if (v4) {
+        const float4* __restrict__ r4 = (const float4*)row;
+        for (uint32_t j = threadIdx.x; j < (n_vocab >> 2); j += kTopkThreads) {
+            const float4 f = r4[j];
+            collect(f.x, 4 * j);
+            collect(f.y, 4 * j + 1);
+            collect(f.z, 4 * j + 2);
+            collect(f.w, 4 * j + 3);
+        }
+    } else {
+        for (uint32_t i = threadIdx.x; i < n_vocab; i += kTopkThreads) collect(row[i], i);
+    }
+    __syncthreads();
+    const uint32_t got = fill < kk ? fill : kk;
+    uint32_t sn = 1;
+    while (sn < got) sn <<= 1;
+    for (uint32_t i = got + threadIdx.x; i < sn; i += kTopkThreads) cand[i] = 0;
+    __syncthreads();
+    for (uint32_t sz = 2; sz <= sn; sz <<= 1) {
+        for (uint32_t stp = sz >> 1; stp > 0; stp >>= 1) {
+            const uint32_t t = threadIdx.x;
+            if (t < sn) {
+                const uint32_t partner = t ^ stp;
+                if (partner > t) {
+                    const bool up = (t & sz) == 0;                 // `up` here means DESCENDING
+                    const unsigned long long a = cand[t], b = cand[partner];
+                    if (up ? (a < b) : (a > b)) { cand[t] = b; cand[partner] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    const float mx = got ? row[~(uint32_t)(cand[0] & 0xffffffffull)] : -INFINITY;
+    float s = 0.0f;
+    if (v4) {
+        const float4* __restrict__ r4 = (const float4*)row;
+        for (uint32_t j = threadIdx.x; j < (n_vocab >> 2); j += kTopkThreads) {
+            const float4 f = r4[j];
+            s += expf(f.x - mx) + expf(f.y - mx) + expf(f.z - mx) + expf(f.w - mx);
+        }
+    } else {
+        for (uint32_t i = threadIdx.x; i < n_vocab; i += kTopkThreads) s += expf(row[i] - mx);
+    }
+    s = r4d_wave_sum(s);
+    const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+    if (lane == 0) red[wave] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        for (uint32_t w = 0; w < kTopkWaves; ++w) sum += red[w];
+        out[0] = mx;
+        out[1] = sum;
+    }
+    for (uint32_t r = threadIdx.x; r < k; r += kTopkThreads) {
+        const bool live = r < got;
+        const uint32_t loc = live ? ~(uint32_t)(cand[r] & 0xffffffffull) : 0u;
+        out[2 + 2 * r] = live ? (float)((int32_t)loc + vocab_off) : -1.0f;
+        out[3 + 2 * r] = live ? row[loc] : -INFINITY;
+    }
+}
+
 // ---------------------------------------------------------------------------- the narrowing stages
 //
 // All four read a fixed-width candidate set in place: index -1 and value -infinity mark a hole, and
@@ -1052,6 +1162,20 @@ static int r4d_sample_argmax_f32(long lg, long tok, int M, int n_vocab, int lg_l
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+static int r4d_sample_logprobs_f32(long lg, long params, long stats, int M, int n_vocab, int k,
+                                   int lg_ld, int st_ld, int vocab_off, long stream) {
+    if (!lg || !params || !stats) return -1;
+    if (M <= 0 || n_vocab <= 0 || k <= 0) return -2;
+    if ((uint32_t)k > kMaxLogprobs) return -3;
+    if (!lg_ld) lg_ld = n_vocab;
+    if (!st_ld) st_ld = 2 + 2 * k;
+    hipLaunchKernelGGL(logprobs_kernel, dim3((uint32_t)M), dim3(kTopkThreads), 0,
+                       (hipStream_t)stream, (const float*)lg, (const SP*)params, (float*)stats,
+                       (uint32_t)n_vocab, (uint32_t)k, (uint32_t)lg_ld, (uint32_t)st_ld,
+                       (int32_t)vocab_off);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 static int r4d_sample_topk_f32(long lg, long params, long cand_idx, long cand_val, long pairs,
                                    int M, int n_vocab, int n_cand,
                                    int lg_ld, int ci_ld, int cv_ld, int pr_ld, int vocab_off,
@@ -1271,6 +1395,28 @@ extern "C" int r4d_rad_sample_argmax(const RadArgs* a, RadStream s) {
     if (!r4d_contig(tok) || r4d_numel(tok) < M) return R4D_NO(RAD_E_SHAPE);
     R4D_LAUNCH(r4d_sample_argmax_f32(r4d_addr(lg), r4d_addr(tok), (int)M, (int)nv, (int)ld,
                                      (long)(uintptr_t)s));
+}
+
+/* stats [M, 2 + 2k] f32: max, sum of exp(l - max), then k (global id, logit) pairs. */
+extern "C" int r4d_rad_sample_logprobs(const RadArgs* a, RadStream s) {
+    const RadTensor* lg;
+    long long M = 0, nv = 0, ld = 0;
+    R4D_NEED(logits_of(a, &lg, &M, &nv, &ld));
+    const RadTensor* pr = r4d_opt(a, V_PARAMS);
+    R4D_NEED(params_ok(pr, M));
+    const RadTensor* st = r4d_opt(a, 2);
+    if (!st) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_f32(st));
+    const long long k = r4d_pgeti_or(a->p, a->n_p, "k", 0);
+    if (k <= 0 || k > (long long)kMaxLogprobs) return R4D_NO(RAD_E_SHAPE);
+    long long Ms = 0;
+    const long long st_ld = rows_pitch(st, 2 + 2 * k, &Ms);
+    if (st_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (Ms < M) return R4D_NO(RAD_E_SHAPE);
+    const long long voff = r4d_pgeti_or(a->p, a->n_p, "vocab_off", 0);
+    R4D_LAUNCH(r4d_sample_logprobs_f32(r4d_addr(lg), r4d_addr(pr), r4d_addr(st), (int)M, (int)nv,
+                                       (int)k, (int)ld, (int)st_ld, (int)voff,
+                                       (long)(uintptr_t)s));
 }
 
 /* ------------------------------------------------------------------ top-k */

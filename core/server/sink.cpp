@@ -1,5 +1,6 @@
 #include "sink.h"
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 
@@ -57,7 +58,13 @@ void Sink::notify() {
     cv_.notify_one();
 }
 
-bool Sink::push(int32_t token, float logprob) {
+void Sink::enable_logprobs(int n) {
+    alt_w_ = n > 0 ? n : 0;
+    alts_.assign(ring_.size() * (size_t)alt_w_, SinkAlt{});
+    alt_n_.assign(ring_.size(), 0);
+}
+
+bool Sink::push(int32_t token, const TokenLogprobs* lp) {
     const uint64_t h = head_.load(std::memory_order_relaxed);
     const uint64_t t = tail_.load(std::memory_order_acquire);
     if (h - t > mask_) {
@@ -66,7 +73,14 @@ bool Sink::push(int32_t token, float logprob) {
         fail(RAD_E_FULL);
         return false;
     }
-    ring_[h & mask_] = SinkToken{token, logprob};
+    const size_t slot = (size_t)(h & mask_);
+    ring_[slot] = SinkToken{ token, lp ? lp->logprob : 0.0f, 0 };
+    if (alt_w_ > 0) {
+        const int n = lp ? std::min(lp->n_top, alt_w_) : 0;
+        for (int j = 0; j < n; ++j)
+            alts_[slot * (size_t)alt_w_ + (size_t)j] = SinkAlt{ lp->top_id[j], lp->top_lp[j] };
+        alt_n_[slot] = n;
+    }
     head_.store(h + 1, std::memory_order_release);
 
     const int64_t t_now = now_ns() - t_start_ns_;
@@ -100,6 +114,13 @@ void Sink::set_prompt_stats(int32_t n_prompt, int32_t n_cached) {
     n_cached_.store(n_cached, std::memory_order_release);
 }
 
+void Sink::set_prompt_progress(int32_t processed, int32_t total, int32_t cached) {
+    prog_total_.store(total, std::memory_order_release);
+    prog_cached_.store(cached, std::memory_order_release);
+    prog_done_.store(processed, std::memory_order_release);
+    notify();
+}
+
 void Sink::mark_admitted() {
     if (t_admit_.load(std::memory_order_relaxed) < 0)
         t_admit_.store(now_ns() - t_start_ns_, std::memory_order_release);
@@ -112,12 +133,19 @@ void Sink::add_drafts(int32_t n, int32_t accepted) {
                        std::memory_order_release);
 }
 
-size_t Sink::read(SinkToken* out, size_t max) {
+size_t Sink::read(SinkToken* out, size_t max, SinkAlt* alts) {
     const uint64_t t = tail_.load(std::memory_order_relaxed);
     const uint64_t h = head_.load(std::memory_order_acquire);
     size_t n = (size_t)(h - t);
     if (n > max) n = max;
-    for (size_t i = 0; i < n; ++i) out[i] = ring_[(t + i) & mask_];
+    for (size_t i = 0; i < n; ++i) {
+        const size_t slot = (size_t)((t + i) & mask_);
+        out[i] = ring_[slot];
+        if (!alts || alt_w_ <= 0) continue;
+        out[i].n_alt = alt_n_[slot];
+        for (int j = 0; j < alt_n_[slot]; ++j)
+            alts[i * (size_t)alt_w_ + (size_t)j] = alts_[slot * (size_t)alt_w_ + (size_t)j];
+    }
     if (n) tail_.store(t + n, std::memory_order_release);
     return n;
 }

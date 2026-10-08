@@ -46,6 +46,7 @@
 
 #include "rad_sample.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <unordered_map>
 
@@ -612,6 +613,58 @@ int ref_sample_argmax(const RadArgs* a, RadStream) {
             if (bi < 0 || v > best) { best = v; bi = i; }
         }
         st_int(tok->dtype, tok->data, offlin(tok, m), bi);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ sample_logprobs */
+/* THE RAW DISTRIBUTION'S SUMMARY, for a row that asks for logprobs (RAD_SP_LOGPROBS): the row's
+ * maximum, the sum of exp(l - max) over it, and its k largest as (id, logit) pairs, descending,
+ * ties to the lower id, ids as floats (exact below 2^24). Read off the logits before any sampling
+ * stage has touched them, which is the distribution OpenAI's and llama-server's logprobs report.
+ * A row without the flag is not written. Under a split vocabulary the ids are global
+ * (+ `vocab_off`) and the host merges the ranks' summaries; a slot past the row's width is id -1,
+ * logit -infinity. The sum is taken in double here: this is the oracle. */
+int ref_sample_logprobs(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *lg = &a->t[0], *pr = &a->t[1], *st = &a->t[2];
+    const int64_t n_vocab = p_int(a, "n_vocab", lg->rank >= 2 ? lg->shape[lg->rank - 1] : 0);
+    const int64_t k = p_int(a, "k", 0);
+    const int64_t voff = p_int(a, "vocab_off", 0);
+    if (n_vocab <= 0 || k <= 0) return RAD_E_SHAPE;
+    const int64_t M = numel(lg) / n_vocab;
+    const int64_t w = 2 + 2 * k;
+    if (M <= 0 || numel(st) < M * w) return RAD_E_SHAPE;
+    Rows R;
+    RAD_REF_TRY(rows_of(pr, M, &R));
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t m = 0; m < M; ++m) {
+        if (!(R.p[m].flags & RAD_SP_LOGPROBS)) continue;
+        const int64_t lb = rowoff(lg, m, n_vocab), ls = laststride(lg);
+        const int64_t sb = rowoff(st, m, w), ss = laststride(st);
+        float mx = -INFINITY;
+        for (int64_t i = 0; i < n_vocab; ++i) mx = std::max(mx, ldt(lg, lb + i * ls));
+        double sum = 0.0;
+        for (int64_t i = 0; i < n_vocab; ++i) sum += std::exp((double)ldt(lg, lb + i * ls) - mx);
+        std::vector<std::pair<float, int64_t>> top;
+        top.reserve((size_t)k + 1);
+        auto above = [](const std::pair<float, int64_t>& x, const std::pair<float, int64_t>& y) {
+            return x.first > y.first || (x.first == y.first && x.second < y.second);
+        };
+        for (int64_t i = 0; i < n_vocab; ++i) {
+            const std::pair<float, int64_t> e{ ldt(lg, lb + i * ls), i };
+            if ((int64_t)top.size() == k && !above(e, top.back())) continue;
+            top.insert(std::upper_bound(top.begin(), top.end(), e, above), e);
+            if ((int64_t)top.size() > k) top.pop_back();
+        }
+        stt(st, sb, mx);
+        stt(st, sb + ss, (float)sum);
+        for (int64_t j = 0; j < k; ++j) {
+            const bool have_j = j < (int64_t)top.size();
+            stt(st, sb + (2 + 2 * j) * ss, have_j ? (float)(top[(size_t)j].second + voff) : -1.0f);
+            stt(st, sb + (3 + 2 * j) * ss, have_j ? top[(size_t)j].first : -INFINITY);
+        }
     }
     return RAD_OK;
 }

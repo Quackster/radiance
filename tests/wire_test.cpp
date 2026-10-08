@@ -404,8 +404,16 @@ json parsed(const std::string& body) {
 
 }  /* namespace */
 
+static ModelCard card(const char* id, int64_t created, int64_t max_model_len = 0) {
+    ModelCard c;
+    c.id = id;
+    c.created = created;
+    c.max_model_len = max_model_len;
+    return c;
+}
+
 TEST(the_model_list_is_a_list_of_one_with_the_fields_clients_read) {
-    const json o = parsed(models_body("q38-flashnext", 1700000000));
+    const json o = parsed(models_body(card("q38-flashnext", 1700000000)));
     CHECK_EQ(o.value("object", std::string()), std::string("list"));
     CHECK(o["data"].is_array());
     CHECK_EQ(o["data"].size(), 1u);
@@ -414,6 +422,38 @@ TEST(the_model_list_is_a_list_of_one_with_the_fields_clients_read) {
     CHECK_EQ(o["data"][0].value("created", (int64_t)0), (int64_t)1700000000);
     /* `owned_by` is in the schema and generated clients deserialise it. */
     CHECK(o["data"][0].contains("owned_by"));
+    /* No length known, none reported: a client falls back to its own default rather than
+     * trusting a made-up one. */
+    CHECK(!o["data"][0].contains("max_model_len"));
+    CHECK(!o["data"][0].contains("root"));
+    CHECK(!o["data"][0].contains("capabilities"));
+}
+
+TEST(the_model_entry_carries_the_capabilities_it_was_given) {
+    ModelCard c = card("q38-flashnext", 1700000000);
+    c.capabilities = R"({"tools":true,"image":false})";
+    const json m = parsed(model_body(c));
+    CHECK(m["capabilities"].value("tools", false));
+    CHECK(!m["capabilities"].value("image", true));
+}
+
+TEST(the_model_entry_names_the_file_behind_the_served_name) {
+    ModelCard c = card("q38-flashnext", 1700000000);
+    c.root = "/models/qwen3.8-next-flash-fp8-iq4r-moe.rad";
+    CHECK_EQ(parsed(model_body(c)).value("root", std::string()), c.root);
+}
+
+TEST(the_model_list_reports_the_context_the_server_runs_with) {
+    const json o = parsed(models_body(card("q38-flashnext", 1700000000, 262144)));
+    CHECK_EQ(o["data"][0].value("max_model_len", (int64_t)0), (int64_t)262144);
+}
+
+TEST(one_model_is_the_entry_itself_not_a_list_of_one) {
+    const json m = parsed(model_body(card("q38-flashnext", 1700000000, 262144)));
+    CHECK_EQ(m.value("object", std::string()), std::string("model"));
+    CHECK_EQ(m.value("id", std::string()), std::string("q38-flashnext"));
+    CHECK_EQ(m.value("max_model_len", (int64_t)0), (int64_t)262144);
+    CHECK(!m.contains("data"));
 }
 
 TEST(a_chat_body_carries_usage_and_one_choice_per_completion) {
@@ -506,11 +546,19 @@ TEST(a_text_completion_body_is_the_other_shape_entirely) {
 
 /* THE LOGPROB SHAPES DIFFER BETWEEN THE TWO ENDPOINTS and both are fixed by the schema: chat
  * nests an array of per-token objects under `content`, completions carries four parallel arrays.
- * text_offset is cumulative over the token texts, which is what makes it an offset into `text`. */
+ * text_offset is where each token's text starts in `text`: where the token before it ended. */
 TEST(logprobs_take_each_endpoints_own_shape) {
     ChoiceOut c;
     c.text = "abcd";
-    c.logprobs = { { 1, "ab", -0.5f }, { 2, "cd", -1.5f } };
+    auto entry = [](int32_t id, const char* t, float lp, size_t end) {
+        LogprobEntry e;
+        e.token = id;
+        e.text = e.bytes = t;
+        e.logprob = lp;
+        e.end = end;
+        return e;
+    };
+    c.logprobs = { entry(1, "ab", -0.5f, 2), entry(2, "cd", -1.5f, 4) };
     OaiRequest r = a_request("x", "m");
     r.want_logprobs = true;
 

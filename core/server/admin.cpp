@@ -1,6 +1,7 @@
-/* core/server/admin.cpp -- vLLM's non-generation endpoints.
+/* core/server/admin.cpp -- vLLM's and llama-server's non-generation endpoints.
  *
- * /version /ping /load /tokenize /detokenize /get_tokenizer_info /server_info /reset_prefix_cache.
+ * /version /ping /load /tokenize /detokenize /get_tokenizer_info /server_info /reset_prefix_cache
+ * /props.
  *
  * Separate from server.cpp because none of it touches the step path: no admission, no Sink, no
  * cancellation, nothing that outlives the handler. They are questions ABOUT the server, answered
@@ -8,15 +9,17 @@
  * streaming lifetime would make that file harder to read for no shared code at all.
  *
  * WHAT IS DELIBERATELY NOT HERE. vLLM's surface also carries /pooling, /classify, /score and
- * /rerank (an embedding or cross-encoder model, which this engine does not load), /sleep, /wake_up
+ * /rerank (a classifier or cross-encoder head, which this engine does not load), /sleep, /wake_up
  * and /is_sleeping (there is no sleep mode: weights are placed once, see spec §5), the LoRA
- * adapter endpoints (no LoRA), /invocations (a SageMaker envelope around the others) and
- * /v1/responses (a stateful conversation store, which is a component and not an endpoint). Each
- * would be a lie in the shape of a 200, so each is absent and answers 404 rather than pretending.
+ * adapter endpoints (no LoRA), /invocations (a SageMaker envelope around the others) and the
+ * Responses API's stored responses (retrieved or deleted by id: a conversation store, which is a
+ * component and not an endpoint); llama-server's carries /slots (its own slot state). Each would
+ * be a lie in the shape of a 200, so each is absent and answers 404 rather than pretending.
  */
 #include "server.h"
 
 #include "rad_internal.h"
+#include "text/tokenizer.h"
 
 #include <nlohmann/json.hpp>
 
@@ -143,8 +146,61 @@ HttpResponse Server::handle_tokenize(const HttpRequest& req) {
 
     auto msgs = b.find("messages");
     auto prom = b.find("prompt");
-    if (msgs != b.end() && prom != b.end())
-        return error_response(err_bad("prompt", "send `prompt` or `messages`, not both"), req.peer);
+    auto cont = b.find("content");
+    if ((msgs != b.end()) + (prom != b.end()) + (cont != b.end()) > 1)
+        return error_response(err_bad("prompt", "send one of `prompt`, `messages` or `content`"),
+                              req.peer);
+
+    /* THE THIRD SHAPE IS llama-server's: `content` -- a string, or strings and token ids mixed,
+     * as its /completion takes a prompt -- with its own two flags and its own defaults (no BOS,
+     * control tokens recognised), answered under its own key, `tokens`, as ids or with
+     * `with_pieces` as {id, piece} objects. A piece that is not whole UTF-8 is its bytes, as
+     * llama-server sends it. */
+    if (cont != b.end()) {
+        const bool add_special   = get_bool_or(b, "add_special", false);
+        const bool parse_special = get_bool_or(b, "parse_special", true);
+        const bool with_pieces   = get_bool_or(b, "with_pieces", false);
+        auto take = [&](const json& v, bool first) -> bool {
+            if (v.is_string()) {
+                const std::vector<int32_t> t =
+                    deps_.tok->encode(v.get<std::string>(), first && add_special, parse_special);
+                toks.insert(toks.end(), t.begin(), t.end());
+                return true;
+            }
+            int32_t id = 0;
+            if (!v.is_number_integer() || !token_id(v, &id)) return false;
+            toks.push_back(id);
+            return true;
+        };
+        bool ok = true;
+        if (cont->is_array()) {
+            bool first = true;
+            for (const json& v : *cont) { ok = ok && take(v, first); first = false; }
+        } else {
+            ok = cont->is_string() && take(*cont, true);
+        }
+        if (!ok)
+            return error_response(err_bad("content", "must be a string, or an array of strings "
+                                                     "and token ids"), req.peer);
+        json arr = json::array();
+        for (int32_t t : toks) {
+            if (!with_pieces) { arr.push_back(t); continue; }
+            const std::string piece = deps_.tok->token_bytes(t);
+            json e;
+            e["id"] = t;
+            /* A piece that is not whole UTF-8 goes as its bytes, 0-255, as llama-server sends it. */
+            if (utf8_valid_prefix(piece) == piece.size()) e["piece"] = piece;
+            else e["piece"] = std::vector<int>((const unsigned char*)piece.data(),
+                                               (const unsigned char*)piece.data() + piece.size());
+            arr.push_back(std::move(e));
+        }
+        json o;
+        o["tokens"]        = std::move(arr);
+        o["count"]         = (int64_t)toks.size();
+        o["max_model_len"] = opt_.max_ctx;
+        metrics_.observe_http(200);
+        return HttpResponse::json_body(200, json_dump(o));
+    }
 
     if (msgs != b.end()) {
         if (!deps_.chat)
@@ -227,8 +283,113 @@ HttpResponse Server::handle_detokenize(const HttpRequest& req) {
         toks.push_back(id);
     }
 
+    /* `prompt` is vLLM's key and `content` llama-server's, for the same text. */
     json o;
     o["prompt"] = deps_.tok->decode(toks);
+    o["content"] = o["prompt"];
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(o));
+}
+
+/* ================================================================== /props */
+/* llama-server's /props, for the clients built against it: a front-end that sizes its context
+ * from default_generation_settings.n_ctx, shows an image button when modalities.vision is set,
+ * and reads what a request that sends no sampler fields inherits. /server_info says all of it and
+ * more, but nothing written for llama-server knows to ask there.
+ *
+ * Only what this server can fill honestly, under llama-server's names: no GGUF metadata, no
+ * per-slot state. n_ctx is the context ONE request may use, which is what llama-server's per-slot
+ * n_ctx means to the clients reading it; left out when the server does not know its length. */
+HttpResponse Server::handle_props(const HttpRequest&) {
+    const SamplingParams& sp = opt_.default_sampling;
+    /* EVERY FIELD llama-server's `params` CARRIES, so a client that reads one does not find it
+     * missing. The samplers this server does not run are reported at their off values -- which
+     * is what it serves -- and `samplers` is its own order, temperature first. */
+    const int64_t n_predict = opt_.default_max_tokens > 0 ? opt_.default_max_tokens : -1;
+    json params;
+    params["n_predict"]           = n_predict;
+    params["max_tokens"]          = n_predict;
+    params["seed"]                = -1;
+    params["temperature"]         = sp.temp;
+    params["dynatemp_range"]      = 0.0;
+    params["dynatemp_exponent"]   = 1.0;
+    params["top_k"]               = sp.top_k;
+    params["top_p"]               = sp.top_p;
+    params["min_p"]               = sp.min_p;
+    params["top_n_sigma"]         = -1.0;
+    params["typical_p"]           = sp.typical_p;
+    params["typ_p"]               = sp.typical_p;
+    params["xtc_probability"]     = sp.xtc_probability;
+    params["xtc_threshold"]       = sp.xtc_threshold;
+    params["repeat_last_n"]       = sp.penalty_last_n;
+    params["repeat_penalty"]      = sp.rep_penalty;
+    params["presence_penalty"]    = sp.pres_penalty;
+    params["frequency_penalty"]   = sp.freq_penalty;
+    params["dry_multiplier"]      = sp.dry_multiplier;
+    params["dry_base"]            = sp.dry_base;
+    params["dry_allowed_length"]  = sp.dry_allowed_length;
+    params["dry_penalty_last_n"]  = sp.dry_penalty_last_n;
+    params["dry_sequence_breakers"] = sp.dry_seq_breakers.empty() && !opt_.default_dry_breakers_set
+                                    ? std::vector<std::string>{ "\n", ":", "\"", "*" }
+                                    : sp.dry_seq_breakers;
+    params["mirostat"]            = 0;
+    params["mirostat_tau"]        = 5.0;
+    params["mirostat_eta"]        = 0.1;
+    params["stop"]                = json::array();
+    params["n_keep"]              = 0;
+    params["n_discard"]           = 0;
+    params["ignore_eos"]          = false;
+    params["stream"]              = true;
+    params["logit_bias"]          = json::array();
+    params["n_probs"]             = 0;
+    params["min_keep"]            = 0;
+    params["grammar"]             = "";
+    params["grammar_lazy"]        = false;
+    params["grammar_triggers"]    = json::array();
+    params["preserved_tokens"]    = json::array();
+    params["chat_format"]         = "";
+    params["reasoning_format"]    = "auto";
+    params["reasoning_in_content"] = false;
+    params["generation_prompt"]   = "";
+    params["samplers"] = { "penalties", "dry", "temperature", "top_k", "top_p", "min_p", "typ_p",
+                           "xtc" };
+    params["backend_sampling"]    = false;
+    params["timings_per_token"]   = false;
+    params["post_sampling_probs"] = false;
+    params["lora"]                = json::array();
+
+    json gen;
+    if (opt_.max_ctx > 0) gen["n_ctx"] = opt_.max_ctx;
+    gen["params"] = std::move(params);
+
+    json modal;
+    modal["vision"] = deps_.mm && deps_.mm->accepts(MediaKind::Image);
+    modal["video"]  = deps_.mm && deps_.mm->accepts(MediaKind::Video);
+    modal["audio"]  = deps_.mm && deps_.mm->accepts(MediaKind::Audio);
+
+    json o;
+    o["default_generation_settings"] = std::move(gen);
+    o["total_slots"] = opt_.max_seqs;
+    o["model_alias"] = opt_.model_id;
+    o["model_path"]  = opt_.model_path;
+    o["modalities"]  = std::move(modal);
+    o["endpoint_slots"]   = false;
+    o["endpoint_props"]   = false;
+    o["endpoint_metrics"] = true;
+    o["chat_template"]      = deps_.chat ? deps_.chat->source() : std::string();
+    o["chat_template_caps"] = json::parse(deps_.chat ? deps_.chat->caps() : std::string("{}"),
+                                          nullptr, false);
+    std::string bos, eos;
+    if (deps_.tok) {
+        const ITokenizer::VocabInfo v = deps_.tok->vocab_info();
+        if (v.bos >= 0) bos = deps_.tok->piece(v.bos);
+        if (v.eos >= 0) eos = deps_.tok->piece(v.eos);
+    }
+    o["bos_token"]   = bos;
+    o["eos_token"]   = eos;
+    o["build_info"]  = "radiance " + opt_.version;
+    o["role"]        = "model";
+    o["is_sleeping"] = false;
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, json_dump(o));
 }
@@ -262,6 +423,30 @@ HttpResponse Server::handle_tokenizer_info(const HttpRequest& req) {
     return HttpResponse::json_body(200, json_dump(o));
 }
 
+/* ================================================================== capabilities */
+json Server::capabilities() const {
+    json caps;
+    caps["chat"]      = deps_.chat != nullptr;
+    caps["tools"]     = deps_.chat && deps_.chat->supports_tools();
+    caps["reasoning"] = deps_.chat && deps_.chat->supports_reasoning();
+    caps["grammar"]   = deps_.grammar != nullptr;
+    caps["embedding"] = deps_.embed != nullptr;
+    caps["image"]     = deps_.mm && deps_.mm->accepts(MediaKind::Image);
+    caps["video"]     = deps_.mm && deps_.mm->accepts(MediaKind::Video);
+    caps["audio"]     = deps_.mm && deps_.mm->accepts(MediaKind::Audio);
+    caps["logprobs"]  = opt_.supports_logprobs;
+    /* THE EFFORTS A CHAT REQUEST MAY SEND, as probed from the template at startup: null when it
+     * takes any word. "none" and "minimal" are this server's, and turn thinking off. */
+    if (lim_.reasoning_efforts.empty()) {
+        caps["reasoning_efforts"] = nullptr;
+    } else {
+        std::vector<std::string> e = { "none", "minimal" };
+        e.insert(e.end(), lim_.reasoning_efforts.begin(), lim_.reasoning_efforts.end());
+        caps["reasoning_efforts"] = e;
+    }
+    return caps;
+}
+
 /* ================================================================== /server_info */
 /* vLLM returns the repr() of its config object, which is a Python string a client can only print.
  * This returns the same information as JSON, in two halves: what the SERVER decided, which is
@@ -288,25 +473,7 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
     srv["uptime_s"]           = unix_now() - started_at_;
     srv["in_flight"]          = in_flight_.load(std::memory_order_relaxed);
 
-    json caps;
-    caps["chat"]      = deps_.chat != nullptr;
-    caps["tools"]     = deps_.chat && deps_.chat->supports_tools();
-    caps["reasoning"] = deps_.chat && deps_.chat->supports_reasoning();
-    caps["grammar"]   = deps_.grammar != nullptr;
-    caps["embedding"] = deps_.embed != nullptr;
-    caps["image"]     = deps_.mm && deps_.mm->accepts(MediaKind::Image);
-    caps["video"]     = deps_.mm && deps_.mm->accepts(MediaKind::Video);
-    caps["audio"]     = deps_.mm && deps_.mm->accepts(MediaKind::Audio);
-    caps["logprobs"]  = opt_.supports_logprobs;
-    /* THE EFFORTS A CHAT REQUEST MAY SEND, as probed from the template at startup: null when it
-     * takes any word. "none" and "minimal" are this server's, and turn thinking off. */
-    if (lim_.reasoning_efforts.empty()) {
-        caps["reasoning_efforts"] = nullptr;
-    } else {
-        std::vector<std::string> e = { "none", "minimal" };
-        e.insert(e.end(), lim_.reasoning_efforts.begin(), lim_.reasoning_efforts.end());
-        caps["reasoning_efforts"] = e;
-    }
+    json caps = capabilities();
 
     /* WHAT A REQUEST THAT LEAVES A FIELD OUT GETS, under the request's own spelling of each
      * field, so a client can read off exactly what leaving one out means on this deployment. */

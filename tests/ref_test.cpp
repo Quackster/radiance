@@ -281,7 +281,7 @@ TEST(op_vocabulary) {
         "embed_lookup", "logits_gemm", "logits_select",
         "sample_penalties", "sample_dry", "sample_temp", "sample_topk", "sample_topp",
         "sample_minp", "sample_typical", "sample_xtc", "sample_mask", "sample_pick",
-        "sample_argmax", "sample_merge_topk",
+        "sample_argmax", "sample_merge_topk", "sample_logprobs",
     };
     for (const char* op : kOps) {
         if (!kern(op)) fprintf(stderr, "    missing op '%s'\n", op);
@@ -3165,6 +3165,27 @@ TEST(op_sample_temp_topk_argmax) {
     A d; d.t(lg).t(spz.operand()).i("M", 1).i("n_vocab", 4);
     CHECK_OK(run("sample_temp", d));
     CHECK_EQ(lg.at(1), 6.0f);
+}
+
+/* The raw distribution's summary: max, sum of exp(l - max), the k largest with the lower id first
+ * on a tie, slots past the vocabulary as holes, global ids under an offset, and a row without the
+ * flag left as it was. */
+TEST(op_sample_logprobs) {
+    T lg(RAD_F32, {2, 4}); lg.f({1, 3, 2, 3,  0, 0, 0, 0});
+    T st(RAD_F32, {2, 2 + 2 * 5});
+    st.f(std::vector<float>(2 * 12, 9.0f));
+    SP sp(2); sp[0].flags = RAD_SP_LOGPROBS;
+    A a; a.t(lg).t(sp.operand()).t(st).i("M", 2).i("n_vocab", 4).i("k", 5).i("vocab_off", 100);
+    CHECK_OK(run("sample_logprobs", a));
+    CHECK_EQ(st.at(0), 3.0f);
+    CHECK_NEAR(st.at(1), std::exp(-2.0f) + 1.0f + std::exp(-1.0f) + 1.0f, 1e-6);
+    CHECK_EQ(st.at(2), 101.0f); CHECK_EQ(st.at(3), 3.0f);     /* the tie: id 1 before id 3 */
+    CHECK_EQ(st.at(4), 103.0f); CHECK_EQ(st.at(5), 3.0f);
+    CHECK_EQ(st.at(6), 102.0f); CHECK_EQ(st.at(7), 2.0f);
+    CHECK_EQ(st.at(8), 100.0f); CHECK_EQ(st.at(9), 1.0f);
+    CHECK_EQ(st.at(10), -1.0f);                                /* four tokens, five slots */
+    CHECK(st.at(11) == -INFINITY);
+    CHECK_EQ(st.at(12), 9.0f);                                 /* row 1 asked for nothing */
 }
 
 TEST(op_sample_narrowing) {

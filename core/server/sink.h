@@ -49,7 +49,14 @@ const char* finish_reason_oai(Finish f);
 
 struct SinkToken {
     int32_t token = 0;
-    float   logprob = 0.0f;   /* 0 when the sampler does not supply one; see Sink::has_logprobs */
+    float   logprob = 0.0f;   /* the token's logprob; 0 unless the request asked for logprobs */
+    int32_t n_alt = 0;        /* how many alternatives read() wrote for this token */
+};
+
+/* One of a token's most likely alternatives, with its logprob. */
+struct SinkAlt {
+    int32_t id = 0;
+    float   logprob = 0.0f;
 };
 
 class Sink {
@@ -73,8 +80,9 @@ public:
 
     /* ------------------------------------------------------------------ producer: scheduler */
 
-    /* Returns false only on overflow, which also marks the request failed. */
-    bool push(int32_t token, float logprob = 0.0f);
+    /* Returns false only on overflow, which also marks the request failed. `lp` is the token's
+     * logprobs when the request asked for them (enable_logprobs), and null otherwise. */
+    bool push(int32_t token, const TokenLogprobs* lp = nullptr);
 
     /* Terminal. Idempotent -- the first call wins, so a cancel racing a natural stop does not
      * produce two finish reasons. */
@@ -97,11 +105,20 @@ public:
     /* A verify step's speculation for this request: `n` tokens proposed, `accepted` of them
      * taken. Summed over the request, the per-request half of /metrics' draft counters. */
     void add_drafts(int32_t n, int32_t accepted);
+    /* HOW MUCH OF THE PROMPT IS IN THE CACHE: at admission (what the prefix cache supplied) and
+     * after every prefill step, of `total`, of which `cached` came from the prefix cache. What
+     * llama-server streams as `prompt_progress` when a request asks for it; wakes the consumer. */
+    void set_prompt_progress(int32_t processed, int32_t total, int32_t cached);
+    int32_t progress_processed() const { return prog_done_.load(std::memory_order_acquire); }
+    int32_t progress_total() const    { return prog_total_.load(std::memory_order_acquire); }
+    int32_t progress_cached() const   { return prog_cached_.load(std::memory_order_acquire); }
 
     /* ------------------------------------------------------------------ consumer: HTTP */
 
-    /* Copies up to `max` tokens out. Returns how many. Never blocks. */
-    size_t read(SinkToken* out, size_t max);
+    /* Copies up to `max` tokens out. Returns how many. Never blocks. With `alts`, each token's
+     * alternatives too: token i's n_alt of them at alts[i * alt_width()], which needs room for
+     * max * alt_width(). */
+    size_t read(SinkToken* out, size_t max, SinkAlt* alts = nullptr);
 
     /* Sleeps until there is something to read, the request is terminal, or `timeout_ms` elapses.
      * Returns true if there is now something to look at. */
@@ -133,11 +150,11 @@ public:
     int32_t n_prompt() const { return n_prompt_.load(std::memory_order_acquire); }
     int32_t n_cached() const { return n_cached_.load(std::memory_order_acquire); }
 
-    /* The engine sets this at wiring time if its sampler returns per-token probabilities. Without
-     * it the logprobs field of a response is null rather than zeros (spec: nothing unimplemented
-     * returns success). */
-    void set_has_logprobs(bool v) { has_logprobs_ = v; }
-    bool has_logprobs() const { return has_logprobs_; }
+    /* THE ALTERNATIVES' RING, sized for `n` a token, beside the token ring: allocated only for a
+     * request that asks for them, because at RAD_MAX_LOGPROBS it is twenty times the token ring.
+     * Called by the consumer before the request is handed to the scheduler. */
+    void enable_logprobs(int n);
+    int  alt_width() const { return alt_w_; }
 
     /* The engine's request id, so a dropped connection can reach IScheduler::cancel. */
     uint64_t id = 0;
@@ -174,7 +191,12 @@ private:
 
     std::atomic<int32_t>  n_prompt_{0};
     std::atomic<int32_t>  n_cached_{0};
-    bool                  has_logprobs_ = false;
+    std::atomic<int32_t>  prog_done_{-1};
+    std::atomic<int32_t>  prog_total_{0};
+    std::atomic<int32_t>  prog_cached_{0};
+    std::vector<SinkAlt>  alts_;                 /* [capacity * alt_w_], parallel to ring_ */
+    std::vector<int32_t>  alt_n_;                /* [capacity] */
+    int                   alt_w_ = 0;
     std::vector<float>    embd_;
 
     std::mutex              m_;
@@ -183,8 +205,8 @@ private:
 
 /* The scheduler's call sites, so core/sched needs one include and no casts of its own. A null
  * sink is legal and means nobody is listening -- an offline or benchmark request. */
-inline bool sink_push(void* s, int32_t token, float logprob = 0.0f) {
-    return s ? static_cast<Sink*>(s)->push(token, logprob) : true;
+inline bool sink_push(void* s, int32_t token, const TokenLogprobs* lp = nullptr) {
+    return s ? static_cast<Sink*>(s)->push(token, lp) : true;
 }
 inline void sink_finish(void* s, Finish f) {
     if (s) static_cast<Sink*>(s)->finish(f);
@@ -200,6 +222,9 @@ inline void sink_prompt_stats(void* s, int32_t n_prompt, int32_t n_cached) {
 }
 inline void sink_admitted(void* s) {
     if (s) static_cast<Sink*>(s)->mark_admitted();
+}
+inline void sink_prompt_progress(void* s, int32_t processed, int32_t total, int32_t cached) {
+    if (s) static_cast<Sink*>(s)->set_prompt_progress(processed, total, cached);
 }
 inline void sink_drafts(void* s, int32_t n, int32_t accepted) {
     if (s) static_cast<Sink*>(s)->add_drafts(n, accepted);

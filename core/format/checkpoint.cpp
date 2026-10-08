@@ -278,16 +278,21 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
      * be a linear position divide for llama3, longrope or YaRN. */
     m.rope_scale  = 1.0f;
 
-    /* The quantisation descriptor, which with the architecture selects the plugin (spec §2.4).
-     * "fp8" plus its format, so qwen35_fp8 and qwen35_bf16 are told apart by the checkpoint
-     * rather than by a flag. */
-    if (const char* qm = gs("quantization_config.quant_method")) {
-        out->quant = qm;
-        if (const char* fm = gs("quantization_config.fmt")) { out->quant += "_"; out->quant += fm; }
-    }
-
+    out->quant = quant_descriptor(*out);
     out->finish();
     return RAD_OK;
+}
+
+/* The quantisation descriptor, which with the architecture selects the plugin (spec §2.4).
+ * "fp8" plus its format, so qwen35_fp8 and qwen35_bf16 are told apart by the checkpoint
+ * rather than by a flag. */
+std::string quant_descriptor(const MetaOwn& m) {
+    std::string q;
+    if (const char* qm = m.get("quantization_config.quant_method")) {
+        q = qm;
+        if (const char* fm = m.get("quantization_config.fmt")) { q += "_"; q += fm; }
+    }
+    return q;
 }
 
 int meta_from_gguf(GgufFile& g, MetaOwn* out) {
@@ -428,10 +433,24 @@ int Checkpoint::open_gguf(const std::string& path) {
     return meta_from_gguf(gguf_, &meta_);
 }
 
-int Checkpoint::add_shard(const std::string& p, const std::string& prefix) {
+int Checkpoint::add_shard(const std::string& p, const std::string& prefix,
+                          const std::unordered_map<std::string, std::string>* owner) {
     shards_.push_back(std::make_unique<SafeTensorsFile>());
     RAD_TRY(shards_.back()->open(p));
+    const std::string file = p.substr(p.find_last_of('/') + 1);
     for (const auto& t : shards_.back()->tensors()) {
+        /* THE INDEX SAYS WHICH SHARD A TENSOR IS READ FROM. A directory that merges two
+         * checkpoints -- a finetune's changed tensors in its own shards beside links to the base
+         * model's -- holds some names in two shards, and only the index tells the copies apart. */
+        if (owner) {
+            auto it = owner->find(t.name);
+            if (it != owner->end() && it->second != file) continue;
+        }
+        if (index_.count(prefix + t.name)) {
+            RAD_ERR("%s: '%s' is also in %s, and no index entry says which copy to read", p.c_str(),
+                    t.name.c_str(), shards_[index_shard_[prefix + t.name]]->path().c_str());
+            return RAD_E_FORMAT;
+        }
         if (t.dtype == RAD_DT_INVALID) {
             RAD_ERR("%s: '%s' has dtype %s, which has no RAD equivalent", p.c_str(),
                     t.name.c_str(), t.dtype_str.c_str());
@@ -443,6 +462,7 @@ int Checkpoint::add_shard(const std::string& p, const std::string& prefix) {
         s.shape     = t.shape;         /* safetensors is already row-major */
         s.data      = t.data;
         s.bytes     = (int64_t)t.bytes;
+        index_shard_.emplace(s.name, shards_.size() - 1);
         index_.emplace(s.name, tensors_.size());
         tensors_.push_back(std::move(s));
     }
@@ -451,13 +471,13 @@ int Checkpoint::add_shard(const std::string& p, const std::string& prefix) {
 
 namespace {
 
-/* Every shard an index names, once each and in name order, or the one model.safetensors. */
+/* Every shard an index names, once each and in name order, or the one model.safetensors; `map`
+ * is the index's weight_map, empty without one. */
 int shard_list(const std::string& dir, const std::string& index, bool index_given,
-               std::vector<std::string>* out) {
-    std::unordered_map<std::string, std::string> map;
-    const int s = st_load_index(index, &map);
+               std::vector<std::string>* out, std::unordered_map<std::string, std::string>* map) {
+    const int s = st_load_index(index, map);
     if (s == RAD_OK) {
-        for (auto& [t, f] : map)
+        for (auto& [t, f] : *map)
             if (std::find(out->begin(), out->end(), f) == out->end()) out->push_back(f);
         std::sort(out->begin(), out->end());
         for (auto& f : *out) f = dir + "/" + f;
@@ -474,6 +494,7 @@ int Checkpoint::open_safetensors(const std::string& path) {
     kind_ = SafeT;
     /* One shard, an index, or the directory holding either: one namespace whichever it is. */
     std::vector<std::string> shards;
+    std::unordered_map<std::string, std::string> owner;
     const bool is_index = path.size() > 10 && path.compare(path.size() - 10, 10, "index.json") == 0;
     const bool is_file = path.size() > 12 &&
                          path.compare(path.size() - 12, 12, ".safetensors") == 0;
@@ -481,9 +502,9 @@ int Checkpoint::open_safetensors(const std::string& path) {
         shards.push_back(path);
     } else {
         RAD_TRY(shard_list(dir_, is_index ? path : dir_ + "/model.safetensors.index.json",
-                           is_index, &shards));
+                           is_index, &shards, &owner));
     }
-    for (const auto& sh : shards) RAD_TRY(add_shard(sh));
+    for (const auto& sh : shards) RAD_TRY(add_shard(sh, "", owner.empty() ? nullptr : &owner));
 
     RAD_TRY(meta_from_config_json(dir_, &meta_));
     RAD_TRY(meta_merge_generation_config(dir_, &meta_));
@@ -683,8 +704,9 @@ int Checkpoint::add_draft(const std::string& dir, const std::string& prefix) {
                                             ? prefix
                                             : prefix.substr(0, prefix.size() - 1), &meta_));
     std::vector<std::string> shards;
-    RAD_TRY(shard_list(dir, dir + "/model.safetensors.index.json", false, &shards));
-    for (const auto& sh : shards) RAD_TRY(add_shard(sh, prefix));
+    std::unordered_map<std::string, std::string> owner;
+    RAD_TRY(shard_list(dir, dir + "/model.safetensors.index.json", false, &shards, &owner));
+    for (const auto& sh : shards) RAD_TRY(add_shard(sh, prefix, owner.empty() ? nullptr : &owner));
     meta_.finish();
     return RAD_OK;
 }

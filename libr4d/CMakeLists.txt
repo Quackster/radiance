@@ -64,6 +64,9 @@ set(R4D_UNITS
   # Twelve, head_dim 256 only: Qwen3.8-Flash-Next's QSA layers are 24 over 2. Four lines that
   # set the ratio and include the unit above, which is the parameterised body.
   "r4d_attn_paged_h256_gqa12|"
+  # Four, head_dim 256: Qwen3.5-0.8B is 8 over 2 at the 27B's head width. Again the body above
+  # with the ratio set.
+  "r4d_attn_paged_h256_gqa4|"
   # Six, head_dim 256 and the same 4-token page: the same QSA layers at four ranks, where each KV
   # head is replicated across a rank pair. Again four lines that set the ratio and include the body.
   "r4d_attn_paged_h256_gqa6_bs4|"

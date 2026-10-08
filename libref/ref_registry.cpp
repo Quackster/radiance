@@ -610,6 +610,12 @@ static const RadParamSpec pTopk[]        = { P_INT("M"), P_INT("n_vocab"), P_INT
 static const RadOperandSpec oTopk[]      = { OPD("logits"), OPD("params"),
                                              OUT("cand_idx"), OUT("cand_val"), OUT_O("pairs") };
 static const RadOperandSpec oArgmax[]    = { OPD("logits"), OPD("params"), OUT("token") };
+/* `stats` is [M, 2 + 2k]: max, sum of exp(l - max), then k (id, logit) pairs. `k` is geometry --
+ * the sampler declares the one width every request's top_logprobs fits in -- and `vocab_off` is
+ * sample_topk's, for global ids under a split vocabulary. */
+static const RadParamSpec pLogprobs[]    = { P_INT("M"), P_INT("n_vocab"), P_INT("k"),
+                                             P_INTO("vocab_off") };
+static const RadOperandSpec oLogprobs[]  = { OPD("logits"), OPD("params"), OUT("stats") };
 static const RadOperandSpec oNarrow[]    = { INOUT("cand_idx"), INOUT("cand_val"), OPD("params") };
 static const RadOperandSpec oPick[]      = { OPD("cand_idx"), OPD("cand_val"), OPD("params"),
                                              OUT("token") };
@@ -1055,6 +1061,9 @@ static const RadOpSchema kSchemas[] = {
   "same descending form the single-rank path produces. Token ids in `gathered` are already "
   "global." },
 { "sample_argmax", ARR(pMVocab), ARR(oArgmax), "Greedy, ties to the lower token id." },
+{ "sample_logprobs", ARR(pLogprobs), ARR(oLogprobs),
+  "For a row with RAD_SP_LOGPROBS: the raw logits' max, sum of exp(l - max) and k largest as (id, "
+  "logit) pairs, descending, ties to the lower id. Other rows are not written." },
 };
 
 /* ================================================================== the kernel table */
@@ -1277,6 +1286,8 @@ SIMPLE("ref_sample_mask", "sample_mask", "sample", "grammar bitmask application"
 SIMPLE("ref_sample_pick", "sample_pick", "sample", "seeded inverse-CDF draw", DT_FLOAT,
        ref_sample_pick),
 SIMPLE("ref_sample_argmax", "sample_argmax", "sample", "greedy pick", DT_FLOAT, ref_sample_argmax),
+SIMPLE("ref_sample_logprobs", "sample_logprobs", "sample", "the raw distribution's summary",
+       DT_FLOAT, ref_sample_logprobs),
 SIMPLE("ref_sample_dry", "sample_dry", "sample", "DRY repetition-suffix penalty", DT_FLOAT,
        ref_sample_dry),
 SIMPLE("ref_sample_typical", "sample_typical", "sample", "locally typical narrowing in place",

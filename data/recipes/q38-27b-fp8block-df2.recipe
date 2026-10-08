@@ -1,0 +1,40 @@
+# q38-27b-fp8block-df2.recipe -- a bf16 Qwen3.8-27B checkpoint (the base model's bf16 release or a
+# finetune of it) as block fp8 with the DFlash2 drafter, the same weights in the same form as
+# Qwen's own FP8 release, so it serves exactly as q38-27b-fp8-df2.rad does.
+#
+#   rad-convert <bf16 Qwen3.8-27B checkpoint> --draft-model <z-lab/Qwen3.8-27B-DFlash2> \
+#       --recipe data/recipes/q38-27b-fp8block-df2.recipe \
+#       --set quantization_config.quant_method=fp8 --set quantization_config.fmt=e4m3 \
+#       --set "quantization_config.weight_block_size=128 128" \
+#       --set quantization_config.activation_scheme=dynamic -o model.rad
+#
+# The --set keys state the format the container is in, as Qwen's FP8 checkpoint's own config does:
+# they are what selects qwen35_fp8 to serve it, where a bf16 checkpoint selects qwen35.
+#
+# The trunk's linears -- attention q/gate, k, v and output, the delta net's qkv/z and output
+# projections, and the MLP's gate/up and down -- as E4M3 with one bf16 scale a 128x128 block,
+# rounded to nearest: the set and the format Qwen's FP8 checkpoint ships (its quantization_config:
+# fp8, e4m3, weight_block_size [128, 128], bf16 scales). Every fused weight's pieces end on a
+# 128-row boundary, so a block never spans two of them. The delta net's a/b projection, the
+# norms, the embedding and the vision tower stay bf16, as there. The lm_head and the drafter are
+# q38-27b-fp8-df2.recipe's.
+
+blk.*.attn_qg.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_k.weight                  rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_v.weight                  rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_output.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ssm_inz.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ssm_out.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_gate_up.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_down.weight                rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+output.weight                        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.draft_head.weight             rtn  codes=u2 zero=u8 group=128 scale=f16 rule=search
+
+dflash.fc.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_q.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_k.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_v.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_output.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_gate_up.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_down.weight         rtn  codes=fp4_e2m1 group=32 scale=e8m0

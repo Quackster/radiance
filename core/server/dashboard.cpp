@@ -59,6 +59,7 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
         json e;
         e["id"]        = s.id;
         e["model"]     = s.model;
+        if (!s.label.empty()) e["label"] = s.label;
         e["tokens"]    = s.n_tokens;
         e["bytes"]     = s.bytes;
         e["idle_s"]    = s.idle_s;
@@ -681,6 +682,7 @@ th + th, td + td { padding-left:14px; }
 /* Fixed, so the tier column starts at one x in both tables. */
 .stbl .ret { width:340px; }
 .sid { font-weight:500; }
+.slabel { margin-left:8px; color:var(--faint); }
 .mv { font:500 10px/1 var(--ui); color:var(--faint); border:1px solid var(--rule);
       border-radius:4px; padding:2px 5px; margin-left:6px; }
 /* WHERE IT IS, by share of the conversation's context, one colour a tier. A conversation is
@@ -2850,6 +2852,8 @@ function sessRow(r, hybrid, manyModels) {
   const tr = el("tr");
   const id = tr.appendChild(el("td"));
   id.appendChild(el("span", "sid", "#" + r.id));
+  /* The client's own name for the conversation (`session_id`), when it sent one. */
+  if (r.label) id.appendChild(el("span", "slabel", r.label));
   if (r.moving) id.appendChild(el("span", "mv", "moving"));
   if (manyModels) tr.appendChild(el("td", "l", r.model || DASH));
   tr.appendChild(el("td", null, cnt3(r.tokens) + " tok"));

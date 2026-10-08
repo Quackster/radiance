@@ -363,10 +363,13 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
          * leaving /tokenize open, which hands an unauthenticated caller the vocabulary and the
          * chat template. This does not. */
         const std::string& p = hreq.path;
-        if (!api_key.empty() && p != "/health" && p != "/ping" && p != "/" && p != "/dashboard") {
-            std::string got = hreq.get_header_value("Authorization");
-            const std::string want = "Bearer " + api_key;
-            if (got != want) {
+        if (!api_key.empty() && p != "/health" && p != "/v1/health" && p != "/ping" && p != "/" &&
+            p != "/dashboard") {
+            /* `Authorization: Bearer` is OpenAI's spelling and `X-Api-Key` Anthropic's, which
+             * llama-server takes as well; either one carrying the key is enough. */
+            const bool ok = hreq.get_header_value("Authorization") == "Bearer " + api_key ||
+                            hreq.get_header_value("X-Api-Key") == api_key;
+            if (!ok) {
                 /* Said like every other refusal (Server::error_response), which this one never
                  * reaches: the gate answers before the router does. */
                 RAD_INFO("req refused from %s:%d -> 401 authentication_error: invalid api key",
@@ -453,13 +456,36 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
             bridge(q, std::move(body), s);
         });
     }
-    svr.Options(".*", [cors](const httplib::Request&, httplib::Response& res) {
+    /* THE PREFLIGHT ALLOWS WHATEVER HEADERS IT IS ASKED ABOUT. A browser client sends more than
+     * the two this server reads -- the OpenAI SDK adds its x-stainless-* set -- and a preflight
+     * that does not list one fails the request before it is sent. A wildcard would not do: CORS
+     * never lets `*` stand for Authorization, so the requested list is echoed back. */
+    svr.Options(".*", [cors](const httplib::Request& req, httplib::Response& res) {
         if (cors) {
+            const std::string asked = req.get_header_value("Access-Control-Request-Headers");
             res.set_header("Access-Control-Allow-Origin", "*");
-            res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+            res.set_header("Access-Control-Allow-Headers",
+                           asked.empty() ? "Content-Type, Authorization, X-Api-Key" : asked);
             res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            res.set_header("Access-Control-Max-Age", "86400");
         }
         res.status = 204;
+    });
+
+    /* A PATH NO ROUTE NAMES is answered by httplib before the router sees it, with no body. Every
+     * other refusal this server makes is an error object, and a client reading one finds an
+     * empty 404 unparseable; so an error with no body gets one here. A response that already
+     * carries a body -- the router's own 404 and 405, the gate's 401 -- is left as it is. */
+    svr.set_error_handler([cors](const httplib::Request& req, httplib::Response& res) {
+        if (!res.body.empty()) return httplib::Server::HandlerResponse::Unhandled;
+        if (cors) res.set_header("Access-Control-Allow-Origin", "*");
+        const std::string type = res.status == 404 ? "not_found_error"
+                               : res.status >= 500 ? "internal_server_error"
+                                                   : "invalid_request_error";
+        const std::string what = res.status == 404 ? "no route for " + req.method + " " + req.path
+                                                   : httplib::status_message(res.status);
+        res.set_content(error_body(type.c_str(), what), "application/json");
+        return httplib::Server::HandlerResponse::Handled;
     });
 
     /* Bound once: asking for a named port and then for any port would leave the first socket

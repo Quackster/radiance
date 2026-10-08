@@ -11,6 +11,7 @@ V="-f lavfi -i color=c=red:s=64x64:d=1:r=4"
 ffmpeg $I -frames:v 1 red.png
 ffmpeg $I -frames:v 2 -f apng red.apng
 ffmpeg $I -frames:v 1 red.jpg
+ffmpeg -f lavfi -i color=c=red:s=1788x282:d=1:r=1 -frames:v 1 red-1788x282.jpg
 ffmpeg $I -frames:v 1 -c:v libwebp red.webp
 ffmpeg $I -frames:v 1 red.gif
 ffmpeg $I -frames:v 1 red.bmp
@@ -29,6 +30,9 @@ ffmpeg $V -c:v libx264 -pix_fmt yuv420p -f mpegts red-h264.ts
 ffmpeg $V -c:v mpeg4 red-mpeg4.avi
 ffmpeg $V -c:v libtheora red-theora.ogv
 ```
+
+`red-1788x282.jpg` is 4:2:0 at a width the scaler's vectors do not divide: converted to RGB it
+is written 12 bytes past width x 3 (`a_picture_of_an_awkward_width_converts_inside_its_buffer`).
 
 The Theora clip repeats its first frame with empty packets, which is how Ogg Theora encodes a frame
 that does not change.

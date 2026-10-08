@@ -122,11 +122,12 @@ enum class Tier { VRAM = 0, HostPinned = 1, HostPageable = 2, SSD = 3, Mapped = 
  * it, and why the operator gets to choose.
  *
  *   Vram   resident on the card, a weight like any other.
- *   Ram    in host memory the card or a host kernel reads in place: the embedding in the pinned
- *          host pool, read over the link; an n-gram table as a locked copy made at load.
- *   Disk   read from the container on demand.
- *   Auto   the fastest of the three that has room once every other weight is placed; Engine::plan
- *          decides it and writes the answer into Config, so every rank plans from one choice. */
+ *   Ram    in host memory the card or a host kernel reads in place: the embedding pinned beside
+ *          the host pool, read over the link; an n-gram table as a copy made at load.
+ *   Disk   read from the container on demand; the n-gram table's only.
+ *   Auto   the fastest of the three that has room once every other weight is placed; the n-gram
+ *          table's only. Engine::plan decides it and writes the answer into Config, so every rank
+ *          plans from one choice. The embedding takes Ram or Vram. */
 enum class TablePlacement { Auto = 0, Vram = 1, Ram = 2, Disk = 3 };
 const char* table_placement_name(TablePlacement p);
 /* --draft-window: how many drafts a step verifies for each sequence (core/sched/draft.h).
@@ -406,9 +407,18 @@ public:
         std::string span;         /* the band, as Band::span */
         std::string why;
         int         domain = 0;   /* RAD_DOMAIN_DEVICE | RAD_DOMAIN_HOST */
+        int32_t     index = 0;    /* the instance that missed (OpInfo::index): bands are its own */
         std::string line() const; /* "op  geometry  [domain] -> why", the full-detail rendering */
     };
     std::vector<Miss> misses;
+    /* THE DEVICE MISSES A REQUEST CAN FALL INTO, in `misses` order: the device bands no kernel
+     * serves and no host kernel stands in for. A host kernel for the same band stands in on the
+     * host backend, where every op without a device row runs on the host (Ctx::bind_ops); on a
+     * card it stands in only for an op that has weights, because the planner moves an op to the
+     * host by placing its weights there and has nothing to place for an op without them --
+     * attention over a cache that lives in VRAM is the case that matters. One rule for the engine
+     * that refuses to start on a hole and for the tools that count them. */
+    std::vector<const Miss*> device_holes(bool host_backend) const;
 
     /* Every (kernel, shape) pair rad-tune would need to benchmark (spec §15). */
     /* `info` is the kernel's own row, so rad-tune can read its RadTunable axes and expand the
@@ -483,6 +493,24 @@ struct ReasoningCount {
     bool inside() const { return st == Think; }
 };
 
+/* THE MOST ALTERNATIVES ONE TOKEN'S LOGPROBS MAY CARRY: OpenAI's bound on top_logprobs. A request
+ * above it is refused. The sampler declares `sample_logprobs` one wider (Sampler::kLpK), for the
+ * width of the row the split-vocabulary gather moves; the extra pair is never reported. */
+static constexpr int RAD_MAX_LOGPROBS = 20;
+
+/* One emitted token's log-probability under the model's RAW distribution -- the logits before any
+ * penalty, temperature, mask or cut -- and its `n_top` most likely alternatives in descending
+ * order, ties to the lower id. What OpenAI's `logprobs` and llama-server's `n_probs` report.
+ * `token` -1 is a token whose logprobs could not be computed (a row with no finite logit): the
+ * scheduler fails its request rather than report a number for it. */
+struct TokenLogprobs {
+    int32_t token = -1;
+    float   logprob = 0.0f;
+    int32_t n_top = 0;
+    int32_t top_id[RAD_MAX_LOGPROBS] = {};
+    float   top_lp[RAD_MAX_LOGPROBS] = {};
+};
+
 struct SamplingParams {
     float  temp = 1.0f;
     int    top_k = 0;                /* 0 = off */
@@ -499,6 +527,14 @@ struct SamplingParams {
     int    dry_penalty_last_n = -1;
     float  xtc_probability = 0.0f;
     float  xtc_threshold = 0.1f;
+    /* TEMPERATURE AFTER THE CUTS rather than before them: top-p, min-p, typical and XTC read the
+     * distribution at temperature 1 and the pick draws at `temp`. llama.cpp's default order; the
+     * default here is vLLM's, temperature first. A request names the order with `samplers`. */
+    bool   temp_last = false;
+    /* LOGPROBS: -1 is none; 0..RAD_MAX_LOGPROBS returns every emitted token's logprob and that
+     * many alternatives. Speculation is unaffected: every verified position is a row of its own,
+     * and an accepted draft is the token the target drew there. */
+    int    n_probs = -1;
     uint64_t seed = 0;
     bool   greedy() const { return top_k == 1 || temp <= 0.0f; }
     std::string grammar;             /* GBNF, or "" */
@@ -630,6 +666,11 @@ struct Request {
      * embedding program (rad_declare_pooled) serves these, and it serves nothing else. */
     bool                 embed = false;
 
+    /* THE CONVERSATION AS THE CLIENT NAMES IT (OpenRouter's `session_id`), "" when it names
+     * none: carried to the session the prefix cache records for it, as a label on /sessions and
+     * the dashboard. It changes nothing about how the request is served. */
+    std::string          session_label;
+
     std::string          finish_reason;
     void*                sink = nullptr;      /* the server's per-request stream sink */
 };
@@ -640,7 +681,8 @@ struct Request {
 enum { RAD_P2P_AUTO = 0, RAD_P2P_ON = 1, RAD_P2P_OFF = 2 };
 
 struct Config {
-    std::string model;                 /* path to the .rad */
+    std::string model;                 /* path to the .rad, or a Hugging Face repo id (hf_model.h) */
+    std::string download_dir;          /* where a repo id is fetched to; empty = the XDG cache */
     std::string radiance_home;
     std::vector<std::string> kernel_hierarchy;   /* ordered; first wins */
 
@@ -681,8 +723,8 @@ struct Config {
      * YaRN off; empty serves what the checkpoint says. Engine::apply_rope_scaling. */
     std::string rope_scaling;
 
-    /* THE OPERATOR STATES A BUDGET OR THE ENGINE DERIVES ONE FROM THE CARD, AND EITHER WAY IT IS
-     * STATED IN FULL BEFORE ANYTHING IS ALLOCATED.
+    /* THE ENGINE DERIVES THE BUDGET FROM THE CARD, AND IT IS STATED IN FULL BEFORE ANYTHING IS
+     * ALLOCATED.
      *
      * Spec §6 forbids a derived budget because a budget derived from the FREE VRAM at startup is
      * a benchmark that moves when a desktop opens a window. What it does not forbid is arithmetic
@@ -696,7 +738,7 @@ struct Config {
      * still one number per card, and the same number on every card whose cache costs as much per
      * token as the dearest rank's.
      *
-     * Zero means "derive"; a stated --vram-weights-mib / --vram-kv-mib still wins outright. */
+     * NO FLAG SETS THEM: zero until the resolver has run. */
     int64_t vram_weights_mib = 0;
     int64_t vram_kv_mib = 0;
     int64_t gpu_headroom_mib = 96;     /* --gpu-headroom, left unclaimed on every card */
@@ -709,11 +751,6 @@ struct Config {
      * a third name for the second one, and a flag whose values are not all distinct is a flag
      * whose log line cannot be read back. */
     std::string kv_cache_dtype = "bf16";
-    /* SET BY THE RESOLVER, NOT BY A FLAG. vram_budget_resolve writes the two budgets above into
-     * this config, which erases the only evidence of whether they were stated or derived -- and
-     * Pools needs that to know whether unspent VRAM is a mis-stated budget worth warning about or
-     * a split it made itself and already printed a receipt for. */
-    bool    vram_budget_derived = false;
     int64_t host_pool_mib = 0;
     /* THE FILE TIER FOR WEIGHTS: what fits neither the VRAM slab nor the pinned host pool is read
      * from the container itself, with O_DIRECT, ahead of the ops that read it -- a scheduled unit by
@@ -725,11 +762,19 @@ struct Config {
 
     std::string placement = "auto";    /* all_vram | layer_offload | expert_tiered | auto */
     /* --embedding-placement and --ngram-placement, as asked (TablePlacement says what each tier
-     * is), and what Engine::plan resolved them to before any rank planned: never Auto. */
-    TablePlacement embedding_placement = TablePlacement::Auto;
+     * is), and what Engine::plan resolved them to before any rank planned: never Auto. The
+     * embedding's default is Ram; `embedding_placement_given` says whether the operator named it,
+     * because a named tier that cannot be honoured stops the server where the default gives way
+     * to the card with the reason. */
+    TablePlacement embedding_placement = TablePlacement::Ram;
+    bool           embedding_placement_given = false;
     TablePlacement ngram_placement     = TablePlacement::Auto;
     TablePlacement embedding_resolved  = TablePlacement::Vram;
     TablePlacement ngram_resolved      = TablePlacement::Disk;
+    /* SET BY THE RESOLVER: the pinned host room the token embedding takes when it resolves to Ram,
+     * a rank, ON TOP OF host_pool_mib -- so the table never takes the experts' share of the pool,
+     * and a dense model that has no pool still has a place for it. */
+    int64_t embedding_host_mib = 0;
     bool    deterministic = false;
     int64_t checkpoint_interval = 2048;   /* linear-state checkpoints (spec §7.3) */
     /* HOW MANY LINEAR-STATE SNAPSHOTS THE SERVER MAY HOLD AT ONCE -- a CAP and not a charge.

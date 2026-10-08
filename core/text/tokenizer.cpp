@@ -1535,6 +1535,35 @@ size_t Detokenizer::safe_prefix() const {
  * sequence, which is what browsers and every other inference server do. The alternative -- one
  * U+FFFD per bad byte -- turns a truncated three-byte character into three replacement
  * characters, which reads as three lost characters rather than the one that was actually lost. */
+/* The well-formed sequence at s[i], a lead byte: its length, or 0 with `*part` the length of the
+ * ill-formed one's maximal subpart (never zero). The SECOND byte's range is what rejects overlong
+ * encodings, surrogates and anything past U+10FFFF without decoding. */
+static inline size_t utf8_seq(std::string_view s, size_t i, size_t* part) {
+    const unsigned char c = (unsigned char)s[i];
+    size_t len; unsigned char lo, hi;
+    if      (c >= 0xC2 && c <= 0xDF) { len = 2; lo = 0x80; hi = 0xBF; }
+    else if (c == 0xE0)              { len = 3; lo = 0xA0; hi = 0xBF; }
+    else if (c >= 0xE1 && c <= 0xEC) { len = 3; lo = 0x80; hi = 0xBF; }
+    else if (c == 0xED)              { len = 3; lo = 0x80; hi = 0x9F; }  /* no surrogates */
+    else if (c >= 0xEE && c <= 0xEF) { len = 3; lo = 0x80; hi = 0xBF; }
+    else if (c == 0xF0)              { len = 4; lo = 0x90; hi = 0xBF; }
+    else if (c >= 0xF1 && c <= 0xF3) { len = 4; lo = 0x80; hi = 0xBF; }
+    else if (c == 0xF4)              { len = 4; lo = 0x80; hi = 0x8F; }  /* <= U+10FFFF */
+    else                             { len = 0; lo = 0; hi = 0; }        /* 0x80-0xC1, 0xF5+ */
+
+    size_t k = 1;
+    if (len) {
+        for (; k < len && i + k < s.size(); ++k) {
+            const unsigned char d = (unsigned char)s[i + k];
+            const unsigned char l = (k == 1) ? lo : 0x80, h = (k == 1) ? hi : 0xBF;
+            if (d < l || d > h) break;
+        }
+    }
+    if (len && k == len) return len;
+    *part = k;
+    return 0;
+}
+
 std::string utf8_sanitize(std::string_view s) {
     /* The common case is a string that is already valid, and it must not be copied byte by byte. */
     std::string out;
@@ -1543,39 +1572,29 @@ std::string utf8_sanitize(std::string_view s) {
     auto flush_good = [&] { out.append(s.data() + good, i - good); good = i; };
 
     while (i < n) {
-        const unsigned char c = (unsigned char)s[i];
-        if (c < 0x80) { ++i; continue; }
-
-        /* Length, and the range the SECOND byte is restricted to. The second-byte bounds are what
-         * reject overlong encodings, surrogates and anything past U+10FFFF without decoding. */
-        size_t len; unsigned char lo, hi;
-        if      (c >= 0xC2 && c <= 0xDF) { len = 2; lo = 0x80; hi = 0xBF; }
-        else if (c == 0xE0)              { len = 3; lo = 0xA0; hi = 0xBF; }
-        else if (c >= 0xE1 && c <= 0xEC) { len = 3; lo = 0x80; hi = 0xBF; }
-        else if (c == 0xED)              { len = 3; lo = 0x80; hi = 0x9F; }  /* no surrogates */
-        else if (c >= 0xEE && c <= 0xEF) { len = 3; lo = 0x80; hi = 0xBF; }
-        else if (c == 0xF0)              { len = 4; lo = 0x90; hi = 0xBF; }
-        else if (c >= 0xF1 && c <= 0xF3) { len = 4; lo = 0x80; hi = 0xBF; }
-        else if (c == 0xF4)              { len = 4; lo = 0x80; hi = 0x8F; }  /* <= U+10FFFF */
-        else                             { len = 0; lo = 0; hi = 0; }        /* 0x80-0xC1, 0xF5+ */
-
-        size_t k = 1;
-        if (len) {
-            for (; k < len && i + k < n; ++k) {
-                const unsigned char d = (unsigned char)s[i + k];
-                const unsigned char l = (k == 1) ? lo : 0x80, h = (k == 1) ? hi : 0xBF;
-                if (d < l || d > h) break;
-            }
-        }
-        if (len && k == len) { i += len; continue; }
+        if ((unsigned char)s[i] < 0x80) { ++i; continue; }
+        size_t part = 0;
+        const size_t len = utf8_seq(s, i, &part);
+        if (len) { i += len; continue; }
 
         flush_good();
         out += "\xEF\xBF\xBD";               /* U+FFFD */
-        i += k;                              /* the maximal subpart, never zero */
+        i += part;                           /* the maximal subpart, never zero */
         good = i;
     }
     flush_good();
     return out;
+}
+
+size_t utf8_valid_prefix(std::string_view s) {
+    size_t i = 0, part = 0;
+    while (i < s.size()) {
+        if ((unsigned char)s[i] < 0x80) { ++i; continue; }
+        const size_t len = utf8_seq(s, i, &part);
+        if (!len) break;
+        i += len;
+    }
+    return i;
 }
 
 std::string Detokenizer::push(int32_t token) {

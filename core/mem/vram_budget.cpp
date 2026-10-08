@@ -82,11 +82,21 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
     const bool shared = host_reserve > b.headroom;
     if (shared) b.headroom = host_reserve;
 
-    /* A host backend has no VRAM to speak of and reports none; there is nothing here to resolve
-     * and inventing a capacity would be exactly the inference §6 forbids. */
+    /* A DEVICE THAT REPORTS NO CAPACITY HAS NOTHING TO SPLIT, and inventing a capacity would be
+     * exactly the inference §6 forbids. What each pool needs is still known: the weights pool
+     * holds what the planner would copy out of the container -- the statics and experts
+     * weight_footprint counts -- and the cache is its ceiling, every sequence at the full context.
+     * (The host backend reports half the machine's memory and is split like a card.) */
     if (b.capacity <= 0) {
-        b.weights = cfg.vram_weights_mib * kMiB;
-        b.kv      = cfg.vram_kv_mib * kMiB;
+        b.weights = std::max<int64_t>(b.statics + b.expert_ceiling, kMiB);
+        b.kv      = std::max<int64_t>(b.kv_ceiling, kMiB);
+        cfg.vram_weights_mib = to_mib_up(b.weights);
+        cfg.vram_kv_mib      = to_mib_up(b.kv);
+        if (log)
+            b.report = fmt("the device reports no capacity: weights pool %s (what the planner "
+                           "copies out of the container), cache %s (every sequence at the full "
+                           "context)", humanb(cfg.vram_weights_mib * kMiB).c_str(),
+                           humanb(cfg.vram_kv_mib * kMiB).c_str());
         if (out) *out = b;
         return RAD_OK;
     }
@@ -98,17 +108,10 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
      * plugin's init has run and its code object is resident. */
     b.already_held = std::max<int64_t>(b.capacity - freeb, 0);
 
-    const bool want_w  = cfg.vram_weights_mib <= 0;
-    const bool want_kv = cfg.vram_kv_mib <= 0;
-    b.derived_weights = want_w;
-    b.derived_kv      = want_kv;
-
     /* What is left after the terms nobody gets to spend. */
-    b.drift = (want_w || want_kv) ? kDriverDrift : 0;
-    int64_t fixed = b.already_held + b.drift + b.headroom + b.arena + b.staging + b.queues;
-    if (!want_w)  fixed += cfg.vram_weights_mib * kMiB;   /* a stated pool is fixed too */
-    if (!want_kv) fixed += cfg.vram_kv_mib * kMiB;
-    b.claimable = b.capacity - fixed;
+    b.drift = kDriverDrift;
+    b.claimable = b.capacity - (b.already_held + b.drift + b.headroom + b.arena + b.staging +
+                                b.queues);
 
     if (b.claimable < 0) {
         b.report = fmt(
@@ -120,7 +123,6 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             "  activation arena   %10s   (buffer plan + kernel scratch)\n"
             "  step staging       %10s   (block tables, media and KV tier staging)\n"
             "  hardware queues    %10s   (%d at %s each, measured)\n"
-            "%s%s"
             "  ------------------------------\n"
             "  SHORT BY           %10s\n"
             "Lower --gpu-headroom-mib, lower --max-num-batched-tokens (the arena scales with it), "
@@ -128,42 +130,31 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), humanb(b.drift).c_str(),
             humanb(b.headroom).c_str(), humanb(b.arena).c_str(), humanb(b.staging).c_str(),
             humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(),
-            want_w  ? "" : fmt("  --vram-weights-mib %10s   (stated)\n",
-                               humanb(cfg.vram_weights_mib * kMiB).c_str()).c_str(),
-            want_kv ? "" : fmt("  --vram-kv-mib      %10s   (stated)\n",
-                               humanb(cfg.vram_kv_mib * kMiB).c_str()).c_str(),
             humanb(-b.claimable).c_str());
         if (log) RAD_ERR("%s", b.report.c_str());
         if (out) *out = b;
         return RAD_E_NOMEM;
     }
 
-    b.weights = want_w  ? 0 : cfg.vram_weights_mib * kMiB;
-    b.kv      = want_kv ? 0 : cfg.vram_kv_mib * kMiB;
-
     /* ---- the static weights come off the top ------------------------------------------------
      *
-     * They are a floor and not a share. Only a DERIVED weight budget pays them here: an operator
-     * who stated --vram-weights-mib has already decided what the weights get, and second-guessing
-     * that is the re-optimisation §6 forbids. */
-    if (want_w) {
-        b.statics = std::min(b.statics, b.claimable);
-        if (b.statics >= b.claimable && b.claimable > 0) {
-            /* Not fatal: the planner will demote what does not fit and the model still serves,
-             * badly. Name it, because "why is this model 8x slower than it should be" has no other
-             * answer at startup. */
-            if (log) RAD_WARN("the static (non-expert) weights alone want %s of the %s this card has to "
-                     "give. Every expert will stream from host memory and the KV cache has "
-                     "nothing left -- this model wants more VRAM, fewer ranks of it, or a smaller "
-                     "--max-num-batched-tokens.",
-                     humanb(b.statics).c_str(), humanb(b.claimable).c_str());
-        }
+     * They are a floor and not a share. */
+    b.statics = std::min(b.statics, b.claimable);
+    if (b.statics >= b.claimable && b.claimable > 0) {
+        /* Not fatal: the planner will demote what does not fit and the model still serves,
+         * badly. Name it, because "why is this model 8x slower than it should be" has no other
+         * answer at startup. */
+        if (log) RAD_WARN("the static (non-expert) weights alone want %s of the %s this card has to "
+                 "give. Every expert will stream from host memory and the KV cache has "
+                 "nothing left -- this model wants more VRAM, fewer ranks of it, or a smaller "
+                 "--max-num-batched-tokens.",
+                 humanb(b.statics).c_str(), humanb(b.claimable).c_str());
     }
-    b.elastic = want_w ? b.claimable - b.statics : b.claimable;
+    b.elastic = b.claimable - b.statics;
     if (b.elastic < 0) b.elastic = 0;
 
     /* ---- and only what is left is divided --------------------------------------------------- */
-    if (want_w && want_kv) {
+    {
         /* An unset cache ceiling (plan_groups failed) bounds nothing; zero experts is a ceiling of
          * zero, which weight_footprint always measures. */
         const int64_t kv_cap = b.kv_ceiling > 0 ? b.kv_ceiling : b.elastic;
@@ -198,20 +189,12 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         b.kv       = kv;
         b.weights  = b.statics + exp;
         b.unusable = std::max<int64_t>(b.elastic - kv - exp, 0);
-    } else if (want_kv) {
-        b.kv = b.kv_ceiling > 0 ? std::min(b.claimable, b.kv_ceiling) : b.claimable;
-        b.unusable = b.claimable - b.kv;
-    } else if (want_w) {
-        /* The KV pool was stated, so `claimable` is already net of it; the weights take the rest,
-         * still capped at what the model has to put there. */
-        int64_t exp = b.elastic;
-        if (exp > b.expert_ceiling) {
-            b.unusable = exp - b.expert_ceiling;
-            exp = b.expert_ceiling;
-        }
-        b.experts = exp;
-        b.weights = b.statics + exp;
     }
+    /* A POOL NOTHING IS PLACED IN STILL HAS TO EXIST. Where every weight is read where the
+     * container's mapping has it -- every op on the host, on the host backend -- the statics and
+     * experts are zero, and the pools refuse a zero budget as a resolver that never ran. A MiB,
+     * out of the headroom as the rounding's is. */
+    b.weights = std::max<int64_t>(b.weights, kMiB);
 
     /* ---- THE PREFILL STAGING REGION, out of the expert share ---------------------------------
      *
@@ -227,12 +210,12 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
      * The share is the budget's -- what the slab alone leaves off -- which is the most a step can
      * see: the loans the KV cache and the smaller arena levels make only ever add residency. A
      * layer whose pooled part is larger than a buffer stages what fits and streams the rest. */
-    if (want_w && layer_max > 0 && b.expert_ceiling > b.experts && cfg.placement != "all_vram" &&
+    if (layer_max > 0 && b.expert_ceiling > b.experts && cfg.placement != "all_vram" &&
         cfg.placement != "layer_offload") {
         const double f = (double)(b.expert_ceiling - b.experts) / (double)b.expert_ceiling;
         const int64_t one = ((int64_t)std::ceil(f * (double)layer_max) + RAD_ALIGN_UNIT - 1) /
                             RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
-        if (b.lends && want_kv) {
+        if (b.lends) {
             /* A LENDING CACHE PAYS FOR IT: the experts are at their floor and a byte less would
              * leave one with no tier, while the region is lent to the slab whenever the steps are
              * small -- the same memory the cache would have lent. */
@@ -263,7 +246,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
      * because it is a real limit rather than a ratio, is that ONE max-length sequence fits: a
      * context no single request can complete is a configuration error however much slack the pool
      * has (core/engine_bringup.cpp, configure_kv). */
-    if (log && b.derived_kv && b.kv_ceiling > 0 && cfg.max_ctx > 0)
+    if (log && b.kv_ceiling > 0 && cfg.max_ctx > 0)
         RAD_INFO("kv: the pool backs %.0f%% of the worst case (%lld sequences all at %lld tokens), "
                  "%.1f full-length sessions. That is concurrency at length before the scheduler "
                  "preempts, not a bound on any one request. WITH PREFIX CACHING a finished "
@@ -276,13 +259,11 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                  (long long)cfg.max_seqs, (long long)cfg.max_ctx,
                  (double)cfg.max_seqs * paged_share(b));
     /* Rounding the floor up claims up to a MiB the split did not hand out. Take it back from the
-     * cache where the cache is ours to size -- a paged pool a MiB smaller addresses a handful
-     * fewer tokens and nothing else -- so the headroom stays whole. Where the KV budget was
-     * STATED it is not ours to shave and the MiB comes out of the headroom instead. */
-    cfg.vram_budget_derived = want_w || want_kv;
+     * cache -- a paged pool a MiB smaller addresses a handful fewer tokens and nothing else -- so
+     * the headroom stays whole. */
     cfg.vram_weights_mib = to_mib_up(b.weights);
     const int64_t w_over = cfg.vram_weights_mib * kMiB - b.weights;
-    cfg.vram_kv_mib      = want_kv ? to_mib(std::max<int64_t>(b.kv - w_over, 0)) : to_mib(b.kv);
+    cfg.vram_kv_mib      = to_mib(std::max<int64_t>(b.kv - w_over, 0));
 
     /* THE RECEIPT. Every term, in the order it was spent, so that a split anybody disagrees with
      * can be argued about against numbers instead of re-derived from sysfs by hand. The unclaimed
@@ -320,13 +301,11 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         humanb(b.arena).c_str(), humanb(b.staging).c_str(),
         humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(),
         shared ? "left to the host" : "--gpu-headroom-mib", humanb(b.headroom).c_str(),
-        shared ? "integrated graphics: this memory is the host's; --vram-kv-mib states a pool "
-                 "outright"
+        shared ? "integrated graphics: this memory is the host's"
                : "left unclaimed on purpose",
         humanb(b.claimable).c_str(),
         humanb(b.statics).c_str(),
-        b.derived_weights ? "off the top: every rank's own shard, and not a share of anything"
-                          : "(not charged here -- --vram-weights-mib was stated)",
+        "off the top: every rank's own shard, and not a share of anything",
         humanb(b.elastic).c_str(),
         b.lends ? "the experts keep what the host pool cannot hold; the cache takes the rest\n"
                   "                                  and lends what no live request holds to the "
@@ -375,10 +354,8 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                   "slab while steps are small\n", humanb(b.stage).c_str(),
                   b.lends ? "cache" : "experts").c_str()
             : "",
-        humanb(cfg.vram_weights_mib * kMiB).c_str(),
-        b.derived_weights ? "static + experts" : "stated by --vram-weights-mib",
-        humanb(cfg.vram_kv_mib * kMiB).c_str(),
-        b.derived_kv ? "the cache's share" : "stated by --vram-kv-mib",
+        humanb(cfg.vram_weights_mib * kMiB).c_str(), "static + experts",
+        humanb(cfg.vram_kv_mib * kMiB).c_str(), "the cache's share",
         humanb(unclaimed).c_str());
 
     if (out) *out = b;

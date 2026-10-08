@@ -114,8 +114,8 @@ Mover::~Mover() {
 }
 
 /* One place the mover asks for memory. Everything device-side and everything pinned comes out of
- * the budgets the operator stated (spec §6); the fallback exists so the placement test can run
- * without standing a whole Pools up, and it announces itself. */
+ * the resolved budgets (spec §6); the fallback exists so the placement test can run without
+ * standing a whole Pools up, and it announces itself. */
 void* Mover::reserve(const char* what, int64_t bytes, int kind) {
     if (bytes <= 0) return nullptr;
     if (budget_) {
@@ -134,7 +134,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     stats_ = MoverStats{};
     if (!budget_)
         RAD_WARN("mover: no Pools handed over; allocating its slab and host pool directly. That "
-                 "double-spends --vram-weights-mib against whatever else already reserved it, so "
+                 "double-spends the weights pool against whatever else already reserved it, so "
                  "it is a test path and not a deployment.");
 
     unit_.assign(plan.units.size(), UnitState{});
@@ -180,7 +180,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
          * resident count is untouched by turning the engine on. Under a static plan the plan
          * asked for none and the slab is exactly the resident set. */
         /* THE PLAN'S NUMBER, not a config cap. The planner reserved these out of
-         * --vram-weights-mib and the report told the operator how many; allocating a different
+         * the weights pool and the report told the operator how many; allocating a different
          * count here would mean the mover works against one number while the operator was charged
          * for another, and the direction that is wrong in is an overrun. */
         const int64_t shadow = plan.dynamic ? sc.n_shadow : 0;

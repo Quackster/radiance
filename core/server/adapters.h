@@ -149,6 +149,7 @@ public:
             SessionStat o;
             o.id        = s.id;
             o.model     = s.model;
+            o.label     = s.label;
             o.n_tokens  = s.n_tokens;
             o.bytes     = s.bytes;
             o.idle_s    = now > s.last_used_ns  ? (double)(now - s.last_used_ns)  / 1e9 : 0.0;
@@ -326,6 +327,7 @@ public:
     std::string push(int32_t t) override { return d_.push(t); }
     std::string flush() override { return d_.flush(); }
     bool stopped() const override { return d_.stopped(); }
+    std::string stop_hit() const override { return d_.stop_hit(); }
     void defer_stops_until(const std::string& m) override { d_.defer_stops_until(m); }
 private:
     Detokenizer d_;
@@ -382,6 +384,14 @@ public:
     std::string piece(int32_t id) const override {
         if (id < 0 || id >= vocab_->n_tokens()) return std::string();
         return utf8_sanitize(vocab_->text(id));
+    }
+    std::string token_bytes(int32_t id) const override {
+        if (id < 0 || id >= vocab_->n_tokens()) return std::string();
+        return tok_.decode({ id }, /*render_special=*/true);
+    }
+    std::string reply_bytes(int32_t id) const override {
+        if (id < 0 || id >= vocab_->n_tokens()) return std::string();
+        return tok_.decode({ id }, /*render_special=*/false);
     }
 
     std::unique_ptr<IDetokenizer> detokenizer(
@@ -556,7 +566,21 @@ public:
     bool supports_tools() const override { return t_.caps().tools; }
     bool supports_reasoning() const override { return t_.caps().preserve_reasoning; }
     std::string tool_refusal() const override { return tool_refusal_; }
-    const std::string& source() const { return t_.source(); }
+    std::string source() const override { return t_.source(); }
+    /* Under llama-server's names (its chat_template_caps), from the same probe. */
+    std::string caps() const override {
+        const ChatCaps& c = t_.caps();
+        json o;
+        o["supports_tools"]               = c.tools;
+        o["supports_tool_calls"]          = c.tool_calls;
+        o["supports_system_role"]         = c.system_role;
+        o["supports_parallel_tool_calls"] = c.parallel_tool_calls;
+        o["supports_preserve_reasoning"]  = c.preserve_reasoning;
+        o["supports_string_content"]      = c.string_content;
+        o["supports_typed_content"]       = c.typed_content;
+        o["supports_object_arguments"]    = c.object_arguments;
+        return o.dump();
+    }
 
     int apply(const json& messages, const json& tools, const ChatRenderOptions& opt,
               ChatRender* out, std::string* why) const override {
@@ -566,6 +590,7 @@ public:
         o.parallel_tool_calls   = opt.parallel_tool_calls;
         o.tool_choice           = opt.tool_choice;
         o.reasoning_format      = opt.reasoning_format;
+        o.continue_final        = opt.continue_final;
         o.grammar               = opt.grammar;
         o.json_schema           = opt.json_schema;
         o.template_kwargs       = opt.template_kwargs;

@@ -344,8 +344,7 @@ can also decline it with `RAD_E_UNSUPPORTED`.
 **Which devices.** Discrete cards are used when there are any, and of those the ones sharing the
 first one's architecture; integrated graphics only when it is all there is. `ROCR_VISIBLE_DEVICES`
 chooses explicitly. On integrated graphics the device memory is the host's: the budget is bounded by
-what the host has available and leaves an eighth of the host's memory to it; `--vram-kv-mib` and
-`--vram-weights-mib` state the pools outright.
+what the host has available and leaves an eighth of the host's memory to it.
 
 **What the core assumes of a card: nothing about its wave size**, its LDS, its fp8 hardware or its
 links — those are your kernels' business. Three things are worth knowing before you start:
@@ -478,8 +477,12 @@ RADIANCE_HOME=$HOME/radiance-plugins:/opt/radiance/share/radiance radiance --mod
 and the container image takes one the same way, mounted:
 `-v /my/plugins:/plugins -e RADIANCE_HOME=/plugins:/opt/radiance/share/radiance`.
 
-**The kernel hierarchy** is `--kernels` (or `$RADIANCE_KERNELS`), an ordered list: `--kernels
-mykernels,libr4d` puts you in front. An entry matches a plugin's name or its file stem, and **the
-list is comma-separated** — the tools also accept colons, the engine's `--kernels` and
-`$RADIANCE_KERNELS` do not, so write commas everywhere. A library on the search path that nobody
-named loads after everything named, and a reference library (§1) after that.
+**The kernel hierarchy** is `--kernels` (or `$RADIANCE_KERNELS`), an ordered list of the kernel
+libraries to use: `--kernels mykernels,libr4d` puts you in front of libr4d. An entry matches a
+plugin's name or its file (`libr4d`, `r4d`, `libr4d.so` and a path to it are one library), and an
+entry that matches nothing is warned about by name. **The list is comma-separated** — the tools
+also accept colons, the engine's `--kernels` and `$RADIANCE_KERNELS` do not, so write commas
+everywhere. A kernel
+library on the search path that the list does not name is not loaded, so name every library you
+want, the host library (`libavx`) and the reference (`libref`) included. With no list every library
+found loads, a reference library (§1) last.

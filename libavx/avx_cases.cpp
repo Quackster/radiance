@@ -423,6 +423,11 @@ std::vector<Case> build_cases() {
                             "sample_argmax" })
         add(op, { HI("M", 5), HI("n_vocab", 517) });
     add("sample_topk", { HI("M", 5), HI("n_vocab", 517), HI("vocab_off", 0) });
+    /* k 7 and 20 (OpenAI's top_logprobs bound) against 517: the one-pass set starts full after
+     * seven columns, and an offset shard reports global ids. */
+    for (int64_t k : { 7, 20 })
+        add("sample_logprobs", { HI("M", 5), HI("n_vocab", 517), HI("k", k), HI("vocab_off", 0) });
+    add("sample_logprobs", { HI("M", 3), HI("n_vocab", 517), HI("k", 5), HI("vocab_off", 1000) });
     for (const char* op : { "sample_topp", "sample_minp", "sample_typical", "sample_xtc",
                             "sample_pick", "sample_merge_topk" })
         add(op, { HI("M", 5), HI("n_cand", 12) });
@@ -508,6 +513,7 @@ std::vector<Case> build_cases() {
     speed("logits_gemm", { HI("M", 1), HI("n_vocab", 32000), HI("n_embd", 2048),
                            HS("dtype", "bf16") }, (double)32000 * 2048 * 2, 2.0 * 32000 * 2048);
     speed("sample_argmax", { HI("M", 1), HI("n_vocab", 32000) }, (double)32000 * 4, 0);
+    speed("sample_logprobs", { HI("M", 1), HI("n_vocab", 32000), HI("k", 20) }, (double)32000 * 4, 0);
     speed("sample_topk", { HI("M", 1), HI("n_vocab", 32000), HI("vocab_off", 0) }, 0, 0);
     /* Decode attention over a real context: 16 query heads in groups of 4, 2048 keys already in
      * the cache. This is the shape a decode step spends its time in. */

@@ -160,6 +160,7 @@ struct SchedMetrics {
 struct SessionStat {
     uint64_t    id = 0;
     std::string model;            /* the container it was built against */
+    std::string label;            /* the client's name for it (`session_id`), or "" */
     int64_t     n_tokens = 0;
     int64_t     bytes = 0;
     double      idle_s = 0;       /* since its last turn */
@@ -310,6 +311,8 @@ public:
      * search text that can no longer contain what it is searching for, and the generation would
      * run to max_tokens. Default false, for a decoder that leaves stop handling to us. */
     virtual bool stopped() const { return false; }
+    /* The stop string that stopped it, "" when none has. */
+    virtual std::string stop_hit() const { return std::string(); }
     /* Match the stop strings only after `marker` has been generated (core/text Detokenizer::
      * defer_stops_until): the reply starts inside its reasoning block. */
     virtual void defer_stops_until(const std::string& /*marker*/) {}
@@ -352,6 +355,15 @@ public:
      * turned the flag on to see. "" when the id is out of range. */
     virtual std::string piece(int32_t /*id*/) const { return std::string(); }
 
+    /* THE BYTES ONE ID DECODES TO, unsanitised, control tokens rendered: llama-server's
+     * `with_pieces`. Not necessarily whole UTF-8 -- a byte-fallback or a split multi-byte
+     * character is a fragment -- so the caller checks before putting it in a JSON string. */
+    virtual std::string token_bytes(int32_t /*id*/) const { return std::string(); }
+    /* The bytes one id adds to a REPLY: token_bytes with control tokens rendered as nothing, as
+     * the decoder renders them -- what a logprobs entry spells the token as, so the entries'
+     * texts add up to the reply, as llama-server's do. */
+    virtual std::string reply_bytes(int32_t id) const { return token_bytes(id); }
+
     /* One incremental decoder per in-flight generation. It is made by the tokenizer rather than
      * default-constructed by the caller, because it needs the vocabulary to decode anything.
      * `stops` is passed down because core/text's Detokenizer can suppress a stop string that
@@ -385,6 +397,9 @@ struct ChatRenderOptions {
     std::string grammar;                     /* the caller's GBNF, or "" */
     std::string json_schema;                 /* a response_format schema, as JSON text, or "" */
     std::string reasoning_format = "auto";
+    /* ASSISTANT PREFILL: continue the conversation's last (assistant) message rather than open a
+     * new turn. "" off, else llama.cpp's "auto", "content" or "reasoning_content". */
+    std::string continue_final;
     std::map<std::string, std::string> template_kwargs;
     /* A render whose refusal is an answer and not an error -- the startup probes of what the
      * template takes -- so the template's refusal is not logged. */
@@ -441,6 +456,13 @@ public:
      * request that sends tools is refused with this sentence rather than answered with calls
      * nobody can read back. */
     virtual std::string tool_refusal() const { return std::string(); }
+
+    /* THE TEMPLATE'S SOURCE TEXT and what the capability probe found in it, for /props: what
+     * llama-server reports as `chat_template` and `chat_template_caps`, so a client built against
+     * it can render a prompt the way this server will. "" when unknown; the caps are a JSON
+     * object as text, "{}" when unknown. */
+    virtual std::string source() const { return std::string(); }
+    virtual std::string caps() const { return "{}"; }
 };
 
 /* A reply taken apart: what core/text's reply parser gives back once the reply is complete. */

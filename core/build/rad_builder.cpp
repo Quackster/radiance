@@ -10,6 +10,7 @@
  * and have fusion be a selection rather than a compiler pass (spec §2.3).
  */
 #include "rad_build.h"
+#include "../device/device.h"
 
 #include <algorithm>
 #include <climits>
@@ -43,6 +44,26 @@ const char* bld_domain_name(int d) { return d == RAD_DOMAIN_HOST ? "host" : "dev
 std::string Program::Miss::line() const {
     return fmt("%-22s %s  [%s] -> %s", op.c_str(), geom.c_str(), bld_domain_name(domain),
                why.c_str());
+}
+
+std::vector<const Program::Miss*> Program::device_holes(bool host_backend) const {
+    /* By INSTANCE, because bands are: two declarations of one op can differ in geometry and in
+     * whether they carry a weight, and only the instance that missed decides whether the planner
+     * can move it to the host. */
+    std::set<std::pair<int32_t, std::string>> no_host;
+    for (const Miss& m : misses)
+        if (m.domain == RAD_DOMAIN_HOST) no_host.emplace(m.index, m.span);
+    std::vector<const Miss*> out;
+    for (const Miss& m : misses) {
+        if (m.domain == RAD_DOMAIN_HOST) continue;
+        const bool host_kernel = no_host.count(std::make_pair(m.index, m.span)) == 0;
+        /* An instance with no weight has nothing the planner places, so nothing moves it. */
+        const bool weightless = m.index > 0 && (size_t)m.index < ops.size() &&
+                                ops[(size_t)m.index].weights.empty();
+        if (host_kernel && (host_backend || !weightless)) continue;
+        out.push_back(&m);
+    }
+    return out;
 }
 
 const char* bld_access_name(int a) {
@@ -565,7 +586,7 @@ void Builder::resolve_bands(OpInfo& oi) {
                  * reports the list whole (spec §3.1). */
                 prog_.misses.push_back({ oi.op, display_geometry(oi, b).str(), b.span,
                                          b.miss[d].empty() ? "no kernel matched" : b.miss[d],
-                                         d });
+                                         d, oi.index });
                 continue;
             }
 
@@ -616,7 +637,7 @@ void Builder::finish_instances() {
                     r.geom.str().c_str(), rad_strerror(s));
                 b.miss[d] = fmt("init() refused the instance: %s", rad_strerror(s));
                 prog_.misses.push_back({ oi.op, display_geometry(oi, b).str(), b.span,
-                                         b.miss[d], d });
+                                         b.miss[d], d, oi.index });
                 r = Resolved{};
             }
         }
@@ -1638,16 +1659,11 @@ int Builder::finish() {
          * SPLIT BY DOMAIN, because the two counts mean different things and one total means
          * neither. Every caller of this that is not the engine -- rad-check, rad-tune, rad-convert
          * -- reads this line and nothing else, so it has to say which kind it found. */
-        /* A device miss whose op resolved on the HOST for the same band is not a hole -- the
-         * planner runs it there (engine_bringup.cpp's miss_report says the same thing at more
-         * length). Counting it as a device miss makes a deliberately host-only op open every run
-         * with a warning that names a hole there is not. */
-        std::set<std::pair<std::string, std::string>> no_host;
-        for (const Program::Miss& m : prog_.misses)
-            if (m.domain == RAD_DOMAIN_HOST) no_host.emplace(m.op, m.span);
-        size_t dev = 0;
-        for (const Program::Miss& m : prog_.misses)
-            if (m.domain != RAD_DOMAIN_HOST && no_host.count(std::make_pair(m.op, m.span))) ++dev;
+        /* A device miss a host kernel stands in for is not a hole -- the planner runs it there
+         * (Program::device_holes has the rule, engine_bringup.cpp's miss_report the longer
+         * account). Counting it as a device miss makes a deliberately host-only op open every
+         * run with a warning that names a hole there is not. */
+        const size_t dev = prog_.device_holes(device_is_host()).size();
         /* A host-only miss set is not a warning at all -- see the report in engine_bringup.cpp --
          * so it does not get warned about here either. The device count is the one that means
          * something to a tool reading this line and nothing else. */

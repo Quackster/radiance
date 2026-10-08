@@ -393,7 +393,7 @@ struct PCBinding final : IPrefixCache {
         /* r.id is the session, and it is the SAME id reserve_checkpoint keys its snapshots by --
          * so the tiers' session view and the checkpoint index are talking about one thing. */
         media_keys(r, &mm_);
-        return m->insert(r.id, toks, mm_, blocks, n_tokens);
+        return m->insert(r.id, toks, mm_, blocks, n_tokens, r.session_label);
     }
     /* Installed by the engine when the idle tiers are on: lands every host copy that is waiting,
      * now, and says whether any landed. Called on the step thread under the scheduler's lock. */

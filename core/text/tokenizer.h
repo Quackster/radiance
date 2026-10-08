@@ -214,6 +214,9 @@ private:
  * would hide that the model produced something undecodable. Well-formed input is returned byte for
  * byte, so this is a no-op on every normal completion. */
 std::string utf8_sanitize(std::string_view s);
+/* How much of `s` is well-formed UTF-8 from its start, by the same rules: what a JSON string can
+ * carry of a byte-level token that ends inside a character. */
+size_t utf8_valid_prefix(std::string_view s);
 
 
 /* Byte-level BPE emits partial UTF-8 sequences -- a single token can be one byte of a

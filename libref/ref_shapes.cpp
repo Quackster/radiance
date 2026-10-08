@@ -1975,6 +1975,18 @@ int ref_sample_argmax_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     return o.finish("sample_argmax", operand, out);
 }
 
+int ref_sample_logprobs_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    int64_t M = 0, nv = 0;
+    if (sample_vocab(p, n_p, &M, &nv) < 0) return RAD_E_UNSUPPORTED;
+    const int64_t k = gi(p, n_p, "k", 0);
+    if (k <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t((uint32_t)RAD_F32, { M, nv });                              /* logits */
+    o.t((uint32_t)RAD_F32, { M, sample_params_words() });           /* params */
+    o.t((uint32_t)RAD_F32, { M, 2 + 2 * k });                       /* stats */
+    return o.finish("sample_logprobs", operand, out);
+}
+
 int ref_sample_topk_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     int64_t M = 0, nv = 0;
     if (sample_vocab(p, n_p, &M, &nv) < 0) return RAD_E_UNSUPPORTED;

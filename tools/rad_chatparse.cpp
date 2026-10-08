@@ -244,7 +244,7 @@ Timing time_new(const Bench& b, const std::vector<std::string>& pieces, int reps
             server::ChatDeltaStream st(req, 0, &bridge);
             size_t n = st.first_chunk().size();
             for (const std::string& p : pieces) n += st.push(p, false).size();
-            n += st.final_chunk(server::Finish::Stop).size();
+            n += st.final_chunk(server::Finish::Stop, server::TimingsOut(), server::UsageOut()).size();
             if (n == 0) std::fprintf(stderr, "no output\n");
         }
         best.sse = std::min(best.sse, since(t0));
@@ -463,7 +463,7 @@ int breakdown(const Bench& b, const Tok& tk, const RealView& view, int reps) {
                 std::string c = st.push(p, false);
                 if (r == 0) all += c;
             }
-            o += st.final_chunk(server::Finish::Stop);
+            o += st.final_chunk(server::Finish::Stop, server::TimingsOut(), server::UsageOut());
             if (r == 0) all += o;
         }
         t_stream.push_back(since(c0));

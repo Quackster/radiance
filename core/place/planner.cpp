@@ -80,7 +80,7 @@ int strategy_parse(const char* s, Strategy* out) {
 Budgets Budgets::from(const Config& c) {
     Budgets b;
     b.vram_weights = c.vram_weights_mib * 1024 * 1024;
-    b.host_pool    = c.host_pool_mib * 1024 * 1024;
+    b.host_pool    = (c.host_pool_mib + c.embedding_host_mib) * 1024 * 1024;
     b.ssd          = c.weights_disk_tier;
     return b;
 }
@@ -123,7 +123,7 @@ int plan_check_weights_pool(const Plan& p, int64_t pool_bytes) {
 }
 
 void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement embedding,
-                      TablePlacement ngram) {
+                      TablePlacement ngram, bool host_backend, bool container) {
     if (!out) return;
     *out = WeightFootprint{};
 
@@ -146,7 +146,7 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
     /* build_units: a model-level weight is its own unit, everything else groups by the declared
      * (layer, expert). Ordered, for the same reason build_units is. */
     struct U { int32_t layer = -1, expert = -1; int64_t bytes = 0; bool mapped = false;
-               bool emb = false, ngram = false, host = true; };
+               bool emb = false, ngram = false, host = true, direct = true; };
     std::map<std::pair<int32_t, int32_t>, size_t> by_group;
     std::vector<U> units;
 
@@ -175,6 +175,7 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
         mu.bytes = align_up(mu.bytes, a) + weight_bytes(wi);
         /* pin_mapped: THE WHOLE UNIT GOES, not the one weight. */
         if (w < device_ok.size() && !device_ok[w]) mu.mapped = true;
+        if (!weight_file_direct(wi, prog.ctx.world_size)) mu.direct = false;
         if (w < host_ok.size() && !host_ok[w]) mu.host = false;
         /* The placement flags' tables: model-level, so the unit is this one weight. */
         if (layer < 0) {
@@ -186,6 +187,7 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
     /* And one align_up a unit, because that is how Mover::init spends the slab: `us.static_off =
      * align_up(static_need, RAD_ALIGN_UNIT)` before every unit it places. A budget that summed raw
      * bytes would be short by one alignment per unit, which on a 512-expert MoE is real. */
+    for (U& mu : units) mu.mapped = mapped_unit(mu.mapped, container && mu.direct, host_backend);
     std::map<int32_t, int64_t> layer_experts;
     std::set<int64_t> expert_strides;
     bool ngram_host = true;
@@ -284,8 +286,8 @@ void Planner::resolve_sites(const Program& prog) {
  * consulted, because it is not a budget question -- and so is an n-gram table --ngram-placement put
  * in RAM or on disk, whatever kernels could read it on a card. The other three off-device tiers are
  * what the planner falls back to when VRAM runs out; this one is where the weight has to be
- * whatever the budgets say, and charging a pool for bytes that are never copied would make the
- * operator size a pool against a number that does not exist.
+ * whatever the budgets say, and charging a pool for bytes that are never copied would size that
+ * pool against a number that does not exist.
  *
  * THE WHOLE UNIT GOES, not the one weight. A unit is the movement granularity and a half-mapped one
  * has no meaning -- and it costs nothing here, because `device_ok_` is cleared for EVERY weight
@@ -295,9 +297,15 @@ void Planner::resolve_sites(const Program& prog) {
 void Planner::pin_mapped(const Program& prog, Plan* p) {
     const TablePlacement ng = in_.config->ngram_resolved;
     for (MoveUnit& mu : p->units) {
-        bool host_only = false;
-        for (rad_weight w : mu.weights)
+        bool host_only = false, direct = in_.container;
+        for (rad_weight w : mu.weights) {
             if (w < device_ok_.size() && !device_ok_[w]) host_only = true;
+            if (w < prog.weights.size() &&
+                !weight_file_direct(prog.weights[w], prog.ctx.world_size)) direct = false;
+        }
+        /* On the host backend a unit stored in another form than its host kernel reads is placed
+         * like any other weight, in the pool its kernel can read too (mapped_unit). */
+        host_only = mapped_unit(host_only, direct, in_.host_backend);
         /* --ngram-placement keeps an n-gram table OFF THE CARD unless it says vram, whether or not
          * a device kernel could read it there: ram and disk are where the operator put it, and the
          * strategies below would otherwise spend the card on 48 GB of rows read sixteen a token. */
@@ -619,8 +627,8 @@ int Planner::assign_all_vram(Plan* p) {
         used += mu.slot_bytes;
     }
     if (p->vram_budget > 0 && used > p->vram_budget) {
-        p->notes.push_back(fmt("all_vram needs %s of weights against a --vram-weights-mib "
-                                  "budget of %s: %s short",
+        p->notes.push_back(fmt("all_vram needs %s of weights against a weights pool "
+                                  "of %s: %s short",
                                   humanb(used).c_str(), humanb(p->vram_budget).c_str(),
                                   humanb(used - p->vram_budget).c_str()));
         return RAD_E_NOMEM;
@@ -768,9 +776,9 @@ int Planner::assign_expert_tiered(Plan* p) {
     rank_units(p, &order);
 
     /* RESERVE THE SPARE SLOTS OUT OF THE BUDGET. The slab has to hold the residents AND the
-     * shadow slots a promotion writes into, and they all come out of --vram-weights-mib -- so a
+     * shadow slots a promotion writes into, and they all come out of the weights pool -- so a
      * fill that spends the whole budget on residents leaves the mover with nowhere to move into
-     * and, worse, makes the mover's allocation overrun the pool the operator sized.
+     * and, worse, makes the mover's allocation overrun the weights pool.
      *
      * Two passes, and the second is enough: the reserve depends only on the first pass's slot
      * counts, and the first pass over-counts (it had more room), so the reserve it produces is an
@@ -900,7 +908,7 @@ int Planner::assign_expert_tiered(Plan* p) {
             k = fill(uncapped, --cap);
         if (fixed + k.used + k.spare + k.file > p->vram_budget) {
             p->notes.push_back(fmt("the file tier's two layer buffers need %s, beside %s of "
-                                   "fixed weights, against a --vram-weights-mib budget of %s",
+                                   "fixed weights, against a weights pool of %s",
                                    humanb(k.file).c_str(), humanb(fixed).c_str(),
                                    humanb(p->vram_budget).c_str()));
             return RAD_E_NOMEM;
@@ -1119,8 +1127,8 @@ int Planner::pin_embedding(const Program& prog, const Config& cfg, Plan* p) cons
         mu.host_forced = true;
         mu.reason = "--embedding-placement ram; read over the link in place";
         RAD_INFO("placement: '%s' (%s) in the pinned host pool, read in place "
-                 "(--embedding-placement %s)", name.c_str(), humanb(mu.bytes).c_str(),
-                 cfg.embedding_placement == TablePlacement::Auto ? "auto" : "ram");
+                 "(--embedding-placement ram%s)", name.c_str(), humanb(mu.bytes).c_str(),
+                 cfg.embedding_placement_given ? "" : ", the default");
     }
     /* Engine::plan resolves Ram only where weight_footprint found a table with this same test,
      * so an empty pass is a plan built from a different program than the budget was: a wiring
@@ -1243,7 +1251,8 @@ int Planner::assign(Plan* p) {
         /* Every pool is budgeted explicitly (spec §6). An offload strategy with no number to
          * spill against would have to infer one from free VRAM, and an engine that quietly
          * re-optimises its own split is an engine whose benchmarks do not reproduce. */
-        RAD_ERR("placement: %s needs --vram-weights-mib; there is nothing to spill against",
+        RAD_ERR("placement: %s needs a weights budget and none was resolved; there is nothing to "
+                "spill against",
                 strategy_name(s));
         return RAD_E_INVAL;
     }

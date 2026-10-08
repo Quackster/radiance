@@ -1332,7 +1332,7 @@ TEST(what_a_streaming_client_assembles_is_the_buffered_answer) {
             for (size_t i = 0; i < reply.size(); ++i)
                 sse += st.push(std::string_view(reply).substr(i, 1), false);
             sse += st.push(std::string_view(), true);
-            sse += st.final_chunk(server::Finish::Stop);
+            sse += st.final_chunk(server::Finish::Stop, server::TimingsOut(), server::UsageOut());
 
             std::string content, reasoning, finish;
             std::vector<std::string> ids, names, args;

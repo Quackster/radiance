@@ -3,7 +3,7 @@
  * ============================== WHY THIS IS NOT THE §6 VIOLATION IT LOOKS LIKE ==============================
  *
  * Spec §6 says the engine does not derive its budgets, and core/mem/pools.cpp still refuses to
- * re-optimise a split the operator stated. The reason given there is exact and worth repeating:
+ * re-optimise the split it is handed. The reason given there is exact and worth repeating:
  * a budget derived from the FREE VRAM at startup is a benchmark that moves when somebody opens a
  * window on the machine's desktop.
  *
@@ -46,10 +46,17 @@
  * (KVManager::ceiling), and an expert plane that fits entirely in VRAM has no use for more; when
  * both fit, both are whole.
  *
- * A stated --vram-weights-mib or --vram-kv-mib still wins outright and turns the whole of this
- * off for that pool. The point is that the DEFAULT is a full card rather than a guess: VRAM left
+ * THERE IS NO FLAG THAT STATES A POOL. The split is a full card rather than a guess: VRAM left
  * unbudgeted is VRAM no pool can use, and on a model whose experts do not fit, every unbudgeted
- * GiB costs measurable decode time.
+ * GiB costs measurable decode time. What an operator moves is the inputs -- --gpu-headroom-mib
+ * takes card space away, --max-model-len and --max-num-seqs bound the cache, --host-pool-mib
+ * decides which experts must stay on the card -- and the arithmetic follows from them.
+ *
+ * A HOST BACKEND HAS NO CARD, and half the machine's memory stands in for one (host_vram_bytes),
+ * split as a card's is. Its weights pool is host memory and holds what a host kernel cannot read
+ * where the container stores it (mapped_unit in core/place/planner.h). A device that reports no
+ * capacity at all is sized at what each pool needs: the weights the planner copies, and the cache
+ * at its ceiling.
  */
 #pragma once
 #include "../rad_core.h"
@@ -97,8 +104,9 @@ struct VramFacts {
     int64_t host_reserve = 0;
 };
 
-/* The resolved split, in bytes, beside every term it came from. Always filled, including when the
- * operator stated the budgets -- the placement report and the pool report both want the totals. */
+/* The resolved split, in bytes, beside every term it came from. Always filled, including for a
+ * device that reports no capacity -- the placement report and the pool report both want the
+ * totals. */
 struct VramBudget {
     int64_t capacity = 0, already_held = 0, headroom = 0, arena = 0, staging = 0;
     int64_t drift = 0;                /* kDriverDrift: what already_held moves by after it is read */
@@ -120,7 +128,6 @@ struct VramBudget {
      * any. */
     int64_t stage = 0;
     int64_t weights = 0;              /* statics + experts: what vram_weights is set to */
-    bool    derived_weights = false, derived_kv = false;
     std::string report;       /* the block the engine prints at startup */
 };
 

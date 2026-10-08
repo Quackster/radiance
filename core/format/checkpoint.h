@@ -84,6 +84,8 @@ struct MetaOwn {
 };
 
 int meta_from_config_json(const std::string& dir, MetaOwn* out);
+/* quantization_config's quant_method and fmt as the plugin descriptor ("fp8_e4m3"), "" without. */
+std::string quant_descriptor(const MetaOwn& m);
 int meta_merge_config_json(const std::string& dir, const std::string& prefix, MetaOwn* out);
 int meta_merge_generation_config(const std::string& dir, MetaOwn* out);
 int meta_merge_preprocessor_configs(const std::string& dir, MetaOwn* out);
@@ -142,7 +144,10 @@ public:
                      std::string* why);
 
 private:
-    int add_shard(const std::string& p, const std::string& prefix = "");
+    /* `owner`, when the checkpoint has an index, is its weight_map: a tensor the index places in
+     * another shard is not read from this one. */
+    int add_shard(const std::string& p, const std::string& prefix = "",
+                  const std::unordered_map<std::string, std::string>* owner = nullptr);
     int open_safetensors(const std::string& path);
     int open_gguf(const std::string& path);
     void detect_import();
@@ -154,6 +159,7 @@ private:
     std::vector<std::unique_ptr<SafeTensorsFile>> shards_;
     std::vector<SrcTensor> tensors_;
     std::unordered_map<std::string, size_t> index_;
+    std::unordered_map<std::string, size_t> index_shard_;   /* name -> shards_ position */
     std::deque<SrcTensor> sliced_;            /* views; a deque never moves what it holds */
     int64_t fp8_br_ = 128, fp8_bc_ = 128;
     Import      import_ = Import::None;

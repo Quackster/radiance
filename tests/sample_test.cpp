@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -447,6 +448,33 @@ TEST(chain_order_temperature_before_the_cuts_is_observable) {
     host_temp(b, 5.0f);
 
     CHECK(a.c.size() != b.c.size());
+}
+
+TEST(temp_last_draws_only_from_the_untempered_nucleus) {
+    /* The same numbers through the whole chain. Temperature last is llama.cpp's order, asked for
+     * with `samplers`: the nucleus is cut on the untempered distribution, so a hot temperature
+     * flattens only what survived the cut and never revives a token it removed. Temperature first
+     * cuts on the flattened distribution and keeps more. */
+    const float logits[3] = { 3.0f, 2.0f, 1.0f };
+    auto b = set_of({ 3.0f, 2.0f, 1.0f });
+    host_top_p(b, 0.5f, 1);
+    std::set<int32_t> nucleus;
+    for (const auto& e : b.c) nucleus.insert(e.id);
+
+    SamplingParams sp;
+    sp.temp = 5.0f;
+    sp.top_p = 0.5f;
+    std::set<int32_t> first, last;
+    for (uint64_t seed = 0; seed < 256; ++seed) {
+        sp.seed = seed;
+        HostRefInput in;
+        sp.temp_last = false;
+        first.insert(host_sample(logits, 3, sp, in));
+        sp.temp_last = true;
+        last.insert(host_sample(logits, 3, sp, in));
+    }
+    for (int32_t t : last) CHECK(nucleus.count(t) == 1);
+    CHECK(first.size() > last.size());
 }
 
 
@@ -1683,6 +1711,260 @@ TEST(a_top_k_of_zero_samples_this_steps_candidates) {
     CHECK_EQ(tok[0], 2);
     CHECK_OK(ch.step({ &a }, { -80.0f, -80.0f, -80.0f, 0.0f }, &tok));
     CHECK_EQ(tok[0], 3);
+}
+
+/* LOGPROBS ARE THE RAW DISTRIBUTION'S, read before any stage. A greedy row asking for them is
+ * staged as a top-1 chain row, and its token and alternatives come back against the normaliser of
+ * the logits the model wrote. */
+TEST(logprobs_are_the_raw_distributions) {
+    HostChain ch(32, 1, 0);
+    NEED_CHAIN(ch)
+    SamplingParams sp = greedy_params();
+    sp.n_probs = 3;
+    Request a = make_req(1, { 30 }, sp);
+    std::vector<float> lg(32, 0.0f);
+    lg[7] = 4.0f; lg[3] = 4.0f; lg[9] = 2.0f;
+    std::vector<int32_t> tok;
+    CHECK_OK(ch.step({ &a }, lg, &tok));
+    CHECK_EQ(tok[0], 3);                           /* the tie goes to the lower id */
+
+    int64_t n = 0;
+    const DeviceSampleParams* p = ch.s.staged_params(&n);
+    CHECK((p[0].flags & RAD_SP_LOGPROBS) != 0);
+    CHECK((p[0].flags & RAD_SP_GREEDY) == 0);
+    CHECK_EQ(p[0].top_k, 1);
+
+    double z = 0.0;
+    for (float v : lg) z += std::exp((double)v);
+    const double lz = std::log(z);
+    TokenLogprobs lp;
+    CHECK_OK(ch.s.logprobs_for(0, tok[0], &lp));
+    CHECK_NEAR(lp.logprob, 4.0 - lz, 1e-5);
+    CHECK_EQ(lp.n_top, 3);
+    CHECK_EQ(lp.top_id[0], 3);
+    CHECK_EQ(lp.top_id[1], 7);
+    CHECK_EQ(lp.top_id[2], 9);
+    CHECK_NEAR(lp.top_lp[2], 2.0 - lz, 1e-5);
+    /* A row that was not staged for logprobs has none, and asking is the caller's error. */
+    CHECK_EQ(ch.s.logprobs_for(1, 0, &lp), RAD_E_STATE);
+}
+
+namespace {
+
+/* THE SUMMARY HOLDS 21 PAIRS (RAD_MAX_LOGPROBS + 1), so a token is outside it only behind 21
+ * larger or tied ones: tokens 0..20 at `hi` fill it, and token 21 at `at` is the first outside --
+ * at `hi` too, it loses the tie to every lower id. The rest of a 32-token vocabulary sits at
+ * `rest`. The prompt is `head`, 0..20 twice, then `tail`, so the penalties count each of 0..20
+ * twice. */
+std::vector<float> outside_logits(float hi, float at, float rest) {
+    std::vector<float> lg(32, rest);
+    for (int t = 0; t <= 20; ++t) lg[(size_t)t] = hi;
+    lg[21] = at;
+    return lg;
+}
+std::vector<int32_t> outside_prompt(std::vector<int32_t> head, const std::vector<int32_t>& tail) {
+    for (int k = 0; k < 2; ++k)
+        for (int32_t t = 0; t <= 20; ++t) head.push_back(t);
+    head.insert(head.end(), tail.begin(), tail.end());
+    return head;
+}
+double log_sum_exp(const std::vector<float>& lg) {
+    double z = 0.0;
+    for (float v : lg) z += std::exp((double)v);
+    return std::log(z);
+}
+
+}  /* namespace */
+
+/* A TOKEN OUTSIDE THE RAW SUMMARY IS RECOVERED FROM THE VALUE IT WAS DRAWN AT. Tokens 0..21 tie at
+ * 5, so the summary holds 0..20; the penalties push those to 5/1.25 - 2 = 2 and token 21 to
+ * 5/1.25 - 1 = 3, which is chosen, and its raw logit is the candidate value with temperature,
+ * frequency and repetition undone. */
+TEST(a_chosen_token_outside_the_summary_has_its_raw_logprob) {
+    HostChain ch(32, 1, 0);
+    NEED_CHAIN(ch)
+    SamplingParams sp;
+    sp.top_k = 1;
+    sp.temp = 0.5f;
+    sp.rep_penalty = 1.25f;
+    sp.freq_penalty = 1.0f;
+    sp.n_probs = 0;
+    Request a = make_req(1, outside_prompt({}, { 21 }), sp);
+    const std::vector<float> lg = outside_logits(5.0f, 5.0f, 0.0f);
+    std::vector<int32_t> tok;
+    CHECK_OK(ch.step({ &a }, lg, &tok));
+    CHECK_EQ(tok[0], 21);
+
+    TokenLogprobs lp;
+    CHECK_OK(ch.s.logprobs_for(0, tok[0], &lp));
+    CHECK_NEAR(lp.logprob, 5.0 - log_sum_exp(lg), 1e-5);
+    CHECK_EQ(lp.n_top, 0);
+}
+
+/* A NEGATIVE LOGIT'S REPETITION PENALTY IS UNDONE ON ITS OWN SIDE OF ZERO, and the presence penalty
+ * is added back with the frequency one. Token 21's raw logit is -1: repetition multiplies it to
+ * -1.25, frequency (once) and presence take it to -13.25, and tokens 0..20 (5/1.25 - 20 - 2 = -18)
+ * and the rest (-30) fall below it. Inverting: -13.25 + 10 + 2 = -1.25, divided by 1.25 is -1. */
+TEST(a_negative_penalised_logit_has_its_raw_logprob) {
+    HostChain ch(32, 1, 0);
+    NEED_CHAIN(ch)
+    SamplingParams sp;
+    sp.top_k = 1;
+    sp.temp = 0.5f;
+    sp.rep_penalty = 1.25f;
+    sp.freq_penalty = 10.0f;
+    sp.pres_penalty = 2.0f;
+    sp.n_probs = 2;
+    Request a = make_req(1, outside_prompt({}, { 21 }), sp);
+    const std::vector<float> lg = outside_logits(5.0f, -1.0f, -30.0f);
+    std::vector<int32_t> tok;
+    CHECK_OK(ch.step({ &a }, lg, &tok));
+    CHECK_EQ(tok[0], 21);
+
+    const double lz = log_sum_exp(lg);
+    TokenLogprobs lp;
+    CHECK_OK(ch.s.logprobs_for(0, tok[0], &lp));
+    CHECK_NEAR(lp.logprob, -1.0 - lz, 1e-5);
+    CHECK_EQ(lp.n_top, 2);
+    CHECK_EQ(lp.top_id[0], 0);
+    CHECK_NEAR(lp.top_lp[0], 5.0 - lz, 1e-5);
+}
+
+/* ONLY THE PENALTY WINDOW IS COUNTED BACK. Token 21 opens the history three times, but the last 42
+ * tokens -- penalty_last_n -- are 0..20 twice, so the stage never penalised it: 0..20 drop to 2 and
+ * 21 stays at 5. Counting the whole staged history would add 3 back and multiply by 1.25. */
+TEST(a_logprob_counts_only_the_penalty_window_back) {
+    HostChain ch(32, 1, 0);
+    NEED_CHAIN(ch)
+    SamplingParams sp;
+    sp.top_k = 1;
+    sp.temp = 0.5f;
+    sp.rep_penalty = 1.25f;
+    sp.freq_penalty = 1.0f;
+    sp.penalty_last_n = 42;
+    sp.n_probs = 0;
+    Request a = make_req(1, outside_prompt({ 21, 21, 21 }, {}), sp);
+    const std::vector<float> lg = outside_logits(5.0f, 5.0f, 0.0f);
+    std::vector<int32_t> tok;
+    CHECK_OK(ch.step({ &a }, lg, &tok));
+    CHECK_EQ(tok[0], 21);
+    int64_t n = 0;
+    CHECK_EQ(ch.s.staged_params(&n)[0].hist_len, 45);
+
+    TokenLogprobs lp;
+    CHECK_OK(ch.s.logprobs_for(0, tok[0], &lp));
+    CHECK_NEAR(lp.logprob, 5.0 - log_sum_exp(lg), 1e-5);
+}
+
+/* TEMPERATURE LAST IS UNDONE FROM THE LATE STAGE'S ROW. A sampled row (top_k 2: top_k 1 is greedy,
+ * which has no late stage), so the early row runs at 1 and the late one at 0.5 over the two
+ * candidates: token 21 at (5/1.25 - 20) / 0.5 = -32 against -72 for the runner-up, a draw that
+ * cannot go the other way. Only the late temperature takes -32 back to -16 before the penalties
+ * are undone. */
+TEST(a_temperature_last_row_has_its_raw_logprob) {
+    HostChain ch(32, 1, 0);
+    NEED_CHAIN(ch)
+    SamplingParams sp;
+    sp.top_k = 2;
+    sp.temp = 0.5f;
+    sp.temp_last = true;
+    sp.rep_penalty = 1.25f;
+    sp.freq_penalty = 20.0f;
+    sp.n_probs = 0;
+    Request a = make_req(1, outside_prompt({}, { 21 }), sp);
+    const std::vector<float> lg = outside_logits(5.0f, 5.0f, -100.0f);
+    std::vector<int32_t> tok;
+    CHECK_OK(ch.step({ &a }, lg, &tok));
+    CHECK_EQ(tok[0], 21);
+    int64_t n = 0;
+    CHECK_EQ(ch.s.staged_params(&n)[0].temp, 1.0f);
+
+    TokenLogprobs lp;
+    CHECK_OK(ch.s.logprobs_for(0, tok[0], &lp));
+    CHECK_NEAR(lp.logprob, 5.0 - log_sum_exp(lg), 1e-5);
+}
+
+/* A ROW WITH NO FINITE LOGIT HAS NO LOGPROBS, and says so, rather than reporting -inf or NaN: the
+ * step itself still runs, and the engine fails the one request (Engine::row_logprobs). */
+TEST(a_row_with_no_finite_logit_has_no_logprobs) {
+    HostChain ch(32, 1, 0);
+    NEED_CHAIN(ch)
+    SamplingParams sp = greedy_params();
+    sp.n_probs = 3;
+    Request a = make_req(1, { 1 }, sp);
+    std::vector<int32_t> tok;
+    CHECK_OK(ch.step({ &a }, std::vector<float>(32, -INFINITY), &tok));
+    TokenLogprobs lp;
+    lp.token = 7;
+    CHECK_EQ(ch.s.logprobs_for(0, tok[0], &lp), RAD_E_INVAL);
+    CHECK_EQ(lp.token, -1);
+}
+
+/* THE RANKS' SUMMARIES MERGE BY RESCALING TO THE LARGER MAXIMUM. Rank 0's shard has maximum 2 and
+ * normaliser 3, rank 1's maximum 5 and normaliser 1.5; their pairs interleave by value, a tie
+ * across ranks going to the lower id. A rank whose normaliser is not finite contributes nothing,
+ * and with no rank left there is no normaliser. */
+TEST(split_vocabulary_logprob_summaries_merge_across_ranks) {
+    const float rows[2][8] = {
+        { 2.0f, 3.0f,   5.0f, 2.0f,   1.0f, 1.0f,  -1.0f, -INFINITY },
+        { 5.0f, 1.5f,  40.0f, 5.0f,  41.0f, 2.0f,  42.0f, 0.5f },
+    };
+    double lz = 0.0;
+    int32_t id[8];
+    float   v[8];
+    CHECK_EQ(merge_logprob_rows(&rows[0][0], 2, 3, &lz, id, v, 8), 5);
+    CHECK_NEAR(lz, std::log(3.0 * std::exp(2.0) + 1.5 * std::exp(5.0)), 1e-6);
+    const int32_t want[5] = { 40, 5, 41, 1, 42 };
+    for (int j = 0; j < 5; ++j) CHECK_EQ(id[j], want[j]);
+    CHECK_EQ(v[1], 2.0f);
+    CHECK_EQ(merge_logprob_rows(&rows[0][0], 2, 3, &lz, id, v, 2), 2);
+
+    float dead[2][8];
+    std::memcpy(dead, rows, sizeof dead);
+    dead[1][1] = NAN;
+    CHECK_EQ(merge_logprob_rows(&dead[0][0], 2, 3, &lz, id, v, 8), 2);
+    CHECK_NEAR(lz, 2.0 + std::log(3.0), 1e-6);
+    CHECK_EQ(id[0], 5);
+    dead[0][1] = 0.0f;
+    CHECK_EQ(merge_logprob_rows(&dead[0][0], 2, 3, &lz, id, v, 8), 0);
+    CHECK(std::isnan(lz));
+}
+
+/* AND DRY IS UNDONE TOO. "22 23" ended the history once before, followed by 21, so DRY takes its
+ * multiplier off token 21 (5 - 1 - 0.5 = 3.5); tokens 0..20 appear twice and lose more to the
+ * frequency penalty (5 - 2 = 3), so 21 is chosen from outside the summary and its raw logit needs
+ * DRY, the penalties and temperature all undone. */
+TEST(a_dry_penalised_token_has_its_raw_logprob) {
+    HostChain ch(32, 1, 0);
+    NEED_CHAIN(ch)
+    SamplingParams sp;
+    sp.top_k = 1;
+    sp.temp = 0.8f;
+    sp.freq_penalty = 1.0f;
+    sp.dry_multiplier = 0.5f;
+    sp.dry_base = 1.75f;
+    sp.dry_allowed_length = 2;
+    sp.n_probs = 0;
+    Request a = make_req(1, outside_prompt({ 22, 23, 21 }, { 22, 23 }), sp);
+    const std::vector<float> lg = outside_logits(5.0f, 5.0f, 0.0f);
+    std::vector<int32_t> tok;
+    CHECK_OK(ch.step({ &a }, lg, &tok));
+    CHECK_EQ(tok[0], 21);
+    int64_t n = 0;
+    CHECK((ch.s.staged_params(&n)[0].flags & RAD_SP_DRY) != 0);
+
+    TokenLogprobs lp;
+    CHECK_OK(ch.s.logprobs_for(0, tok[0], &lp));
+    CHECK_NEAR(lp.logprob, 5.0 - log_sum_exp(lg), 1e-5);
+}
+
+TEST(admission_refuses_more_than_twenty_logprobs) {
+    Sampler s;
+    SamplingParams sp;
+    sp.n_probs = RAD_MAX_LOGPROBS + 1;
+    std::string why;
+    CHECK(s.check_request(sp, &why) < 0);
+    CHECK(why.find("logprobs") != std::string::npos);
 }
 
 /* repeat_last_n = 0 TURNS THE PENALTIES OFF, as it does in llama.cpp -- it is not "the whole

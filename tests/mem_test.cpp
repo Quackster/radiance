@@ -126,14 +126,14 @@ static void publish(Fixture& f, uint64_t id, const std::vector<int32_t>& tokens,
 
 /* ================================================================== pools */
 
-TEST(pool_budgets_are_stated_not_inferred) {
+TEST(pools_refuse_a_split_the_resolver_never_made) {
     Config c;
-    c.vram_weights_mib = 0;     /* the operator said nothing */
+    c.vram_weights_mib = 0;     /* the resolver never ran */
     c.vram_kv_mib = 0;
     Pools p;
     CHECK_EQ(p.configure(c, 0, &rad_malloc_allocator(), &rad_malloc_allocator()), RAD_E_INVAL);
-    CHECK(p.fit_report().find("--vram-weights-mib") != std::string::npos);
-    CHECK(p.fit_report().find("--vram-kv-mib") != std::string::npos);
+    CHECK(p.fit_report().find("vram_weights resolved to 0 MiB") != std::string::npos);
+    CHECK(p.fit_report().find("vram_kv resolved to 0 MiB") != std::string::npos);
     CHECK(!p.configured());
 }
 
@@ -198,6 +198,44 @@ TEST(a_refused_backing_allocation_says_it_was_refused_and_why) {
 
 /* ================================================================== the derived budget */
 
+TEST(a_device_with_no_capacity_sizes_its_pools_from_the_program) {
+    /* A device that reports no capacity: the pools are still derived, from what the program
+     * needs rather than from a share of anything. */
+    Config c = small_config();
+    c.vram_weights_mib = 0;
+    c.vram_kv_mib      = 0;
+    VramFacts f{};
+    f.statics    = 0;                 /* every op on the host: its weights stay in the mapping */
+    f.kv_ceiling = 300LL << 20;
+    VramBudget b;
+    CHECK_OK(vram_budget_resolve(c, { f }, &b));
+    CHECK_EQ(c.vram_weights_mib, (int64_t)1);           /* a pool nothing is placed in */
+    CHECK_EQ(c.vram_kv_mib, (int64_t)300);              /* every sequence at the full context */
+
+    f.statics = 5LL << 20;                              /* a device-domain op's weights */
+    Config c2 = small_config();
+    c2.vram_weights_mib = 0;
+    c2.vram_kv_mib      = 0;
+    CHECK_OK(vram_budget_resolve(c2, { f }, &b));
+    CHECK_EQ(c2.vram_weights_mib, (int64_t)5);
+}
+
+TEST(a_program_that_copies_no_weight_still_gets_a_weights_pool) {
+    /* Every op on the host -- CPU-only serving -- reads its weights where the container's mapping
+     * has them, so nothing is copied to the weights pool. It still has to exist: a zero budget is
+     * what the pools refuse as a resolver that never ran. */
+    Config c = small_config();
+    VramFacts f{};
+    f.capacity   = 16LL << 30;        /* the host backend presents half the machine as a card */
+    f.free       = f.capacity;
+    f.arena      = 64LL << 20;
+    f.kv_ceiling = 300LL << 20;
+    VramBudget b;
+    CHECK_OK(vram_budget_resolve(c, { f }, &b));
+    CHECK_EQ(c.vram_weights_mib, (int64_t)1);
+    CHECK(c.vram_kv_mib >= 299);
+}
+
 TEST(derived_budget_takes_the_statics_off_the_top_then_divides_the_rest) {
     /* With no lender stated the experts come first; what each side gets is the subject of the
      * cases below. */
@@ -223,7 +261,6 @@ TEST(derived_budget_takes_the_statics_off_the_top_then_divides_the_rest) {
     /* Held, the driver's drift on it, the headroom and the arena. */
     CHECK_EQ(b.drift, 16LL << 20);
     CHECK_EQ(b.claimable, f.capacity - (512LL << 20) - (16LL << 20) - (96LL << 20) - (144LL << 20));
-    CHECK(b.derived_weights && b.derived_kv);
 
     /* THE FLOOR IS NOT A SHARE. The statics come out whole before the split sees anything, so
      * nothing the cache is given can demote an attention projection to host memory. */
@@ -423,25 +460,6 @@ TEST(the_engine_s_queues_come_off_the_card_before_the_split) {
                             - c2.vram_weights_mib * MiB - c2.vram_kv_mib * MiB;
     CHECK(unclaimed >= 112 * MiB);
     CHECK(unclaimed < 114 * MiB);
-}
-
-TEST(a_stated_budget_still_wins_and_the_other_side_still_derives) {
-    Config c = small_config();
-    c.vram_weights_mib = 20000;          /* stated */
-    c.vram_kv_mib      = 0;              /* derived */
-    c.gpu_headroom_mib = 96;
-
-    VramFacts f{};
-    f.capacity   = 32LL << 30;
-    f.free       = f.capacity - (512LL << 20);
-    f.arena      = 144LL << 20;
-    f.kv_ceiling = 100LL << 30;
-
-    VramBudget b;
-    CHECK_OK(vram_budget_resolve(c, { f }, &b));
-    CHECK_EQ(c.vram_weights_mib, 20000ll);        /* untouched */
-    CHECK(!b.derived_weights && b.derived_kv);
-    CHECK_EQ(b.kv, b.claimable);                  /* the KV pool gets everything that is left */
 }
 
 TEST(the_smallest_card_binds_and_a_short_one_refuses_by_name) {
@@ -756,7 +774,7 @@ TEST(kv_refuses_a_group_with_no_block_size) {
 
 TEST(kv_refuses_when_fixed_costs_do_not_fit) {
     /* --max-seqs 128 at 16 KiB of GDN state each is 2 MiB of fixed cost against a 1 MiB
-     * --vram-kv-mib. Refused by name, with the arithmetic printed; not silently served at fewer
+     * the KV pool. Refused by name, with the arithmetic printed; not silently served at fewer
      * sequences than the operator asked for. */
     Fixture f;
     f.cfg.max_seqs = 128;

@@ -54,6 +54,7 @@ struct ChatOptions {
     bool        parallel_tool_calls = false;
     std::string tool_choice = "auto";           /* auto | none | required */
     std::string reasoning_format = "auto";      /* none | auto | deepseek | deepseek-legacy */
+    std::string continue_final;                 /* "" | auto | content | reasoning_content */
     std::string grammar;                        /* a user-supplied GBNF, or empty */
     std::string json_schema;                    /* response_format json_schema, or empty */
     bool        add_bos = false;

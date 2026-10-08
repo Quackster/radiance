@@ -36,10 +36,8 @@ std::string dir_path() {
            std::to_string((long long)getpid());
 }
 
-/* One model.safetensors and a config.json in a fresh directory. */
-std::string write_checkpoint(const std::vector<T>& ts, const std::string& config) {
-    const std::string dir = dir_path();
-    ::mkdir(dir.c_str(), 0755);
+/* One safetensors file holding `ts`, in order. */
+void write_shard(const std::string& path, const std::vector<T>& ts) {
     std::string hdr = "{";
     uint64_t off = 0;
     for (size_t i = 0; i < ts.size(); ++i) {
@@ -53,13 +51,20 @@ std::string write_checkpoint(const std::vector<T>& ts, const std::string& config
     }
     hdr += "}";
     while (hdr.size() % 8) hdr += ' ';
-    FILE* f = std::fopen((dir + "/model.safetensors").c_str(), "wb");
+    FILE* f = std::fopen(path.c_str(), "wb");
     const uint64_t n = hdr.size();
     std::fwrite(&n, 8, 1, f);
     std::fwrite(hdr.data(), 1, hdr.size(), f);
     for (const T& t : ts) std::fwrite(t.bytes.data(), 1, t.bytes.size(), f);
     std::fclose(f);
-    f = std::fopen((dir + "/config.json").c_str(), "wb");
+}
+
+/* One model.safetensors and a config.json in a fresh directory. */
+std::string write_checkpoint(const std::vector<T>& ts, const std::string& config) {
+    const std::string dir = dir_path();
+    ::mkdir(dir.c_str(), 0755);
+    write_shard(dir + "/model.safetensors", ts);
+    FILE* f = std::fopen((dir + "/config.json").c_str(), "wb");
     std::fwrite(config.data(), 1, config.size(), f);
     std::fclose(f);
     return dir;
@@ -187,6 +192,23 @@ TEST(nested_processors_keep_their_namespace_and_image_aliases) {
     std::remove((dir + "/processor_config.json").c_str());
     std::remove((dir + "/preprocessor_config.json").c_str());
     std::remove((dir + "/config_sentence_transformers.json").c_str());
+    remove_checkpoint(dir);
+}
+
+/* rad-convert's --set of quantization_config re-derives the descriptor from the same keys, so a
+ * bf16 checkpoint whose recipe writes block fp8 is converted for the fp8 plugin by stating the
+ * format, and the container never states one format while selecting the plugin of another. */
+TEST(the_descriptor_is_quant_method_and_fmt_whoever_set_them) {
+    const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
+                                             "{\"model_type\":\"qwen3_5\",\"hidden_size\":256}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK_EQ(ck.meta().quant, std::string());
+    MetaOwn m = ck.meta();
+    m.set("quantization_config.quant_method", "fp8");
+    CHECK_EQ(quant_descriptor(m), std::string("fp8"));
+    m.set("quantization_config.fmt", "e4m3");
+    CHECK_EQ(quant_descriptor(m), std::string("fp8_e4m3"));
     remove_checkpoint(dir);
 }
 
@@ -687,4 +709,46 @@ TEST(a_quark_mxfp4_weight_is_its_codes_and_exponents) {
     REQUIRE_EQ(ckpt_resolve(ck, prog, "n", false, &w, &why), RAD_OK);
     CHECK(w.trivial && rad_enc_is(&w.enc, "plain"));
     remove_checkpoint(dir);
+}
+
+/* A DIRECTORY THAT MERGES TWO CHECKPOINTS holds some tensors in two shards: a finetune's changed
+ * tensors in shards of its own beside links to every shard of the base model, which still carry
+ * the old copies. The index is what says which copy is the model's, so it is what decides; a name
+ * in two shards that no index entry settles is refused rather than read from whichever shard sorts
+ * first. */
+TEST(the_index_decides_which_shard_a_tensor_is_read_from) {
+    const std::string dir = dir_path();
+    ::mkdir(dir.c_str(), 0755);
+    const T base_x = bf16("x.weight", { 2, 4 }, 1.0f), base_y = bf16("y.weight", { 4 }, 2.0f);
+    const T ft_x = bf16("x.weight", { 2, 4 }, 5.0f);
+    write_shard(dir + "/a.safetensors", { base_x, base_y });   /* sorts first */
+    write_shard(dir + "/b.safetensors", { ft_x });
+    auto put = [&](const char* name, const std::string& body) {
+        FILE* f = std::fopen((dir + "/" + name).c_str(), "wb");
+        std::fwrite(body.data(), 1, body.size(), f);
+        std::fclose(f);
+    };
+    put("config.json", kConfig);
+    put("model.safetensors.index.json",
+        R"({"weight_map":{"x.weight":"b.safetensors","y.weight":"a.safetensors"}})");
+    {
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        const SrcTensor* x = ck.find("x.weight");
+        const SrcTensor* y = ck.find("y.weight");
+        REQUIRE(x && y);
+        CHECK_EQ(std::memcmp(x->data, ft_x.bytes.data(), ft_x.bytes.size()), 0);
+        CHECK_EQ(std::memcmp(y->data, base_y.bytes.data(), base_y.bytes.size()), 0);
+    }
+    /* the index names both shards but not x: two copies and nothing to choose between them */
+    put("model.safetensors.index.json",
+        R"({"weight_map":{"y.weight":"a.safetensors","z.weight":"b.safetensors"}})");
+    {
+        Checkpoint ck;
+        CHECK_EQ(ck.open(dir), RAD_E_FORMAT);
+    }
+    for (const char* f : { "a.safetensors", "b.safetensors", "config.json",
+                           "model.safetensors.index.json" })
+        std::remove((dir + "/" + f).c_str());
+    ::rmdir(dir.c_str());
 }

@@ -134,8 +134,7 @@ private:
     /* --embedding-placement and --ngram-placement, resolved into Config before the card is split
      * (engine_bringup.cpp says how auto chooses). */
     int resolve_table_placement(const std::vector<VramFacts>& facts,
-                                const std::vector<int64_t>& emb_bytes,
-                                const std::vector<int64_t>& floor_emb_ram, int64_t kv_floor,
+                                const std::vector<int64_t>& emb_bytes, int64_t kv_floor,
                                 int64_t ngram_bytes, bool ngram_device, bool ngram_host);
     /* --ngram-placement ram: the copy of the container's [src, src + n), file offset `foff`, made
      * once and shared by every rank -- locked for the host gather, or pinned for a device kernel
@@ -167,6 +166,9 @@ private:
         std::vector<int32_t>  token;      /* [n_seq] */
         std::vector<int32_t>  accepted;   /* [n_seq] */
         std::vector<uint8_t>  eos;        /* [n_seq] */
+        /* [n_rows] each sampled row's logprobs, for the rows of requests that asked for them;
+         * empty on a step with none. */
+        std::vector<TokenLogprobs> lp;
     };
 
     /* The text frontend, loaded out of the container. `vocab_view_` is what the sampler's
@@ -239,6 +241,7 @@ private:
      * wait left until after them. */
     int  collect_issue(const RadBatch* b, StepOut& so);
     int  collect_step(const RadBatch* b, StepOut& so);
+    int  row_logprobs(StepOut& so, int32_t row, int32_t token);
     /* WHERE THE STEP ENDS ON THE CARD: after its last draft pass and the copies the host reads,
      * and before the step issued ahead of it. collect_step waits for this and not for the
      * stream, so the card runs the next step while the host commits this one. */

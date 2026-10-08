@@ -52,15 +52,17 @@ namespace rad {
 /* ================================================================== the miss report */
 /* WHAT DID NOT RESOLVE, in the three shapes the three answers want.
  *
- * A DEVICE miss WITH NO HOST KERNEL EITHER is a hole. The band exists, a request can land in it,
- * and the step that does fails at ISSUE rather than here -- declare completes either way -- so
- * every one gets a line of its own carrying the geometry and the constraint that refused it.
+ * A DEVICE miss NO HOST KERNEL STANDS IN FOR is a hole (Program::device_holes has the rule). The
+ * band exists and a request can land in it, so the engine refuses to start on one rather than
+ * serve until the first step that does -- and every one gets a line of its own carrying the
+ * geometry and the constraint that refused it.
  *
- * A DEVICE miss whose op DID resolve on the host is not a hole at all. The planner puts that op's
+ * A DEVICE miss a host kernel stands in for is not a hole at all. The planner puts that op's
  * arithmetic on the host and its weights in the container's mapping, which is how `embed_lookup_q`
  * serves a table too large to copy into VRAM when no device kernel for it is loaded. Reporting
  * that as fatal produces an error nobody believes, and an error nobody believes is how a real one
- * goes unread.
+ * goes unread. An op with no weights has nothing to place, so on a card its host kernel does not
+ * stand in: paged attention reads a cache in VRAM, and only a device kernel can.
  *
  * A HOST miss removes ONE placement option for ONE op, and for a kernel library written for a GPU
  * it is the ordinary case rather than news: most ops have no host implementation and never will.
@@ -70,7 +72,7 @@ namespace rad {
  * with thousands of lines of `E` that are all host misses, and a real device hole is invisible
  * among them. */
 struct MissReport {
-    std::vector<std::string> device;   /* one line each; fatal at issue */
+    std::vector<std::string> device;   /* one line each; the engine does not start */
     std::string              host;     /* one line, or empty */
     /* Device bands whose op DOES have a host kernel. Not a hole: the planner runs such an op on
      * the host and pins its weights there (Tier::Mapped), which is the whole of how a table too
@@ -78,29 +80,43 @@ struct MissReport {
      * operator has to learn to ignore -- and an error nobody believes is how a real one goes
      * unread. */
     std::string              host_only;
+    /* A hole is an all-reduce instance declared on the lossy wire (`exact` 0, which the model
+     * plugin derives from --tp-wire, rad_builder.h). The libraries may serve that world size on
+     * the exact wire, so the refusal names the flag that asks for it. */
+    bool                     lossy_wire = false;
 
     bool operator==(const MissReport& o) const {
-        return device == o.device && host == o.host && host_only == o.host_only;
+        return device == o.device && host == o.host && host_only == o.host_only &&
+               lossy_wire == o.lossy_wire;
     }
 };
 
-static MissReport miss_report(const Program& p) {
+static MissReport miss_report(const Program& p, bool host_backend) {
     MissReport r;
     std::vector<std::string>              host_ops;    /* in first-seen order */
     std::map<std::string, std::string>    host_spans;  /* op -> "M <= 64, M in (64, 512]" */
 
-    /* (op, band) pairs the HOST could not serve either. A device miss that is in this set is a
-     * hole; one that is not has a host kernel standing behind it. */
-    std::set<std::pair<std::string, std::string>> no_host;
+    const std::vector<const Program::Miss*> holes = p.device_holes(host_backend);
+    std::set<std::pair<int32_t, std::string>> no_host;   /* (instance, band) with no host kernel */
     for (const Program::Miss& m : p.misses)
-        if (m.domain == RAD_DOMAIN_HOST) no_host.emplace(m.op, m.span);
+        if (m.domain == RAD_DOMAIN_HOST) no_host.emplace(m.index, m.span);
+    for (const Program::Miss* m : holes) {
+        long long exact = 1;
+        if (m->index > 0 && (size_t)m->index < p.ops.size() &&
+            p.ops[(size_t)m->index].base.get_i("exact", &exact) && exact == 0)
+            r.lossy_wire = true;
+        r.device.push_back(m->line());
+        if (!no_host.count(std::make_pair(m->index, m->span)))
+            r.device.back() += " (its host kernel cannot stand in: the op has no weights for "
+                               "the planner to place on the host)";
+    }
 
     std::vector<std::string> host_only_ops;
     for (const Program::Miss& m : p.misses) {
         if (m.domain != RAD_DOMAIN_HOST) {
-            if (no_host.count(std::make_pair(m.op, m.span))) r.device.push_back(m.line());
-            else if (std::find(host_only_ops.begin(), host_only_ops.end(), m.op) ==
-                     host_only_ops.end()) host_only_ops.push_back(m.op);
+            if (std::find(holes.begin(), holes.end(), &m) == holes.end() &&
+                std::find(host_only_ops.begin(), host_only_ops.end(), m.op) ==
+                    host_only_ops.end()) host_only_ops.push_back(m.op);
             continue;
         }
         auto it = host_spans.find(m.op);
@@ -234,20 +250,27 @@ static void report_pool_refusal(int rank, int device, const Pools& pools, const 
         }
         /* A refusal with room under both is not a capacity one, and advice to shrink the pool
          * would send the reader after the wrong cause: the device's reason above is the answer. */
-        const int64_t want = (int64_t)cfg.tp * cfg.host_pool_mib * 1024 * 1024 + pinned + mapped;
+        const int64_t pool = (cfg.host_pool_mib + cfg.embedding_host_mib) * 1024 * 1024;
+        const int64_t want = (int64_t)cfg.tp * pool + pinned + mapped;
         const bool fits = cap > 0 && avail >= 0 && want <= cap && want <= avail;
-        RAD_ERR("host: --host-pool-mib %lld is pinned once per rank, so %d rank(s) pin %s; this "
+        RAD_ERR("host: --host-pool-mib %lld%s is pinned once per rank, so %d rank(s) pin %s; this "
                 "process had taken %s of pinned host memory before rank %d's pool. The amdgpu "
                 "driver caps pinned memory system-wide at %s (ttm.pages_limit, half of RAM unless "
                 "raised), and %s of RAM is available. %s",
-                (long long)cfg.host_pool_mib, cfg.tp,
-                humanb((int64_t)cfg.tp * cfg.host_pool_mib * 1024 * 1024).c_str(),
+                (long long)cfg.host_pool_mib,
+                cfg.embedding_host_mib
+                    ? fmt(" and the token embedding's %lld MiB", (long long)cfg.embedding_host_mib).c_str()
+                    : "",
+                cfg.tp, humanb((int64_t)cfg.tp * pool).c_str(),
                 humanb(pinned + mapped).c_str(), rank,
                 cap > 0 ? humanb(cap).c_str() : "an unreadable limit",
                 avail >= 0 ? humanb(avail).c_str() : "an unknown amount",
                 fits ? "The pools fit under both, so the refusal is not one of size; the reason "
                        "the device gave is above"
-                     : "Lower --host-pool-mib, or raise the cap");
+                     : cfg.embedding_host_mib
+                         ? "Lower --host-pool-mib, keep the embedding on the card with "
+                           "--embedding-placement vram, or raise the cap"
+                         : "Lower --host-pool-mib, or raise the cap");
     }
 }
 
@@ -417,7 +440,8 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
 bool Engine::ngram_gather_to_host() {
     for (auto& r : ranks_) {
         WeightFootprint f;
-        weight_footprint(r->program, &f, TablePlacement::Vram, TablePlacement::Disk);
+        weight_footprint(r->program, &f, TablePlacement::Vram, TablePlacement::Disk,
+                         device_is_host(), file_ != nullptr);
         if (!f.ngram_host) return false;
     }
     for (auto& r : ranks_)
@@ -432,78 +456,79 @@ bool Engine::ngram_gather_to_host() {
 /* WHERE THE TWO LOOKUP TABLES GO (--embedding-placement, --ngram-placement), decided once for every
  * rank before the card is split, and written into Config for the planner and the load phase.
  *
- * THE EMBEDDING: Auto keeps it on the card -- where every other weight a step reads lives --
- * unless that leaves the split unable to hold the fixed weights, or leaves a derived KV pool
- * unable to hold one --max-model-len sequence (`kv_floor`); then the pinned host pool takes it if
- * --host-pool-mib can, the card's lookup reading it over the link in place. Disk is refused: the
+ * THE EMBEDDING: Ram, the default, pins it in host memory of its own beside --host-pool-mib
+ * (Config::embedding_host_mib), the card's lookup reading its M rows a step over the link in
+ * place, so its VRAM goes to the KV cache and the experts. Where it cannot -- a model whose output
+ * head is tied to the table reads it whole every step, and a host without the memory has nowhere
+ * to pin it -- the default keeps it on the card and says why, and a named `ram` stops the server.
+ * Vram keeps it on the card with every other weight a step reads. There is no third tier: the
  * lookup writes the activations a card reads, which a host kernel reading the container cannot
  * reach -- an architecture declares a buffer's domain, and the token embedding's is the device.
  *
  * THE N-GRAM TABLE: Vram where a device kernel gathers it and the card holds it; Ram as a copy,
  * pinned for that kernel to read over the link or locked for the host gather; Disk in the
  * container, read by the host gather. Each tier is refused where no kernel reads it there. Auto
- * takes the first that holds the table, in that order: the card's test is the embedding's, and
- * RAM's is lockable_room's -- the memory and every cgroup after the pools still to be allocated,
- * and the memlock limit for a locked copy. */
+ * takes the first that holds the table, in that order: the card's test is the fixed weights and a
+ * KV pool for one --max-model-len sequence (`kv_floor`) beside it, and RAM's is lockable_room's --
+ * the memory and every cgroup after the pools still to be allocated, and the memlock limit for a
+ * locked copy. */
 int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
-                                    const std::vector<int64_t>& emb_bytes,
-                                    const std::vector<int64_t>& floor_emb_ram, int64_t kv_floor,
+                                    const std::vector<int64_t>& emb_bytes, int64_t kv_floor,
                                     int64_t ngram_bytes, bool ngram_device, bool ngram_host) {
     const int64_t MiB = (int64_t)1 << 20;
     int64_t emb_max = 0;
     for (int64_t b : emb_bytes) emb_max = std::max(emb_max, b);
 
     TablePlacement emb = cfg_.embedding_placement;
+    const bool emb_asked = cfg_.embedding_placement_given;
     std::string emb_why;
-    if (emb == TablePlacement::Disk) {
-        RAD_ERR("--embedding-placement disk: the token embedding's lookup writes activations the "
-                "card reads, and a host kernel reading the container cannot write them -- the "
-                "architecture declares that buffer on the device. Use vram, ram or auto.");
-        return RAD_E_INVAL;
-    }
+    /* THE HOST MEMORY THE TABLE WOULD PIN, every rank its own shard, after the pools and the prefix
+     * cache's host tier still to be allocated: lockable_room's test, without the memlock limit,
+     * which a pin the cards read is not charged to. */
+    const int64_t emb_pin = (int64_t)cfg_.tp * align_up(emb_max, (int64_t)MiB);
+    const int64_t pools_still = (int64_t)cfg_.tp * cfg_.host_pool_mib * MiB +
+                                cfg_.prefix_cache_host_mib * MiB;
+    std::string emb_room_why;
+    auto emb_room = [&]() { return lockable_room(emb_pin, pools_still, false, &emb_room_why); };
     if (emb_max == 0) {
-        if (emb == TablePlacement::Ram) {
+        if (emb == TablePlacement::Ram && emb_asked) {
             RAD_ERR("--embedding-placement ram: this model has no token embedding table that only "
                     "embed_lookup reads. An output head tied to the table reads it too, and would "
                     "stream it over the link every step.");
             return RAD_E_INVAL;
         }
         emb = TablePlacement::Vram;
-        emb_why = "no table only embed_lookup reads";
-    } else if (emb == TablePlacement::Auto) {
-        VramBudget tb;
-        const int st = vram_budget_trial(cfg_, facts, &tb);
-        const bool holds = st == RAD_OK && (!tb.derived_kv || tb.kv >= kv_floor);
-        const bool host  = cfg_.host_pool_mib * MiB >= emb_max;
-        if (holds) {
+        emb_why = "no table only embed_lookup reads (an output head tied to it reads it too, "
+                  "whole, every step)";
+    } else if (emb == TablePlacement::Ram) {
+        if (!emb_room()) {
+            if (emb_asked) {
+                RAD_ERR("--embedding-placement ram: the token embedding (%s a rank, pinned on "
+                        "every rank) cannot be held in host memory: %s. Use vram.",
+                        humanb(emb_max).c_str(), emb_room_why.c_str());
+                return RAD_E_NOMEM;
+            }
             emb = TablePlacement::Vram;
-            emb_why = "the card holds it beside the other weights and a KV pool for one "
-                      "--max-model-len sequence";
-        } else if (host) {
-            emb = TablePlacement::Ram;
-            emb_why = st != RAD_OK
-                ? "the card cannot hold the other weights with it, and the pinned host pool can"
-                : fmt("with it on the card the KV pool is %s, short of the %s one --max-model-len "
-                      "sequence needs, and the pinned host pool can hold it",
-                      humanb(tb.kv).c_str(), humanb(kv_floor).c_str());
+            emb_why = "the host cannot pin it: " + emb_room_why;
         } else {
-            emb = TablePlacement::Vram;
-            emb_why = fmt("the card is short of room for it, and --host-pool-mib %lld cannot hold "
-                          "%s either", (long long)cfg_.host_pool_mib, humanb(emb_max).c_str());
+            emb_why = emb_asked ? "as asked"
+                                : "pinned in host memory and read over the link in place, so its "
+                                  "VRAM goes to the KV cache and the experts";
         }
     } else {
         emb_why = "as asked";
     }
     cfg_.embedding_resolved = emb;
+    cfg_.embedding_host_mib = emb == TablePlacement::Ram ? align_up(emb_max, MiB) / MiB : 0;
 
     TablePlacement ng = cfg_.ngram_placement;
     std::string ng_why;
     /* THE FASTEST TIER WITH THE ROOM, the card first: the table on the card, every rank holding
      * all of it (a lookup is not sharded), with the fixed weights and a KV pool for one
-     * --max-model-len sequence beside it, as the embedding's test is; then a copy in RAM -- pinned
+     * --max-model-len sequence beside it; then a copy in RAM -- pinned
      * for a device kernel to read over the link, or locked for the host gather; then the
      * container, which only the host gather reads. Each is open only where a kernel reads it. */
-    const int64_t still = (int64_t)cfg_.tp * cfg_.host_pool_mib * MiB +
+    const int64_t still = (int64_t)cfg_.tp * (cfg_.host_pool_mib + cfg_.embedding_host_mib) * MiB +
                           cfg_.prefix_cache_host_mib * MiB;
     const int64_t need = align_up(ngram_bytes, (int64_t)2 << 20);
     const char* copy = ngram_device ? "a pinned copy the card reads" : "a locked copy";
@@ -513,10 +538,7 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         for (size_t i = 0; i < with.size(); ++i) {
             VramFacts& f = with[i];
             f.statics += ngram_bytes;
-            if (emb == TablePlacement::Ram) {
-                f.statics -= emb_max;
-                f.expert_floor = floor_emb_ram[i];
-            }
+            if (emb == TablePlacement::Ram) f.statics -= emb_bytes[i];
             fixed = std::max(fixed, f.statics);
         }
         /* `fixed` and not the trial's own statics: the split clamps those to what the card can give
@@ -528,7 +550,7 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
          * only the card, and a table that took their room would leave them nowhere. */
         const bool starved = st == RAD_OK && tb.lends && tb.expert_ceiling > 0 &&
                              tb.experts < tb.expert_floor;
-        if (st == RAD_OK && !over && !starved && (!tb.derived_kv || tb.kv >= kv_floor))
+        if (st == RAD_OK && !over && !starved && tb.kv >= kv_floor)
             return true;
         if (st != RAD_OK)
             *why = "the card cannot hold the other weights with it";
@@ -608,8 +630,7 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
 
     if (emb_max > 0)
         RAD_INFO("placement: token embedding (%s a rank) %s%s: %s", humanb(emb_max).c_str(),
-                 table_placement_name(emb),
-                 cfg_.embedding_placement == TablePlacement::Auto ? " (auto)" : "", emb_why.c_str());
+                 table_placement_name(emb), emb_asked ? "" : " (default)", emb_why.c_str());
     if (ngram_bytes > 0)
         RAD_INFO("placement: n-gram table (%s) %s%s: %s", humanb(ngram_bytes).c_str(),
                  table_placement_name(ng),
@@ -956,9 +977,9 @@ int Engine::declare() {
         const int64_t exact_rows = (cfg_.tp_wire_min_kb * 1024 + row_bytes - 1) / row_bytes - 1;
         RAD_WARN("tp wire: LOSSY (--tp-wire wht6) at %lld KiB a message and above. A cross-rank "
                  "all-reduce of that size carries a quantised payload instead of bf16 (libr4d's "
-                 "is Walsh-Hadamard-rotated 6-bit at two ranks and tiered int8 at four), so this "
-                 "process does not compute the same function the exact wire does. Steps of at "
-                 "most %lld rows are exact: single-sequence decode, and a "
+                 "is Walsh-Hadamard-rotated 6-bit at two ranks and tiered int8 at three and "
+                 "four), so this process does not compute the same function the exact wire does. "
+                 "Steps of at most %lld rows are exact: single-sequence decode, and a "
                  "decode step until sequences x (1 + speculative depth) passes that; prefill and "
                  "a busy decode step are lossy. --tp-wire-min-kb moves the floor.",
                  (long long)cfg_.tp_wire_min_kb, (long long)exact_rows);
@@ -976,7 +997,7 @@ int Engine::declare() {
      * rank whose report differs is itself worth seeing, and gets its own. */
     {
         std::vector<MissReport> rep;
-        for (auto& r : ranks_) rep.push_back(miss_report(r->program));
+        for (auto& r : ranks_) rep.push_back(miss_report(r->program, device_is_host()));
         bool same = true;
         for (size_t i = 1; i < rep.size(); ++i) if (!(rep[i] == rep[0])) same = false;
 
@@ -992,6 +1013,23 @@ int Engine::declare() {
             if (!rep[i].host_only.empty()) RAD_INFO("%s", rep[i].host_only.c_str());
             if (!rep[i].host.empty()) RAD_INFO("%s", rep[i].host.c_str());
         }
+        /* A HOLE IS A REFUSAL HERE, not an error the first request finds. Every band is one a
+         * request can land in -- the bands are cut from the limits this run was started with --
+         * and the step that lands in one fails at issue and takes the engine down with it. A
+         * kernel library that serves the op (--kernels), or a model whose geometry the installed
+         * one covers, is the remedy; serving until then is not. --debug-graph serves nothing, so
+         * it goes on to print the graph the holes are in, and its exit status says they are there
+         * (Engine::dump). */
+        for (const MissReport& m : rep)
+            if (!m.device.empty() && !cfg_.debug_graph) {
+                if (m.lossy_wire)
+                    RAD_ERR("the band(s) above include the lossy wire --tp-wire wht6 asks for, "
+                            "which the loaded kernel libraries do not implement at --tp %d; "
+                            "--tp-wire exact asks for the exact one", cfg_.tp);
+                RAD_ERR("not starting: the kernel libraries loaded have no kernel for the device "
+                        "band(s) above, and this model needs them");
+                return RAD_E_UNSUPPORTED;
+            }
     }
     /* A CHECKPOINT WEIGHT THAT IS NOT SERVED AS IT STANDS was declared as plain and nothing can
      * load it: every one is named, with the remedy, whatever declare made of the rest. */
@@ -1198,11 +1236,10 @@ int Engine::plan() {
              * already this card's even share of the static weights: declare ran once per rank
              * with every dimension divided. */
             WeightFootprint wf;
-            weight_footprint(r->program, &wf, TablePlacement::Vram, TablePlacement::Disk);
+            weight_footprint(r->program, &wf, TablePlacement::Vram, TablePlacement::Disk,
+                             device_is_host(), file_ != nullptr);
             f.statics = wf.statics;
             f.experts = wf.experts;
-            /* The expert floor waits for the tables' placement: the embedding may take its share
-             * of the host pool first. */
             wfs.push_back(wf);
             /* THE CACHE LENDS where units move and the pool can give its blocks back in place. */
             f.lends = VMem::supported() && !cfg_.deterministic &&
@@ -1213,8 +1250,8 @@ int Engine::plan() {
             ngram_host = ngram_host || wf.ngram_host;
             /* ONE --max-model-len SEQUENCE'S CACHE: the same groups planned for a single
              * sequence, which is the least a KV pool can hold and still serve every request the
-             * API accepts (configure_kv warns below it). --embedding-placement auto keeps the
-             * table off the card only to stay above it. */
+             * API accepts (configure_kv warns below it). --ngram-placement auto puts the table
+             * on the card only where the pool stays above it. */
             {
                 Config one = cfg_;
                 one.max_seqs = 1;
@@ -1270,28 +1307,22 @@ int Engine::plan() {
             late_lazy_bytes_ = std::max(late_lazy_bytes_, lazy);
             facts.push_back(f);
         }
-        /* THE PINNED HOST POOL IS THE EXPERTS' OTHER HOME, less what Planner::plan takes out of it
-         * before any expert: the embedding when it is placed there, and the file tier's staging.
-         * Both floors are known before the tables are placed, so placing them can ask whether the
-         * experts would still have a tier. */
-        std::vector<int64_t> floor_emb_ram(facts.size(), 0);
+        /* THE PINNED HOST POOL IS THE EXPERTS' OTHER HOME, less the file tier's staging, which
+         * Planner::plan takes out of it before any expert. The embedding placed in host memory
+         * brings its own room (Config::embedding_host_mib), so it leaves this floor as it is. */
         for (size_t i = 0; i < facts.size(); ++i) {
             int64_t room = cfg_.host_pool_mib * ((int64_t)1 << 20);
             if (cfg_.weights_disk_tier)
                 room -= file_stage_reserve(wfs[i].layer_unit_max, wfs[i].routed);
             facts[i].expert_floor = expert_vram_floor(wfs[i], std::max<int64_t>(room, 0));
-            floor_emb_ram[i] = expert_vram_floor(wfs[i], std::max<int64_t>(room - emb_bytes[i], 0));
         }
-        RAD_TRY(resolve_table_placement(facts, emb_bytes, floor_emb_ram, kv_floor, ngram_bytes,
-                                        ngram_device, ngram_host));
+        RAD_TRY(resolve_table_placement(facts, emb_bytes, kv_floor, ngram_bytes, ngram_device,
+                                        ngram_host));
         /* The n-gram table was counted off the card; on it, it is every rank's whole table. */
         if (cfg_.ngram_resolved == TablePlacement::Vram)
             for (VramFacts& f : facts) f.statics += ngram_bytes;
         if (cfg_.embedding_resolved == TablePlacement::Ram)
-            for (size_t i = 0; i < facts.size(); ++i) {
-                facts[i].statics -= emb_bytes[i];
-                facts[i].expert_floor = floor_emb_ram[i];
-            }
+            for (size_t i = 0; i < facts.size(); ++i) facts[i].statics -= emb_bytes[i];
         VramBudget vb;
         RAD_TRY(vram_budget_resolve(cfg_, facts, &vb));
         if (!vb.report.empty()) RAD_INFO("%s", vb.report.c_str());
@@ -1317,8 +1348,7 @@ int Engine::plan() {
          * pool, up to every one of its weights resident. The token count, the carve, the loan and
          * the dearest ranks' pools are what they were.
          *
-         * Only a DERIVED split under expert_tiered is re-split. An operator who stated either pool
-         * has decided what every card gets. And under `auto` a rank whose grown pool covers all of
+         * Only a split under expert_tiered is re-split: under `auto` a rank whose grown pool covers all of
          * its weights would choose all_vram while its peers spill -- one strategy per world is the
          * contract that keeps their movers alike, so `auto` keeps the common split. A cache that
          * does not lend (--deterministic, or a device without virtual memory management) is
@@ -1341,8 +1371,6 @@ int Engine::plan() {
         int64_t T = -1;
         if (cheaper.empty()) {
             /* Every rank's cache costs the same per token: there is nothing to re-split. */
-        } else if (!vb.derived_kv || !vb.derived_weights) {
-            kept = "a stated --vram-kv-mib or --vram-weights-mib is applied to every card";
         } else if (cfg_.placement != "expert_tiered") {
             kept = fmt("--placement %s keeps one split for every card; only expert_tiered re-splits",
                        cfg_.placement.c_str());
@@ -1442,6 +1470,7 @@ int Engine::plan() {
             in.n_profile = (int64_t)file_->header().prof_count;
         }
         in.container = file_ != nullptr;
+        in.host_backend = device_is_host();
         Planner planner(in);
         s = planner.plan(&r->plan);
         if (cfg_.debug_placement || s < 0)
@@ -2329,7 +2358,7 @@ int Engine::load_weights() {
          * past the end of the weights pool is a write to device memory the process does not own,
          * and on this driver that does not fault -- the copy is accepted, never completes, and
          * the host thread spins inside the runtime with the copy engine idle and no I/O. It looks
-         * exactly like a hang, and it moves with --vram-weights-mib because a bigger pool is a
+         * exactly like a hang, and it moves with the weights pool's size because a bigger pool is a
          * later overrun. Cheap enough to check on every copy, and checked before any of them
          * start rather than as each one is issued. */
         const uint8_t* wp_lo = (const uint8_t*)r->pools.weights().base();
@@ -3217,6 +3246,7 @@ int Engine::start() {
     /* The cards are chosen, so a kernel library's device code is checked against the ones the
      * ranks will run on and not against whichever device the backend happens to list first. */
     rad_tools_registry().set_code_device(devs[0]);
+    rad_tools_registry().set_no_device_code(device_is_host());
     RAD_TRY(load_plugins());
 
     ranks_.clear();
@@ -3570,34 +3600,27 @@ int Engine::start() {
                      r->device, humanb(got).c_str(), asked.c_str(), humanb(want - got).c_str(),
                      humanb(room).c_str());
         } else if (got > want + 256 * MiB) {
-            /* AND "TOO MUCH" IS ONLY A FAULT WHERE SOMEBODY STATED THE BUDGET. Where the resolver
-             * made the split, what is left is left because neither pool could address another
-             * byte -- a small dense model already at the largest context its cache can hold
-             * leaves most of the card -- and vram_budget.cpp printed it on the `unusable` line.
-             * Warning here would contradict that receipt and send the reader looking for a flag
-             * to set. A rank plan() re-split for the common token count also leaves what its
-             * weights could not use, and the `kv: rank N ...` line said how much. */
+            /* "TOO MUCH" IS NOT A FAULT: the resolver made the split, and what is left is left
+             * because neither pool could address another byte -- a small dense model already at
+             * the largest context its cache can hold leaves most of the card -- and vram_budget.cpp
+             * printed it on the `unusable` line. A rank plan() re-split for the common token count
+             * also leaves what its weights could not use, and the `kv: rank N ...` line said how
+             * much. */
             const int64_t unclaimed_mib =
                 (cfg_.vram_weights_mib + cfg_.vram_kv_mib) -
                 (rank_cfg_[ri].vram_weights_mib + rank_cfg_[ri].vram_kv_mib);
-            if (cfg_.vram_budget_derived && unclaimed_mib > 0)
+            if (unclaimed_mib > 0)
                 RAD_INFO("card %d settled at %s free against %s. The split accounted for it: %lld "
                          "MiB are what rank %d's weights could not use of what its KV pool did not "
                          "need, on the `kv: rank %d ...` line above, and the rest is the `unusable` "
                          "line of the VRAM budget.",
                          r->device, humanb(got).c_str(), asked.c_str(), (long long)unclaimed_mib,
                          r->index, r->index);
-            else if (cfg_.vram_budget_derived)
+            else
                 RAD_INFO("card %d settled at %s free against %s. The split accounted for it: "
                          "neither pool could address another byte, which is the `unusable` line of "
                          "the VRAM budget above.",
                          r->device, humanb(got).c_str(), asked.c_str());
-            else
-                RAD_WARN("card %d settled at %s free against %s, so %s is unused. On a model that "
-                         "does not fit in VRAM every unused GiB is weight that has to be moved "
-                         "instead of read, and that is decode step time.",
-                         r->device, humanb(got).c_str(), asked.c_str(),
-                         humanb(got - want).c_str());
         } else
             RAD_INFO("card %d settled at %s free, against %s",
                      r->device, humanb(got).c_str(), asked.c_str());
@@ -3614,17 +3637,12 @@ int Engine::dump() {
     Program& p = ranks_[0]->program;
     fputs(dump_graph_str(p, nullptr).c_str(), stdout);
     if (cfg_.debug_selection) fputs(rad_tools_registry().selection_table().c_str(), stdout);
-    /* A HOST miss is not a failure -- see miss_report(). The exit code answers "is there a
-     * hole a request can fall into", and a host miss is not one. NOR IS A DEVICE MISS WHOSE OP
-     * HAS A HOST KERNEL: the planner places that op on the host and pins its weights in the
-     * container's mapping, which is how a table too large to copy into VRAM is served at all. A
-     * hole is a band NEITHER domain resolved. */
-    std::set<std::pair<std::string, std::string>> no_host;
-    for (const Program::Miss& m : p.misses)
-        if (m.domain == RAD_DOMAIN_HOST) no_host.emplace(m.op, m.span);
-    for (const Program::Miss& m : p.misses)
-        if (m.domain != RAD_DOMAIN_HOST && no_host.count(std::make_pair(m.op, m.span)))
-            return RAD_E_NOKERNEL;
+    /* The exit code answers "is there a hole a request can fall into", by the rule declare()
+     * refuses to serve on (Program::device_holes, miss_report()): a device band no kernel
+     * resolved, unless a host kernel stands in for an op whose weights the planner can place on
+     * the host. A host miss is not one. */
+    for (auto& r : ranks_)
+        if (!r->program.device_holes(device_is_host()).empty()) return RAD_E_NOKERNEL;
     return RAD_OK;
 }
 
