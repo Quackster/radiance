@@ -100,8 +100,8 @@ At `--tp 4` the gated residual's write carries the exact all-reduce, with the Mo
 of it, on decode and verify steps; a prefill chunk runs the unfused chain. That chain's exact
 all-reduce is one-shot up to 1 MiB a message and two-shot above that, which sends half the bytes
 on a prefill chunk; both produce the same bits. The row above runs exact.
-`--tp-wire wht6` at four ranks selects a different lossy wire, tiered int8 over the two-shot,
-above `--tp-wire-min-kb`. Eight ranks have no lossy wire, so `--tp 8 --tp-wire wht6` stops at
+`--tp-wire wht6` at three and four ranks selects a different lossy wire, tiered int8 over the
+two-shot, above `--tp-wire-min-kb`. Eight ranks have no lossy wire, so `--tp 8 --tp-wire wht6` stops at
 startup naming the all-reduce. Four ranks is a capacity configuration; its per-step rate against
 `--tp 2` on the same cards has not been measured. The
 tiering flags are the tp2 recipe carried over. Above two ranks each rank still owns a **slice of

@@ -10826,6 +10826,127 @@ static void ar_three_rank_pattern(const Plugin& pl, const std::vector<int>& devs
     }
 }
 
+/* THE THREE-RANK TIERED-INT8 WIRE, held to what a lossy wire can be held to.
+ *
+ * Exactly: every rank ends with the same bytes (the owner stores the decode of the words it
+ * published, so the wire is bit-identical across ranks by construction), and a message the wire
+ * declines -- under `min_bytes`, or not whole 32-element groups -- is the exact one-shot's fold,
+ * bit for bit. Statistically: the rest is within a quantisation error of the fp32 sum. The input is
+ * the per-element pattern plus a large outlier every 997 elements on rank 1 (the record's tier 2
+ * keeps a dominant element exact), and the sizes walk groups % 3 of 0, 1 and 2 to the 20971520
+ * ceiling, so a group reduced by the wrong owner or read from the wrong slot is an error of the
+ * order of the values themselves -- a relative RMS near 1, not the few tenths of a percent an int8
+ * wire costs. */
+struct ArTi8 {
+    const RadKernelInfo* row;
+    int rank, dev;
+    std::vector<int64_t> sizes;
+    void* inst = nullptr;
+    int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
+    std::vector<std::vector<uint16_t>> out;
+};
+
+static float ar_ti8_value(int rank, int64_t i) {
+    if (rank == 1 && i % 997 == 13) return 900.0f;   /* exact in bf16 */
+    return ar_pattern_value(rank, i);
+}
+
+static void ar_ti8_worker(ArTi8* t) {
+    if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
+    int64_t most = 0;
+    for (int64_t n : t->sizes) most = n > most ? n : most;
+    std::vector<RadParam> ps = {
+        PI("world_size", 3), PI("numel", most), PS("dtype", "bf16"), PI("exact", 0),
+        PI("min_bytes", 131072),
+    };
+    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, 3, &t->inst);
+    if (t->rc_init != RAD_OK) return;
+    void* buf = nullptr;
+    if (hipMalloc(&buf, (size_t)most * 2) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; return; }
+    std::vector<uint16_t> h((size_t)most);
+    for (int64_t n : t->sizes) {
+        for (int64_t i = 0; i < n; ++i) h[(size_t)i] = h_to_bf16(ar_ti8_value(t->rank, i));
+        st_memcpy(buf, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);
+        RadTensor ts[1] = { T(buf, RAD_BF16, { n }) };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts; a.n_t = 1;
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.instance = t->inst;
+        a.rank = t->rank;
+        a.world_size = 3;
+        const int rc = t->row->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        if (rc != RAD_OK && t->rc_launch == RAD_OK) t->rc_launch = rc;
+        std::vector<uint16_t> got((size_t)n);
+        st_memcpy(got.data(), buf, (size_t)n * 2, hipMemcpyDeviceToHost);
+        t->out.push_back(std::move(got));
+    }
+    st_free(buf);
+}
+
+static void ar_three_rank_ti8(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    if (devs.size() < 3) { skip(name, "fewer than three gfx1201 cards"); return; }
+    /* 32768 is under the 128 KiB floor and 65544 is not whole groups: both exact. The rest are
+     * lossy: 65536 sits ON the floor (2048 groups, % 3 = 2), then 2048 x 2048 / 2049 / 2050 rows
+     * (groups % 3 = 2, 0, 1) and the ceiling (655360 groups, % 3 = 1), and 2048 rows again. */
+    const std::vector<int64_t> sizes = { 4194304, 32768, 65536, 4196352, 65544, 4198400, 20971520,
+                                         4194304 };
+    ArTi8 t[3];
+    for (int r = 0; r < 3; ++r) { t[r].row = row; t[r].rank = r; t[r].dev = devs[(size_t)r]; t[r].sizes = sizes; }
+    std::thread a(ar_ti8_worker, &t[0]), b(ar_ti8_worker, &t[1]), c(ar_ti8_worker, &t[2]);
+    a.join(); b.join(); c.join();
+    const std::string nm(name);
+    const bool up = t[0].rc_init == RAD_OK && t[1].rc_init == RAD_OK && t[2].rc_init == RAD_OK;
+    ok((nm + " init (peer rendezvous)").c_str(), up,
+       "rc " + std::to_string(t[0].rc_init) + "/" + std::to_string(t[1].rc_init) + "/" +
+           std::to_string(t[2].rc_init));
+    if (!up) return;
+    const bool ran = t[0].rc_launch == RAD_OK && t[1].rc_launch == RAD_OK && t[2].rc_launch == RAD_OK;
+    ok((nm + " launches").c_str(), ran,
+       "rc " + std::to_string(t[0].rc_launch) + "/" + std::to_string(t[1].rc_launch) + "/" +
+           std::to_string(t[2].rc_launch));
+    if (ran) {
+        for (size_t k = 0; k < sizes.size(); ++k) {
+            const int64_t n = sizes[k];
+            const bool lossy = n * 2 >= 131072 && n % 32 == 0;
+            int64_t diff_ranks = 0, inexact = 0;
+            double se = 0.0, sx = 0.0, worst = 0.0;
+            for (int64_t i = 0; i < n; ++i) {
+                const uint16_t g0 = t[0].out[k][(size_t)i];
+                if (t[1].out[k][(size_t)i] != g0 || t[2].out[k][(size_t)i] != g0) ++diff_ranks;
+                float acc = 0.0f;
+                for (int r = 0; r < 3; ++r) acc += h_bf16(h_to_bf16(ar_ti8_value(r, i)));
+                const double e = (double)h_bf16(g0) - (double)acc;
+                if (!lossy && g0 != h_to_bf16(acc)) ++inexact;
+                se += e * e; sx += (double)acc * acc;
+                const double rel = std::fabs(e) / (std::fabs((double)acc) + 1.0);
+                if (rel > worst) worst = rel;
+            }
+            const double rrms = sx > 0 ? std::sqrt(se / sx) : 0.0;
+            const std::string what = nm + " numel " + std::to_string(n) + " (" +
+                                     std::to_string(n / 32) + " groups, % 3 = " +
+                                     std::to_string((n / 32) % 3) + ")";
+            ok((what + ": every rank holds the same bytes").c_str(), diff_ranks == 0,
+               std::to_string(diff_ranks) + " elements differ between ranks");
+            if (!lossy) {
+                ok((what + ": declined by the wire, so the exact fold, bit for bit").c_str(),
+                   inexact == 0, std::to_string(inexact) + " elements not the exact fold");
+            } else {
+                char d[160];
+                std::snprintf(d, sizeof(d), "relative RMS %.4f%%, worst |err|/(|sum|+1) %.4f",
+                              rrms * 100.0, worst);
+                std::printf("        %s: %s\n", what.c_str(), d);
+                ok((what + ": within the int8 wire's error of the fp32 sum (relative RMS < 1%)").c_str(),
+                   rrms < 0.01, d);
+            }
+        }
+    }
+    if (row->fini) for (int r = 0; r < 3; ++r) if (t[r].inst) row->fini(t[r].inst);
+}
+
 static void gather_three_rank(const Plugin& pl, const std::vector<int>& devs, const char* name) {
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
@@ -12660,7 +12781,7 @@ static void device_phase(const Plugin& pl) {
     /* Every collective has a host twin (r4d_rows.cpp): the same kernel with its mailbox in pinned
      * host memory. A case is the pair's, so the twin is held to exactly the original's checks. */
     for (const char* base : { "ar_oneshot_2rank_exact", "ar_gather_2rank", "ar_oneshot_3rank_exact",
-                              "ar_twoshot_3rank_exact", "ar_gather_3rank" }) {
+                              "ar_twoshot_3rank_exact", "ar_twoshot_3rank_ti8", "ar_gather_3rank" }) {
         for (const std::string& n : { std::string(base), std::string(base) + "_host" }) {
             if (!sel(n.c_str())) continue;
             const bool three = std::strstr(base, "3rank") != nullptr;
@@ -12676,6 +12797,8 @@ static void device_phase(const Plugin& pl) {
              * ar_oneshot_3rank_exact` reproduces one of them alone. */
             } else if (three && std::strstr(base, "gather")) {
                 gather_three_rank(pl, devs, n.c_str());
+            } else if (three && std::strstr(base, "ti8")) {
+                ar_three_rank_ti8(pl, devs, n.c_str());
             } else if (three && std::strstr(base, "twoshot")) {
                 ar_three_rank_pattern(pl, devs, n.c_str());
             } else {

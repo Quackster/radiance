@@ -953,6 +953,43 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
  * four-rank crossover has been measured to set another. In place is safe for the exact two-shot's
  * reason: a thread owns the same 8 elements of a shard in all three phases, reads them from the
  * input before it writes them, and no peer reads this rank's input. */
+/* The same wire at three ranks, over the uneven two-shot (r4d_ar_twoshot_Nrank_ti8.hip): the only
+ * lossy row at three, so as at four a lossy request resolves it at every size and a message
+ * under `min_bytes` -- or one that is not whole 32-element groups -- goes to the exact one-shot.
+ * A 2048-wide row is 64 groups, so the residual is always whole groups; what it rarely is, is a
+ * multiple of three groups, and the kernel's split does not need it to be. */
+extern "C" int r4d_rad_ar_twoshot_3rank_ti8(const RadArgs* a, RadStream s) {
+    ArCall c;
+    int rc = ar_setup(a, &c, 1);
+    if (rc != RAD_OK) return rc;
+    if (c.in->world != 3) return RAD_E_SHAPE;
+    if (c.in->dtype == 2) return RAD_E_DTYPE;
+
+    int group = 0, group_bytes = 0;
+    r4d_ar_ti8_dims(&group, &group_bytes);
+    if (group <= 0) return RAD_E_DEVICE;
+    const long long floor_b = r4d_pgeti_or(a->p, a->n_p, "min_bytes", R4D_AR_WHT6_MIN_BYTES);
+    const long n_groups = c.numel / group;
+    if ((long long)c.numel * c.in->esize < floor_b || c.numel % group || n_groups < c.in->world)
+        return r4d_rad_ar_oneshot_3rank_exact(a, s);
+    /* The slot holds two wire images of the LONGEST shard. */
+    const long sg = (n_groups + c.in->world - 1) / c.in->world;
+    const long wire = (sg * group_bytes + 15) / 16 * 16;
+    if (2 * wire > c.in->slot_bytes) return RAD_E_SCRATCH;
+    /* nthreads must be a multiple of the encoder's group width -- a throw in the entry point. */
+    if (c.nthreads % 32) return RAD_E_INVAL;
+
+    const ArInst* in = c.in;
+    R4D_TRY("ar_twoshot_3rank_ti8",
+        r4d_ar_twoshot_3rank_ti8(in->peer_scratch[0], in->peer_scratch[1],
+                                 in->peer_flags[0], in->peer_flags[1],
+                                 in->my_scratch, in->my_flags, in->my_seq, in->slot_bytes,
+                                 c.inp, c.out, c.numel, in->dtype, in->rank,
+                                 (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
+                                 c.pub));
+    return RAD_OK;
+}
+
 extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
     ArCall c;
     int rc = ar_setup(a, &c, 1);

@@ -422,12 +422,19 @@ void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long out, long n_elem, long dtype, long rank, long stream,
                                 long nblocks, long nthreads, long drain, long acq, long pub);
 // The tiered int8 wire on both of the two-shot's hops (r4d_ar_twoshot_Nrank_ti8.hip; codec
-// in r4d_ar_ti8.h), 4 ranks only. The wire: int8 groups of 32 with an fp16 scale and a
+// in r4d_ar_ti8.h), 3 or 4 ranks. The wire: int8 groups of 32 with an fp16 scale and a
 // per-group record (T1 plain, T2 top-1-exact, T3 wht32) 38 bytes/group, deterministic
 // tiering, bit-identical across ranks. Same peer-argument order and flag layout as the exact
 // pair; slot stride in bytes (the wire is not 16B-aligned), holding two wire images; the 
-// encoder writes its own slot too (no loc_pack). numel must tile 32-elem groups over the ws
-// shards (numel % 128).
+// encoder writes its own slot too (no loc_pack). numel must be whole 32-elem groups; the
+// groups split over the ranks as evenly as they divide (the first ng % ws shards one group
+// longer) and every slot is laid out for the longest shard. The 4-rank entry still asks for
+// numel % 128, the even split.
+void r4d_ar_twoshot_3rank_ti8(long peer_scratch0, long peer_scratch1, long peer_flags0,
+                              long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
+                              long slot_stride_bytes, long inp, long out, long n_elem,
+                              long dtype, long rank, long stream, long nblocks,
+                              long nthreads, long drain, long acq, long pub);
 void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                               long peer_flags0, long peer_flags1, long peer_flags2,
                               long my_scratch, long my_flags, long seq_ctrs,

@@ -188,6 +188,7 @@ int  r4d_rad_ar_oneshot_8rank_exact(const RadArgs*, RadStream);
 int  r4d_rad_ar_twoshot_3rank_exact(const RadArgs*, RadStream);
 int  r4d_rad_ar_twoshot_4rank_exact(const RadArgs*, RadStream);
 int  r4d_rad_ar_twoshot_8rank_exact(const RadArgs*, RadStream);
+int  r4d_rad_ar_twoshot_3rank_ti8  (const RadArgs*, RadStream);
 int  r4d_rad_ar_twoshot_4rank_ti8  (const RadArgs*, RadStream);
 /* The fused all-reduce + norm shares the IPC set, so it shares init/fini. */
 int  r4d_rad_ar_ln_init(const RadParam*, int, int rank, int world, void** out);

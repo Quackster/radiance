@@ -2691,6 +2691,11 @@ static const RadConstraint cArWht6[] = {
     C_EQ("world_size", 2), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 64),
     C_P2P,
 };
+/* DIV 32, not 96: the three-rank split is uneven in whole groups (r4d_rad_ar_twoshot_3rank_ti8). */
+static const RadConstraint cArTi8Ts3[] = {
+    C_EQ("world_size", 3), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 32),
+    C_P2P,
+};
 static const RadConstraint cArTi8Ts4[] = {
     C_EQ("world_size", 4), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 128),
     C_P2P,
@@ -4482,6 +4487,18 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
   ROW(cArExact8), ROW(tAr), nullptr,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_oneshot_8rank_exact, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+
+{ "ar_twoshot_3rank_ti8", "all_reduce", "ar",
+  "all-reduce (sum), reduce-scatter + all-gather; both hops ride the tiered-int8 wire (double "
+  "quant, the owner storing the decode of its own words) -- lossy",
+  "exactly 3 ranks, all peer-accessible; groups of 32, split over the shards as evenly as they "
+  "divide (the first groups % 3 take one more); under min_bytes the exact one-shot; cudagraph-safe",
+  "bf16 / fp16 payload, int8 + fp16 scale + u32 record per group on the wire, fp32 accumulate in "
+  "ascending rank order, bit-identical across ranks",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+  ROW(cArTi8Ts3), ROW(tAr), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_ti8, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
 { "ar_twoshot_4rank_ti8", "all_reduce", "ar",

@@ -132,6 +132,8 @@ decode step) and its two-shot above it (every prefill chunk): reduce-scatter + a
 sends 4/3 of the message per rank instead of twice it. A message rarely divides into thirds -- a
 2048-wide bf16 row is 256 16-byte words -- so the first `words % 3` shards take one word more.
 Both rows fold in fp32 in ascending rank order, so the band edge between them changes no bits.
+`--tp-wire wht6` at three ranks is the four-rank tiered-int8 wire over the same uneven two-shot,
+above `--tp-wire-min-kb`; under it, the exact one-shot.
 
 The log says what the geometry did:
 

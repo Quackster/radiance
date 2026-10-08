@@ -956,7 +956,7 @@ int Engine::declare() {
         const int64_t exact_rows = (cfg_.tp_wire_min_kb * 1024 + row_bytes - 1) / row_bytes - 1;
         RAD_WARN("tp wire: LOSSY (--tp-wire wht6) at %lld KiB a message and above. A cross-rank "
                  "all-reduce of that size carries a quantised payload instead of bf16 (libr4d's "
-                 "is Walsh-Hadamard-rotated 6-bit at two ranks and tiered int8 at four), so this "
+                 "is Walsh-Hadamard-rotated 6-bit at two ranks and tiered int8 at three and four), so this "
                  "process does not compute the same function the exact wire does. Steps of at "
                  "most %lld rows are exact: single-sequence decode, and a "
                  "decode step until sequences x (1 + speculative depth) passes that; prefill and "

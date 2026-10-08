@@ -46,8 +46,8 @@ static const Flag g_flags[] = {
 
     { "--tp",                 "N",      "tensor-parallel ranks" },
     { "--tp-wire",            "MODE",   "cross-rank all-reduce payload: exact (default) or wht6, a\n"
-                                        "lossy wire: rotated 6-bit at 2 ranks, tiered int8 at 4,\n"
-                                        "none at 8" },
+                                        "lossy wire: rotated 6-bit at 2 ranks, tiered int8 at 3\n"
+                                        "and 4, none at 8" },
     { "--tp-wire-min-kb",     "N",      "smallest all-reduce, in KiB, the lossy wire is used for" },
     { "--p2p",                "MODE",   "how the collectives reach the other cards: auto (default)\n"
                                         "asks the driver, on requires peer access and stops without\n"

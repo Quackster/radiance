@@ -791,8 +791,9 @@ which is why it is a named flag and not a heuristic.
 `--tp-wire-min-kb` is the floor below which messages are still served exactly — 128 KiB leaves
 single-sequence decode exact and compresses prefill, which is where the win is.
 
-At four ranks `wht6` selects a different lossy wire with the same floor: tiered int8 over a
-two-shot all-reduce, both hops quantised. Eight ranks have no lossy wire, and `--tp 8 --tp-wire
+At three and four ranks `wht6` selects a different lossy wire with the same floor: tiered int8
+over a two-shot all-reduce, both hops quantised (at three the shards are whole 32-element groups,
+one group uneven where the message does not divide). Eight ranks have no lossy wire, and `--tp 8 --tp-wire
 wht6` stops at startup naming the all-reduce it found no kernel for. The exact wire at four and
 eight ranks is one-shot up to 1 MiB a message and two-shot above it, which sends
 2·(ranks−1)/ranks of the message per rank instead of (ranks−1) times it; the two produce the same
