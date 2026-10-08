@@ -27,6 +27,11 @@ namespace rad {
  * enough for any vector load an RDNA4 kernel issues (dwordx4 is 16 B). A kernel that needs more
  * than this from its scratch says so through its scratch hook, which is sized separately. */
 static constexpr int64_t kBufAlign = (int64_t)RAD_ALIGN_SUB;
+/* Keep the bulk activations on a 4 KiB boundary independently of small sampler/state planes.
+ * Moving this base by a few sub-blocks can change device throughput even when every kernel and
+ * tensor shape is unchanged. Individual buffers still need only the sub-block alignment above.
+ * The padding stays in the fixed region so smaller-step plans and arena lending retain it. */
+static constexpr int64_t kTransientBaseAlign = (int64_t)RAD_ALIGN_UNIT;
 
 #include <cstdlib>
 
@@ -129,7 +134,7 @@ int plan_buffers(Program& p, BufPlanReport* rep) {
         off += it.bytes;
         off = align_up(off, kBufAlign);
     }
-    const int64_t fixed = align_up(off, kBufAlign);
+    const int64_t fixed = align_up(off, transient.empty() ? kBufAlign : kTransientBaseAlign);
     r.persist_bytes = fixed;
 
     std::vector<Item> placed;

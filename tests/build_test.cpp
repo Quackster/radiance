@@ -294,11 +294,70 @@ TEST(liveness_packing) {
     /* A PERSIST buffer survives across steps, so it gets its own region -- at the BOTTOM, where
      * no smaller step's plan moves it, with the transients above. */
     CHECK_EQ(k.arena_offset, 0);
-    CHECK_EQ(p.arena_fixed_bytes, 512);
+    CHECK_EQ(p.arena_fixed_bytes, 4096);
     for (const BufferInfo* t : { &a, &bb, &c, &d }) CHECK(t->arena_offset >= p.arena_fixed_bytes);
-    CHECK_EQ(p.arena_bytes, 5632);
-    CHECK_EQ(rep.persist_bytes, 512);
+    CHECK_EQ(p.arena_bytes, 9216);
+    CHECK_EQ(rep.persist_bytes, 4096);
     CHECK_EQ(rep.n_unknown_live, 0);
+}
+
+TEST(small_fixed_metadata_does_not_shift_the_transient_region) {
+    auto mk = [](bool metadata) {
+        Program p;
+        p.buffers.emplace_back();
+        p.ops.resize(4);
+        p.buffers.push_back(make_buf("x", 2048, RAD_BUF_TRANSIENT, 1, 3));
+        p.buffers.push_back(make_buf("y", 1024, RAD_BUF_TRANSIENT, 1, 3));
+        p.buffers.push_back(make_buf("state", 512, RAD_BUF_PERSIST, -1, -1));
+        if (metadata) {
+            p.buffers.push_back(make_buf("metadata", 256, RAD_BUF_PERSIST, -1, -1));
+            p.buffers.push_back(make_buf("indices", 1024, RAD_BUF_DERIVED, -1, -1));
+        }
+        return p;
+    };
+    Program before = mk(false), after = mk(true);
+    CHECK_OK(plan_buffers(before));
+    CHECK_OK(plan_buffers(after));
+    CHECK_EQ(before.arena_fixed_bytes, 4096);
+    CHECK_EQ(after.arena_fixed_bytes, before.arena_fixed_bytes);
+    CHECK_EQ(after.arena_bytes, before.arena_bytes);
+    for (size_t i = 1; i <= 3; ++i)
+        CHECK_EQ(after.buffers[i].arena_offset, before.buffers[i].arena_offset);
+    /* Fixed data remains private even when the transients share one stable boundary. */
+    for (size_t i = 3; i < after.buffers.size(); ++i) {
+        const BufferInfo& b = after.buffers[i];
+        CHECK(b.arena_offset + b.bytes <= after.arena_fixed_bytes);
+        for (size_t j = i + 1; j < after.buffers.size(); ++j) {
+            const BufferInfo& other = after.buffers[j];
+            CHECK(b.arena_offset + b.bytes <= other.arena_offset ||
+                  other.arena_offset + other.bytes <= b.arena_offset);
+        }
+    }
+    for (size_t i = 1; i <= 2; ++i)
+        CHECK(after.buffers[i].arena_offset >= after.arena_fixed_bytes);
+}
+
+TEST(plans_without_device_transients_do_not_pay_for_transient_alignment) {
+    for (bool host_only : {false, true}) {
+        Program p;
+        p.buffers.emplace_back();
+        p.ops.resize(4);
+        p.buffers.push_back(make_buf("state", 512, RAD_BUF_PERSIST, -1, -1));
+        p.buffers.push_back(make_buf("other", 256,
+                                    host_only ? RAD_BUF_TRANSIENT : RAD_BUF_DERIVED, 1, 3));
+        if (host_only)
+            for (size_t i = 1; i < p.buffers.size(); ++i)
+                p.buffers[i].decl.domain = RAD_DOMAIN_HOST;
+        BufPlanReport rep;
+        CHECK_OK(plan_buffers(p, &rep));
+        CHECK_EQ(p.buffers[1].arena_offset, 0);
+        CHECK_EQ(p.buffers[2].arena_offset, 512);
+        CHECK_EQ(p.arena_fixed_bytes, host_only ? 0 : 768);
+        CHECK_EQ(p.arena_bytes, host_only ? 0 : 768);
+        CHECK_EQ(rep.persist_bytes, host_only ? 0 : 768);
+        CHECK_EQ(p.host_arena_bytes, host_only ? 768 : 0);
+        CHECK_EQ(rep.host_bytes, host_only ? 768 : 0);
+    }
 }
 
 /* A SMALLER STEP'S PLAN: the same buffers, rows scaled, the fixed region untouched, and the
@@ -318,17 +377,19 @@ TEST(a_smaller_step_packs_its_transients_lower_and_keeps_the_fixed_region) {
         p.buffers.push_back(rowbuf("x", 256, 1, 2));
         p.buffers.push_back(rowbuf("y", 512, 2, 4));
         p.buffers.push_back(rowbuf("z", 256, 3, 5));
-        p.buffers.push_back(make_buf("state", 4096, RAD_BUF_PERSIST, -1, -1));
+        p.buffers.push_back(make_buf("state", 512, RAD_BUF_PERSIST, -1, -1));
         return p;
     };
     Program full = mk(2048);
     CHECK_OK(plan_buffers(full));
+    CHECK_EQ(full.arena_fixed_bytes, 4096);
     Program probe = mk(256);
     ArenaLevel lv;
     std::string why;
     CHECK_OK(plan_level(full, probe, 256, &lv, &why));
     CHECK_EQ(lv.rows, 256);
     CHECK_EQ(lv.offset[4], full.buffers[4].arena_offset);      /* the fixed region stays */
+    CHECK_EQ(lv.offset[2], 4096);                           /* including its padding */
     for (int i = 1; i <= 3; ++i) {
         CHECK(lv.offset[(size_t)i] >= full.arena_fixed_bytes);
         CHECK(lv.offset[(size_t)i] + buffer_bytes(lv.decl[(size_t)i]) <= lv.end);
@@ -351,13 +412,14 @@ TEST(a_smaller_step_packs_its_transients_lower_and_keeps_the_fixed_region) {
     CHECK_EQ(plan_level(full, other, 256, &lv, &why), RAD_E_STATE);
     /* Persistent state sized by the step keeps its full size and its place at a smaller one... */
     Program shrank = mk(256);
-    shrank.buffers[4].decl.shape[0] = 1024;
+    shrank.buffers[4].decl.shape[0] = 128;
     CHECK_OK(plan_level(full, shrank, 256, &lv, &why));
     CHECK_EQ(lv.decl[4].shape[0], full.buffers[4].decl.shape[0]);
     CHECK_EQ(lv.offset[4], full.buffers[4].arena_offset);
+    CHECK_EQ(lv.offset[2], full.arena_fixed_bytes);
     /* ...and one LARGER at a smaller step was never sized by the step at all. */
     Program grew = mk(256);
-    grew.buffers[4].decl.shape[0] = 8192;
+    grew.buffers[4].decl.shape[0] = 1024;
     CHECK_EQ(plan_level(full, grew, 256, &lv, &why), RAD_E_STATE);
 }
 
