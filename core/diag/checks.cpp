@@ -203,7 +203,9 @@ void check_small_bar(const Facts& f, std::vector<Finding>* out) {
             fmt("%s: the host and the other cards see %s of its %s of VRAM", card_name(*c).c_str(),
                 humanb(c->vram_visible).c_str(), humanb(c->vram_total).c_str()),
             "without Resizable BAR a peer can address only a window of the card's memory, which "
-            "limits peer-to-peer collectives and copies into VRAM from the host",
+            "limits peer-to-peer collectives and copies into VRAM from the host; the engine also "
+            "keeps that card's kernel arguments in pinned host memory, and every dispatch reads "
+            "them across the link",
             "enable Resizable BAR (\"Re-Size BAR Support\" and \"Above 4G Decoding\") in the "
             "firmware setup");
     }

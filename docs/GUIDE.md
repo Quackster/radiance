@@ -50,7 +50,7 @@ driver. [`DOCKER.md`](DOCKER.md) covers it, with compose files per model.
 |---|---|
 | Required | Linux, a C++20 compiler, CMake 3.21+, Ninja, pthreads |
 | Optional | ROCm with `hipcc`, for AMD device kernels; without it you get the host backend. Set `ROCM_PATH` if ROCm is not at `/opt/rocm` |
-| With a card | Resizable BAR on (Above 4G Decoding and Resizable BAR in the firmware setup). The host writes every dispatch's arguments into VRAM, and startup refuses a card whose memory the CPU cannot reach |
+| With a card | Resizable BAR on (Above 4G Decoding and Resizable BAR in the firmware setup). The host writes every dispatch's arguments into VRAM there; without a large BAR they stay in pinned host memory and every dispatch reads them over the link, which costs launch rate |
 | Optional | OpenMP, used by the host kernel libraries if present |
 | Optional | `clang++` (or ROCm's), for `tests/r4d_emu` when the C++ compiler is g++; CMake 3.25+ for `CMakePresets.json` |
 | Shell harnesses | `curl` and `jq` |

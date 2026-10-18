@@ -85,7 +85,9 @@ only.
 ## Run with Docker
 
 The host needs Docker and an `amdgpu` driver that supports ROCm 10.1; it does not need ROCm. The
-card needs Resizable BAR on (Above 4G Decoding and Resizable BAR in the firmware setup). The image
+card works best with Resizable BAR on (Above 4G Decoding and Resizable BAR in the firmware setup);
+without it the engine keeps kernel arguments in pinned host memory, and every dispatch reads them
+over the link. The image
 is [`stilldeadcode/radiance`](https://hub.docker.com/r/stilldeadcode/radiance), with its kernels
 built for `gfx1201`. Pull it, clone this repository for its compose files, then start a model from
 one of them:

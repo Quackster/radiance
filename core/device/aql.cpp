@@ -16,8 +16,9 @@
  *
  * Fences: kernels on one queue see each other's writes through the L2 with an agent-scope fence.
  * System scope is needed only for memory the L2 does not see:
- *   - the kernel argument ring is in VRAM and written by the host through the BAR, which the L2
- *     does not snoop. A slot is rewritten one lap after it was last read, so a system-scope
+ *   - the kernel argument ring is written by the host: into VRAM through the BAR when the BAR
+ *     spans the card's memory, into pinned host memory otherwise. The L2 caches neither without
+ *     an invalidation. A slot is rewritten one lap after it was last read, so a system-scope
  *     acquire is placed at least once per half lap; without it every kernel after the first lap
  *     reads its predecessor's arguments. Slots are 1 KiB so no argument fetch shares a cache line
  *     with the next slot;
@@ -210,6 +211,7 @@ struct Dev {
     hsa_amd_memory_pool_t vram{};
     bool        has_vram = false;
     uint32_t    kfd_id = 0;             /* the driver's gpu_id: its sysfs and ioctls name it so */
+    bool        host_kargs = false;     /* no large BAR: the argument ring lives in host memory */
 };
 
 struct Global {
@@ -282,8 +284,8 @@ int topo_node(uint32_t gpu_id) {
 /* Whether the CPU can write the card's VRAM: 1 yes, 0 no, -1 unknown. The driver maps VRAM for
  * the CPU only when the PCI BAR spans all of it. With a smaller BAR (Resizable BAR off or
  * unsupported) the topology reports a private frame buffer heap and the runtime maps every VRAM
- * allocation PROT_NONE, including the kernel argument rings. The heap type is what the runtime
- * itself decides from. */
+ * allocation PROT_NONE, so argument rings go to host memory instead (init_devices). The heap type
+ * is what the runtime itself decides from. */
 int vram_host_writable(uint32_t gpu_id) {
     constexpr unsigned long long kHeapFbPrivate = 2;    /* HSA_HEAPTYPE_FRAME_BUFFER_PRIVATE */
     const int n = gpu_id ? topo_node(gpu_id) : -1;
@@ -405,14 +407,26 @@ bool init_devices() {
             g.why = fmt("HIP device %d (%s) has no matching HSA agent with a VRAM pool", i, bus);
             return false;
         }
-        /* The host writes every dispatch's arguments into VRAM (a_stream_create), so a card the
-         * CPU cannot write is refused here instead of at the first launch's SIGSEGV. */
+        /* The host writes every dispatch's arguments (a_stream_create), in VRAM when the BAR
+         * spans it. A smaller BAR makes the runtime map VRAM for the CPU PROT_NONE, which would
+         * fault at the first launch; the ring goes to pinned host memory instead, as HIP's own
+         * launches do, at the cost of the card reading each dispatch's arguments over the link. */
         if (vram_host_writable(g.dev[(size_t)i].kfd_id) == 0) {
-            g.why = fmt("card %d (%s) does not let the CPU write its VRAM: its PCI BAR is smaller "
-                        "than its memory. The AQL backend needs Resizable BAR -- turn on Above 4G "
-                        "Decoding and Resizable BAR in the firmware setup; `lspci -vv` then shows "
-                        "the card's first region as large as its VRAM", i, bus);
-            return false;
+            g.dev[(size_t)i].host_kargs = true;
+            RAD_WARN("device: card %d (%s) has a PCI BAR smaller than its VRAM (Resizable BAR "
+                     "off, or the slot's window too small), so kernel arguments stay in pinned host "
+                     "memory and every dispatch reads them across the link, which costs launch "
+                     "rate. Above 4G Decoding and Resizable BAR in the firmware setup remove the "
+                     "difference where the slot allows it",
+                     i, bus);
+        }
+        /* The fallback on a card that needs none, to measure what reading each dispatch's
+         * arguments across the link costs against the same card's VRAM rings. */
+        const char* force_host_kargs = std::getenv("RADIANCE_DEBUG_AQL_HOST_KARGS");
+        if (force_host_kargs && *force_host_kargs && *force_host_kargs != '0') {
+            g.dev[(size_t)i].host_kargs = true;
+            RAD_WARN("device: card %d (%s): RADIANCE_DEBUG_AQL_HOST_KARGS puts the kernel argument "
+                     "rings in host memory", i, bus);
         }
     }
     /* Without the handler a fault falls back to the runtime's own handling, which the
@@ -570,7 +584,7 @@ struct Stream {
     hsa_agent_t     agent{};
     hsa_queue_t*    q = nullptr;
     uint64_t        mask = 0;
-    char*           karg = nullptr;           /* VRAM, CPU-mapped through the BAR */
+    char*           karg = nullptr;           /* VRAM the CPU writes through the BAR, or host memory */
     std::atomic<bool> busy{false};
     uint64_t        wr = 0;                   /* next packet index */
     uint64_t        rd = 0;                   /* last read index seen */
@@ -906,7 +920,7 @@ inline int reserve(Stream* s, uint64_t* out) {
 inline void publish(Stream* s, uint64_t idx, uint16_t header, uint16_t setup) {
     s->wr = idx + 1;
     hsa_queue_store_write_index_relaxed(s->q, idx + 1);
-    _mm_sfence();                       /* the argument slot is write-combined VRAM */
+    _mm_sfence();                       /* the argument slot, written before the header */
     __atomic_store_n(reinterpret_cast<uint32_t*>(
                          static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) +
                          (idx & s->mask)),
@@ -947,7 +961,7 @@ struct Tape {
     uint64_t             magic = kTapeMagic;
     std::vector<TapeRec> rec;
     std::vector<unsigned char> karg_host;   /* the argument blocks, kept to compare tapes by */
-    char*                karg = nullptr;    /* VRAM, CPU-mapped, from the end of the capture on */
+    char*                karg = nullptr;    /* placed at the end of the capture */
     std::string          bad;               /* why this tape cannot be played, if it cannot */
     /* Last packet the latest play wrote on each queue; the argument block is freed only after
      * all of them are consumed. */
@@ -1083,7 +1097,7 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
  * doorbell once per kPlayRing packets: the doorbell is an uncached write across the link and a
  * pass is over a thousand dispatches. Each body is copied as recorded; the header is decided now
  * as in dispatch(), since its acquire scope depends on host writes since recording. Argument
- * blocks were written to VRAM when the tape was made, so no fence precedes the header. Ring
+ * blocks were placed when the tape was made, so no fence precedes the header. Ring
  * before a reserve that would wait: the packet processor only takes announced packets. */
 constexpr int kPlayRing = 64;
 
@@ -1407,12 +1421,14 @@ int a_stream_create(RadStream* out, int high_priority) {
     hsa_amd_profiling_set_profiler_enabled(s->q, 1);
     if (high_priority) hsa_amd_queue_set_priority(s->q, HSA_AMD_QUEUE_PRIORITY_HIGH);
     void* ka = nullptr;
-    if (hsa_amd_memory_pool_allocate(d.vram, (size_t)(s->mask + 1) * kKargSlot, 0, &ka) !=
+    hsa_amd_memory_pool_t kpool = d.host_kargs ? G().host_fine : d.vram;
+    hsa_agent_t kpeer = d.host_kargs ? d.agent : G().cpu;
+    if (hsa_amd_memory_pool_allocate(kpool, (size_t)(s->mask + 1) * kKargSlot, 0, &ka) !=
             HSA_STATUS_SUCCESS ||
-        hsa_amd_agents_allow_access(1, &G().cpu, nullptr, ka) != HSA_STATUS_SUCCESS) {
+        hsa_amd_agents_allow_access(1, &kpeer, nullptr, ka) != HSA_STATUS_SUCCESS) {
         hsa_queue_destroy(s->q);
-        device_set_error("rad_stream_create: the kernel argument ring could not be placed in VRAM "
-                         "the host can write -- the AQL backend needs a large BAR");
+        device_set_error("rad_stream_create: the kernel argument ring could not be placed in %s",
+                         d.host_kargs ? "pinned host memory" : "VRAM the host can write");
         return RAD_E_DEVICE;
     }
     s->karg = static_cast<char*>(ka);
@@ -1758,8 +1774,9 @@ void a_tape_pause(int on) {
     else if (t_tape_pause > 0) --t_tape_pause;
 }
 
-/* Moves the argument blocks to VRAM on the tape's card, where the packet processor reads them as
- * it reads the ring; the packets are then final except for the header. */
+/* Moves the argument blocks to the tape's card, into the memory the stream ring uses there: VRAM
+ * the host writes through the BAR, or pinned host memory without one. The packets are then final
+ * except for the header. */
 RadTape a_tape_end(int keep) {
     Tape* t = t_tape;
     t_tape = nullptr;
@@ -1783,13 +1800,16 @@ RadTape a_tape_end(int keep) {
         }
     }
     if (!t->karg_host.empty()) {
+        const Dev& d = G().dev[(size_t)ord];
         void* ka = nullptr;
-        if (hsa_amd_memory_pool_allocate(G().dev[(size_t)ord].vram, t->karg_host.size(), 0, &ka) !=
-                HSA_STATUS_SUCCESS ||
-            hsa_amd_agents_allow_access(1, &G().cpu, nullptr, ka) != HSA_STATUS_SUCCESS) {
+        hsa_amd_memory_pool_t pool = d.host_kargs ? G().host_fine : d.vram;
+        hsa_agent_t peer = d.host_kargs ? d.agent : G().cpu;
+        if (hsa_amd_memory_pool_allocate(pool, t->karg_host.size(), 0, &ka) != HSA_STATUS_SUCCESS ||
+            hsa_amd_agents_allow_access(1, &peer, nullptr, ka) != HSA_STATUS_SUCCESS) {
             if (ka) hsa_amd_memory_pool_free(ka);
             device_set_error("the pass cannot be recorded: %zu bytes of kernel arguments could "
-                             "not be placed in VRAM", t->karg_host.size());
+                             "not be placed in %s", t->karg_host.size(),
+                             d.host_kargs ? "pinned host memory" : "VRAM");
             tape_free(t);
             return nullptr;
         }
