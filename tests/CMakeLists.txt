@@ -110,7 +110,11 @@ set(RAD_TEST_ENV ${RAD_TEST_CARD_ENV} "ROCR_VISIBLE_DEVICES=99")
 # Binaries that need more CPU than the default budget, and what costs it. Lower an entry when its
 # cost comes down, so the tripwire stays tight.
 set(RAD_TEST_CPU_BUDGET_quant_ggml_test 25)  # llama.cpp's iq1_s and iq2_* grid searches, ~13 s
-set(RAD_TEST_CPU_BUDGET_tokenizer_test 20)  # the reference encoder over every corpus: ~3 s built by GCC 16, ~10.5 s by GCC 14 (the image's Ubuntu)
+# The image's GCC 14 build on a loaded six-core host: tokenizer_test spent 26.8 s and gbnf_test's
+# shard 2 went over the default, while both pass their checks on an idle GCC 15 build in 5.9 s and
+# 7.1 s. The budget is a tripwire, not a target: lower these when the image's cost comes down.
+set(RAD_TEST_CPU_BUDGET_gbnf_test 40)
+set(RAD_TEST_CPU_BUDGET_tokenizer_test 40)  # the reference encoder over every corpus: ~3 s built by GCC 16, ~10.5 s by GCC 14 (the image's Ubuntu)
 
 # Binaries whose OpenMP team is busy for most of their run, so a parallel ctest counts them as a
 # team's worth of slots rather than one.
