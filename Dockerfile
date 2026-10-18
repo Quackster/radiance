@@ -42,11 +42,15 @@ ARG ROCM_VERSION=10.1.0-full
 ARG UBUNTU_VERSION=24.04
 ARG FFMPEG_VERSION=8.1.3
 ARG FFMPEG_SHA256=7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3
+# Where the tarball lives. ffmpeg.org is the only source for a fresh release (the mirrors lag by
+# days) and it stalls a transfer now and then; point this at a local mirror when it does.
+ARG FFMPEG_BASE=https://ffmpeg.org/releases
 
 # ----------------------------------------------------------------------------------------- ffmpeg
 FROM ubuntu:${UBUNTU_VERSION} AS ffmpeg
 ARG FFMPEG_VERSION
 ARG FFMPEG_SHA256
+ARG FFMPEG_BASE
 ARG JOBS=
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -54,6 +58,16 @@ RUN apt-get update \
       libwebp-dev libopenh264-dev \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp
+# Fetched in its own layer, with retries: ffmpeg.org stalls a transfer now and then (curl error
+# 56), and a build that is also pulling the 8.7 GB ROCm base image and running two apt-get
+# installs is when it happens. --retry-all-errors retries the stall; --speed-limit cuts a dead
+# connection after a minute of silence instead of letting TCP time out over ten. A stall then
+# costs one retry, not the compile that shares this layer. The hash is checked once, after the
+# last attempt.
+RUN curl -fsSL --retry 10 --retry-delay 5 --retry-all-errors \
+      --connect-timeout 20 --speed-limit 4096 --speed-time 60 \
+      -o ffmpeg.tar.xz "${FFMPEG_BASE}/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
+ && echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c -
 # Demuxers: media.cpp's kFormats whitelist. Decoders: what those containers carry -- still
 # images, H.264 and HEVC (MP4, MOV, HEIF), VP8 and VP9 (WebM, WebP), AV1 through dav1d (WebM, MP4,
 # AVIF), MPEG-1/2/4, Theora and the FLV/H.263 family. JPEG XL is recognised and refused by name
@@ -63,9 +77,7 @@ WORKDIR /tmp
 # muxer. No protocols: media.cpp and mp4.cpp read and write memory through their own I/O
 # contexts.
 RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
-    curl -fsSL "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" -o ffmpeg.tar.xz \
- && echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c - \
- && tar -xJf ffmpeg.tar.xz && cd "ffmpeg-${FFMPEG_VERSION}" \
+    tar -xJf ffmpeg.tar.xz && cd "ffmpeg-${FFMPEG_VERSION}" \
  && ./configure --prefix=/opt/ffmpeg --enable-shared --disable-static --disable-debug \
       --disable-programs --disable-doc --disable-network --disable-autodetect --disable-everything \
       --disable-avdevice --disable-avfilter --enable-swresample \
